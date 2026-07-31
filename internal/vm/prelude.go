@@ -197,6 +197,12 @@ function session.send(text) op({ type = "send", text = text }) end
 function session.push(channel, reply_to, text)
   return op({ type = "session.push", channel = channel, reply_to = reply_to, text = text })
 end
+-- session.push_user sends to a user by identity UUID. Channel-agnostic: pass
+-- the UUID from msg.from ("user:<uuid>" -> strip the prefix) of a prior turn.
+-- Requires the channel.push capability and the identity layer to be enabled.
+function session.push_user(uuid, text)
+  return op({ type = "session.push_user", address = "user:" .. uuid, text = text })
+end
 -- session.exit terminates this session cleanly: the loop is not restarted,
 -- timers/requests are reaped, and the parent (if any) receives agent.died.
 -- The calling coroutine is never resumed.

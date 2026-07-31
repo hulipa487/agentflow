@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"agentflow/internal/core/budget"
 	"agentflow/internal/core/caps"
 	"agentflow/internal/core/gateway"
+	"agentflow/internal/core/identity"
 	"agentflow/internal/core/memory"
 	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/pool"
@@ -38,6 +40,7 @@ import (
 	"agentflow/internal/drivers/redis"
 	"agentflow/internal/drivers/shell"
 	"agentflow/internal/drivers/store"
+	"agentflow/internal/drivers/store/volatile"
 	"agentflow/internal/drivers/telegram"
 	"agentflow/internal/drivers/webhook"
 	"agentflow/internal/ui"
@@ -68,6 +71,7 @@ func main() {
 	memReg.RegisterProvider(mongodb.Provider{})
 	memReg.RegisterProvider(postgres.Provider{})
 	memReg.RegisterProvider(pgvector.Provider{})
+	memReg.RegisterProvider(volatile.Provider{})
 	for _, a := range cfg.Agents {
 		_ = cfg.ResolveMemoryProfile(a)
 	}
@@ -343,6 +347,27 @@ func main() {
 	rtr := router.New(routeSrc, sup, log)
 	go rtr.Run(ctx)
 
+	// Identity layer (opt-in). When enabled, every inbound channel event is
+	// minted a stable user UUID before the router sees it, and the supervisor
+	// gains a user resolver for session.push_user. When disabled, the sink is
+	// the router directly — unchanged behavior.
+	var identReg *identity.Registry
+	var sink router.Sink = rtr
+	if cfg.Runtime.Identity.Enabled {
+		idPath := cfg.IdentityPath()
+		if dir := filepath.Dir(idPath); dir != "" && dir != "." {
+			_ = os.MkdirAll(dir, 0750)
+		}
+		identReg, err = identity.Open(idPath, log)
+		if err != nil {
+			log.Error("identity registry failed", "err", err)
+			os.Exit(1)
+		}
+		sink = identity.NewSink(rtr, identReg, log)
+		sup.SetUserResolver(identReg)
+		log.Info("identity layer enabled", "db", idPath)
+	}
+
 	// Channels. "webhooks" collects all channel drivers that need graceful
 	// shutdown (webhook + telegram-webhook).
 	var channels []channelStopper
@@ -353,7 +378,7 @@ func main() {
 		}
 		switch ch.Type {
 		case "webhook":
-			d := webhook.New(name, ch.Listen, ch.Path, ch.Agent, rtr, log)
+			d := webhook.New(name, ch.Listen, ch.Path, ch.Agent, sink, log)
 			if err := d.Start(); err != nil {
 				log.Error("channel start failed", "channel", name, "err", err)
 				os.Exit(1)
@@ -361,7 +386,7 @@ func main() {
 			gw.Register(d)
 			channels = append(channels, d)
 		case "telegram":
-			d := telegram.New(name, ch.Token, ch.Agent, ch.Mode, ch.AllowUsers, ch.Listen, ch.Path, rtr, log)
+			d := telegram.New(name, ch.Token, ch.Agent, ch.Mode, ch.AllowUsers, ch.Listen, ch.Path, sink, log)
 			if err := d.Start(ctx); err != nil {
 				log.Error("channel start failed", "channel", name, "err", err)
 				os.Exit(1)
@@ -412,6 +437,9 @@ func main() {
 	}
 	_ = memReg.Close()
 	_ = rtStore.Close()
+	if identReg != nil {
+		_ = identReg.Close()
+	}
 	adminStopCtx, adminCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer adminCancel()
 	_ = admin.Stop(adminStopCtx)

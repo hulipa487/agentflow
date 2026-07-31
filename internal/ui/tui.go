@@ -59,16 +59,25 @@ func New(src Source) *Model {
 }
 
 // SetProgram lets the log tee push lines into the running program.
-func (m *Model) SetProgram(p *tea.Program) { m.prog = p }
+func (m *Model) SetProgram(p *tea.Program) {
+	m.mu.Lock()
+	m.prog = p
+	m.mu.Unlock()
+}
 
-// PushLog is called by the slog tee for every record. It is safe before the
-// program starts (lines buffer and flush on first frame).
+// PushLog is called by the slog tee for every record. Before the program
+// starts (prog == nil) lines buffer in pending and flush on the first frame;
+// once running they go straight to the update loop. It must never do both for
+// one line or every record renders twice.
 func (m *Model) PushLog(line string) {
 	m.mu.Lock()
-	m.pending = append(m.pending, line)
+	prog := m.prog
+	if prog == nil {
+		m.pending = append(m.pending, line)
+	}
 	m.mu.Unlock()
-	if m.prog != nil {
-		m.prog.Send(logMsg(line))
+	if prog != nil {
+		prog.Send(logMsg(line))
 	}
 }
 

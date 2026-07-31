@@ -11,11 +11,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"agentflow/internal/builtins"
+	"agentflow/internal/core/address"
 	"agentflow/internal/core/memory"
 	"agentflow/internal/core/pool"
 	"agentflow/internal/core/safety"
@@ -160,6 +161,13 @@ type Gateway interface {
 	Send(channel, replyTo, text string) error
 }
 
+// UserResolver resolves a user UUID to a delivery target for proactive push
+// (session.push_user). It is satisfied by the identity.Registry; defined
+// here (not imported from identity) to avoid a session↔identity import cycle.
+type UserResolver interface {
+	LookupUser(uuid string) (channel, replyTo string, ok bool)
+}
+
 // AgentSummary is safe runtime metadata returned by agent.list.
 type AgentSummary struct {
 	SessionID string `json:"session_id"`
@@ -216,6 +224,7 @@ func (b *StringBox) Store(s string) { b.v.Store(s) }
 var blockingOps = map[string]bool{
 	"send":            true,
 	"session.push":    true,
+	"session.push_user": true,
 	"llm.chat":        true,
 	"llm.stream.open": true,
 	"llm.stream.next": true,
@@ -264,6 +273,7 @@ type Actor struct {
 	gw       Gateway
 	agents   AgentService
 	sched    SchedulerService
+	users    UserResolver
 	safety   *safety.Dispatcher
 	handlers map[string]OpHandler
 	pool     *pool.Pool
@@ -281,7 +291,7 @@ type Actor struct {
 	busy atomic.Bool
 }
 
-func New(name string, identity Identity, info *Info, gw Gateway, agents AgentService, sched SchedulerService, safe *safety.Dispatcher, handlers map[string]OpHandler, p *pool.Pool, log *slog.Logger) *Actor {
+func New(name string, identity Identity, info *Info, gw Gateway, agents AgentService, sched SchedulerService, users UserResolver, safe *safety.Dispatcher, handlers map[string]OpHandler, p *pool.Pool, log *slog.Logger) *Actor {
 	return &Actor{
 		Name:        name,
 		Identity:    identity,
@@ -291,6 +301,7 @@ func New(name string, identity Identity, info *Info, gw Gateway, agents AgentSer
 		gw:          gw,
 		agents:      agents,
 		sched:       sched,
+		users:       users,
 		safety:      safe,
 		handlers:     handlers,
 		pool:        p,
@@ -348,8 +359,11 @@ func (a *Actor) Run(ctx context.Context) {
 
 func (a *Actor) loadSource() (string, error) {
 	if a.LoopFile != "" {
-		b, err := os.ReadFile(a.LoopFile)
-		return string(b), err
+		// LoopFile may be a directory (a multi-module loop); builtins.Resolve
+		// handles both file and directory, concatenating a directory's *.lua
+		// members in sorted order. For a plain file it reads the file.
+		src, _, err := builtins.Resolve(a.LoopFile)
+		return src, err
 	}
 	return a.LoopSrc, nil
 }
@@ -522,6 +536,27 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 			return `"session.push requires a channel"`, false
 		}
 		return a.egress(ctx, op.Channel, op.ReplyTo, op.Text)
+	}
+	if op.Type == "session.push_user" {
+		// Proactive egress to a user by identity UUID. Channel-agnostic: the
+		// loop only knows the UUID (from msg.from of a prior turn); the
+		// resolver maps it back to {channel, reply_to}. Same capability gate
+		// and safety egress as session.push.
+		if !a.Identity.Capabilities["channel.push"] {
+			return `"agent lacks channel.push capability"`, false
+		}
+		if a.users == nil {
+			return `"identity not enabled on this runtime"`, false
+		}
+		addr, err := address.Parse(op.Address)
+		if err != nil || addr.Kind != address.User {
+			return `"session.push_user requires a user:<uuid> address"`, false
+		}
+		channel, replyTo, ok := a.users.LookupUser(addr.User)
+		if !ok {
+			return `"unknown user"`, false
+		}
+		return a.egress(ctx, channel, replyTo, op.Text)
 	}
 	if a.agents != nil {
 		switch op.Type {

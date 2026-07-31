@@ -25,11 +25,21 @@ func TestParse(t *testing.T) {
 func TestParseRejectsMalformed(t *testing.T) {
 	for _, raw := range []string{
 		"", "agent:", "agent:bad/name", "agent:one:two", "session:",
-		"user:alice", "agent:worker:new:extra",
+		"user:", "user:bad|char", "user:bad:char", "user:bad.char", "agent:worker:new:extra",
 	} {
 		if _, err := Parse(raw); err == nil {
 			t.Fatalf("Parse(%q) unexpectedly succeeded", raw)
 		}
+	}
+}
+
+func TestParseUser(t *testing.T) {
+	got, err := Parse("user:u_8f3a9b2c")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got.Kind != User || got.User != "u_8f3a9b2c" || got.String() != "user:u_8f3a9b2c" {
+		t.Fatalf("unexpected parse: %+v", got)
 	}
 }
 

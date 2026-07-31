@@ -54,10 +54,31 @@ type Message struct {
 	Ts         int64          `json:"ts,omitempty"`
 }
 
-// ChatMessage is one llm.chat turn crossing the bridge.
+// ChatMessage is one llm.chat turn crossing the bridge. Plain turns use
+// Role+Content. An assistant turn that requested tools sets ToolCalls; a
+// "tool" role turn carrying a result sets ToolCallID (+ ToolResult or Content).
 type ChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string         `json:"role"`
+	Content    string         `json:"content,omitempty"`
+	ToolCalls  []ToolCallSpec `json:"tool_calls,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
+	ToolResult any            `json:"tool_result,omitempty"`
+}
+
+// ToolCallSpec is one tool invocation crossing the bridge (name + parsed args).
+type ToolCallSpec struct {
+	ID   string         `json:"id,omitempty"`
+	Name string         `json:"name"`
+	Args map[string]any `json:"args,omitempty"`
+}
+
+// ToolSpec is a provider-agnostic tool definition a loop passes via llm.chat
+// opts. It crosses the bridge as {name, description, parameters} and is
+// reshaped per provider at request time.
+type ToolSpec struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
 }
 
 // Op is a request yielded by Lua through the async bridge.
@@ -72,6 +93,8 @@ type Op struct {
 	Temperature *float64      `json:"temperature,omitempty"`
 	MaxTokens   int           `json:"max_tokens,omitempty"`
 	Stream      string        `json:"stream,omitempty"`
+	Tools       []ToolSpec    `json:"tools,omitempty"`
+	ToolChoice  string        `json:"tool_choice,omitempty"`
 
 	// Proactive channel egress (session.push).
 	Channel string `json:"channel,omitempty"`

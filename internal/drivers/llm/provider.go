@@ -58,21 +58,39 @@ func maxTokensOf(cfg config.Model, opts Opts) int {
 	return 4096
 }
 
-// splitSystem separates the leading system message (providers model it
-// differently); the rest must be user/assistant turns.
-func splitSystem(msgs []Message) (system string, turns []Message) {
-	turns = msgs
-	if len(msgs) > 0 && msgs[0].Role == "system" {
-		system = msgs[0].Content
-		turns = msgs[1:]
-	}
-	return system, turns
-}
-
 func mustJSON(v any) []byte {
 	b, err := json.Marshal(v)
 	if err != nil {
 		panic(err) // request shapes are static; a marshal failure is a bug
 	}
 	return b
+}
+
+// parseArgs unmarshals a tool-call arguments JSON string into a map. An empty
+// or malformed body yields an empty map (the loop still sees the call name).
+func parseArgs(raw string) map[string]any {
+	args := map[string]any{}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return args
+	}
+	_ = json.Unmarshal([]byte(raw), &args)
+	return args
+}
+
+// openaiTools converts the provider-agnostic ToolDef list to the OpenAI Chat
+// Completions request shape: [{type:"function",function:{name,description,parameters}}].
+func openaiTools(tools []ToolDef) []map[string]any {
+	out := make([]map[string]any, 0, len(tools))
+	for _, t := range tools {
+		out = append(out, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        t.Name,
+				"description": t.Description,
+				"parameters":  t.Parameters,
+			},
+		})
+	}
+	return out
 }

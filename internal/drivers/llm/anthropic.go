@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"agentflow/internal/config"
 )
@@ -17,7 +18,7 @@ import (
 func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs []Message, opts Opts) (<-chan event, bool, error) {
 	base := resolveBase(cfg, "https://api.anthropic.com")
 	url := base + "/v1/messages"
-	system, turns := splitSystem(msgs)
+	system, turns := anthropicTurns(msgs)
 
 	body := map[string]any{
 		"model":      cfg.Model,
@@ -30,6 +31,20 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 	}
 	if opts.Temperature != nil {
 		body["temperature"] = *opts.Temperature
+	}
+	if len(opts.Tools) > 0 {
+		tools := make([]map[string]any, 0, len(opts.Tools))
+		for _, t := range opts.Tools {
+			tools = append(tools, map[string]any{
+				"name":         t.Name,
+				"description":  t.Description,
+				"input_schema": t.Parameters,
+			})
+		}
+		body["tools"] = tools
+		if opts.ToolChoice != "" {
+			body["tool_choice"] = map[string]any{"type": opts.ToolChoice}
+		}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(mustJSON(body)))
@@ -58,12 +73,29 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 		defer close(events)
 		defer resp.Body.Close()
 		var usage Usage
+		// Anthropic emits content blocks indexed by position. A tool_use block
+		// starts with id+name, then receives input_delta.partial_json fragments.
+		type blk struct {
+			id   string
+			name string
+			args strings.Builder
+		}
+		blocks := map[int]*blk{}
+		var order []int
 		for data := range sseDatas(ctx, resp.Body) {
 			var ev struct {
-				Type  string `json:"type"`
+				Type         string `json:"type"`
+				Index        int    `json:"index"`
+				ContentBlock *struct {
+					Type  string `json:"type"`
+					ID    string `json:"id"`
+					Name  string `json:"name"`
+					Text  string `json:"text"`
+				} `json:"content_block"`
 				Delta struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
+					Type       string `json:"type"`
+					Text       string `json:"text"`
+					PartialJSON string `json:"partial_json"`
 				} `json:"delta"`
 				Usage struct {
 					InputTokens  int `json:"input_tokens"`
@@ -81,12 +113,24 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 			switch ev.Type {
 			case "message_start":
 				usage.Input = ev.Message.Usage.InputTokens
+			case "content_block_start":
+				if ev.ContentBlock != nil && ev.ContentBlock.Type == "tool_use" {
+					blocks[ev.Index] = &blk{id: ev.ContentBlock.ID, name: ev.ContentBlock.Name}
+					order = append(order, ev.Index)
+				}
 			case "content_block_delta":
-				if ev.Delta.Text != "" {
-					select {
-					case events <- event{delta: ev.Delta.Text}:
-					case <-ctx.Done():
-						return
+				switch ev.Delta.Type {
+				case "text_delta":
+					if ev.Delta.Text != "" {
+						select {
+						case events <- event{delta: ev.Delta.Text}:
+						case <-ctx.Done():
+							return
+						}
+					}
+				case "input_json_delta":
+					if b, ok := blocks[ev.Index]; ok {
+						b.args.WriteString(ev.Delta.PartialJSON)
 					}
 				}
 			case "message_delta":
@@ -96,7 +140,62 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 				return
 			}
 		}
+		if len(order) > 0 {
+			calls := make([]ToolCall, 0, len(order))
+			for _, i := range order {
+				b := blocks[i]
+				calls = append(calls, ToolCall{ID: b.id, Name: b.name, Args: parseArgs(b.args.String())})
+			}
+			events <- event{toolCalls: calls}
+		}
 		events <- event{usage: usage}
 	}()
 	return events, false, nil
+}
+
+// anthropicTurns converts the neutral Message list to Anthropic's shape: the
+// leading system message is extracted (returned as the first result), and the
+// remaining turns are reshaped so that assistant tool_calls become tool_use
+// content blocks and "tool" role turns become user tool_result blocks. Adjacent
+// tool results are merged into one user message, as Anthropic requires.
+func anthropicTurns(msgs []Message) (system string, turns []map[string]any) {
+	if len(msgs) > 0 && msgs[0].Role == "system" {
+		system = msgs[0].Content
+		msgs = msgs[1:]
+	}
+	for _, m := range msgs {
+		switch {
+		case m.Role == "assistant" && len(m.ToolCalls) > 0:
+			content := []map[string]any{}
+			if m.Content != "" {
+				content = append(content, map[string]any{"type": "text", "text": m.Content})
+			}
+			for _, tc := range m.ToolCalls {
+				content = append(content, map[string]any{
+					"type":  "tool_use",
+					"id":    tc.ID,
+					"name":  tc.Name,
+					"input": tc.Args,
+				})
+			}
+			turns = append(turns, map[string]any{"role": "assistant", "content": content})
+		case m.Role == "tool":
+			result := m.ToolResult
+			if result == nil {
+				result = m.Content
+			}
+			block := map[string]any{"type": "tool_result", "tool_use_id": m.ToolCallID, "content": result}
+			// Merge into a preceding user tool_result message if present.
+			if n := len(turns); n > 0 {
+				if prev, ok := turns[n-1]["content"].([]map[string]any); ok {
+					turns[n-1]["content"] = append(prev, block)
+					continue
+				}
+			}
+			turns = append(turns, map[string]any{"role": "user", "content": []map[string]any{block}})
+		default:
+			turns = append(turns, map[string]any{"role": m.Role, "content": m.Content})
+		}
+	}
+	return system, turns
 }

@@ -16,16 +16,39 @@ import (
 	"agentflow/internal/config"
 )
 
-// Message is a single chat turn. Content is plain text (phase 1).
+// Message is a single chat turn. Content is plain text. ToolCalls is set on
+// an assistant turn that requested tools; ToolCallID and ToolResult are set
+// on a "tool" role turn that carries a tool's result back to the model.
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	ToolResult any        `json:"tool_result,omitempty"`
+}
+
+// ToolCall is one tool invocation the model requested. Args is the parsed
+// arguments object.
+type ToolCall struct {
+	ID   string         `json:"id,omitempty"`
+	Name string         `json:"name"`
+	Args map[string]any `json:"args"`
+}
+
+// ToolDef is the provider-agnostic shape a loop passes in opts.Tools. Each
+// provider reshapes it to its native request format in its open func.
+type ToolDef struct {
+	Name        string
+	Description string
+	Parameters  map[string]any
 }
 
 // Opts are per-call overrides from Lua (llm.chat opts).
 type Opts struct {
 	Temperature *float64
 	MaxTokens   int
+	Tools       []ToolDef
+	ToolChoice  string // "" | "auto" | "none"
 }
 
 // Usage counts tokens as reported by the provider (0 when unknown).
@@ -34,13 +57,14 @@ type Usage struct {
 	Output int `json:"output"`
 }
 
-// event is one normalized provider event: a text delta, terminal usage, or
-// an error. Exactly one of the fields is meaningful per event; a closed
-// channel means the stream is over.
+// event is one normalized provider event: a text delta, terminal usage, an
+// error, or the assembled tool_calls at stream end. Exactly one of the fields
+// is meaningful per event; a closed channel means the stream is over.
 type event struct {
-	delta string
-	usage Usage
-	err   error
+	delta     string
+	usage     Usage
+	err       error
+	toolCalls []ToolCall
 }
 
 // Manager resolves model names to provider clients and owns live streams.
@@ -74,26 +98,31 @@ func (m *Manager) resolve(name string) (config.Model, error) {
 	return cfg, nil
 }
 
-// Chat performs a full completion and returns the buffered text.
-func (m *Manager) Chat(ctx context.Context, model string, msgs []Message, opts Opts) (string, Usage, error) {
+// Chat performs a full completion and returns the buffered text plus any
+// tool_calls the model requested at stream end.
+func (m *Manager) Chat(ctx context.Context, model string, msgs []Message, opts Opts) (string, []ToolCall, Usage, error) {
 	cfg, err := m.resolve(model)
 	if err != nil {
-		return "", Usage{}, err
+		return "", nil, Usage{}, err
 	}
 	events, err := m.openWithRetry(ctx, cfg, msgs, opts)
 	if err != nil {
-		return "", Usage{}, err
+		return "", nil, Usage{}, err
 	}
 	var text string
 	var usage Usage
+	var toolCalls []ToolCall
 	for ev := range events {
 		if ev.err != nil {
-			return "", usage, ev.err
+			return "", nil, usage, ev.err
 		}
 		text += ev.delta
 		usage = ev.usage
+		if len(ev.toolCalls) > 0 {
+			toolCalls = ev.toolCalls
+		}
 	}
-	return text, usage, nil
+	return text, toolCalls, usage, nil
 }
 
 // Stream is a live completion; Next blocks for the next delta.
@@ -129,27 +158,32 @@ func (m *Manager) StreamOpen(ctx context.Context, model string, msgs []Message, 
 }
 
 // StreamNext returns the next delta; done=true means the stream finished
-// (usage is valid then). A finished stream unregisters itself.
-func (m *Manager) StreamNext(ctx context.Context, id string) (delta string, done bool, usage Usage, err error) {
+// (usage and toolCalls are valid then). A finished stream unregisters itself.
+func (m *Manager) StreamNext(ctx context.Context, id string) (delta string, done bool, usage Usage, toolCalls []ToolCall, err error) {
 	m.mu.Lock()
 	st, ok := m.streams[id]
 	m.mu.Unlock()
 	if !ok {
-		return "", false, Usage{}, fmt.Errorf("unknown stream %q", id)
+		return "", false, Usage{}, nil, fmt.Errorf("unknown stream %q", id)
 	}
 	select {
 	case ev, open := <-st.ch:
 		if !open {
 			m.StreamClose(id)
-			return "", true, Usage{}, nil
+			return "", true, Usage{}, nil, nil
 		}
 		if ev.err != nil {
 			m.StreamClose(id)
-			return "", true, ev.usage, ev.err
+			return "", true, ev.usage, nil, ev.err
 		}
-		return ev.delta, false, ev.usage, nil
+		if len(ev.toolCalls) > 0 {
+			// Tool calls arrive once at stream end; treat as done so the
+			// loop picks them up without waiting for the channel close.
+			return "", true, ev.usage, ev.toolCalls, nil
+		}
+		return ev.delta, false, ev.usage, nil, nil
 	case <-ctx.Done():
-		return "", false, Usage{}, ctx.Err()
+		return "", false, Usage{}, nil, ctx.Err()
 	}
 }
 

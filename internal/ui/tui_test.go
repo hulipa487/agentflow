@@ -82,3 +82,34 @@ func TestTruncate(t *testing.T) {
 		t.Errorf("unexpected truncation: %q", got)
 	}
 }
+
+// A pushed line must land in m.logs exactly once, whether pushed before the
+// program starts (buffered) or after (sent to the update loop). Regression for
+// the duplicated-log-lines bug where PushLog did both.
+func TestPushLogDeduplicates(t *testing.T) {
+	m := New(Source{Snapshot: func() ([]supervisor.SessionStatus, int, int) { return nil, 0, 0 }})
+
+	// Before the program: buffered, flushed on first View.
+	m.PushLog("early line")
+	m.drainPending()
+	if countOccurrences(m.logs, "early line") != 1 {
+		t.Fatalf("early line should appear once, logs=%v", m.logs)
+	}
+
+	// After the program: goes through the update loop as a logMsg.
+	um, _ := m.Update(logMsg("live line"))
+	m = um.(*Model)
+	if countOccurrences(m.logs, "live line") != 1 {
+		t.Fatalf("live line should appear once, logs=%v", m.logs)
+	}
+}
+
+func countOccurrences(logs []string, want string) int {
+	n := 0
+	for _, l := range logs {
+		if l == want {
+			n++
+		}
+	}
+	return n
+}

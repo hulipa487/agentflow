@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"path/filepath"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -42,11 +43,22 @@ type Runtime struct {
 	} `yaml:"reload"`
 	Persistence string `yaml:"persistence"` // e.g. sqlite://./data/agentflow.db
 	Admin       AdminConfig `yaml:"admin"`
+	Identity    IdentityConfig `yaml:"identity"`
 }
 
 // AdminConfig configures the metrics/admin HTTP endpoint.
 type AdminConfig struct {
 	Listen string `yaml:"listen"` // default 127.0.0.1:9090 (loopback only)
+}
+
+// IdentityConfig configures the optional user-identity layer. When disabled
+// (the default), channel drivers submit to the router directly and message
+// From stays channel-native — zero behavior change. When enabled, every
+// inbound is minted a stable user UUID (persisted here) and From is rewritten
+// to "user:<uuid>", making loops channel-agnostic and proactive push uniform.
+type IdentityConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	Persistence string `yaml:"persistence"` // sqlite path; "" = <runtime persistence dir>/identity.db
 }
 
 // Model is a named LLM provider configuration.
@@ -481,7 +493,7 @@ func validate(path string, c *Config) error {
 
 	for bname, b := range c.Memory.Backends {
 		switch b.Provider {
-		case "builtin:sqlite", "builtin:redis", "builtin:mongodb", "builtin:postgres", "builtin:pgvector":
+		case "builtin:sqlite", "builtin:redis", "builtin:mongodb", "builtin:postgres", "builtin:pgvector", "builtin:volatile":
 		default:
 			return fmt.Errorf("%s: memory backend %q has unsupported provider %q", path, bname, b.Provider)
 		}
@@ -532,4 +544,19 @@ func (c *Config) PersistencePath() string {
 		return p[len(prefix):]
 	}
 	return p
+}
+
+// IdentityPath returns the sqlite path for the identity registry, resolved
+// beside the runtime persistence path unless explicitly overridden.
+func (c *Config) IdentityPath() string {
+	if c.Runtime.Identity.Persistence != "" {
+		return c.Runtime.Identity.Persistence
+	}
+	// Default to a sibling file in the runtime persistence directory.
+	p := c.PersistencePath()
+	dir := filepath.Dir(p)
+	if dir == "" || dir == "." {
+		return "identity.db"
+	}
+	return dir + "/identity.db"
 }

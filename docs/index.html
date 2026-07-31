@@ -134,6 +134,25 @@
        safety.egress ─► gateway.egress ─► channel.Deliver ─► user</code></pre>
   </div>
 
+  <h3>Multi-agent orchestration</h3>
+  <p>Static agents (each with its own model + instructions) collaborate via <code>agent.send</code>/<code>agent.request</code> under <code>can_contact</code> ACLs; ephemeral children are spawned from <code>profiles.agent</code> templates with capability attenuation. The <code>plugins/orchestrator/</code> example wires four roles:</p>
+  <div class="diagram-scroll">
+  <pre class="diagram"><code>chit-chat:      user ──telegram/webhook──► main ──llm──► user
+
+expert consult: user ──► main ──[directive: consult]──► expert_code (agent.request)
+                                    ◄── opinion ── (agent.reply)
+                          main ──llm (fold opinion)──► user
+
+project launch: user ──► main ──[directive: start_project]──► agent.spawn("project_manager")
+                          main ─► PM: brief{goal, channel, reply_to, chat_key}
+                          PM ── decompose → store tasks ── spawn N workers
+                          PM ──► worker: task      worker ──► PM: report
+                          PM ──► main: {kind: milestone|decision|notify, ...}
+                          main ──session.push(channel, reply_to, text)──► user  (idle-time push)
+                          PM ── shutdown workers ── session.exit()</code></pre>
+  </div>
+  <p><code>session.push</code> (cap <code>channel.push</code>) is proactive egress — a background agent reaches the user without an active inbound message. <code>session.exit</code> terminates a spawned session cleanly (the parent receives <code>agent.died</code>). See <code>examples/agentflow.orchestrator.yaml</code>.</p>
+
   <h3>Layer responsibilities</h3>
   <table class="table config-table">
     <thead><tr><th>Layer</th><th>Owns</th><th>Description</th></tr></thead>
@@ -530,10 +549,12 @@ llm.stream(messages, opts?) -> iterator    -- yields chunks; call directly, not 
 
   <h3><code>session</code> — core</h3>
   <pre><code>session.inbox() -> Message                    -- the loop's consumption point
-session.send(text_or_message)               -- egress through the active channel</code></pre>
+session.send(text_or_message)               -- egress through the active channel
+session.push(channel, reply_to, text)        -- proactive egress; cap: channel.push
+session.exit()                               -- terminate this session (no restart)</code></pre>
 
   <h3><code>agent</code> — caps: <code>agent.send</code>, <code>agent.request</code>, <code>agent.spawn</code></h3>
-  <pre><code>agent.info() -> { name, model, instructions, history_budget, memory, shell, ... }
+  <pre><code>agent.info() -> { name, session_id, address, model, instructions, history_budget, memory, shell, ... }
 agent.send(addr, payload)                    -- "agent:name" | "session:id"
 agent.request(addr, payload, timeout) -> Message   -- error on timeout
 agent.reply(request_id, payload)             -- resolve a parked request

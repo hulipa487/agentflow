@@ -1,0 +1,89 @@
+version: "1"
+
+# AgentFlow multi-agent orchestrator.
+# Four named models so each role can point at a different endpoint/model.
+# All use the openai provider against a compatible base_url; set the env
+# vars (or edit the defaults) to point each role at a real endpoint.
+models:
+  main:
+    provider: openai
+    model: ${MAIN_MODEL:-af-main}
+    base_url: ${OPENAI_BASE_URL:-http://127.0.0.1:11434/v1}
+    api_key: ${OPENAI_API_KEY:-}
+  expert:
+    provider: openai
+    model: ${EXPERT_MODEL:-af-expert}
+    base_url: ${EXPERT_BASE_URL:-http://127.0.0.1:11434/v1}
+    api_key: ${EXPERT_API_KEY:-}
+  pm:
+    provider: openai
+    model: ${PM_MODEL:-af-pm}
+    base_url: ${PM_BASE_URL:-http://127.0.0.1:11434/v1}
+    api_key: ${PM_API_KEY:-}
+  worker:
+    provider: openai
+    model: ${WORKER_MODEL:-af-worker}
+    base_url: ${WORKER_BASE_URL:-http://127.0.0.1:11434/v1}
+    api_key: ${WORKER_API_KEY:-}
+
+memory:
+  backends:
+    main_db:
+      provider: builtin:sqlite
+      config:
+        path: ./data/agentflow-orchestrator.db
+
+profiles:
+  agent:
+    # One ephemeral PM per project (spawned by main).
+    project_manager:
+      loop: ./plugins/orchestrator/pm.lua
+      model: pm
+      instructions: ./instructions/pm.md
+      capabilities: [llm.chat, memory, agent.send, agent.spawn]
+      # PM may contact its parent (main) implicitly; explicitly listing it
+      # also satisfies boot-time can_contact validation.
+      can_contact: [main]
+    # Workers spawned by a PM to run individual tasks.
+    worker:
+      loop: ./plugins/orchestrator/worker.lua
+      model: worker
+      instructions: ./instructions/worker.md
+      capabilities: [llm.chat, memory, agent.send]
+      # To enable real file/git execution, uncomment and configure a shell
+      # profile, then add: shell: docker, skills: [builtin:fs.read, builtin:fs.write, builtin:git.status]
+      ephemeral:
+        idle_ttl: 30m
+        max_lifetime: 2h
+
+agents:
+  main:
+    loop: ./plugins/orchestrator/main.lua
+    model: main
+    instructions: ./instructions/main.md
+    memory: builtin:conversational
+    history_budget: 8000
+    capabilities: [llm.chat, memory, tools, agent.send, agent.request, agent.spawn, channel.push]
+    can_contact: [expert_code]
+
+  expert_code:
+    loop: ./plugins/orchestrator/expert.lua
+    model: expert
+    instructions: ./instructions/expert_code.md
+    capabilities: [llm.chat, agent.send]
+    # No channels: experts never talk to the user.
+
+gateway:
+  channels:
+    # Webhook channel for local/scripted testing without Telegram.
+    - type: webhook
+      name: webhook
+      listen: ":8080"
+      path: /webhook
+      agent: main
+    # Telegram is the user-facing channel. Uncomment and set TG_TOKEN to use it.
+    # - type: telegram
+    #   name: telegram
+    #   token: ${TG_TOKEN}
+    #   allow_users: []   # telegram user ids; empty = allow all
+    #   agent: main

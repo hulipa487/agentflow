@@ -146,3 +146,56 @@ func TestSpawnRequiresCapability(t *testing.T) {
 		t.Fatal("expected spawn without capability to fail")
 	}
 }
+
+// TestSendToSpawnedChildSession verifies that a parent can deliver to a
+// freshly spawned child by its session:<id> address. This is the path the
+// orchestrator's PM uses to receive its brief after agent.spawn returns.
+func TestSendToSpawnedChildSession(t *testing.T) {
+	sup := newTestSupervisor(t)
+	sup.templates["coder"] = &SpawnTemplate{
+		Name:         "coder",
+		LoopSrc:      "function loop() while true do session.inbox() end end",
+		Capabilities: map[string]bool{"llm.chat": true, "agent.send": true},
+		Handlers:     map[string]session.OpHandler{},
+		Memory:       &session.Info{Name: "coder"},
+	}
+	// Register the spawn template under the child agent name too, so Deliver
+	// can route to an existing spawned child by agent name (see main.go wiring).
+	sup.defs["spawn:coder"] = &AgentDef{
+		Info:         &session.Info{Name: "spawn:coder"},
+		CanContact:   map[string]bool{"planner": true},
+		Capabilities: map[string]bool{"llm.chat": true, "agent.send": true},
+		Handlers:     map[string]session.OpHandler{},
+		LoopSrc:      "function loop() while true do session.inbox() end end",
+	}
+	parent := session.Identity{
+		SessionID:    "planner|x",
+		Agent:        "planner",
+		CanContact:   map[string]bool{"worker": true},
+		Capabilities: map[string]bool{"agent.spawn": true, "agent.send": true, "llm.chat": true},
+	}
+	res, err := sup.Spawn(context.Background(), parent, "coder", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Send to the child by its session address — this must reach the child.
+	if err := sup.Send(context.Background(), parent, res.Address, map[string]any{"type": "brief"}); err != nil {
+		t.Fatalf("send to child session %q failed: %v", res.Address, err)
+	}
+	// The child's mailbox should now hold the brief.
+	sup.mu.Lock()
+	child := sup.sessions[res.SessionID]
+	sup.mu.Unlock()
+	if child == nil {
+		t.Fatal("child session gone")
+	}
+	select {
+	case m := <-child.Mailbox:
+		if m.Payload == nil || m.Payload["type"] != "brief" {
+			t.Fatalf("child got wrong message: %+v", m)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("child never received the brief")
+	}
+}
+

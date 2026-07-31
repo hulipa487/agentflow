@@ -13,6 +13,9 @@ func TestToolCallingLoopsParse(t *testing.T) {
 	files := []string{
 		filepath.Join("..", "builtins", "lua", "react.lua"),
 		filepath.Join("..", "..", "plugins", "orchestrator", "main.lua"),
+		filepath.Join("..", "..", "plugins", "orchestrator", "expert.lua"),
+		filepath.Join("..", "..", "plugins", "orchestrator", "pm.lua"),
+		filepath.Join("..", "..", "plugins", "orchestrator", "worker.lua"),
 	}
 	for _, f := range files {
 		code, err := os.ReadFile(f)

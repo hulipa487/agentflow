@@ -5,11 +5,14 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/mattn/go-isatty"
 
 	"agentflow/internal/builtins"
 	"agentflow/internal/config"
@@ -37,11 +40,13 @@ import (
 	"agentflow/internal/drivers/store"
 	"agentflow/internal/drivers/telegram"
 	"agentflow/internal/drivers/webhook"
+	"agentflow/internal/ui"
 )
 
 func main() {
 	cfgPath := flag.String("config", "agentflow.yaml", "path to agentflow.yaml")
 	workers := flag.Int("workers", 8, "op worker pool size")
+	noTUI := flag.Bool("no-tui", false, "disable the terminal dashboard (plain stderr logs)")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -302,7 +307,26 @@ func main() {
 
 	memMgr.StartGC(ctx, 5*time.Minute, agentMemories)
 
-	sup := supervisor.New(defs, gw, opPool, shellMgr, log)
+	// Terminal dashboard: only when attached to a TTY and not disabled. The tee
+	// handler mirrors slog records into the TUI log pane and drops the stderr
+	// copy (the TUI owns the screen). On non-TTY output (piped logs, systemd)
+	// the plain stderr logger stays. The snapshot closure reads sup lazily so
+	// the dashboard can be created before the supervisor.
+	var sup *supervisor.Supervisor
+	var dash *ui.Dashboard
+	if !*noTUI && isatty.IsTerminal(os.Stdout.Fd()) {
+		dash = ui.Start(ui.Source{Snapshot: func() ([]supervisor.SessionStatus, int, int) {
+			if sup == nil {
+				return nil, 0, 0
+			}
+			return sup.Snapshot()
+		}})
+		log = slog.New(dash.LogHandler(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug})))
+		slog.SetDefault(log)
+		defer dash.Stop()
+	}
+
+	sup = supervisor.New(defs, gw, opPool, shellMgr, log)
 	sup.SetScheduler(schedSvc)
 	sup.Start(ctx)
 

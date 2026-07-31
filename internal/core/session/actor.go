@@ -274,6 +274,11 @@ type Actor struct {
 	// exiting is set by the session.exit op (actor goroutine only). Run
 	// checks it after runOnce returns so an exited session is not restarted.
 	exiting bool
+
+	// busy reports whether the actor is actively processing a message (vs.
+	// blocked waiting for the next inbox). Read by the supervisor's status
+	// snapshot for the TUI; written only by the actor goroutine.
+	busy atomic.Bool
 }
 
 func New(name string, identity Identity, info *Info, gw Gateway, agents AgentService, sched SchedulerService, safe *safety.Dispatcher, handlers map[string]OpHandler, p *pool.Pool, log *slog.Logger) *Actor {
@@ -301,6 +306,10 @@ func (a *Actor) Reload() {
 	default: // already pending
 	}
 }
+
+// Busy reports whether the actor is actively processing a message rather than
+// blocked waiting for the next inbox. Safe for concurrent reads (TUI snapshot).
+func (a *Actor) Busy() bool { return a.busy.Load() }
 
 // Run is the actor's main loop. It owns the Luau state; call from one
 // goroutine only. It restarts the loop on crashes and reload signals until
@@ -650,8 +659,10 @@ func (a *Actor) infoJSON() string {
 
 // waitInbox blocks for the next message, a reload signal, or shutdown.
 func (a *Actor) waitInbox(ctx context.Context) (Message, bool) {
+	a.busy.Store(false) // idle while parked on the mailbox
 	select {
 	case m := <-a.Mailbox:
+		a.busy.Store(true)
 		return m, true
 	case <-a.reload:
 		a.log.Info("hot reload: restarting loop")

@@ -284,6 +284,20 @@ func main() {
 			Capabilities:  tmpl.Capabilities,
 			Handlers:      handlers,
 		}
+		// Also register the template under the spawned child's agent name
+		// ("spawn:<name>") so a parent can deliver to an existing child by its
+		// session:<id> address: Deliver resolves the agent name to a def, and a
+		// live child at <agent>|<childKey> is found without re-spawning.
+		childDef := &supervisor.AgentDef{
+			SpawnTemplate: tmpl,
+			Info:          tmpl.Memory,
+			CanContact:    tmpl.CanContact,
+			Capabilities:  tmpl.Capabilities,
+			Handlers:      handlers,
+			LoopFile:      watchPath,
+			LoopSrc:       src,
+		}
+		defs["spawn:"+pname] = childDef
 	}
 
 	memMgr.StartGC(ctx, 5*time.Minute, agentMemories)

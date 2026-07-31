@@ -3,31 +3,62 @@
 #   make            # luau + agentflow binary (default)
 #   make luau       # compile vendored Luau -> internal/vm/lib/libluau.a
 #   make build      # just the Go binary (requires libluau.a)
-#   make test       # go test with the cgo/zig toolchain
-#   make vet        # go vet with the cgo/zig toolchain
+#   make test       # go test with the cgo toolchain
+#   make vet        # go vet with the cgo toolchain
 #   make run        # build, then run with CONFIG (default: examples/agentflow.minimal.yaml)
 #   make clean      # remove objects, static lib, and binary
 #
-# Requires GNU make, zig (as hermetic C/C++ toolchain), and Go 1.25+.
+# Toolchain is auto-selected by host OS:
+#   Windows -> zig (hermetic; no system gcc required)
+#   Linux   -> system gcc (cc / c++ / ar)
+#   macOS   -> clang++ / ar (Apple toolchain)
+# Requires GNU make, Go 1.25+, and (on Windows) zig.
 
 .DEFAULT_GOAL := all
 
-# ---- toolchain -------------------------------------------------------------
-CC      := zig cc
-CXX     := zig c++
-AR      := zig ar
+# ---- host detection --------------------------------------------------------
+# GOHOSTOS / GOHOSTARCH are set by the Go toolchain from `go env` and reflect
+# the build host, not the target. They're stable across `make` invocations.
+GOHOSTOS  := $(shell go env GOHOSTOS)
+GOHOSTARCH:= $(shell go env GOHOSTARCH)
 
-# Luau cross-compile target. Override: make TARGET=x86_64-linux-gnu
-TARGET  ?= x86_64-windows-gnu
+# ---- toolchain (auto per OS) ------------------------------------------------
+# Windows uses zig as a hermetic C/C++ toolchain (zig cc wraps a clang frontend
+# and a native target triple). Linux uses the system gcc; macOS uses clang++.
+# TARGET is only meaningful for zig (its -target flag); the native toolchains
+# build for the host without one.
+ifeq ($(GOHOSTOS),windows)
+  CC      := zig cc
+  CXX     := zig c++
+  AR      := zig ar
+  # zig's -target uses x86_64/aarch64, not Go's amd64/arm64.
+  ZIG_ARCH := amd64
+  ifeq ($(GOHOSTARCH),amd64)
+    ZIG_ARCH := x86_64
+  else ifeq ($(GOHOSTARCH),arm64)
+    ZIG_ARCH := aarch64
+  endif
+  CXXFLAGS += -target $(ZIG_ARCH)-windows-gnu
+  GOENV   := CGO_ENABLED=1 CC="zig cc" CXX="zig c++"
+else ifeq ($(GOHOSTOS),linux)
+  CC      := cc
+  CXX     := c++
+  AR      := ar
+  GOENV   := CGO_ENABLED=1 CC="cc" CXX="c++"
+else ifeq ($(GOHOSTOS),darwin)
+  CC      := clang
+  CXX     := clang++
+  AR      := ar
+  GOENV   := CGO_ENABLED=1 CC="clang" CXX="clang++"
+else
+  $(error unsupported host OS: $(GOHOSTOS))
+endif
 
 # Output binary. On Windows you may want: make BIN=agentflow.exe
 BIN     ?= agentflow
 
 # Config used by `make run`
 CONFIG  ?= examples/agentflow.minimal.yaml
-
-# cgo environment for all Go commands
-GOENV   := CGO_ENABLED=1 CC="zig cc" CXX="zig c++"
 
 # ---- Luau static library ---------------------------------------------------
 LUAU    := third_party/luau
@@ -42,7 +73,7 @@ INCFLAGS := \
 	-I$(LUAU)/Bytecode/include \
 	-I$(LUAU)/Compiler/include
 
-CXXFLAGS := -target $(TARGET) -O2 -DNDEBUG -std=c++17
+CXXFLAGS += -O2 -DNDEBUG -std=c++17
 
 # Objects are tagged per module (vm_, common_, ast_, bc_, cc_) to avoid name
 # collisions between same-named files in different Luau modules.
@@ -96,5 +127,6 @@ vet:
 
 clean:
 	rm -rf $(OBJ) $(LIB) $(BIN) $(BIN).exe
+
 
 .PHONY: all luau build run test vet clean

@@ -73,6 +73,10 @@ type Op struct {
 	MaxTokens   int           `json:"max_tokens,omitempty"`
 	Stream      string        `json:"stream,omitempty"`
 
+	// Proactive channel egress (session.push).
+	Channel string `json:"channel,omitempty"`
+	ReplyTo string `json:"reply_to,omitempty"`
+
 	// Store / memory / tool ops.
 	Table  string        `json:"table,omitempty"`
 	Key    string        `json:"key,omitempty"`
@@ -188,6 +192,7 @@ func (b *StringBox) Store(s string) { b.v.Store(s) }
 // blockingOps run on the worker pool; everything else is inline.
 var blockingOps = map[string]bool{
 	"send":            true,
+	"session.push":    true,
 	"llm.chat":        true,
 	"llm.stream.open": true,
 	"llm.stream.next": true,
@@ -242,6 +247,10 @@ type Actor struct {
 
 	reload chan struct{}
 	log    *slog.Logger
+
+	// exiting is set by the session.exit op (actor goroutine only). Run
+	// checks it after runOnce returns so an exited session is not restarted.
+	exiting bool
 }
 
 func New(name string, identity Identity, info *Info, gw Gateway, agents AgentService, sched SchedulerService, safe *safety.Dispatcher, handlers map[string]OpHandler, p *pool.Pool, log *slog.Logger) *Actor {
@@ -290,6 +299,10 @@ func (a *Actor) Run(ctx context.Context) {
 			return
 		}
 		crashed := a.runOnce(ctx)
+		if a.exiting {
+			a.log.Info("session exited via session.exit")
+			return
+		}
 		if crashed {
 			a.log.Warn("loop crashed; restarting in 1s")
 			select {
@@ -418,6 +431,12 @@ func (a *Actor) dispatchInline(ctx context.Context, op Op, current *Message) (re
 		a.log.Log(ctx, levelOf(op.Level), op.Msg)
 		return "true", true, true
 
+	case "session.exit":
+		// The coroutine is never resumed; Run sees the flag and lets the
+		// actor terminate instead of restarting the loop.
+		a.exiting = true
+		return "true", true, false
+
 	case "agent.info":
 		return a.infoJSON(), true, true
 
@@ -459,28 +478,18 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 		if current.Channel == "" {
 			return `"no active message to reply to"`, false
 		}
-		// Safety egress: run the reply through the dispatcher before the
-		// gateway delivers it. A drop means nothing is sent.
-		text := op.Text
-		if a.safety != nil {
-			res := a.safety.Egress(ctx, safety.EgressInput{
-				Text:   text,
-				Source: "agent",
-			})
-			if res.Drop {
-				a.log.Info("safety egress dropped reply", "reason", res.Reason)
-				return `"reply blocked by safety filter"`, false
-			}
-			text = res.Text
+		return a.egress(ctx, current.Channel, current.ReplyTo, op.Text)
+	}
+	if op.Type == "session.push" {
+		// Proactive egress: send to an explicit channel/recipient without an
+		// active inbound message. Capability-gated; same safety egress as send.
+		if !a.Identity.Capabilities["channel.push"] {
+			return `"agent lacks channel.push capability"`, false
 		}
-		if a.gw != nil {
-			if err := a.gw.Send(current.Channel, current.ReplyTo, text); err != nil {
-				a.log.Warn("egress failed", "err", err)
-				r, _ := jsonString(err.Error())
-				return r, false
-			}
+		if op.Channel == "" {
+			return `"session.push requires a channel"`, false
 		}
-		return "true", true
+		return a.egress(ctx, op.Channel, op.ReplyTo, op.Text)
 	}
 	if a.agents != nil {
 		switch op.Type {
@@ -558,6 +567,30 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 	return r, false
 }
 
+// egress runs text through the safety dispatcher and delivers it to a
+// channel recipient via the gateway. A safety drop means nothing is sent.
+func (a *Actor) egress(ctx context.Context, channel, replyTo, text string) (string, bool) {
+	if a.safety != nil {
+		res := a.safety.Egress(ctx, safety.EgressInput{
+			Text:   text,
+			Source: "agent",
+		})
+		if res.Drop {
+			a.log.Info("safety egress dropped reply", "reason", res.Reason)
+			return `"reply blocked by safety filter"`, false
+		}
+		text = res.Text
+	}
+	if a.gw != nil {
+		if err := a.gw.Send(channel, replyTo, text); err != nil {
+			a.log.Warn("egress failed", "err", err)
+			r, _ := jsonString(err.Error())
+			return r, false
+		}
+	}
+	return "true", true
+}
+
 func (a *Actor) infoJSON() string {
 	instructions := ""
 	if a.Info.Instructions != nil {
@@ -579,6 +612,8 @@ func (a *Actor) infoJSON() string {
 	}
 	r, _ := jsonString(map[string]any{
 		"name":           a.Info.Name,
+		"session_id":     a.Identity.SessionID,
+		"address":        "session:" + a.Identity.SessionID,
 		"model":          a.Info.Model,
 		"instructions":   instructions,
 		"history_budget": budget,

@@ -14,6 +14,7 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 - **Scheduler** — `scheduler.every/after/cron`; timers arrive as mailbox messages, never a cross-goroutine Luau call.
 - **Budget** — per-agent token pools with reserve/commit/release around LLM calls, daily reset.
 - **Safety** — core-owned ingress/egress chain (source-attribution, signal-gate, steady-directive, support-offer, affect-guard) that cannot be uninstalled from Lua.
+- **Multi-agent** — static agents with per-model config + `can_contact` ACLs, ephemeral children via spawn profiles, and correlated RPC (`agent.request`/`agent.reply`); an orchestrator pattern (main + experts + project manager + workers) ships under `plugins/orchestrator/`.
 - **Observability** — `/healthz`, `/readyz`, `/metrics`, `/v1/sessions` on loopback with optional bearer-token auth.
 
 ### Driver set
@@ -31,7 +32,10 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 
 - Go 1.25+
 - GNU make
-- [zig](https://ziglang.org/) — used as the hermetic C/C++ compiler for the Luau cgo bridge
+- A C/C++ toolchain for the Luau cgo bridge — the Makefile auto-selects by host OS:
+  - **Windows**: [zig](https://ziglang.org/) (hermetic; no system gcc needed)
+  - **Linux**: system gcc (`cc`/`c++`/`ar`)
+  - **macOS**: Xcode/clang (`clang`/`clang++`/`ar`)
 
 Luau is vendored under `third_party/luau/` (currently **0.731**, MIT license — see `third_party/luau/LICENSE.txt`) and is committed to the repo, so a fresh clone builds without fetching anything.
 
@@ -39,13 +43,13 @@ Luau is vendored under `third_party/luau/` (currently **0.731**, MIT license —
 
 ```bash
 make            # compile vendored Luau -> internal/vm/lib/libluau.a, then the agentflow binary
-make test       # go test with the cgo/zig toolchain
+make test       # go test with the host C/C++ toolchain
 make vet        # go vet
 make run        # build, then run (CONFIG=examples/agentflow.minimal.yaml by default)
 make clean      # remove build objects, static lib, and binary
 ```
 
-Cross-compile the Luau side with `make TARGET=x86_64-linux-gnu` (pair with the matching `GOOS`/`GOARCH` for the Go binary).
+The Makefile detects the host via `go env GOHOSTOS`/`GOHOSTARCH` and picks the compiler, archiver, and (on Windows) zig's `-target` triple accordingly. To cross-compile instead, set `GOOS`/`GOARCH` and a matching zig `-target` manually — native builds on each target OS are the recommended path.
 
 ## Quick start
 
@@ -80,6 +84,23 @@ models:
 | `examples/agentflow.shell-tools.yaml` | Shell (Docker) + filesystem/git tools |
 | `examples/agentflow.telegram.yaml` | Anthropic + Telegram polling |
 | `examples/agentflow.openai-telegram.yaml` | OpenAI-compatible + Telegram |
+| `examples/agentflow.orchestrator.yaml` | Multi-agent: main + expert + PM + workers |
+
+## Multi-agent orchestration
+
+The `plugins/orchestrator/` example wires four agent roles, each with its own model and system prompt:
+
+- **Main** (`main.lua`) — the only user-facing agent. Chats, consults experts, and launches projects. Emits fenced-JSON directives the runtime acts on, then re-asks the LLM for the final reply.
+- **Expert** (`expert.lua`) — static, channel-less. Receives a question via `agent.request`, returns a second opinion via `agent.reply`; never talks to the user.
+- **Project manager** (`pm.lua`) — one ephemeral instance per project (`agent.spawn("project_manager")`). Decomposes the brief into tasks, spawns workers, dispatches them, and reports milestones/decisions back to main.
+- **Worker** (`worker.lua`) — ephemeral, one task at a time. Produces an artifact and reports to its PM; exits on shutdown.
+
+Background updates reach the user through `session.push` (a new capability-gated op for proactive channel egress), and finished agents clean up with `session.exit`. See `examples/agentflow.orchestrator.yaml` for the wiring and `instructions/` for the role prompts.
+
+```bash
+./agentflow -config examples/agentflow.orchestrator.yaml
+curl -X POST localhost:8080/webhook -d '{"from":"alice","text":"plan and write a fizzbuzz script"}'
+```
 
 ## Documentation
 
@@ -102,10 +123,11 @@ agentflow/
 │   ├── core/           # actor, supervisor, router, scheduler, safety, memory, budget, metrics, ...
 │   ├── drivers/        # llm, memory backends, telegram, webhook, shell, mcp
 │   ├── builtins/       # embedded Lua builtins (react loop, per_chat route, support chunks)
+│   ├── plugins/examples/   # example Lua loop plugins
+│   ├── plugins/orchestrator/ # multi-agent: main + expert + PM + workers
 │   └── vm/             # Luau cgo bridge + embedded prelude
 ├── examples/           # runnable YAML configs
-├── plugins/examples/   # example Lua loop plugins
-├── instructions/       # agent system-prompt files
+├── instructions/       # agent system-prompt files (incl. orchestrator roles)
 ├── docs/               # documentation website (GitHub Pages-ready)
 └── third_party/luau/   # vendored Luau 0.731 (MIT, committed)
 ```

@@ -14,7 +14,10 @@ local escapes = {
 
 local function is_array(t)
   local n = #t
-  if n == 0 then return next(t) == nil end
+  -- Empty tables encode as objects ({}), not arrays. Every op payload table
+  -- in this runtime is object-shaped (map[string]any on the Go side); an
+  -- empty {} must not cross the bridge as [] or cgo unmarshal fails.
+  if n == 0 then return false end
   local i = 0
   for k in pairs(t) do
     if type(k) ~= "number" then return false end
@@ -187,6 +190,17 @@ af = { op = op }
 session = {}
 function session.inbox() return op({ type = "inbox" }) end
 function session.send(text) op({ type = "send", text = text }) end
+-- session.push sends to an explicit channel/recipient without an active
+-- inbound message (proactive/background egress). Requires the channel.push
+-- capability. reply_to is the channel-specific recipient (e.g. telegram
+-- chat id).
+function session.push(channel, reply_to, text)
+  return op({ type = "session.push", channel = channel, reply_to = reply_to, text = text })
+end
+-- session.exit terminates this session cleanly: the loop is not restarted,
+-- timers/requests are reaped, and the parent (if any) receives agent.died.
+-- The calling coroutine is never resumed.
+function session.exit() op({ type = "session.exit" }) end
 
 log = {}
 local function mklog(level)

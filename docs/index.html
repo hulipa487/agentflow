@@ -153,8 +153,9 @@
   <h2>Quick Start</h2>
 
   <h3>Build</h3>
-  <p>The Luau VM bridge requires cgo via zig as the hermetic C compiler:</p>
-  <pre><code>CGO_ENABLED=1 CC="zig cc" CXX="zig c++" go build -o agentflow ./cmd/agentflow</code></pre>
+  <p>The Makefile compiles the vendored Luau VM bridge via cgo (zig as the hermetic C compiler), then the binary:</p>
+  <pre><code>make        # luau static lib -> agentflow binary
+make test   # go test with the cgo/zig toolchain</code></pre>
 
   <h3>Run</h3>
   <p>The fastest path needs no model — the echo example replies with a file-based loop:</p>

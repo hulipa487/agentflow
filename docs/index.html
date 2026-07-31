@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AgentFlow Documentation</title>
+<link rel="stylesheet" href="css/styles.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+<nav id="topnav">
+  <div class="nav-left">
+    <span class="logo">AgentFlow</span>
+    <span class="tagline">Self-hosted LLM agent runtime</span>
+  </div>
+  <div class="nav-right">
+    <button id="theme-toggle" class="toggle-btn" title="Toggle theme">
+      <span class="theme-icon-light">🌙</span>
+      <span class="theme-icon-dark" hidden>☀️</span>
+    </button>
+  </div>
+</nav>
+
+<aside id="sidebar">
+  <ul class="nav-list">
+    <li><a href="#summary" class="nav-link">Project Summary</a></li>
+    <li><a href="#architecture" class="nav-link">Architecture</a></li>
+    <li><a href="#quickstart" class="nav-link">Quick Start</a></li>
+    <li><a href="#config" class="nav-link">Configuration Guide</a></li>
+    <li><a href="#config-ref" class="nav-link">Full Config Reference</a></li>
+    <li><a href="#lua" class="nav-link">Lua Plugin Design</a></li>
+    <li><a href="#hooks" class="nav-link">Hook Point Specs</a></li>
+    <li><a href="#caps" class="nav-link">Capability API</a></li>
+  </ul>
+</aside>
+
+<main id="content">
+
+<section id="summary" class="section">
+  <h1>AgentFlow</h1>
+  <p class="lead">A single-binary, self-hosted LLM agent runtime built in Go and Luau. Configure the ordinary; program the exceptional.</p>
+
+  <h2>What it is</h2>
+  <p>AgentFlow runs LLM-powered agents that can remember, use tools, execute shell commands, schedule background work, talk to other agents, and serve users through webhooks and Telegram. Every agent is defined declaratively in YAML; all behavior beyond the defaults comes from hot-reloadable Lua plugins that hook into versioned interfaces exposed by the core.</p>
+
+  <h2>Design principles</h2>
+  <ul>
+    <li><strong>Core provides capabilities; plugins provide behavior; YAML provides wiring.</strong></li>
+    <li><strong>One Luau state per session</strong> — actor model, message-passing only.</li>
+    <li><strong>Failure defaults to truthful</strong> — unavailable tools return structured errors, never fabricated results.</li>
+    <li><strong>Builtins are plugins</strong> — shipped in the binary, shadowable by name, same contract as user plugins.</li>
+    <li><strong>The capability boundary is a message protocol</strong> — not a language API.</li>
+  </ul>
+
+  <h2>Stack</h2>
+  <table class="table">
+    <thead><tr><th>Decision</th><th>Choice</th><th>Rationale</th></tr></thead>
+    <tbody>
+      <tr><td>Runtime</td><td>Go</td><td>Orchestration-shaped; goroutine-per-actor; driver ecosystem</td></tr>
+      <tr><td>Script</td><td>Luau (cgo)</td><td>Untrusted scripts; native coroutines; strong sandboxing</td></tr>
+      <tr><td>cgo toolchain</td><td>zig cc</td><td>Hermetic C compiler; cross-compile; sane Windows dev</td></tr>
+      <tr><td>Concurrency</td><td>Actors + worker pool</td><td>Lua coroutines park on async ops; no OS threads burned</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <strong>Current status</strong>: <span>Phases 0–4 complete. The core runtime (actors, memory, tools, shell, multi-agent, scheduler, budget, safety, metrics) is implemented and tested. Every storage backend is a real provider — SQLite, Redis, MongoDB, and PostgreSQL for KV/document storage, and pgvector for vector recall (SQLite vector queries return an explicit unsupported error, never silent empties). LLM providers cover all three compatible API shapes: Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses, each targeting self-hosted/proxied endpoints via <code>base_url</code>. Channels: webhook, and Telegram in both polling and webhook modes.</span>
+  </div>
+</section>
+
+<section id="architecture" class="section">
+  <h2>Architecture</h2>
+  <p>A request flows vertically through five layers: channels carry bytes in, the core authorities (safety, router, supervisor) decide where they go, per-session actors run a Luau loop, the loop calls capability-backed ops through the async bridge, and drivers reach external systems. Each layer is independently substitutable.</p>
+
+  <div class="diagram-scroll">
+  <pre class="diagram"><code>┌─ Channels (bytes in / replies out) ──────────────────────────────────────────┐
+│  webhook          telegram:polling          telegram:webhook                  │
+│  (POST handler)   (getUpdates loop)         (POST /telegram/&lt;name&gt;)          │
+└───────────┬───────────────────┬──────────────────────┬───────────────────────┘
+            │                   │                      │
+            ▼                   ▼                      ▼
+┌─ Gateway &amp; Router ──────────────────────────────────────────────────────────┐
+│  gateway.ingress  ──►  <strong>safety.ingress</strong> (core-owned)  ──►  gateway.route   │
+│  (per_chat)            signal gate / affect guard       (session authority)   │
+└───────────┬──────────────────────────────────────────────────────────────────┘
+            │ inbound Message{to, from, provenance}   provenance core-stamped
+            ▼
+┌─ Supervisor (address authority + ACL + lifecycle) ─────────────────────────┐
+│  parse addr ──► enforce can_contact ──► deliver to session mailbox          │
+│  spawn / request / reply  ·  ephemeral children  ·  cleanup on death         │
+└───────────┬──────────────────────────────────────────────────────────────────┘
+            │ one mailbox per session
+            ▼
+┌─ Actor (1 goroutine + 1 Luau state per session) ───────────────────────────┐
+│  inbox ──► loop() ──► llm.chat / tools.run / shell.exec / agent.send / …     │
+└───────────┬──────────────────────────────────────────────────────────────────┘
+            │ __af_op(json) yield ── Go worker pool resumes with result
+            ▼
+┌─ Capabilities &amp; Drivers ────────────────────────────────────────────────────┐
+│  llm:    anthropic · openai · openai-responses   (base_url → compatible host)│
+│  memory: sqlite · redis · mongodb · postgres     pgvector (vector recall)    │
+│  shell:  docker · ssh                             tools: builtins + mcp      │
+└──────────────────────────────────────────────────────────────────────────────┘
+            │ outbound reply
+            ▼
+┌─ Egress ───────────────────────────────────────────────────────────────────┐
+│  <strong>safety.egress</strong> (core-owned)  ──►  gateway.egress  ──►  channel Deliver  │
+└────────────────────────────────────────────────────────────────────────────┘</code></pre>
+  </div>
+
+  <h3>Functional flow — one user turn</h3>
+  <div class="diagram-scroll">
+  <pre class="diagram"><code>user ─► [channel]
+          │ normalize → session.Message{from, text}
+          ▼
+       gateway.ingress ─► safety.ingress ─► gateway.route
+          │                                  (per_chat → session id)
+          ▼                                     │
+       supervisor.deliver ◄─────────────────────┘
+          │ enforce can_contact, stamp provenance, enqueue mailbox
+          ▼
+       actor mailbox ◄──── scheduler.every / after / cron ── (timer messages)
+          ▼
+       loop() resumes
+          │  ├─ memory.recall(history)        ── async bridge ──► store backend
+          │  ├─ llm.chat(messages)            ── async bridge ──► llm driver
+          │  ├─ loop.on_tool_call → tools.run ── async bridge ──► tool / mcp / shell
+          │  └─ memory.write(record)          ── async bridge ──► store backend
+          ▼
+       session.send(reply)
+          ▼
+       safety.egress ─► gateway.egress ─► channel.Deliver ─► user</code></pre>
+  </div>
+
+  <h3>Layer responsibilities</h3>
+  <table class="table config-table">
+    <thead><tr><th>Layer</th><th>Owns</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>channels</td><td>Transport</td><td>Normalize raw platform bytes into the shared <code>session.Message</code> and format replies back out.</td></tr>
+      <tr><td>gateway / router</td><td>Routing</td><td>Run <code>gateway.ingress</code>, the core-owned <code>safety.ingress</code> gate, and <code>gateway.route</code> to resolve a session address.</td></tr>
+      <tr><td>supervisor</td><td>Authority</td><td>Address parsing, <code>can_contact</code> ACL, provenance stamping, mailbox delivery, spawn/request/reply, lifecycle cleanup.</td></tr>
+      <tr><td>actor</td><td>Execution</td><td>One goroutine + one Luau state per session. Drives the loop, parks on <code>__af_op</code>, resumes on results.</td></tr>
+      <tr><td>capabilities</td><td>Ops</td><td>Lua-facing tables (<code>llm</code>, <code>memory</code>, <code>tools</code>, <code>shell</code>, <code>agent</code>, <code>scheduler</code>) each wrapping the single async-bridge primitive.</td></tr>
+      <tr><td>drivers</td><td>I/O</td><td>Reach real systems: LLM providers, storage/vector backends, shell providers, MCP servers.</td></tr>
+      <tr><td>safety</td><td>Guard</td><td>Core-owned, runs on ingress and egress regardless of the loop handler. Cannot be uninstalled from Lua.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="quickstart" class="section">
+  <h2>Quick Start</h2>
+
+  <h3>Build</h3>
+  <p>The Luau VM bridge requires cgo via zig as the hermetic C compiler:</p>
+  <pre><code>CGO_ENABLED=1 CC="zig cc" CXX="zig c++" go build -o agentflow ./cmd/agentflow</code></pre>
+
+  <h3>Run</h3>
+  <p>The fastest path needs no model — the echo example replies with a file-based loop:</p>
+  <pre><code>./agentflow -config examples/agentflow.minimal.yaml
+curl -X POST localhost:8080/webhook -d '{"from":"alice","text":"hello"}'</code></pre>
+  <p>For an LLM-backed bot, point a real model at it (next block) and use <code>examples/agentflow.compatible.yaml</code> as a template.</p>
+
+  <h3>Connect a real model</h3>
+  <p>AgentFlow targets Anthropic/OpenAI-compatible proxies and gateways — not the official APIs. Set <code>base_url</code> to your endpoint:</p>
+  <pre><code>models:
+  default:
+    provider: openai          # API shape: anthropic | openai | openai-responses
+    model: gpt-4o
+    base_url: http://127.0.0.1:11434/v1   # Ollama / vLLM / LiteLLM / OpenRouter
+    api_key: ${OPENAI_API_KEY}</code></pre>
+  <p><code>provider</code> selects the request/response format. <code>base_url</code> selects the host. <code>api_key</code> may be empty for keyless local endpoints (Ollama).</p>
+</section>
+
+<section id="config" class="section">
+  <h2>Configuration Guide</h2>
+  <p>AgentFlow is configured through a single YAML file (<code>agentflow.yaml</code>). Every value is validated at boot — an unknown key is a boot error with file and line, never a runtime surprise. Environment interpolation (<code>${VAR}</code> and <code>${VAR:-default}</code>) is supported anywhere a string is accepted.</p>
+
+  <h3>File skeleton</h3>
+  <pre><code>version: "1"
+
+runtime:    { ... }   # core tuning: VM limits, workers, reload, persistence, admin
+models:     { ... }   # named LLM providers
+memory:     { ... }   # instance-wide backend instances
+profiles:   { ... }   # reusable configs: memory/, safety/, shell/, agent/
+gateway:    { ... }   # channels
+mcp:        { ... }   # MCP servers
+tools:      { ... }   # global tool policy
+agents:     { ... }   # the agents themselves
+plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
+
+  <h3>Philosophy</h3>
+  <p>YAML defines <em>topology</em> — what exists and how it's wired. Behavior lives in Lua plugins. Parameters live in YAML. This separation means a working chatbot is a ~12-line YAML with zero code, while every point in the pipeline remains overridable.</p>
+
+  <div class="callout">
+    <strong>Strict parsing</strong>: <span><code>KnownFields(true)</code> means every unknown key is a boot error. There are no "ignored" typos.</span>
+  </div>
+</section>
+
+<section id="config-ref" class="section">
+  <h2>Full Config Reference</h2>
+
+  <h3><code>runtime</code> — instance-wide tuning</h3>
+  <table class="table config-table">
+    <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>vm.memory_limit</code></td><td>string</td><td>64m</td><td>Per Luau state allocator ceiling</td></tr>
+      <tr><td><code>vm.instruction_budget</code></td><td>string</td><td>10m</td><td>Per-resume interrupt watchdog</td></tr>
+      <tr><td><code>scheduler.workers</code></td><td>int</td><td>8</td><td>Op worker pool size</td></tr>
+      <tr><td><code>reload.watch</code></td><td>bool</td><td>true</td><td>Hot reload for plugins and instructions</td></tr>
+      <tr><td><code>persistence</code></td><td>string</td><td>sqlite://./data/agentflow.db</td><td>Runtime metadata (timers, budgets, child records)</td></tr>
+      <tr><td><code>admin.listen</code></td><td>string</td><td>127.0.0.1:9090</td><td>Metrics/admin HTTP endpoint</td></tr>
+    </tbody>
+  </table>
+
+  <h3><code>models</code> — named LLM providers</h3>
+  <pre><code>models:
+  default:
+    provider: anthropic        # anthropic | openai | openai-responses
+    model: claude-sonnet-5
+    api_key: ${ANTHROPIC_API_KEY}
+    base_url: ~                # override endpoint host
+    timeout: 30s
+    retry: 2
+    max_tokens: 4096</code></pre>
+  <p><code>provider</code> selects the request/response shape. <code>base_url</code> selects the host. For OpenAI-compatible endpoints (Ollama, vLLM, LiteLLM), include <code>/v1</code> in <code>base_url</code>; <code>openai</code> appends <code>/chat/completions</code> and <code>openai-responses</code> appends <code>/responses</code>. For Anthropic-compatible endpoints, set <code>base_url</code> to the host root; the runtime appends <code>/v1/messages</code>.</p>
+
+  <h3><code>memory.backends</code> — backend instances</h3>
+  <p>Every backend below is a real provider — no stubs. Storage backends carry KV/prefix/text/TTL; the vector backend carries semantic recall. SQLite intentionally rejects vector queries with an explicit error rather than returning silent empty results.</p>
+  <table class="table config-table">
+    <thead><tr><th>Provider</th><th>Kind</th><th>Features</th></tr></thead>
+    <tbody>
+      <tr><td><code>builtin:sqlite</code></td><td>storage</td><td>kv, prefix_scan, text_search, ttl, transaction</td></tr>
+      <tr><td><code>builtin:redis</code></td><td>storage</td><td>kv, prefix_scan, ttl</td></tr>
+      <tr><td><code>builtin:mongodb</code></td><td>storage</td><td>kv, prefix_scan, ttl</td></tr>
+      <tr><td><code>builtin:postgres</code></td><td>storage</td><td>kv, prefix_scan, text_search, transaction</td></tr>
+      <tr><td><code>builtin:pgvector</code></td><td>vector</td><td>vector (cosine, 1536-dim embeddings)</td></tr>
+    </tbody>
+  </table>
+  <pre><code>memory:
+  backends:
+    main_db:
+      provider: builtin:sqlite
+      config:
+        path: ./data/agentflow.db</code></pre>
+
+  <h3><code>profiles</code> — reusable configs</h3>
+  <p>Profile kinds are namespaced: <code>memory/&lt;name&gt;</code>, <code>safety/&lt;name&gt;</code>, <code>shell/&lt;name&gt;</code>, <code>agent/&lt;name&gt;</code>. Agents reference them by short name.</p>
+
+  <h4>Memory profile</h4>
+  <pre><code>profiles:
+  memory/conversational:
+    stores:
+      dialogue: { backend: main_db, table: dialogue, window: 1000, retention: 30d }
+      facts: { backend: main_db, table: facts, requires: [kv, text_search] }
+    write: [builtin:routing_table]
+    recall: builtin:recency</code></pre>
+  <table class="table config-table">
+    <thead><tr><th>Store key</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>backend</code></td><td>Required. References a backend instance name.</td></tr>
+      <tr><td><code>table</code> / <code>collection</code></td><td>Backend-specific physical target.</td></tr>
+      <tr><td><code>retention</code></td><td>Duration or <code>forever</code>. Core GC.</td></tr>
+      <tr><td><code>window</code></td><td>Max records kept. Core GC.</td></tr>
+      <tr><td><code>requires</code></td><td>Feature list validated against provider at boot.</td></tr>
+    </tbody>
+  </table>
+
+  <h4>Safety profile</h4>
+  <pre><code>profiles:
+  safety/default:
+    filters: [source-attribution, signal-gate, steady-directive, support-offer, affect-guard]</code></pre>
+  <p><code>safety: none</code> is an explicit opt-out. The dispatcher is core-owned and runs regardless of the loop handler.</p>
+
+  <h4>Shell profile</h4>
+  <pre><code>profiles:
+  shell/sandboxed:
+    provider: docker
+    image: python:3.12-slim
+    workdir: /work
+    network: none
+    mem_limit: 512m
+    cpu_limit: 1.0
+    env: { PATH: /usr/local/bin:/usr/bin }    # docker only
+    # SSH fields: host, user, password, key_file</code></pre>
+
+  <h4>Agent profile (spawnable)</h4>
+  <pre><code>profiles:
+  agent/coder:
+    model: default
+    loop: builtin:react
+    skills: [builtin:fs.read, builtin:git.status]
+    capabilities: [llm.chat, tools]
+    can_contact: []
+    ephemeral:
+      max_lifetime: 2h
+      idle_ttl: 15m
+      max_turns: 200
+    budget:
+      tokens_per_day: 100000</code></pre>
+
+  <h3><code>gateway.channels</code></h3>
+  <table class="table config-table">
+    <thead><tr><th>Type</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>webhook</code></td><td>POST → router → session → reply (55s timeout)</td></tr>
+      <tr><td><code>telegram</code> (<code>mode: polling</code>)</td><td>Default. Long-poll <code>getUpdates</code>, <code>allow_users</code> enforced</td></tr>
+      <tr><td><code>telegram</code> (<code>mode: webhook</code>)</td><td>Receives POST updates at <code>path</code> (default <code>/telegram/&lt;name&gt;</code>); requires <code>listen</code></td></tr>
+    </tbody>
+  </table>
+  <pre><code>gateway:
+  channels:
+    - type: webhook
+      listen: ":8080"
+      path: /webhook
+      agent: bot
+    - type: telegram
+      token: ${TG_TOKEN}
+      mode: polling            # polling (default) | webhook
+      allow_users: [123456789]
+      agent: bot
+    - type: telegram
+      name: tg-hook
+      token: ${TG_TOKEN}
+      mode: webhook
+      listen: ":8443"
+      path: /telegram/tg-hook
+      agent: bot</code></pre>
+
+  <h3><code>mcp.servers</code></h3>
+  <pre><code>mcp:
+  servers:
+    filesystem:
+      command: npx
+      args: ["-y", "@mcp/server-filesystem", "/data"]</code></pre>
+  <p>Tools discovered at connect enter the registry as <code>mcp:&lt;server&gt;/&lt;tool&gt;</code>. If the server disconnects, invocations return structured <code>unavailable</code>.</p>
+
+  <h3><code>tools.policy</code></h3>
+  <pre><code>tools:
+  policy:
+    default: all          # all | none
+    forbidden: [social_post, auto_purchase]
+    overrides:
+      "builtin:fs.write": { needs_confirm: true }
+      "mcp:github/create_issue": { needs_confirm: true }</code></pre>
+
+  <h3><code>agents</code></h3>
+  <pre><code>agents:
+  bot:
+    loop: builtin:react
+    model: default
+    instructions: ./instructions/bot.md
+    capabilities: [llm.chat, memory, tools, agent.send, shell.exec]
+    skills: [builtin:web_search, builtin:fs.read]
+    memory: builtin:conversational     # preset, or inline
+    safety: default
+    shell: sandboxed                    # optional
+    can_contact: [worker]               # ACL
+    budget:
+      tokens_per_day: 500000
+    channels: [webhook]</code></pre>
+  <p><strong>Capability ceiling</strong>: <code>plugins.allow_capabilities</code> (global) ⊇ <code>agents.&lt;name&gt;.capabilities</code> (per-agent) ⊇ spawn-spec grants (child). You cannot delegate what you lack.</p>
+
+  <h3><code>plugins</code></h3>
+  <pre><code>plugins:
+  dir: ./plugins
+  allow_capabilities:           # global ceiling — nothing exceeds this
+    - llm.chat
+    - memory
+    - tools
+    - scheduler
+    - shell.exec
+    - agent.spawn
+    - agent.send
+    - agent.request</code></pre>
+</section>
+
+<section id="lua" class="section">
+  <h2>Lua Plugin Design Guidelines</h2>
+
+  <p>Plugins are Luau scripts that hook into versioned interfaces exposed by the core. Every hook is exactly one kind: <strong>filter</strong> (transforms a value, chainable), <strong>handler</strong> (produces a result, exactly one per slot), or <strong>tap</strong> (observe-only, all attached taps run).</p>
+
+  <h3>The contract</h3>
+  <ul>
+    <li><strong>One Luau state per session</strong> — a fresh sandbox per session, no <code>io</code>/<code>os</code>/<code>debug</code>. The registry injects exactly the capability tables granted by the manifest ∧ agent ∧ global ceiling.</li>
+    <li><strong>The async bridge is the only blocking primitive</strong> — <code>__af_op(json) → (json, ok)</code> yields the coroutine; Go executes on a worker pool; the coroutine resumes with the result. No OS thread is blocked.</li>
+    <li><strong>Identity is unforgeable</strong> — <code>from</code>, <code>to</code>, provenance, and request IDs are core-stamped. Lua payloads cannot set trusted sender metadata.</li>
+    <li><strong>Builtins are plugins</strong> — shipped in the binary, shadowable by name. Copy any builtin as a starting point.</li>
+  </ul>
+
+  <h3>Writing a loop plugin</h3>
+  <p>A loop plugin is a Lua script that defines a <code>loop()</code> function. The core drives it: <code>session.inbox()</code> yields until a message arrives, then the loop processes it.</p>
+  <pre><code>-- my_agent.lua
+local history = {}
+
+function loop()
+  while true do
+    local msg = session.inbox()
+    if msg.type == "user" and msg.text then
+      local info = agent.info()
+      local messages = {
+        { role = "system", content = info.instructions },
+        { role = "user", content = msg.text },
+      }
+      local ok, reply = pcall(llm.chat, messages, { model = info.model })
+      local text = ok and reply.text or ("error: " .. tostring(reply))
+      session.send(text)
+      history[#history + 1] = { role = "user", content = msg.text }
+      history[#history + 1] = { role = "assistant", content = text }
+    end
+  end
+end</code></pre>
+
+  <h3>Writing a support chunk</h3>
+  <p>Support chunks are <code>Eval</code>'d into every session state before the loop plugin. They define globals the loop reads. <code>builtin:token_budget</code>, <code>builtin:routing_table</code>, <code>builtin:recency</code>, <code>builtin:fact_extractor</code>, <code>builtin:exec_policy</code>, and <code>builtin:ttl</code> are all support chunks.</p>
+  <pre><code>-- my_recall.lua (loaded before the loop)
+function my_recall_handler(query, opts)
+  local info = agent.info()
+  local store = (info.memory and info.memory.stores and info.memory.stores.dialogue) or "dialogue"
+  local result = store.query(store, { kind = "all", table = store })
+  return result.records or {}
+end</code></pre>
+
+  <h3>Shadowing</h3>
+  <p>Drop a plugin file with the same name as a builtin in <code>plugins/</code> to shadow it instance-wide. The shadow is resolved at load time and logged at boot.</p>
+
+  <h3>Restrictions to remember</h3>
+  <ul>
+    <li><code>llm.stream</code> returns an iterator — call it directly (<code>local d = next_chunk()</code>), never in a generic-for. Luau inherits the Lua 5.1 restriction that the for-loop iterator protocol cannot yield across the bridge.</li>
+    <li>Errors crossing the bridge are JSON strings; the prelude unwraps them so user-facing bubbles don't carry prelude line numbers.</li>
+    <li>A sick provider must not crash-loop the session — use <code>pcall</code> around <code>llm.chat</code> and emit an honest error bubble.</li>
+    <li>Tool calls that need confirmation (<code>needs_confirm: true</code>) park the coroutine — the loop sees a normal tool result after the user confirms.</li>
+  </ul>
+</section>
+
+<section id="hooks" class="section">
+  <h2>Hook Point Specifications</h2>
+  <p>Every hook name is <code>&lt;module&gt;.&lt;point&gt;</code>. Hooks are dispatched by the core; plugins register by implementing the function name.</p>
+
+  <h3>Gateway</h3>
+  <table class="table hook-table">
+    <thead><tr><th>Hook</th><th>Kind</th><th>Signature</th><th>Default</th></tr></thead>
+    <tbody>
+      <tr><td><code>gateway.ingress</code></td><td>filter</td><td><code>(raw, ctx) -> Message?</code></td><td>channel normalizers</td></tr>
+      <tr><td><code>gateway.route</code></td><td>handler</td><td><code>(msg, ctx) -> SessionAddr | {spawn}</code></td><td><code>builtin:per_chat</code></td></tr>
+      <tr><td><code>gateway.egress</code></td><td>filter</td><td><code>(msg, ctx) -> Message?</code></td><td>channel formatters</td></tr>
+      <tr><td><code>gateway.undeliverable</code></td><td>handler</td><td><code>(msg, err, ctx) -> ()</code></td><td>—</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Session</h3>
+  <table class="table hook-table">
+    <thead><tr><th>Hook</th><th>Kind</th><th>Signature</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>session.start</code></td><td>tap</td><td><code>(session) -> ()</code></td><td>First spawn only</td></tr>
+      <tr><td><code>session.resume</code></td><td>filter</td><td><code>(saved, ctx) -> table</code></td><td>After suspend / crash-restart</td></tr>
+      <tr><td><code>session.migrate</code></td><td>handler</td><td><code>(old_state, new_version) -> table</code></td><td>Hot reload continuity</td></tr>
+      <tr><td><code>session.end</code></td><td>tap</td><td><code>(session, reason) -> ()</code></td><td>Reason: shutdown | crash | terminated</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Loop</h3>
+  <p>The <code>loop</code> handler owns the session coroutine for its lifetime. The remaining hooks fire <em>inside</em> <code>builtin:react</code> — custom loops may honor them voluntarily.</p>
+  <table class="table hook-table">
+    <thead><tr><th>Hook</th><th>Kind</th><th>Signature</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>loop</code></td><td>handler</td><td><code>(session) -> ()</code></td><td><code>builtin:react</code></td></tr>
+      <tr><td><code>loop.before_turn</code></td><td>filter</td><td><code>(turn, ctx) -> TurnCtx</code></td><td>Inject context, cost checks</td></tr>
+      <tr><td><code>loop.on_tool_call</code></td><td>filter</td><td><code>(call, ctx) -> "allow" | "deny" | ToolCall</code></td><td>Permission gating, rewrite</td></tr>
+      <tr><td><code>loop.on_tool_result</code></td><td>filter</td><td><code>(result, ctx) -> ToolResult</code></td><td>Honest degradation, truncation</td></tr>
+      <tr><td><code>loop.after_turn</code></td><td>tap</td><td><code>(record) -> ()</code></td><td>Memory writes, fact extraction</td></tr>
+      <tr><td><code>loop.on_interrupt</code></td><td>handler</td><td><code>(pending, ctx) -> "queue" | "cancel" | "prepend"</code></td><td>Mid-turn message policy</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Memory</h3>
+  <table class="table hook-table">
+    <thead><tr><th>Hook</th><th>Kind</th><th>Signature</th><th>Default</th></tr></thead>
+    <tbody>
+      <tr><td><code>memory.write</code></td><td>filter</td><td><code>(record, ctx) -> MemoryRecord?</code></td><td><code>builtin:routing_table</code></td></tr>
+      <tr><td><code>memory.recall</code></td><td>handler</td><td><code>(query, ctx) -> {Memory}</code></td><td><code>builtin:recency</code></td></tr>
+      <tr><td><code>memory.compact</code></td><td>handler</td><td><code>(scope) -> ()</code></td><td>—</td></tr>
+      <tr><td><code>memory.on_write</code></td><td>tap</td><td><code>(record) -> ()</code></td><td>Audit</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Shell</h3>
+  <table class="table hook-table">
+    <thead><tr><th>Hook</th><th>Kind</th><th>Signature</th><th>Default</th></tr></thead>
+    <tbody>
+      <tr><td><code>shell.provision</code></td><td>handler</td><td><code>(session) -> ShellHandle</code></td><td>Docker / SSH provider</td></tr>
+      <tr><td><code>shell.before_exec</code></td><td>filter</td><td><code>(cmd, ctx) -> "allow" | "deny" | string</code></td><td><code>builtin:exec_policy</code></td></tr>
+      <tr><td><code>shell.teardown</code></td><td>handler</td><td><code>(handle) -> ()</code></td><td><code>builtin:ttl</code></td></tr>
+      <tr><td><code>shell.on_exec</code></td><td>tap</td><td><code>(cmd, result) -> ()</code></td><td>—</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Safety — core-owned, unbypassable</h3>
+  <div class="callout warn">
+    <strong>Security note</strong>: <span>These chains are dispatched by the <strong>core</strong>, not the loop. Replacing the loop handler can never uninstall them.</span>
+  </div>
+  <table class="table hook-table">
+    <thead><tr><th>Hook</th><th>Kind</th><th>Signature</th></tr></thead>
+    <tbody>
+      <tr><td><code>safety.ingress</code></td><td>filter</td><td><code>(msg, ctx) -> Message</code></td></tr>
+      <tr><td><code>safety.egress</code></td><td>filter</td><td><code>(text, ctx) -> string?</code> (nil = drop)</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Core lifecycle</h3>
+  <table class="table hook-table">
+    <thead><tr><th>Hook</th><th>Kind</th><th>Signature</th></tr></thead>
+    <tbody>
+      <tr><td><code>agent.start</code></td><td>tap</td><td><code>(agent) -> ()</code></td></tr>
+      <tr><td><code>agent.stop</code></td><td>tap</td><td><code>(agent) -> ()</code></td></tr>
+      <tr><td><code>core.on_reload</code></td><td>tap</td><td><code>(what) -> ()</code></td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="caps" class="section">
+  <h2>Native Capability API</h2>
+  <p>These are the Lua-facing tables exposed by the prelude. Each wraps the single <code>__af_op</code> yield primitive. The capability a table requires must be in the agent's effective grants.</p>
+
+  <h3><code>llm</code> — cap: <code>llm.chat</code></h3>
+  <pre><code>llm.chat(messages, opts?) -> { text, usage }
+llm.stream(messages, opts?) -> iterator    -- yields chunks; call directly, not in for-in</code></pre>
+
+  <h3><code>session</code> — core</h3>
+  <pre><code>session.inbox() -> Message                    -- the loop's consumption point
+session.send(text_or_message)               -- egress through the active channel</code></pre>
+
+  <h3><code>agent</code> — caps: <code>agent.send</code>, <code>agent.request</code>, <code>agent.spawn</code></h3>
+  <pre><code>agent.info() -> { name, model, instructions, history_budget, memory, shell, ... }
+agent.send(addr, payload)                    -- "agent:name" | "session:id"
+agent.request(addr, payload, timeout) -> Message   -- error on timeout
+agent.reply(request_id, payload)             -- resolve a parked request
+agent.spawn(profile, spec) -> { address, session_id, agent }
+agent.list() -> [{ session_id, agent, parent_id }]</code></pre>
+
+  <h3><code>scheduler</code> — cap: <code>scheduler</code></h3>
+  <pre><code>scheduler.every(interval, fn) -> Timer       -- dies with session
+scheduler.after(delay, fn) -> Timer
+scheduler.cron(expr, fn) -> Timer
+scheduler.cancel(timer)</code></pre>
+  <p>Timers enqueue <code>Message{Type:"timer"}</code> to the owning session's mailbox — they never invoke a Luau state from a timer goroutine.</p>
+
+  <h3><code>memory</code> — cap: <code>memory</code></h3>
+  <pre><code>memory.write(record) -> boolean             -- through memory.write chain
+memory.recall(query, opts?) -> {Memory}      -- active recall handler
+store.put(table, key, value, opts?)          -- low-level
+store.get(table, key) -> { value, found }
+store.query(table, query) -> { records }
+store.delete(table, key)</code></pre>
+
+  <h3><code>tools</code> — cap: <code>tools</code></h3>
+  <pre><code>tools.list() -> [ToolSpec]
+tools.run(name, args, opts?) -> ToolResult   -- same permission gate as LLM calls</code></pre>
+
+  <h3><code>shell</code> — cap: <code>shell.exec</code></h3>
+  <pre><code>shell.spawn(opts) -> ShellHandle              -- through shell.provision handler
+shell.exec(handle, cmd) -> ExecResult        -- through shell.before_exec filter
+shell.write(handle, path, content)
+shell.read(handle, path) -> content
+shell.destroy(handle)</code></pre>
+
+  <h3><code>core utilities</code> — core</h3>
+  <pre><code>log.debug/info/warn/error(msg, fields?)
+json.encode(value) / json.decode(text)
+time.sleep(seconds)            -- yields; never blocks a thread</code></pre>
+</section>
+
+<footer>
+  <p>AgentFlow documentation — built from the implemented codebase.</p>
+</footer>
+
+</main>
+<script src="js/theme.js"></script>
+<script src="js/nav.js"></script>
+</body>
+</html>

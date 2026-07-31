@@ -1,0 +1,36 @@
+# build artifacts
+# built binary (go build -o agentflow). Anchored to repo root so it does not
+# match cmd/agentflow/, the source directory.
+/agentflow
+/agentflow.exe
+/agentflow.exe~
+/agentflow~
+# cgo build objects and the compiled Luau static library
+build/obj/
+internal/vm/lib/
+
+# runtime data (sqlite stores, logs)
+data/
+
+# vendored Luau is committed (MIT); do not ignore it.
+
+# local instance config (may carry secrets)
+config.yaml
+
+# editor / OS cruft
+*~
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# go test / coverage artifacts
+*.out
+*.prof
+coverage.*
+
+# claude dev notes (design docs, progress tracking) and local agent settings
+claude_dev/
+.claude/

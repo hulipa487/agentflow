@@ -1,0 +1,259 @@
+/* AgentFlow documentation site — styles */
+
+:root[data-theme="dark"] {
+  --bg: #0d1117;
+  --bg-card: #161b22;
+  --bg-code: #1c2128;
+  --border: #30363d;
+  --text: #e6edf3;
+  --text-muted: #8b949e;
+  --text-dim: #6e7681;
+  --accent: #58a6ff;
+  --accent-dim: #1f6feb;
+  --accent-bg: rgba(56, 139, 253, 0.12);
+  --warn: #f0883e;
+  --warn-bg: rgba(248, 81, 73, 0.1);
+  --table-stripe: #11151c;
+  --link: #58a6ff;
+  --link-hover: #79c0ff;
+  --shadow: 0 6px 24px rgba(0,0,0,0.4);
+}
+
+:root[data-theme="light"] {
+  --bg: #ffffff;
+  --bg-card: #f6f8fa;
+  --bg-code: #eff1f3;
+  --border: #d0d7de;
+  --text: #1f2328;
+  --text-muted: #636c76;
+  --text-dim: #848d97;
+  --accent: #0969da;
+  --accent-dim: #0550ae;
+  --accent-bg: rgba(9, 105, 218, 0.08);
+  --warn: #bf8700;
+  --warn-bg: rgba(191, 135, 0, 0.08);
+  --table-stripe: #f6f8fa;
+  --link: #0969da;
+  --link-hover: #0550ae;
+  --shadow: 0 4px 16px rgba(0,0,0,0.08);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.7;
+  transition: background 0.2s ease, color 0.2s ease;
+}
+
+/* Nav */
+#topnav {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  height: 56px;
+  background: var(--bg-card);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 24px;
+  z-index: 100;
+}
+.nav-left { display: flex; align-items: baseline; gap: 12px; }
+.logo {
+  font-weight: 700;
+  font-size: 1.1rem;
+  color: var(--accent);
+  letter-spacing: -0.02em;
+}
+.tagline { font-size: 0.8rem; color: var(--text-muted); }
+.nav-right { display: flex; gap: 8px; }
+.toggle-btn {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-family: inherit;
+  transition: all 0.15s ease;
+}
+.toggle-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+/* Sidebar */
+#sidebar {
+  position: fixed;
+  top: 56px;
+  left: 0;
+  width: 260px;
+  height: calc(100vh - 56px);
+  overflow-y: auto;
+  background: var(--bg);
+  border-right: 1px solid var(--border);
+  padding: 24px 0;
+}
+.nav-list { list-style: none; }
+.nav-list li { margin: 0; }
+.nav-link {
+  display: block;
+  padding: 8px 24px;
+  color: var(--text-muted);
+  text-decoration: none;
+  font-size: 0.9rem;
+  border-left: 3px solid transparent;
+  transition: all 0.15s ease;
+}
+.nav-link:hover {
+  color: var(--accent);
+  background: var(--accent-bg);
+  border-left-color: var(--accent);
+}
+.nav-link.active {
+  color: var(--accent);
+  border-left-color: var(--accent);
+  font-weight: 500;
+}
+
+/* Content */
+#content {
+  margin-left: 260px;
+  padding: 56px 48px 80px;
+  max-width: 900px;
+}
+.section {
+  padding-top: 56px;
+  margin-top: -56px;
+  scroll-margin-top: 56px;
+}
+h1 { font-size: 2.2rem; margin-bottom: 12px; letter-spacing: -0.02em; }
+h2 { font-size: 1.6rem; margin: 32px 0 16px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+h3 { font-size: 1.2rem; margin: 24px 0 12px; color: var(--text); }
+h4 { font-size: 1rem; margin: 20px 0 8px; color: var(--text-muted); font-weight: 600; }
+p { margin-bottom: 12px; }
+.lead { font-size: 1.15rem; color: var(--text-muted); margin-bottom: 24px; }
+
+ul { margin: 0 0 16px 20px; }
+ul li { margin-bottom: 6px; }
+
+/* Code */
+pre {
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  overflow-x: auto;
+  margin-bottom: 16px;
+  font-size: 0.875rem;
+}
+code {
+  font-family: 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
+  font-size: 0.85em;
+  background: var(--bg-code);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+pre code {
+  background: none;
+  padding: 0;
+  font-size: 0.85rem;
+  line-height: 1.6;
+}
+
+/* Architecture diagrams — monospace art, horizontally scrollable on narrow screens */
+pre.diagram {
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 18px 20px;
+  overflow-x: auto;
+  margin: 16px 0;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+pre.diagram code {
+  background: none;
+  padding: 0;
+  font-family: 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
+  font-size: 0.78rem;
+  white-space: pre;
+  color: var(--text);
+  display: block;
+  min-width: max-content;
+}
+pre.diagram strong {
+  color: var(--accent);
+  font-weight: 600;
+}
+.diagram-scroll {
+  overflow-x: auto;
+  margin-bottom: 16px;
+}
+
+/* Tables */
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 16px;
+  font-size: 0.9rem;
+}
+.table th, .table td {
+  text-align: left;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.table th {
+  font-weight: 600;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.table tbody tr:nth-child(even) { background: var(--table-stripe); }
+.config-table td:first-child { font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; color: var(--accent); }
+.config-table td:nth-child(2) { font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; color: var(--text-muted); }
+.hook-table td:first-child { font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; color: var(--accent); white-space: nowrap; }
+
+/* Callouts */
+.callout {
+  background: var(--accent-bg);
+  border: 1px solid var(--accent);
+  border-left: 4px solid var(--accent);
+  border-radius: 8px;
+  padding: 14px 18px;
+  margin: 16px 0;
+  font-size: 0.92rem;
+}
+.callout.warn {
+  background: var(--warn-bg);
+  border-color: var(--warn);
+  border-left-color: var(--warn);
+}
+
+/* Footer */
+footer {
+  margin-top: 60px;
+  padding-top: 24px;
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 0.85rem;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+
+/* Responsive */
+@media (max-width: 900px) {
+  #sidebar { width: 100%; height: auto; position: relative; top: 0; border-right: none; border-bottom: 1px solid var(--border); display: none; }
+  #sidebar.open { display: block; }
+  #content { margin-left: 0; padding: 24px; }
+  .nav-left .tagline { display: none; }
+}
+
+/* Hidden utility (theme-toggle icon swap) */
+[hidden] { display: none !important; }

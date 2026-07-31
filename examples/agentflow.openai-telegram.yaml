@@ -1,0 +1,51 @@
+version: "1"
+
+# OpenAI-compatible endpoint + Telegram long-poll.
+#
+# This hits any endpoint that implements the OpenAI Chat Completions API:
+#   - Ollama: http://127.0.0.1:11434/v1
+#   - vLLM:   http://127.0.0.1:8000/v1
+#   - LiteLLM proxy, OpenRouter, etc.
+#
+# The provider stays `openai` even though it's not OpenAI's official endpoint.
+# provider = API shape; base_url = actual host.
+#
+# Convention: base_url should include the OpenAI prefix (usually /v1). The
+# runtime appends /chat/completions. So for Ollama the default below produces
+# http://127.0.0.1:11434/v1/chat/completions.
+#
+# Required environment variables:
+#   TG_TOKEN           (Telegram bot token from @BotFather)
+#
+# Optional environment variables:
+#   OPENAI_BASE_URL    (defaults to local Ollama: http://127.0.0.1:11434/v1)
+#   OPENAI_API_KEY     (defaults to empty; not needed for local Ollama)
+#   OPENAI_MODEL       (defaults to gpt-4o-mini)
+#
+# To restrict which Telegram users can talk to the bot, edit allow_users
+# directly in this file. Example: [123456789, 987654321]
+
+models:
+  openai_compat:
+    provider: openai
+    model: ${OPENAI_MODEL:-gpt-4o-mini}
+    base_url: ${OPENAI_BASE_URL:-http://127.0.0.1:11434/v1}
+    api_key: ${OPENAI_API_KEY:-}
+    timeout: 60s
+    retry: 2
+
+agents:
+  bot:
+    loop: builtin:react
+    model: openai_compat
+    instructions: ./instructions/bot.md
+    history_budget: 6000
+
+gateway:
+  channels:
+    - type: telegram
+      name: telegram-bot
+      token: ${TG_TOKEN}
+      # List of allowed Telegram user IDs. Empty array means allow anyone.
+      allow_users: []
+      agent: bot

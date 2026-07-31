@@ -1,0 +1,15 @@
+version: "1"
+
+# Phase-0 regression example: file-based echo loop, no LLM.
+#   curl -X POST localhost:8080/webhook -d '{"from":"alice","text":"hi"}'
+
+agents:
+  echo:
+    loop: ./plugins/examples/echo.lua
+
+gateway:
+  channels:
+    - type: webhook
+      listen: ":8080"
+      path: /webhook
+      agent: echo

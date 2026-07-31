@@ -1,0 +1,148 @@
+package supervisor
+
+import (
+	"context"
+	"io"
+	"log/slog"
+	"testing"
+	"time"
+
+	"agentflow/internal/core/gateway"
+	"agentflow/internal/core/pool"
+	"agentflow/internal/core/session"
+)
+
+// This file tests the multi-agent authority layer: ACL enforcement, request
+// correlation, spawn attenuation, and lifecycle cleanup. It uses lightweight
+// actors with a no-op loop so no real LLM/VM is required for the core paths.
+
+func newTestSupervisor(t *testing.T) *Supervisor {
+	t.Helper()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	gw := gateway.NewRegistry(log)
+	p := pool.New(2)
+	defs := map[string]*AgentDef{
+		"planner": {
+			Info:     &session.Info{Name: "planner", HistoryBudget: 100},
+			CanContact: map[string]bool{"worker": true},
+			Capabilities: map[string]bool{"llm.chat": true, "agent.send": true, "agent.request": true, "agent.spawn": true},
+			Handlers: map[string]session.OpHandler{},
+			LoopSrc:  "function loop() while true do session.inbox() end end",
+		},
+		"worker": {
+			Info:     &session.Info{Name: "worker", HistoryBudget: 100},
+			CanContact: map[string]bool{"planner": true},
+			Capabilities: map[string]bool{"llm.chat": true, "agent.reply": true},
+			Handlers: map[string]session.OpHandler{},
+			LoopSrc:  "function loop() while true do session.inbox() end end",
+		},
+	}
+	sup := New(defs, gw, p, nil, log)
+	sup.Start(context.Background())
+	return sup
+}
+
+func TestSendEnforcesACL(t *testing.T) {
+	sup := newTestSupervisor(t)
+	parent := session.Identity{
+		SessionID:    "planner|x",
+		Agent:        "planner",
+		CanContact:   map[string]bool{"worker": true},
+		Capabilities: map[string]bool{"agent.send": true},
+	}
+	if err := sup.Send(context.Background(), parent, "agent:worker", map[string]any{"hi": 1}); err != nil {
+		t.Fatalf("expected send to worker to succeed, got %v", err)
+	}
+	// planner has no contact entry for "intruder"
+	if err := sup.Send(context.Background(), parent, "agent:intruder", nil); err == nil {
+		t.Fatal("expected send to intruder to fail")
+	}
+}
+
+func TestSendRequiresCapability(t *testing.T) {
+	sup := newTestSupervisor(t)
+	source := session.Identity{
+		SessionID:    "worker|x",
+		Agent:        "worker",
+		CanContact:   map[string]bool{"planner": true},
+		Capabilities: map[string]bool{}, // no agent.send
+	}
+	if err := sup.Send(context.Background(), source, "agent:planner", nil); err == nil {
+		t.Fatal("expected send without capability to fail")
+	}
+}
+
+func TestRequestTimeout(t *testing.T) {
+	sup := newTestSupervisor(t)
+	parent := session.Identity{
+		SessionID:    "planner|x",
+		Agent:        "planner",
+		CanContact:   map[string]bool{"worker": true},
+		Capabilities: map[string]bool{"agent.request": true},
+	}
+	_, err := sup.Request(context.Background(), parent, "agent:worker", nil, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+}
+
+func TestSpawnAttenuation(t *testing.T) {
+	sup := newTestSupervisor(t)
+	sup.templates["coder"] = &SpawnTemplate{
+		Name:         "coder",
+		LoopSrc:      "function loop() while true do session.inbox() end end",
+		Capabilities: map[string]bool{"llm.chat": true, "agent.send": true, "shell.exec": true},
+		CanContact:   map[string]bool{"worker": true},
+		Handlers:     map[string]session.OpHandler{},
+		Memory:       &session.Info{Name: "coder"},
+	}
+	parent := session.Identity{
+		SessionID:    "planner|x",
+		Agent:        "planner",
+		CanContact:   map[string]bool{"worker": true},
+		Capabilities: map[string]bool{"agent.spawn": true, "llm.chat": true, "agent.send": true},
+	}
+	res, err := sup.Spawn(context.Background(), parent, "coder", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Agent != "spawn:coder" {
+		t.Fatalf("expected agent name spawn:coder, got %q", res.Agent)
+	}
+
+	// The child's caps should be parent ∩ template = {llm.chat, agent.send}; shell.exec dropped.
+	sup.mu.Lock()
+	child := sup.sessions[res.SessionID]
+	sup.mu.Unlock()
+	if child == nil {
+		t.Fatal("child not registered")
+	}
+	if child.Identity.Capabilities["shell.exec"] {
+		t.Fatal("child should not retain shell.exec after attenuation")
+	}
+	if !child.Identity.Capabilities["agent.send"] {
+		t.Fatal("child should retain agent.send")
+	}
+	// Parent should now be able to contact the child.
+	if !child.Identity.CanContact["planner"] {
+		t.Fatal("child should have implicit parent contact")
+	}
+}
+
+func TestSpawnRequiresCapability(t *testing.T) {
+	sup := newTestSupervisor(t)
+	sup.templates["coder"] = &SpawnTemplate{
+		Name:         "coder",
+		LoopSrc:      "function loop() end",
+		Capabilities: map[string]bool{"llm.chat": true},
+		Handlers:     map[string]session.OpHandler{},
+	}
+	parent := session.Identity{
+		SessionID:    "planner|x",
+		Agent:        "planner",
+		Capabilities: map[string]bool{}, // no agent.spawn
+	}
+	if _, err := sup.Spawn(context.Background(), parent, "coder", nil); err == nil {
+		t.Fatal("expected spawn without capability to fail")
+	}
+}

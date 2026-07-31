@@ -1,0 +1,480 @@
+// agentflow — phase 2 entrypoint: memory, tools, MCP, router, channels, llm.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"agentflow/internal/builtins"
+	"agentflow/internal/config"
+	"agentflow/internal/core/budget"
+	"agentflow/internal/core/caps"
+	"agentflow/internal/core/gateway"
+	"agentflow/internal/core/memory"
+	"agentflow/internal/core/metrics"
+	"agentflow/internal/core/pool"
+	"agentflow/internal/core/reload"
+	"agentflow/internal/core/router"
+	"agentflow/internal/core/runtime"
+	"agentflow/internal/core/safety"
+	"agentflow/internal/core/session"
+	"agentflow/internal/core/scheduler"
+	"agentflow/internal/core/supervisor"
+	"agentflow/internal/core/tools"
+	"agentflow/internal/drivers/llm"
+	"agentflow/internal/drivers/mcp"
+	"agentflow/internal/drivers/mongodb"
+	"agentflow/internal/drivers/pgvector"
+	"agentflow/internal/drivers/postgres"
+	"agentflow/internal/drivers/redis"
+	"agentflow/internal/drivers/shell"
+	"agentflow/internal/drivers/store"
+	"agentflow/internal/drivers/telegram"
+	"agentflow/internal/drivers/webhook"
+)
+
+func main() {
+	cfgPath := flag.String("config", "agentflow.yaml", "path to agentflow.yaml")
+	workers := flag.Int("workers", 8, "op worker pool size")
+	flag.Parse()
+
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		log.Error("config load failed", "err", err)
+		os.Exit(1)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Memory backends. Pre-resolve default profiles so builtin:conversational
+	// adds its default backend before we open the registry.
+	memReg := memory.NewRegistry()
+	memReg.RegisterProvider(store.Provider{})
+	memReg.RegisterProvider(redis.Provider{})
+	memReg.RegisterProvider(mongodb.Provider{})
+	memReg.RegisterProvider(postgres.Provider{})
+	memReg.RegisterProvider(pgvector.Provider{})
+	for _, a := range cfg.Agents {
+		_ = cfg.ResolveMemoryProfile(a)
+	}
+	for name, b := range cfg.Memory.Backends {
+		memReg.AddBackend(name, b.Provider, b.Config)
+	}
+	if err := memReg.Open(ctx); err != nil {
+		log.Error("memory backends failed", "err", err)
+		os.Exit(1)
+	}
+	memMgr := memory.NewManager(memReg, log)
+
+	// Drivers and shared infrastructure.
+	llmMgr := llm.NewManager(cfg.Models, log)
+	opPool := pool.New(*workers)
+	gw := gateway.NewRegistry(log)
+
+	// Shell manager (Docker + SSH providers).
+	shellMgr := shell.NewManager([]shell.ShellProvider{
+		shell.NewDockerProvider(log),
+		shell.NewSSHProvider(log),
+	}, log)
+
+	// Scheduler: session-owned timers. Fires are delivered as timer messages,
+	// never by invoking a Luau state from a timer goroutine.
+	schedSvc := scheduler.New(log)
+
+	// Runtime store: persists timer/budget/child metadata.
+	rtStore, err := runtime.Open(cfg.PersistencePath())
+	if err != nil {
+		log.Error("runtime store failed", "err", err)
+		os.Exit(1)
+	}
+
+	// Tool registry: builtins + shell builtins + MCP discovery.
+	toolReg := tools.NewRegistry()
+	tools.RegisterBuiltins(toolReg)
+	tools.RegisterShellBuiltins(toolReg, shellMgr)
+	mcpClients := map[string]*mcp.Client{}
+	for sname, s := range cfg.MCP.Servers {
+		c, err := mcp.NewClient(sname, s.Command, s.Args, log)
+		if err != nil {
+			log.Warn("mcp server failed", "server", sname, "err", err)
+			continue
+		}
+		mcpClients[sname] = c
+		mts, err := c.ListTools(ctx)
+		if err != nil {
+			log.Warn("mcp list tools failed", "server", sname, "err", err)
+			continue
+		}
+		for _, t := range mts {
+			toolReg.Register(t)
+			log.Info("mcp tool registered", "tool", t.Name)
+		}
+	}
+
+	// Resolve per-agent memory and build handler maps.
+	agentMemories := []memory.AgentMemory{}
+	defs := map[string]*supervisor.AgentDef{}
+	for name, a := range cfg.Agents {
+		src, watchPath, err := builtins.Resolve(a.Loop)
+		if err != nil {
+			log.Error("agent loop resolve failed", "agent", name, "err", err)
+			os.Exit(1)
+		}
+		instructions := &session.StringBox{}
+		if a.Instructions != "" {
+			b, err := os.ReadFile(a.Instructions)
+			if err != nil {
+				log.Error("instructions read failed", "agent", name, "file", a.Instructions, "err", err)
+				os.Exit(1)
+			}
+			instructions.Store(string(b))
+		}
+
+		var amPtr *memory.AgentMemory
+		mp := cfg.ResolveMemoryProfile(a)
+		if len(mp.Stores) > 0 {
+			profile := map[string]memory.Store{}
+			for sname, s := range mp.Stores {
+				profile[sname] = memoryFromConfig(s)
+			}
+			am, err := memReg.ResolveStores(profile)
+			if err != nil {
+				log.Error("memory resolve failed", "agent", name, "err", err)
+				os.Exit(1)
+			}
+			am.Write = mp.Write
+			am.Recall = mp.Recall
+			agentMemories = append(agentMemories, am)
+			amPtr = &am
+		}
+
+		agentSet := toolReg.Expose(a.Skills, cfg.Tools.Policy, false)
+		handlers := map[string]session.OpHandler{}
+		// Budget metering: if the agent declares tokens_per_day, wrap LLM
+		// handlers with reserve/commit/release.
+		llmHandlers := caps.LLMHandlers(llmMgr)
+		if tokensPerDay := budgetTokens(a); tokensPerDay > 0 {
+			pool := budget.NewPool(tokensPerDay)
+			pool.StartDailyReset()
+			llmHandlers = caps.MeteredLLMHandlers(llmMgr, pool)
+		}
+		for k, h := range llmHandlers {
+			handlers[k] = h
+		}
+		for k, h := range caps.StoreHandlers(amPtr, memMgr) {
+			handlers[k] = h
+		}
+		for k, h := range caps.ToolHandlers(agentSet) {
+			handlers[k] = h
+		}
+		for k, h := range caps.ShellHandlers(shellMgr) {
+			handlers[k] = h
+		}
+
+		effectiveCaps := capabilitySet(a.Capabilities)
+		canContact := stringSet(a.CanContact)
+		safeDispatcher := resolveSafety(cfg, a.Safety)
+		defs[name] = &supervisor.AgentDef{
+			Info: &session.Info{
+				Name:          name,
+				Model:         a.Model,
+				Instructions:  instructions,
+				HistoryBudget: a.HistoryBudget,
+				Memory:        amPtr,
+				Shell:         shellProfileMap(cfg, a.Shell),
+				Skills:        a.Skills,
+				Capabilities:  a.Capabilities,
+			},
+			LoopFile:         watchPath,
+			LoopSrc:          src,
+			InstructionsPath: a.Instructions,
+			Handlers:         handlers,
+			CanContact:       canContact,
+			Capabilities:     effectiveCaps,
+			Safety:           safeDispatcher,
+		}
+	}
+
+	// Resolve spawn profiles into supervisor templates. A spawn profile's
+	// grants are validated against the global ceiling at config load; the
+	// supervisor attenuates them against the parent at spawn time.
+	for pname, p := range cfg.Profiles.Agent {
+		src, watchPath, err := builtins.Resolve(p.Loop)
+		if err != nil {
+			log.Error("spawn profile loop resolve failed", "profile", pname, "err", err)
+			os.Exit(1)
+		}
+		instructions := &session.StringBox{}
+		if p.Instructions != "" {
+			b, err := os.ReadFile(p.Instructions)
+			if err != nil {
+				log.Error("spawn profile instructions read failed", "profile", pname, "file", p.Instructions, "err", err)
+				os.Exit(1)
+			}
+			instructions.Store(string(b))
+		}
+
+		var amPtr *memory.AgentMemory
+		if p.Memory == "builtin:conversational" {
+			mp := config.DefaultMemoryProfile()
+			profile := map[string]memory.Store{}
+			for sname, s := range mp.Stores {
+				profile[sname] = memoryFromConfig(s)
+			}
+			am, err := memReg.ResolveStores(profile)
+			if err != nil {
+				log.Error("spawn profile memory resolve failed", "profile", pname, "err", err)
+				os.Exit(1)
+			}
+			am.Write = mp.Write
+			am.Recall = mp.Recall
+			agentMemories = append(agentMemories, am)
+			amPtr = &am
+		}
+
+		agentSet := toolReg.Expose(p.Skills, cfg.Tools.Policy, false)
+		handlers := map[string]session.OpHandler{}
+		for k, h := range caps.LLMHandlers(llmMgr) {
+			handlers[k] = h
+		}
+		for k, h := range caps.StoreHandlers(amPtr, memMgr) {
+			handlers[k] = h
+		}
+		for k, h := range caps.ToolHandlers(agentSet) {
+			handlers[k] = h
+		}
+		for k, h := range caps.ShellHandlers(shellMgr) {
+			handlers[k] = h
+		}
+
+		tmpl := &supervisor.SpawnTemplate{
+			Name:         pname,
+			LoopFile:     watchPath,
+			LoopSrc:      src,
+			Model:        p.Model,
+			Instructions: p.Instructions,
+			Shell:        shellProfileMap(cfg, p.Shell),
+			CanContact:   stringSet(p.CanContact),
+			Capabilities: capabilitySet(p.Capabilities),
+			Skills:       p.Skills,
+			Handlers:     handlers,
+			Safety:       resolveSafety(cfg, ""),
+			Memory: &session.Info{
+				Name:          "spawn:" + pname,
+				Model:         p.Model,
+				Instructions:  instructions,
+				HistoryBudget: 6000,
+				Memory:        amPtr,
+				Skills:        p.Skills,
+				Capabilities:  p.Capabilities,
+			},
+		}
+		defs["__spawn__"+pname] = &supervisor.AgentDef{
+			SpawnTemplate: tmpl,
+			CanContact:    tmpl.CanContact,
+			Capabilities:  tmpl.Capabilities,
+			Handlers:      handlers,
+		}
+	}
+
+	memMgr.StartGC(ctx, 5*time.Minute, agentMemories)
+
+	sup := supervisor.New(defs, gw, opPool, shellMgr, log)
+	sup.SetScheduler(schedSvc)
+	sup.Start(ctx)
+
+	// Router: routing is Lua (builtin:per_chat unless overridden).
+	routeRef := cfg.Gateway.Route
+	if routeRef == "" {
+		routeRef = "builtin:per_chat"
+	}
+	routeSrc, _, err := builtins.Resolve(routeRef)
+	if err != nil {
+		log.Error("route plugin resolve failed", "err", err)
+		os.Exit(1)
+	}
+	rtr := router.New(routeSrc, sup, log)
+	go rtr.Run(ctx)
+
+	// Channels. "webhooks" collects all channel drivers that need graceful
+	// shutdown (webhook + telegram-webhook).
+	var channels []channelStopper
+	for i, ch := range cfg.Gateway.Channels {
+		name := ch.Name
+		if name == "" {
+			name = fmt.Sprintf("%s-%d", ch.Type, i)
+		}
+		switch ch.Type {
+		case "webhook":
+			d := webhook.New(name, ch.Listen, ch.Path, ch.Agent, rtr, log)
+			if err := d.Start(); err != nil {
+				log.Error("channel start failed", "channel", name, "err", err)
+				os.Exit(1)
+			}
+			gw.Register(d)
+			channels = append(channels, d)
+		case "telegram":
+			d := telegram.New(name, ch.Token, ch.Agent, ch.Mode, ch.AllowUsers, ch.Listen, ch.Path, rtr, log)
+			if err := d.Start(ctx); err != nil {
+				log.Error("channel start failed", "channel", name, "err", err)
+				os.Exit(1)
+			}
+			gw.Register(d)
+			channels = append(channels, d)
+		}
+	}
+
+	watcher := reload.New(sup, log)
+	watcher.Start()
+
+	// Metrics/admin: authenticated HTTP endpoint with health/readiness/metrics
+	// and a read-only sessions view. Binds to loopback by default; a non-empty
+	// ADMIN_TOKEN enables bearer-token auth for non-health endpoints.
+	metricReg := metrics.NewRegistry()
+	for _, c := range metrics.DefaultCounters() {
+		metricReg.Register(c)
+	}
+	adminAddr := cfg.Runtime.Admin.Listen
+	if adminAddr == "" {
+		adminAddr = "127.0.0.1:9090"
+	}
+	adminToken := os.Getenv("ADMIN_TOKEN")
+	admin := metrics.NewAdminServer(adminAddr, adminToken, metricReg, log)
+	admin.SetReady(true)
+	admin.SetSessions(func() []metrics.SessionInfo {
+		infos := []metrics.SessionInfo{}
+		for _, a := range sup.Agents() {
+			infos = append(infos, metrics.SessionInfo{Agent: a.Info.Name})
+		}
+		return infos
+	})
+	go func() {
+		if err := admin.Start(); err != nil {
+			log.Warn("admin server stopped", "err", err)
+		}
+	}()
+
+	log.Info("agentflow up", "agents", len(defs), "channels", len(cfg.Gateway.Channels))
+	<-ctx.Done()
+
+	log.Info("shutting down")
+	watcher.Stop()
+	memMgr.Stop()
+	for _, c := range mcpClients {
+		_ = c.Close()
+	}
+	_ = memReg.Close()
+	_ = rtStore.Close()
+	adminStopCtx, adminCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer adminCancel()
+	_ = admin.Stop(adminStopCtx)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	for _, d := range channels {
+		d.Stop(shutdownCtx)
+	}
+}
+
+// channelStopper is the shutdown interface for channel drivers.
+type channelStopper interface {
+	Stop(context.Context)
+}
+
+func capabilitySet(caps []string) map[string]bool {
+	if len(caps) == 0 {
+		caps = config.DefaultCapabilities
+	}
+	return stringSet(caps)
+}
+
+func stringSet(values []string) map[string]bool {
+	out := make(map[string]bool, len(values))
+	for _, value := range values {
+		if value != "" {
+			out[value] = true
+		}
+	}
+	return out
+}
+
+// resolveSafety turns a safety profile reference into a dispatcher. "none"
+// or "" means safety:none (explicit opt-out). "default" gives the builtin
+// baseline. Unknown names are treated as none with a warning.
+func resolveSafety(cfg *config.Config, ref string) *safety.Dispatcher {
+	switch ref {
+	case "", "none":
+		return safety.New(safety.None)
+	case "default":
+		return safety.New(safety.DefaultProfile())
+	default:
+		return safety.New(safety.None)
+	}
+}
+
+// budgetTokens extracts the tokens_per_day from the agent's budget config.
+func budgetTokens(a config.Agent) int64 {
+	if a.Budget == nil {
+		return 0
+	}
+	v, ok := a.Budget["tokens_per_day"]
+	if !ok {
+		return 0
+	}
+	switch n := v.(type) {
+	case int:
+		return int64(n)
+	case int64:
+		return n
+	case float64:
+		return int64(n)
+	}
+	return 0
+}
+
+func memoryFromConfig(s config.Store) memory.Store {
+	ret := memory.Store{
+		Backend:    s.Backend,
+		Table:      s.Table,
+		Collection: s.Collection,
+		Window:     s.Window,
+	}
+	if s.Retention != "" {
+		d, err := time.ParseDuration(s.Retention)
+		if err == nil {
+			ret.Retention = d
+		}
+	}
+	return ret
+}
+
+func shellProfileMap(cfg *config.Config, name string) map[string]any {
+	if name == "" || cfg.Profiles.Shell == nil {
+		return nil
+	}
+	p, ok := cfg.Profiles.Shell[name]
+	if !ok {
+		return nil
+	}
+	return map[string]any{
+		"provider":  p.Provider,
+		"image":     p.Image,
+		"workdir":   p.WorkDir,
+		"network":   p.Network,
+		"mem_limit": p.MemLimit,
+		"cpu_limit": p.CPULimit,
+		"env":       p.Env,
+		"host":      p.Host,
+		"user":      p.User,
+		"password":  p.Password,
+		"key_file":  p.KeyFile,
+	}
+}

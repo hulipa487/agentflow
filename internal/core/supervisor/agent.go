@@ -104,6 +104,44 @@ func (s *Supervisor) List(source session.Identity) []session.AgentSummary {
 	return out
 }
 
+// SessionStatus is one live session's row in the TUI snapshot.
+type SessionStatus struct {
+	SessionID string
+	Agent     string
+	ParentID  string
+	Busy      bool
+}
+
+// Snapshot returns a point-in-time view of every live session for the TUI:
+// per-session status plus active/idle/total counts. Unlike List, it is not
+// scoped to a caller — it powers the operator-facing dashboard.
+func (s *Supervisor) Snapshot() (rows []SessionStatus, active, idle int) {
+	s.mu.Lock()
+	actors := make([]*session.Actor, 0, len(s.sessions))
+	for _, a := range s.sessions {
+		actors = append(actors, a)
+	}
+	s.mu.Unlock()
+
+	// Read Busy outside the lock: it is an atomic per-actor flag, and the
+	// actor set was captured under the lock.
+	for _, a := range actors {
+		busy := a.Busy()
+		rows = append(rows, SessionStatus{
+			SessionID: a.Identity.SessionID,
+			Agent:     a.Identity.Agent,
+			ParentID:  a.Identity.ParentID,
+			Busy:      busy,
+		})
+		if busy {
+			active++
+		} else {
+			idle++
+		}
+	}
+	return rows, active, idle
+}
+
 func (s *Supervisor) recipientAgent(dst address.Address) (string, error) {
 	switch dst.Kind {
 	case address.Agent:

@@ -1,9 +1,10 @@
 -- builtin:react — the default session loop: message in → recall → tools → LLM → reply.
 --
 -- Phase 2: history is fetched from memory.recall and written back with
--- memory.write after the turn. Tool definitions from tools.list are included
--- in the system prompt; if the LLM returns tool_calls, they are invoked via
--- tools.run and the results are sent back for a final answer.
+-- memory.write after the turn. Tool definitions from tools.list are passed to
+-- the provider natively via llm.chat's tools opt; if the LLM returns
+-- tool_calls, they are invoked via tools.run and the results are echoed back
+-- as "tool" role turns for a final answer.
 
 local function trim_messages(messages, budget)
   if token_budget then
@@ -45,28 +46,40 @@ local function fetch_tools()
   return list
 end
 
-local function build_tool_prompt(tool_list)
-  if #tool_list == 0 then return "" end
-  local lines = { "\nYou have access to the following tools:" }
+-- to_tool_defs flattens tools.list entries (OpenAI-shaped
+-- {type="function", function={name,description,parameters}}) into the
+-- provider-agnostic {name, description, parameters} the llm bridge expects.
+local function to_tool_defs(tool_list)
+  local defs = {}
   for _, t in ipairs(tool_list) do
     local fn = t["function"] or t
-    lines[#lines + 1] = "- " .. tostring(fn.name) .. ": " .. tostring(fn.description)
+    defs[#defs + 1] = {
+      name = fn.name,
+      description = fn.description,
+      parameters = fn.parameters or { type = "object", properties = {} },
+    }
   end
-  lines[#lines + 1] = "\nIf you want to use a tool, reply with JSON: {\"tool_calls\":[{\"name\":\"...\",\"arguments\":{}}]} and nothing else."
-  return table.concat(lines, "\n")
+  return defs
 end
 
+-- execute_tool_calls runs each native tool call and returns the "tool" role
+-- messages to echo back, carrying tool_call_id + result for the provider.
 local function execute_tool_calls(tool_calls)
-  local results = {}
+  local turns = {}
   for _, tc in ipairs(tool_calls) do
     local tool_name = tc.name or (tc["function"] and tc["function"]["name"])
-    local ok, res = pcall(tools.run, tool_name, tc.arguments or tc.args or {})
+    local ok, res = pcall(tools.run, tool_name, tc.args or tc.arguments or {})
     if not ok then
       res = { ok = false, error = tostring(res) }
     end
-    results[#results + 1] = { name = tool_name, result = res }
+    turns[#turns + 1] = {
+      role = "tool",
+      tool_call_id = tc.id or "",
+      name = tool_name,
+      tool_result = res,
+    }
   end
-  return results
+  return turns
 end
 
 function loop()
@@ -77,33 +90,37 @@ function loop()
       local info = agent.info()
       local history = fetch_history()
       local tool_list = fetch_tools()
+      local tool_defs = to_tool_defs(tool_list)
 
-      local tool_prompt = build_tool_prompt(tool_list)
       local messages = {}
       if info.instructions and info.instructions ~= "" then
-        messages[#messages + 1] = { role = "system", content = info.instructions .. tool_prompt }
-      elseif tool_prompt ~= "" then
-        messages[#messages + 1] = { role = "system", content = tool_prompt }
+        messages[#messages + 1] = { role = "system", content = info.instructions }
       end
       for _, h in ipairs(history) do messages[#messages + 1] = h end
       messages[#messages + 1] = { role = "user", content = msg.text }
       messages = trim_messages(messages, info.history_budget)
 
-      local ok, reply = pcall(llm.chat, messages, { model = info.model })
+      local chat_opts = { model = info.model }
+      if #tool_defs > 0 then
+        chat_opts.tools = tool_defs
+        chat_opts.tool_choice = "auto"
+      end
+
+      local ok, reply = pcall(llm.chat, messages, chat_opts)
       local text
       if ok then
-        -- Support structured tool_calls responses from the LLM.
+        -- Native tool_calls from the provider.
         if type(reply) == "table" and reply.tool_calls and #reply.tool_calls > 0 then
-          local results = execute_tool_calls(reply.tool_calls)
-          local result_text = ""
-          for _, r in ipairs(results) do
-            local txt = r.result.text or r.result.error or tostring(r.result)
-            result_text = result_text .. "[" .. r.name .. "] " .. txt .. "\n"
-          end
-          messages[#messages + 1] = { role = "assistant", content = reply.text or "" }
-          messages[#messages + 1] = { role = "user", content = "Tool results:\n" .. result_text }
+          -- Echo the assistant tool-call turn + each tool result, then re-ask.
+          messages[#messages + 1] = {
+            role = "assistant",
+            content = reply.text or "",
+            tool_calls = reply.tool_calls,
+          }
+          local tool_turns = execute_tool_calls(reply.tool_calls)
+          for _, tt in ipairs(tool_turns) do messages[#messages + 1] = tt end
           messages = trim_messages(messages, info.history_budget)
-          local ok2, reply2 = pcall(llm.chat, messages, { model = info.model })
+          local ok2, reply2 = pcall(llm.chat, messages, chat_opts)
           if ok2 then
             text = reply2.text or tostring(reply2)
           else

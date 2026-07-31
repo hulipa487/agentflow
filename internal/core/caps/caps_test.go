@@ -3,13 +3,18 @@ package caps
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"agentflow/internal/config"
 	"agentflow/internal/core/memory"
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/tools"
+	"agentflow/internal/drivers/llm"
 )
 
 func TestStoreHandlers(t *testing.T) {
@@ -115,5 +120,98 @@ func TestForbiddenTool(t *testing.T) {
 	}
 	if _, has := result["error"]; !has {
 		t.Fatalf("expected error field, got %v", result)
+	}
+}
+
+// TestLLMChatToolRoundTrip verifies the caps layer maps Op.Tools into provider
+// tool defs, surfaces reply.tool_calls in the response, and echoes a tool turn
+// (assistant tool_calls + tool result) back into the follow-up request.
+func TestLLMChatToolRoundTrip(t *testing.T) {
+	var bodies [][]byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, b)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if len(bodies) == 1 {
+			// First request (tools attached): return a tool call.
+			_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]}}]}
+
+data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}
+
+data: [DONE]
+
+`))
+			return
+		}
+		// Follow-up (tool turn echoed): return the final answer.
+		_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"content":"It is 21C."}}]}
+
+data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":20,"completion_tokens":6}}
+
+data: [DONE]
+
+`))
+	}))
+	defer srv.Close()
+
+	mgr := llm.NewManager(map[string]config.Model{
+		"default": {Provider: "openai", Model: "m", BaseURL: srv.URL},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h := LLMHandlers(mgr)
+
+	tools := []session.ToolSpec{{
+		Name:        "get_weather",
+		Description: "Get weather",
+		Parameters:  map[string]any{"type": "object", "properties": map[string]any{"city": map[string]any{"type": "string"}}},
+	}}
+	resp, ok := h["llm.chat"](context.Background(), session.Op{
+		Type:       "llm.chat",
+		Messages:   []session.ChatMessage{{Role: "user", Content: "weather?"}},
+		Tools:      tools,
+		ToolChoice: "auto",
+	})
+	if !ok {
+		t.Fatalf("llm.chat failed: %s", resp)
+	}
+	var result map[string]any
+	if err := json.Unmarshal([]byte(resp), &result); err != nil {
+		t.Fatal(err)
+	}
+	calls, _ := result["tool_calls"].([]any)
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 tool_call in response, got %v", result["tool_calls"])
+	}
+	// Request 1 carried the tool defs + tool_choice.
+	if !strings.Contains(string(bodies[0]), `"get_weather"`) || !strings.Contains(string(bodies[0]), `"tool_choice"`) {
+		t.Errorf("first request missing tools/tool_choice: %s", bodies[0])
+	}
+
+	// Now simulate the loop's follow-up: echo the assistant tool_calls turn +
+	// a tool result, and confirm the request reshapes them natively.
+	resp2, ok := h["llm.chat"](context.Background(), session.Op{
+		Type: "llm.chat",
+		Messages: []session.ChatMessage{
+			{Role: "user", Content: "weather?"},
+			{Role: "assistant", ToolCalls: []session.ToolCallSpec{{ID: "call_1", Name: "get_weather", Args: map[string]any{"city": "Paris"}}}},
+			{Role: "tool", ToolCallID: "call_1", ToolResult: map[string]any{"temp": "21C"}},
+		},
+		Tools: tools,
+	})
+	if !ok {
+		t.Fatalf("follow-up llm.chat failed: %s", resp2)
+	}
+	body := string(bodies[1])
+	for _, want := range []string{`"tool_calls"`, `"call_1"`, `"role":"tool"`, `"tool_call_id":"call_1"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("follow-up request missing %q\nbody: %s", want, body)
+		}
+	}
+	var result2 map[string]any
+	if err := json.Unmarshal([]byte(resp2), &result2); err != nil {
+		t.Fatal(err)
+	}
+	if result2["text"] != "It is 21C." {
+		t.Errorf("expected final answer, got %v", result2["text"])
 	}
 }

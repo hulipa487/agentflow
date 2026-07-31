@@ -15,9 +15,36 @@ func LLMHandlers(m *llm.Manager) map[string]session.OpHandler {
 	toLLM := func(ms []session.ChatMessage) []llm.Message {
 		out := make([]llm.Message, len(ms))
 		for i, mm := range ms {
-			out[i] = llm.Message{Role: mm.Role, Content: mm.Content}
+			out[i] = llm.Message{
+				Role:       mm.Role,
+				Content:    mm.Content,
+				ToolCallID: mm.ToolCallID,
+				ToolResult: mm.ToolResult,
+			}
+			if len(mm.ToolCalls) > 0 {
+				calls := make([]llm.ToolCall, len(mm.ToolCalls))
+				for j, tc := range mm.ToolCalls {
+					calls[j] = llm.ToolCall{ID: tc.ID, Name: tc.Name, Args: tc.Args}
+				}
+				out[i].ToolCalls = calls
+			}
 		}
 		return out
+	}
+	toToolDefs := func(specs []session.ToolSpec) []llm.ToolDef {
+		out := make([]llm.ToolDef, len(specs))
+		for i, s := range specs {
+			out[i] = llm.ToolDef{Name: s.Name, Description: s.Description, Parameters: s.Parameters}
+		}
+		return out
+	}
+	optsOf := func(op session.Op) llm.Opts {
+		return llm.Opts{
+			Temperature: op.Temperature,
+			MaxTokens:   op.MaxTokens,
+			Tools:       toToolDefs(op.Tools),
+			ToolChoice:  op.ToolChoice,
+		}
 	}
 	fail := func(err error) (string, bool) {
 		b, _ := json.Marshal(err.Error())
@@ -26,22 +53,16 @@ func LLMHandlers(m *llm.Manager) map[string]session.OpHandler {
 
 	return map[string]session.OpHandler{
 		"llm.chat": func(ctx context.Context, op session.Op) (string, bool) {
-			text, usage, err := m.Chat(ctx, op.Model, toLLM(op.Messages), llm.Opts{
-				Temperature: op.Temperature,
-				MaxTokens:   op.MaxTokens,
-			})
+			text, toolCalls, usage, err := m.Chat(ctx, op.Model, toLLM(op.Messages), optsOf(op))
 			if err != nil {
 				return fail(err)
 			}
-			b, _ := json.Marshal(map[string]any{"text": text, "usage": usage})
+			b, _ := json.Marshal(map[string]any{"text": text, "usage": usage, "tool_calls": toolCalls})
 			return string(b), true
 		},
 
 		"llm.stream.open": func(ctx context.Context, op session.Op) (string, bool) {
-			id, err := m.StreamOpen(ctx, op.Model, toLLM(op.Messages), llm.Opts{
-				Temperature: op.Temperature,
-				MaxTokens:   op.MaxTokens,
-			})
+			id, err := m.StreamOpen(ctx, op.Model, toLLM(op.Messages), optsOf(op))
 			if err != nil {
 				return fail(err)
 			}
@@ -50,15 +71,16 @@ func LLMHandlers(m *llm.Manager) map[string]session.OpHandler {
 		},
 
 		"llm.stream.next": func(ctx context.Context, op session.Op) (string, bool) {
-			delta, done, usage, err := m.StreamNext(ctx, op.Stream)
+			delta, done, usage, toolCalls, err := m.StreamNext(ctx, op.Stream)
 			if err != nil && !done {
 				return fail(err)
 			}
 			b, _ := json.Marshal(map[string]any{
-				"delta": delta,
-				"done":  done,
-				"usage": usage,
-				"error": errString(err),
+				"delta":      delta,
+				"done":       done,
+				"usage":      usage,
+				"tool_calls": toolCalls,
+				"error":      errString(err),
 			})
 			return string(b), true
 		},

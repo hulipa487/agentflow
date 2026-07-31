@@ -52,8 +52,10 @@ func SupportChunks() []string {
 }
 
 // Resolve turns a loop/route reference into Lua source. "builtin:<name>"
-// resolves to an embedded builtin; anything else is a file path. The second
-// return value is the file path for hot-reload watching ("" for builtins).
+// resolves to an embedded builtin; anything else is a file or directory path.
+// The second return value is the watch path for hot-reload ("" for builtins):
+// a file watches itself; a directory is concatenated as its *.lua files in
+// sorted name order and the directory is watched as a whole.
 func Resolve(ref string) (src string, watchPath string, err error) {
 	if name, ok := strings.CutPrefix(ref, "builtin:"); ok {
 		s, found := sources[name]
@@ -62,9 +64,38 @@ func Resolve(ref string) (src string, watchPath string, err error) {
 		}
 		return s, "", nil
 	}
-	b, err := os.ReadFile(ref)
+	fi, err := os.Stat(ref)
 	if err != nil {
 		return "", "", fmt.Errorf("read plugin %s: %w", ref, err)
 	}
-	return string(b), ref, nil
+	if !fi.IsDir() {
+		b, err := os.ReadFile(ref)
+		if err != nil {
+			return "", "", fmt.Errorf("read plugin %s: %w", ref, err)
+		}
+		return string(b), ref, nil
+	}
+	// Directory loop: concatenate all *.lua files (sorted) with a newline
+	// between, so a multi-module loop can be authored as separate files. The
+	// order is lexical — name modules with a leading digit (10_identity.lua)
+	// or rely on a single `loop.lua` entry that runs last.
+	entries, err := os.ReadDir(ref)
+	if err != nil {
+		return "", "", fmt.Errorf("read loop dir %s: %w", ref, err)
+	}
+	var parts []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".lua") {
+			continue
+		}
+		b, err := os.ReadFile(ref + "/" + e.Name())
+		if err != nil {
+			return "", "", fmt.Errorf("read %s/%s: %w", ref, e.Name(), err)
+		}
+		parts = append(parts, string(b))
+	}
+	if len(parts) == 0 {
+		return "", "", fmt.Errorf("loop dir %s has no .lua files", ref)
+	}
+	return strings.Join(parts, "\n"), ref, nil
 }

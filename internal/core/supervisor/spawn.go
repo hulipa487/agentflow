@@ -66,7 +66,7 @@ func (s *Supervisor) Spawn(ctx context.Context, parent session.Identity, profile
 		Capabilities: childCaps,
 	}
 
-	a := session.New(skey, identity, info, s.gw, s, s.sched, tmpl.Safety, tmpl.Handlers, s.pool, s.log)
+	a := session.New(skey, identity, info, s.gw, s, s.sched, s.users, tmpl.Safety, tmpl.Handlers, s.pool, s.log)
 	a.LoopFile = tmpl.LoopFile
 	a.LoopSrc = tmpl.LoopSrc
 	a.SupportSrcs = builtins.SupportChunks()

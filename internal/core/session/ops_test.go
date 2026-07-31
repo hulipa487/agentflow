@@ -44,7 +44,7 @@ func newTestActor(t *testing.T, caps map[string]bool, gw Gateway, loopSrc string
 	a := New("main|test",
 		Identity{SessionID: "main|test", Agent: "main", Capabilities: caps},
 		&Info{Name: "main", HistoryBudget: 100},
-		gw, nil, nil, nil, map[string]OpHandler{}, pool.New(1), log)
+		gw, nil, nil, nil, nil, map[string]OpHandler{}, pool.New(1), log)
 	a.LoopSrc = loopSrc
 	ctx, cancel := context.WithCancel(context.Background())
 	go a.Run(ctx)
@@ -115,7 +115,7 @@ func TestSessionExitTerminates(t *testing.T) {
 	a := New("worker|test",
 		Identity{SessionID: "worker|test", Agent: "worker", Capabilities: map[string]bool{}},
 		&Info{Name: "worker", HistoryBudget: 100},
-		gw, nil, nil, nil, map[string]OpHandler{}, pool.New(1), log)
+		gw, nil, nil, nil, nil, map[string]OpHandler{}, pool.New(1), log)
 	a.LoopSrc = `function loop() session.exit() end`
 
 	exits := make(chan EndReason, 4)
@@ -156,5 +156,117 @@ end
 	want := "session:main|test|main|test"
 	if got != want {
 		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+// fakeUsers is a UserResolver stub for push_user tests.
+type fakeUsers struct {
+	lookup map[string]struct{ channel, replyTo string }
+}
+
+func (f *fakeUsers) LookupUser(uuid string) (string, string, bool) {
+	c, ok := f.lookup[uuid]
+	if !ok {
+		return "", "", false
+	}
+	return c.channel, c.replyTo, true
+}
+
+// newUserTestActor is newTestActor with an injected UserResolver.
+func newUserTestActor(t *testing.T, caps map[string]bool, gw Gateway, users UserResolver, loopSrc string) (*Actor, context.CancelFunc) {
+	t.Helper()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	a := New("main|test",
+		Identity{SessionID: "main|test", Agent: "main", Capabilities: caps},
+		&Info{Name: "main", HistoryBudget: 100},
+		gw, nil, nil, users, nil, map[string]OpHandler{}, pool.New(1), log)
+	a.LoopSrc = loopSrc
+	ctx, cancel := context.WithCancel(context.Background())
+	go a.Run(ctx)
+	t.Cleanup(cancel)
+	return a, cancel
+}
+
+func TestSessionPushUserResolvesAndDelivers(t *testing.T) {
+	gw := &fakeGW{}
+	users := &fakeUsers{lookup: map[string]struct{ channel, replyTo string }{
+		"u_abc": {"telegram", "12345"},
+	}}
+	a, _ := newUserTestActor(t, map[string]bool{"channel.push": true}, gw, users, `
+function loop()
+  local msg = session.inbox()
+  local ok, err = pcall(session.push_user, "u_abc", "reaching out")
+  session.send(tostring(ok) .. ":" .. tostring(err))
+end
+`)
+	a.Mailbox <- Message{ID: "1", Type: "user", From: "user:u_abc", Text: "go", Channel: "webhook", ReplyTo: "r1"}
+
+	waitFor(t, "push + report", 5*time.Second, func() bool { return len(gw.snapshot()) >= 2 })
+	sends := gw.snapshot()
+	if sends[0].channel != "telegram" || sends[0].replyTo != "12345" || sends[0].text != "reaching out" {
+		t.Fatalf("bad push_user: %+v", sends[0])
+	}
+	if sends[1].text != "true:true" {
+		t.Fatalf("expected push to succeed (true:true), report says %q", sends[1].text)
+	}
+}
+
+func TestSessionPushUserUnknownUUID(t *testing.T) {
+	gw := &fakeGW{}
+	users := &fakeUsers{lookup: map[string]struct{ channel, replyTo string }{}}
+	a, _ := newUserTestActor(t, map[string]bool{"channel.push": true}, gw, users, `
+function loop()
+  local msg = session.inbox()
+  local ok, err = pcall(session.push_user, "u_nope", "x")
+  session.send(tostring(ok) .. ":" .. tostring(err))
+end
+`)
+	a.Mailbox <- Message{ID: "1", Type: "user", From: "user:u_abc", Text: "go", Channel: "webhook", ReplyTo: "r1"}
+
+	waitFor(t, "report", 5*time.Second, func() bool { return len(gw.snapshot()) > 0 })
+	sends := gw.snapshot()
+	if !strings.HasPrefix(sends[0].text, "false:") || !strings.Contains(sends[0].text, "unknown user") {
+		t.Fatalf("expected unknown-user error, got %q", sends[0].text)
+	}
+}
+
+func TestSessionPushUserRequiresCapability(t *testing.T) {
+	gw := &fakeGW{}
+	users := &fakeUsers{lookup: map[string]struct{ channel, replyTo string }{
+		"u_abc": {"telegram", "12345"},
+	}}
+	// No channel.push capability.
+	a, _ := newUserTestActor(t, map[string]bool{}, gw, users, `
+function loop()
+  local msg = session.inbox()
+  local ok, err = pcall(session.push_user, "u_abc", "x")
+  session.send(tostring(ok) .. ":" .. tostring(err))
+end
+`)
+	a.Mailbox <- Message{ID: "1", Type: "user", From: "user:u_abc", Text: "go", Channel: "webhook", ReplyTo: "r1"}
+
+	waitFor(t, "report", 5*time.Second, func() bool { return len(gw.snapshot()) > 0 })
+	sends := gw.snapshot()
+	if !strings.HasPrefix(sends[0].text, "false:") || !strings.Contains(sends[0].text, "channel.push") {
+		t.Fatalf("expected capability denial, got %q", sends[0].text)
+	}
+}
+
+func TestSessionPushUserRequiresIdentity(t *testing.T) {
+	gw := &fakeGW{}
+	// users is nil — identity layer disabled.
+	a, _ := newUserTestActor(t, map[string]bool{"channel.push": true}, gw, nil, `
+function loop()
+  local msg = session.inbox()
+  local ok, err = pcall(session.push_user, "u_abc", "x")
+  session.send(tostring(ok) .. ":" .. tostring(err))
+end
+`)
+	a.Mailbox <- Message{ID: "1", Type: "user", From: "user:u_abc", Text: "go", Channel: "webhook", ReplyTo: "r1"}
+
+	waitFor(t, "report", 5*time.Second, func() bool { return len(gw.snapshot()) > 0 })
+	sends := gw.snapshot()
+	if !strings.HasPrefix(sends[0].text, "false:") || !strings.Contains(sends[0].text, "identity not enabled") {
+		t.Fatalf("expected identity-not-enabled error, got %q", sends[0].text)
 	}
 }

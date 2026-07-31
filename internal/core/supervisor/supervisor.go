@@ -59,6 +59,7 @@ type Supervisor struct {
 	pool     *pool.Pool
 	shellMgr *shell.Manager
 	sched    *schedulerAdapter
+	users    session.UserResolver
 	log      *slog.Logger
 
 	mu        sync.Mutex
@@ -95,6 +96,11 @@ func (s *Supervisor) SetScheduler(svc *scheduler.Service) {
 	s.sched = newSchedulerAdapter(svc, s, s.log)
 }
 
+// SetUserResolver installs the identity resolver used by session.push_user.
+// Called by main; nil (the default) leaves push_user returning "identity not
+// enabled" — the runtime works unchanged without the identity layer.
+func (s *Supervisor) SetUserResolver(r session.UserResolver) { s.users = r }
+
 // Start fixes the context used for lazily spawned actors.
 func (s *Supervisor) Start(ctx context.Context) { s.ctx = ctx }
 
@@ -119,7 +125,7 @@ func (s *Supervisor) Deliver(agent, key string, msg session.Message) error {
 			CanContact:   def.CanContact,
 			Capabilities: def.Capabilities,
 		}
-		a = session.New(skey, identity, def.Info, s.gw, s, s.sched, def.Safety, def.Handlers, s.pool, s.log)
+		a = session.New(skey, identity, def.Info, s.gw, s, s.sched, s.users, def.Safety, def.Handlers, s.pool, s.log)
 		a.LoopFile = def.LoopFile
 		a.LoopSrc = def.LoopSrc
 		a.SupportSrcs = builtins.SupportChunks()

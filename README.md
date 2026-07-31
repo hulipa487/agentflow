@@ -30,6 +30,7 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 ## Requirements
 
 - Go 1.25+
+- GNU make
 - [zig](https://ziglang.org/) — used as the hermetic C/C++ compiler for the Luau cgo bridge
 
 Luau is vendored under `third_party/luau/` (currently **0.731**, MIT license — see `third_party/luau/LICENSE.txt`) and is committed to the repo, so a fresh clone builds without fetching anything.
@@ -37,12 +38,14 @@ Luau is vendored under `third_party/luau/` (currently **0.731**, MIT license —
 ## Build
 
 ```bash
-# compile vendored Luau into a static library (build/obj -> internal/vm/lib/libluau.a)
-build/build-luau.sh
-
-# build the binary via cgo with zig as the C compiler
-CGO_ENABLED=1 CC="zig cc" CXX="zig c++" go build -o agentflow ./cmd/agentflow
+make            # compile vendored Luau -> internal/vm/lib/libluau.a, then the agentflow binary
+make test       # go test with the cgo/zig toolchain
+make vet        # go vet
+make run        # build, then run (CONFIG=examples/agentflow.minimal.yaml by default)
+make clean      # remove build objects, static lib, and binary
 ```
+
+Cross-compile the Luau side with `make TARGET=x86_64-linux-gnu` (pair with the matching `GOOS`/`GOARCH` for the Go binary).
 
 ## Quick start
 
@@ -93,13 +96,13 @@ On GitHub, this can be published via GitHub Pages → "Deploy from a branch" →
 
 ```
 agentflow/
+├── Makefile            # build: vendored Luau -> libluau.a -> agentflow binary
 ├── cmd/agentflow/      # main entrypoint
 ├── internal/           # core runtime + drivers (not importable — internal module)
 │   ├── core/           # actor, supervisor, router, scheduler, safety, memory, budget, metrics, ...
 │   ├── drivers/        # llm, memory backends, telegram, webhook, shell, mcp
 │   ├── builtins/       # embedded Lua builtins (react loop, per_chat route, support chunks)
 │   └── vm/             # Luau cgo bridge + embedded prelude
-├── build/              # build-luau.sh (compiles vendored Luau)
 ├── examples/           # runnable YAML configs
 ├── plugins/examples/   # example Lua loop plugins
 ├── instructions/       # agent system-prompt files
@@ -109,6 +112,6 @@ agentflow/
 
 ## Notes
 
-- **Vendored Luau** (0.731) is committed under `third_party/luau/`, so the repo builds from a clean clone. To upgrade it, replace that directory with a newer release and re-run `build/build-luau.sh`.
+- **Vendored Luau** (0.731) is committed under `third_party/luau/`, so the repo builds from a clean clone. To upgrade it, replace that directory with a newer release and re-run `make`.
 - **`config.yaml`** is gitignored — it's the local instance config and may contain credentials. Keep secrets in it or in environment variables, never in tracked files.
 - Runtime state (sqlite stores) lives under `data/` and is gitignored.

@@ -71,15 +71,46 @@ func TestShellHandlerNoOwner(t *testing.T) {
 	}
 }
 
+// TestShellSpawnPassesShellOpts verifies the ShellOpts escape hatch flows from
+// op.ShellOpts through to SpawnOpts.ShellOpts (the seam vultr/docker read).
+func TestShellSpawnPassesShellOpts(t *testing.T) {
+	tp := newTestShellProvider("docker")
+	mgr := shell.NewManager([]shell.ShellProvider{tp}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h := ShellHandlers(mgr)
+	ctx := session.WithOwner(context.Background(), "session-1")
+
+	op := session.Op{
+		Type:      "shell.spawn",
+		ShellProvider: "docker",
+		Image:     "alpine:3.20",
+		ShellOpts: map[string]any{"region": "ewr", "plan": "vc2-1c-1gb"},
+	}
+	resp, ok := h["shell.spawn"](ctx, op)
+	if !ok {
+		t.Fatalf("spawn failed: %s", resp)
+	}
+	if tp.lastOpts.ShellOpts["region"] != "ewr" {
+		t.Fatalf("ShellOpts.region not plumbed: got %v", tp.lastOpts.ShellOpts["region"])
+	}
+	if tp.lastOpts.ShellOpts["plan"] != "vc2-1c-1gb" {
+		t.Fatalf("ShellOpts.plan not plumbed: got %v", tp.lastOpts.ShellOpts["plan"])
+	}
+	if tp.lastOpts.Image != "alpine:3.20" {
+		t.Fatalf("Image not plumbed: got %q", tp.lastOpts.Image)
+	}
+}
+
 // testShellProvider is a minimal ShellProvider for testing ShellHandlers.
 type testShellProvider struct {
-	name    string
-	handles map[string]*shell.Handle
+	name        string
+	handles     map[string]*shell.Handle
+	lastOpts    shell.SpawnOpts
 }
 
 func (p *testShellProvider) Name() string { return p.name }
 
 func (p *testShellProvider) Spawn(ctx context.Context, opts shell.SpawnOpts) (*shell.Handle, error) {
+	p.lastOpts = opts
 	return &shell.Handle{ID: "h-1", State: 1, Image: opts.Image, Meta: map[string]any{}}, nil
 }
 

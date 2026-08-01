@@ -128,8 +128,8 @@ type Store struct {
 
 // ShellProfile defines defaults for shell.spawn.
 type ShellProfile struct {
-	Provider string            `yaml:"provider"` // docker | ssh
-	Image    string            `yaml:"image"`
+	Provider string            `yaml:"provider"` // docker (one-shot) | vultr (persistent) | ssh
+	Image    string            `yaml:"image"`    // docker: default alpine:3.20
 	WorkDir  string            `yaml:"workdir"`
 	Network  string            `yaml:"network"`
 	MemLimit string            `yaml:"mem_limit"`
@@ -139,6 +139,17 @@ type ShellProfile struct {
 	User     string            `yaml:"user"`
 	Password string            `yaml:"password"`
 	KeyFile  string            `yaml:"key_file"`
+
+	// Vultr provisioning (provider: vultr). The API key is resolved from the
+	// VULTR_API_KEY environment variable at boot (see cmd/agentflow), never
+	// stored in this struct.
+	Region  string   `yaml:"region"`  // e.g. "ewr"
+	Plan    string   `yaml:"plan"`    // e.g. "vc2-1c-1gb"
+	OsID    int      `yaml:"os_id"`   // integer (Vultr OS id)
+	Label   string   `yaml:"label"`   // instance label prefix
+	SSHKey  string   `yaml:"ssh_key"` // inline public key (optional)
+	SSHKeyID string  `yaml:"sshkey_id"` // pre-registered Vultr ssh-key id (optional)
+	Tags    []string `yaml:"tags"`
 }
 
 // SpawnProfile is a reusable template for an ephemeral child. It contains
@@ -375,6 +386,9 @@ func validate(path string, c *Config) error {
 				if _, ok := c.Profiles.Shell[a.Shell]; !ok {
 					return fmt.Errorf("%s: agent %q references unknown shell profile %q", path, name, a.Shell)
 				}
+				if err := validateShellProfile(path, name, a.Shell, c.Profiles.Shell[a.Shell]); err != nil {
+					return err
+				}
 			} else {
 				return fmt.Errorf("%s: agent %q references unknown shell profile %q", path, name, a.Shell)
 			}
@@ -438,6 +452,9 @@ func validate(path string, c *Config) error {
 			}
 			if _, ok := c.Profiles.Shell[p.Shell]; !ok {
 				return fmt.Errorf("%s: spawn profile %q references unknown shell profile %q", path, pname, p.Shell)
+			}
+			if err := validateShellProfile(path, "spawn:"+pname, p.Shell, c.Profiles.Shell[p.Shell]); err != nil {
+				return err
 			}
 		}
 		for _, target := range p.CanContact {
@@ -505,6 +522,28 @@ func validate(path string, c *Config) error {
 		}
 	}
 
+	return nil
+}
+
+// validateShellProfile checks provider-specific requirements for a shell
+// profile referenced by an agent or spawn profile. Vultr provisioning needs
+// region and plan; the API key is read from the environment at boot, so it is
+// not checked here (a missing key fails fast at spawn with a clear error).
+func validateShellProfile(path, owner, name string, p ShellProfile) error {
+	switch p.Provider {
+	case "vultr":
+		if p.Region == "" || p.Plan == "" {
+			return fmt.Errorf("%s: shell profile %q (used by %q) is provider vultr but missing required region/plan", path, name, owner)
+		}
+	case "ssh":
+		if p.Host == "" {
+			return fmt.Errorf("%s: shell profile %q (used by %q) is provider ssh but missing required host", path, name, owner)
+		}
+	case "docker", "":
+		// docker is one-shot; image defaults to alpine:3.20 if unset. No reqs.
+	default:
+		return fmt.Errorf("%s: shell profile %q (used by %q) has unknown provider %q", path, name, owner, p.Provider)
+	}
 	return nil
 }
 

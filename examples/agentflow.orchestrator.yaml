@@ -1,9 +1,10 @@
 version: "1"
 
-# AgentFlow multi-agent orchestrator.
-# Four named models so each role can point at a different endpoint/model.
-# All use the openai provider against a compatible base_url; set the env
-# vars (or edit the defaults) to point each role at a real endpoint.
+# AgentFlow multi-agent orchestrator with per-user memory partitioning.
+# All users share one main|singleton session; their memories stay isolated
+# because every store key is prefixed with the identity layer's user UUID.
+# Identity is enabled, and the route is a constant-key (singleton) route.
+
 models:
   main:
     provider: openai
@@ -26,6 +27,11 @@ models:
     base_url: ${WORKER_BASE_URL:-http://127.0.0.1:11434/v1}
     api_key: ${WORKER_API_KEY:-}
 
+runtime:
+  identity:
+    enabled: true
+    persistence: ./data/identity.db
+
 memory:
   backends:
     main_db:
@@ -34,6 +40,26 @@ memory:
         path: ./data/agentflow-orchestrator.db
 
 profiles:
+  shell:
+    # One-shot shell: every command runs in a fresh Alpine container that is
+    # removed on exit. No filesystem or env state carries between commands.
+    docker_oneshot:
+      provider: docker
+      image: alpine:3.20
+      network: none
+      mem_limit: 512m
+      cpu_limit: 1.0
+    # Persistent shell: a Vultr VPS launched on demand when the worker spawns
+    # its shell, SSHed into for the worker's lifetime, and destroyed when the
+    # worker exits. The API key is read from VULTR_API_KEY at boot (env-var
+    # indirection; never committed here). Pick a cheap region/plan/os_id.
+    vultr_persistent:
+      provider: vultr
+      region: ${VULTR_REGION:-ewr}
+      plan: ${VULTR_PLAN:-vc2-1c-1gb}
+      os_id: 1743   # Ubuntu 22.04 x64
+      label: agentflow-worker
+      tags: [agentflow]
   agent:
     # One ephemeral PM per project (spawned by main).
     project_manager:
@@ -49,22 +75,30 @@ profiles:
       loop: ./plugins/orchestrator/worker.lua
       model: worker
       instructions: ./instructions/worker.md
-      capabilities: [llm.chat, memory, agent.send]
-      # To enable real file/git execution, uncomment and configure a shell
-      # profile, then add: shell: docker, skills: [builtin:fs.read, builtin:fs.write, builtin:git.status]
+      capabilities: [llm.chat, memory, agent.send, tools, shell.exec]
+      # Shell profile + skills: the worker spawns a shell on first task and
+      # exposes these tools to the model. Switch docker_oneshot <-> vultr_persistent.
+      shell: docker_oneshot
+      skills: [builtin:fs.read, builtin:fs.write, builtin:git.status]
       ephemeral:
         idle_ttl: 30m
         max_lifetime: 2h
 
 agents:
   main:
-    loop: ./plugins/orchestrator/main.lua
+    loop: ./plugins/orchestrator/main   # directory loop
     model: main
     instructions: ./instructions/main.md
-    memory: builtin:conversational
     history_budget: 8000
     capabilities: [llm.chat, memory, tools, agent.send, agent.request, agent.spawn, channel.push]
     can_contact: [expert_code]
+    memory:
+      stores:
+        dialogue: { backend: main_db, table: dialogue, retention: 30d, window: 1000, requires: [kv] }
+        facts:    { backend: main_db, table: facts,    retention: forever, requires: [kv, text_search] }
+        projects: { backend: main_db, table: projects, retention: forever, requires: [kv] }
+        clarify:  { backend: main_db, table: clarify,  retention: 24h,  requires: [kv] }
+        scratch:  { backend: main_db, table: scratch,  retention: 24h,  requires: [kv] }
 
   expert_code:
     loop: ./plugins/orchestrator/expert.lua
@@ -74,6 +108,7 @@ agents:
     # No channels: experts never talk to the user.
 
 gateway:
+  route: ./routes/singleton.lua   # constant key -> one main|singleton session
   channels:
     # Webhook channel for local/scripted testing without Telegram.
     - type: webhook

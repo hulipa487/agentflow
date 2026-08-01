@@ -301,17 +301,18 @@ shell = {}
 function shell.spawn(opts)
   opts = opts or {}
   return op({ type = "shell.spawn",
-    image     = opts.image,
-    workdir   = opts.workdir,
-    env       = opts.env,
-    network   = opts.network,
-    mem_limit = opts.mem_limit,
-    cpu_limit = opts.cpu_limit,
-    provider  = opts.provider,
-    host      = opts.host,
-    user      = opts.user,
-    password  = opts.password,
-    key_file  = opts.key_file,
+    image      = opts.image,
+    workdir    = opts.workdir,
+    env        = opts.env,
+    network    = opts.network,
+    mem_limit  = opts.mem_limit,
+    cpu_limit  = opts.cpu_limit,
+    provider   = opts.provider,
+    host       = opts.host,
+    user       = opts.user,
+    password   = opts.password,
+    key_file   = opts.key_file,
+    shell_opts = opts.shell_opts,
   })
 end
 function shell.exec(handle_id, command)

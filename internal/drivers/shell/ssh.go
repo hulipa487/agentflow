@@ -13,7 +13,11 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// SSHProvider implements ShellProvider for a remote SSH connection.
+// SSHProvider implements ShellProvider for a remote SSH connection to an
+// already-running host (the host is supplied in SpawnOpts; nothing here
+// provisions it). The Vultr provider reuses the shared sshExec/sshRead/
+// sshWrite/sshDial helpers below for its exec/read/write after it has
+// launched an instance.
 type SSHProvider struct {
 	log *slog.Logger
 }
@@ -33,12 +37,55 @@ func (p *SSHProvider) Spawn(ctx context.Context, opts SpawnOpts) (*Handle, error
 		return nil, fmt.Errorf("ssh: user is required")
 	}
 
+	client, err := sshDial(ctx, opts.Host, opts.User, opts)
+	if err != nil {
+		return nil, err
+	}
+	h := &Handle{
+		ID:       "ssh-" + uuid.New().String()[:8],
+		Provider: "ssh",
+		State:    HandleRunning,
+		Meta: map[string]any{
+			"host": opts.Host,
+			"user": opts.User,
+		},
+		internal: client,
+	}
+	return h, nil
+}
+
+func (p *SSHProvider) Exec(ctx context.Context, handle *Handle, cmdStr string) (*ExecResult, error) {
+	return sshExec(ctx, handle.internal.(*ssh.Client), cmdStr)
+}
+
+func (p *SSHProvider) Read(ctx context.Context, handle *Handle, path string) ([]byte, error) {
+	return sshRead(ctx, handle.internal.(*ssh.Client), path)
+}
+
+func (p *SSHProvider) Write(ctx context.Context, handle *Handle, path string, content []byte) error {
+	return sshWrite(ctx, handle.internal.(*ssh.Client), path, content)
+}
+
+func (p *SSHProvider) Destroy(ctx context.Context, handle *Handle) error {
+	client := handle.internal.(*ssh.Client)
+	err := client.Close()
+	handle.State = HandleDestroyed
+	return err
+}
+
+func (p *SSHProvider) Alive(handle *Handle) bool {
+	return sshAlive(handle.internal.(*ssh.Client))
+}
+
+// sshDial connects to host (host:port) as user with the auth derived from opts
+// (password and/or key_file). The dial is ctx-cancellable.
+func sshDial(ctx context.Context, host, user string, opts SpawnOpts) (*ssh.Client, error) {
 	auth, err := sshAuth(opts)
 	if err != nil {
 		return nil, err
 	}
 	cfg := &ssh.ClientConfig{
-		User:            opts.User,
+		User:            user,
 		Auth:            auth,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // Phase 3b: explicit trusted_hosts later.
 		Timeout:         30 * time.Second,
@@ -50,28 +97,62 @@ func (p *SSHProvider) Spawn(ctx context.Context, opts SpawnOpts) (*Handle, error
 	}
 	ch := make(chan result, 1)
 	go func() {
-		client, err := ssh.Dial("tcp", opts.Host, cfg)
+		client, err := ssh.Dial("tcp", host, cfg)
 		ch <- result{client: client, err: err}
 	}()
 	select {
 	case r := <-ch:
 		if r.err != nil {
-			return nil, fmt.Errorf("ssh dial %s: %w", opts.Host, r.err)
+			return nil, fmt.Errorf("ssh dial %s: %w", host, r.err)
 		}
-		h := &Handle{
-			ID:       "ssh-" + uuid.New().String()[:8],
-			Provider: "ssh",
-			State:    HandleRunning,
-			Meta: map[string]any{
-				"host": opts.Host,
-				"user": opts.User,
-			},
-			internal: r.client,
-		}
-		return h, nil
+		return r.client, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+// sshDialWithSigner connects to host as user authenticating with the given
+// signer (used by the Vultr provider, which generates an ephemeral key). The
+// dial is retried on connection-refused for a short window so a freshly-booted
+// instance has time to bring up sshd.
+func sshDialWithSigner(ctx context.Context, host, user string, signer ssh.Signer) (*ssh.Client, error) {
+	cfg := &ssh.ClientConfig{
+		User:            user,
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         10 * time.Second,
+	}
+
+	deadline := time.Now().Add(45 * time.Second)
+	var lastErr error
+	for {
+		client, err := ssh.Dial("tcp", host, cfg)
+		if err == nil {
+			return client, nil
+		}
+		lastErr = err
+		if !isConnRefused(err) {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
+	}
+	return nil, fmt.Errorf("ssh dial %s: %w", host, lastErr)
+}
+
+// isConnRefused reports whether err looks like a connection-refused (sshd not
+// up yet) vs. a permanent auth/network failure.
+func isConnRefused(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "connect: connection refused") ||
+		strings.Contains(msg, "i/o timeout")
 }
 
 func sshAuth(opts SpawnOpts) ([]ssh.AuthMethod, error) {
@@ -96,8 +177,8 @@ func sshAuth(opts SpawnOpts) ([]ssh.AuthMethod, error) {
 	return auth, nil
 }
 
-func (p *SSHProvider) Exec(ctx context.Context, handle *Handle, cmdStr string) (*ExecResult, error) {
-	client := handle.internal.(*ssh.Client)
+// sshExec runs cmdStr over an established SSH client and returns its output.
+func sshExec(ctx context.Context, client *ssh.Client, cmdStr string) (*ExecResult, error) {
 	sess, err := client.NewSession()
 	if err != nil {
 		return nil, fmt.Errorf("ssh new session: %w", err)
@@ -134,8 +215,9 @@ func (p *SSHProvider) Exec(ctx context.Context, handle *Handle, cmdStr string) (
 	}, nil
 }
 
-func (p *SSHProvider) Read(ctx context.Context, handle *Handle, path string) ([]byte, error) {
-	res, err := p.Exec(ctx, handle, "cat "+shellQuote(path))
+// sshRead reads a file at path over an established SSH client.
+func sshRead(ctx context.Context, client *ssh.Client, path string) ([]byte, error) {
+	res, err := sshExec(ctx, client, "cat "+shellQuote(path))
 	if err != nil {
 		return nil, err
 	}
@@ -145,8 +227,8 @@ func (p *SSHProvider) Read(ctx context.Context, handle *Handle, path string) ([]
 	return []byte(res.Stdout), nil
 }
 
-func (p *SSHProvider) Write(ctx context.Context, handle *Handle, path string, content []byte) error {
-	client := handle.internal.(*ssh.Client)
+// sshWrite writes content to path over an established SSH client.
+func sshWrite(ctx context.Context, client *ssh.Client, path string, content []byte) error {
 	sess, err := client.NewSession()
 	if err != nil {
 		return fmt.Errorf("ssh new session: %w", err)
@@ -169,15 +251,8 @@ func (p *SSHProvider) Write(ctx context.Context, handle *Handle, path string, co
 	}
 }
 
-func (p *SSHProvider) Destroy(ctx context.Context, handle *Handle) error {
-	client := handle.internal.(*ssh.Client)
-	err := client.Close()
-	handle.State = HandleDestroyed
-	return err
-}
-
-func (p *SSHProvider) Alive(handle *Handle) bool {
-	client := handle.internal.(*ssh.Client)
+// sshAlive reports whether the SSH client's keepalive request succeeds.
+func sshAlive(client *ssh.Client) bool {
 	_, _, err := client.SendRequest("keepalive@agentflow", true, nil)
 	return err == nil
 }

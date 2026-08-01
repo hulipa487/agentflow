@@ -4,8 +4,10 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 // testProvider is a ShellProvider that replaces real docker with in-memory
@@ -119,4 +121,49 @@ func TestManagerUnknownProvider(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for unknown provider")
 	}
+}
+
+// TestDockerOneShotFreshEnv proves the defining property of the one-shot
+// Docker driver: no filesystem state carries between Exec calls. Each command
+// runs in a brand-new container, so a file written in one call is absent in
+// the next. Skipped when no docker daemon is reachable (e.g. CI without
+// Docker Desktop).
+func TestDockerOneShotFreshEnv(t *testing.T) {
+	if !dockerAvailable() {
+		t.Skip("docker daemon not reachable; skipping one-shot integration test")
+	}
+	p := NewDockerProvider(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx := context.Background()
+
+	h, err := p.Spawn(ctx, SpawnOpts{Image: "alpine:3.20"})
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+
+	// Write a file in one container.
+	if _, err := p.Exec(ctx, h, "echo hello > /tmp/once && cat /tmp/once"); err != nil {
+		t.Fatalf("exec write: %v", err)
+	}
+
+	// A subsequent command must NOT see /tmp/once — fresh container.
+	res, err := p.Exec(ctx, h, "test -f /tmp/once && echo present || echo absent")
+	if err != nil {
+		t.Fatalf("exec check: %v", err)
+	}
+	if !strings.Contains(res.Stdout, "absent") {
+		t.Fatalf("one-shot violated: /tmp/once persisted across calls (stdout=%q)", res.Stdout)
+	}
+
+	if err := p.Destroy(ctx, h); err != nil {
+		t.Fatalf("destroy: %v", err)
+	}
+}
+
+// dockerAvailable reports whether the docker CLI can reach a daemon. Used only
+// to gate the one-shot integration test; cheap to call once per test run.
+func dockerAvailable() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", "version", "--format", "{{.Server.Version}}")
+	return cmd.Run() == nil
 }

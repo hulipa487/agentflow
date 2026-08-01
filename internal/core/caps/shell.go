@@ -36,16 +36,17 @@ func ShellHandlers(mgr *shell.Manager) map[string]session.OpHandler {
 				provider = "docker"
 			}
 			h, err := mgr.Spawn(ctx, owner, provider, shell.SpawnOpts{
-				Image:    op.Image,
-				WorkDir:  op.WorkDir,
-				Env:      op.ShellEnv,
-				Network:  op.Net,
-				MemLimit: op.MemLimit,
-				CPULimit: op.CPULimit,
-				Host:     op.Host,
-				User:     op.User,
-				Password: op.Password,
-				KeyFile:  op.KeyFile,
+				Image:     op.Image,
+				WorkDir:   op.WorkDir,
+				Env:       op.ShellEnv,
+				Network:   op.Net,
+				MemLimit:  op.MemLimit,
+				CPULimit:  op.CPULimit,
+				Host:      op.Host,
+				User:      op.User,
+				Password:  op.Password,
+				KeyFile:   op.KeyFile,
+				ShellOpts: op.ShellOpts,
 			})
 			if err != nil {
 				return fail(err)

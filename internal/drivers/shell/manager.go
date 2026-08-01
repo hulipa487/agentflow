@@ -34,6 +34,11 @@ type SpawnOpts struct {
 	User     string
 	Password string
 	KeyFile  string
+
+	// ShellOpts is the generic escape hatch for provider-specific options that
+	// don't map to a typed field above (e.g. a Vultr region/plan/os_id, or a
+	// one-shot docker image override). Each provider reads the keys it knows.
+	ShellOpts map[string]any
 }
 
 // ExecResult is the output of a command executed inside a shell handle.

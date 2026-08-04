@@ -135,7 +135,7 @@
   </div>
 
   <h3>Multi-agent orchestration</h3>
-  <p>Static agents (each with its own model + instructions) collaborate via <code>agent.send</code>/<code>agent.request</code> under <code>can_contact</code> ACLs; ephemeral children are spawned from <code>profiles.agent</code> templates with capability attenuation. The <code>plugins/orchestrator/</code> example wires four roles:</p>
+  <p>Static agents (each with its own model + instructions) collaborate via <code>agent.send</code>/<code>agent.request</code> under <code>can_contact</code> ACLs; ephemeral children are spawned from <code>profiles.agent</code> templates with capability attenuation. A reference orchestrator (main + expert + project manager + workers) is a common pattern built on these primitives — it lives outside this runtime, in a separate product repo:</p>
   <div class="diagram-scroll">
   <pre class="diagram"><code>chit-chat:      user ──telegram/webhook──► main ──llm──► user
 
@@ -151,7 +151,7 @@ project launch: user ──► main ──[directive: start_project]──► ag
                           main ──session.push(channel, reply_to, text)──► user  (idle-time push)
                           PM ── shutdown workers ── session.exit()</code></pre>
   </div>
-  <p><code>session.push</code> (cap <code>channel.push</code>) is proactive egress — a background agent reaches the user without an active inbound message. <code>session.exit</code> terminates a spawned session cleanly (the parent receives <code>agent.died</code>). See <code>examples/agentflow.orchestrator.yaml</code>.</p>
+  <p><code>session.push</code> (cap <code>channel.push</code>) is proactive egress — a background agent reaches the user without an active inbound message. <code>session.exit</code> terminates a spawned session cleanly (the parent receives <code>agent.died</code>). The orchestrator wiring and role prompts ship with the reference product repo, not this runtime.</p>
 
   <h3>Layer responsibilities</h3>
   <table class="table config-table">

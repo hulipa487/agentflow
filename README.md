@@ -11,10 +11,11 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 - **Memory** — provider → backend → store layering; `builtin:conversational` preset; retention/window GC.
 - **Tools** — filesystem & git inside shell handles, honest-degradation `web_search`, and MCP stdio servers discovered at boot.
 - **Shell** — Docker and SSH providers with resource limits and an exec-policy filter.
+- **HTTP** — `http.request` / `os.env` Lua ops with scheme validation, body cap, and secret-header redaction.
+- **Credentials** — encrypted-at-rest, per-tenant credential store; loops reference a key by `{service=...}` and Go resolves and injects it at request time.
 - **Scheduler** — `scheduler.every/after/cron`; timers arrive as mailbox messages, never a cross-goroutine Luau call.
 - **Budget** — per-agent token pools with reserve/commit/release around LLM calls, daily reset.
 - **Safety** — core-owned ingress/egress chain (source-attribution, signal-gate, steady-directive, support-offer, affect-guard) that cannot be uninstalled from Lua.
-- **Multi-agent** — static agents with per-model config + `can_contact` ACLs, ephemeral children via spawn profiles, and correlated RPC (`agent.request`/`agent.reply`); an orchestrator pattern (main + experts + project manager + workers) ships under `plugins/orchestrator/`.
 - **Observability** — `/healthz`, `/readyz`, `/metrics`, `/v1/sessions` on loopback with optional bearer-token auth.
 
 ### Driver set
@@ -84,23 +85,12 @@ models:
 | `examples/agentflow.shell-tools.yaml` | Shell (Docker) + filesystem/git tools |
 | `examples/agentflow.telegram.yaml` | Anthropic + Telegram polling |
 | `examples/agentflow.openai-telegram.yaml` | OpenAI-compatible + Telegram |
-| `examples/agentflow.orchestrator.yaml` | Multi-agent: main + expert + PM + workers |
 
-## Multi-agent orchestration
-
-The `plugins/orchestrator/` example wires four agent roles, each with its own model and system prompt:
-
-- **Main** (`main.lua`) — the only user-facing agent. Chats, consults experts, and launches projects. Emits fenced-JSON directives the runtime acts on, then re-asks the LLM for the final reply.
-- **Expert** (`expert.lua`) — static, channel-less. Receives a question via `agent.request`, returns a second opinion via `agent.reply`; never talks to the user.
-- **Project manager** (`pm.lua`) — one ephemeral instance per project (`agent.spawn("project_manager")`). Decomposes the brief into tasks, spawns workers, dispatches them, and reports milestones/decisions back to main.
-- **Worker** (`worker.lua`) — ephemeral, one task at a time. Produces an artifact and reports to its PM; exits on shutdown.
-
-Background updates reach the user through `session.push` (a new capability-gated op for proactive channel egress), and finished agents clean up with `session.exit`. See `examples/agentflow.orchestrator.yaml` for the wiring and `instructions/` for the role prompts.
-
-```bash
-./agentflow -config examples/agentflow.orchestrator.yaml
-curl -X POST localhost:8080/webhook -d '{"from":"alice","text":"plan and write a fizzbuzz script"}'
-```
+The runtime ships as a standalone engine. Reference product apps built on top
+of agentflow — for example a full multi-agent orchestrator (main + expert +
+project manager + workers), with its own loops, route, and instruction files —
+live in a separate repo and consume agentflow as a binary/library. This repo
+holds only the runtime and generic, runnable examples.
 
 ## Documentation
 
@@ -120,14 +110,13 @@ agentflow/
 ├── Makefile            # build: vendored Luau -> libluau.a -> agentflow binary
 ├── cmd/agentflow/      # main entrypoint
 ├── internal/           # core runtime + drivers (not importable — internal module)
-│   ├── core/           # actor, supervisor, router, scheduler, safety, memory, budget, metrics, ...
+│   ├── core/           # actor, supervisor, router, scheduler, safety, memory, budget, metrics, credentials, ...
 │   ├── drivers/        # llm, memory backends, telegram, webhook, shell, mcp
 │   ├── builtins/       # embedded Lua builtins (react loop, per_chat route, support chunks)
-│   ├── plugins/examples/   # example Lua loop plugins
-│   ├── plugins/orchestrator/ # multi-agent: main + expert + PM + workers
 │   └── vm/             # Luau cgo bridge + embedded prelude
+├── plugins/examples/   # example Lua loop plugins
 ├── examples/           # runnable YAML configs
-├── instructions/       # agent system-prompt files (incl. orchestrator roles)
+├── instructions/       # agent system-prompt guidance (see instructions/README.md)
 ├── docs/               # documentation website (GitHub Pages-ready)
 └── third_party/luau/   # vendored Luau 0.731 (MIT, committed)
 ```

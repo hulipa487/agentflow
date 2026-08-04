@@ -19,6 +19,7 @@ import (
 	"agentflow/internal/config"
 	"agentflow/internal/core/budget"
 	"agentflow/internal/core/caps"
+	"agentflow/internal/core/credentials"
 	"agentflow/internal/core/gateway"
 	"agentflow/internal/core/identity"
 	"agentflow/internal/core/memory"
@@ -98,6 +99,26 @@ func main() {
 		shell.NewSSHProvider(log),
 		shell.NewVultrProvider(log, os.Getenv("VULTR_API_KEY")),
 	}, log)
+
+	// Encrypted per-tenant credential store. Enabled via runtime.credentials;
+	// the master key is read from the named env var (never the config file).
+	// When disabled, credStore stays nil and http.request's `auth` fails with a
+	// clear "not enabled" error instead of panicking.
+	var credStore *credentials.Store
+	if cfg.Runtime.Credentials.Enabled {
+		envName := cfg.CredentialsMasterKeyEnv()
+		masterKey := os.Getenv(envName)
+		if masterKey == "" {
+			log.Error("runtime.credentials.enabled but env var unset", "env", envName)
+			os.Exit(1)
+		}
+		credStore, err = credentials.Open(cfg.CredentialsPath(), masterKey, log)
+		if err != nil {
+			log.Error("credential store open failed", "err", err)
+			os.Exit(1)
+		}
+		defer credStore.Close()
+	}
 
 	// Scheduler: session-owned timers. Fires are delivered as timer messages,
 	// never by invoking a Luau state from a timer goroutine.
@@ -192,6 +213,9 @@ func main() {
 		for k, h := range caps.ShellHandlers(shellMgr) {
 			handlers[k] = h
 		}
+		for k, h := range caps.HTTPHandlers(log, credStore) {
+			handlers[k] = h
+		}
 
 		effectiveCaps := capabilitySet(a.Capabilities)
 		canContact := stringSet(a.CanContact)
@@ -266,6 +290,9 @@ func main() {
 			handlers[k] = h
 		}
 		for k, h := range caps.ShellHandlers(shellMgr) {
+			handlers[k] = h
+		}
+		for k, h := range caps.HTTPHandlers(log, credStore) {
 			handlers[k] = h
 		}
 
@@ -424,6 +451,7 @@ func main() {
 		}
 		return infos
 	})
+	admin.SetCredentials(credStore)
 	go func() {
 		if err := admin.Start(); err != nil {
 			log.Warn("admin server stopped", "err", err)

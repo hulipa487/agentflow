@@ -61,3 +61,16 @@ func TestValidateShellProfile(t *testing.T) {
 		})
 	}
 }
+
+// TestCredentialsMasterKeyEnvDefault verifies the env-var name resolution.
+func TestCredentialsMasterKeyEnvDefault(t *testing.T) {
+	c := &Config{}
+	if got := c.CredentialsMasterKeyEnv(); got != "CREDENTIALS_MASTER_KEY" {
+		t.Fatalf("default env = %q, want CREDENTIALS_MASTER_KEY", got)
+	}
+	c2 := &Config{}
+	c2.Runtime.Credentials.MasterKeyEnv = "MY_KEY_ENV"
+	if got := c2.CredentialsMasterKeyEnv(); got != "MY_KEY_ENV" {
+		t.Fatalf("override env = %q, want MY_KEY_ENV", got)
+	}
+}

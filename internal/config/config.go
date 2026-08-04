@@ -44,6 +44,17 @@ type Runtime struct {
 	Persistence string `yaml:"persistence"` // e.g. sqlite://./data/agentflow.db
 	Admin       AdminConfig `yaml:"admin"`
 	Identity    IdentityConfig `yaml:"identity"`
+	Credentials CredentialsConfig `yaml:"credentials"`
+}
+
+// CredentialsConfig controls the encrypted per-tenant credential store. When
+// enabled, the http.request op can resolve an `auth={service=...}` reference
+// to a stored API key at request time. The master key is read from the named
+// environment variable at boot (never from the config file).
+type CredentialsConfig struct {
+	Enabled      bool   `yaml:"enabled"`
+	Path         string `yaml:"path"` // sqlite path; "" = <runtime persistence dir>/credentials.db
+	MasterKeyEnv string `yaml:"master_key_env"` // env var holding the master key; default "CREDENTIALS_MASTER_KEY"
 }
 
 // AdminConfig configures the metrics/admin HTTP endpoint.
@@ -337,6 +348,9 @@ func validate(path string, c *Config) error {
 	if c.Runtime.Persistence == "" {
 		c.Runtime.Persistence = "sqlite://./data/agentflow.db"
 	}
+	if c.Runtime.Credentials.Enabled && c.CredentialsMasterKeyEnv() == "" {
+		return fmt.Errorf("%s: runtime.credentials.enabled requires master_key_env to name the env var holding the master key", path)
+	}
 
 	allowedCaps := map[string]bool{}
 	for _, cap := range c.Plugins.AllowCapabilities {
@@ -598,4 +612,27 @@ func (c *Config) IdentityPath() string {
 		return "identity.db"
 	}
 	return dir + "/identity.db"
+}
+
+// CredentialsPath returns the sqlite path for the credential store, resolved
+// beside the runtime persistence path unless explicitly overridden.
+func (c *Config) CredentialsPath() string {
+	if c.Runtime.Credentials.Path != "" {
+		return c.Runtime.Credentials.Path
+	}
+	p := c.PersistencePath()
+	dir := filepath.Dir(p)
+	if dir == "" || dir == "." {
+		return "credentials.db"
+	}
+	return dir + "/credentials.db"
+}
+
+// CredentialsMasterKeyEnv returns the env var holding the credential master
+// key, defaulting to CREDENTIALS_MASTER_KEY.
+func (c *Config) CredentialsMasterKeyEnv() string {
+	if c.Runtime.Credentials.MasterKeyEnv != "" {
+		return c.Runtime.Credentials.MasterKeyEnv
+	}
+	return "CREDENTIALS_MASTER_KEY"
 }

@@ -17,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"agentflow/internal/core/credentials"
 )
 
 // Counter is an atomic int64 metric.
@@ -96,12 +98,13 @@ func DefaultCounters() map[string]*Counter {
 // AdminServer is the HTTP admin/metrics endpoint. It binds to loopback by
 // default; remote binding requires a bearer token.
 type AdminServer struct {
-	srv     *http.Server
-	reg     *Registry
-	token   string
-	readyz  func() bool
-	sessions func() []SessionInfo
-	log     *slog.Logger
+	srv       *http.Server
+	reg       *Registry
+	token     string
+	readyz    func() bool
+	sessions  func() []SessionInfo
+	credStore *credentials.Store
+	log       *slog.Logger
 }
 
 // SessionInfo is read-only session metadata for the admin endpoint.
@@ -123,6 +126,8 @@ func NewAdminServer(addr, token string, reg *Registry, log *slog.Logger) *AdminS
 	mux.HandleFunc("/readyz", s.handleReady)
 	mux.HandleFunc("/metrics", s.auth(s.handleMetrics))
 	mux.HandleFunc("/v1/sessions", s.auth(s.handleSessions))
+	mux.HandleFunc("/admin/credentials", s.auth(s.handleCredentials))
+	mux.HandleFunc("/admin/credentials/", s.auth(s.handleCredentialsDelete))
 	s.srv = &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	return s
 }
@@ -135,6 +140,13 @@ func (s *AdminServer) SetReady(ready bool) {
 // SetSessions sets the session lister. The supervisor provides this.
 func (s *AdminServer) SetSessions(lister func() []SessionInfo) {
 	s.sessions = lister
+}
+
+// SetCredentials sets the credential store backing the /admin/credentials
+// endpoints. The control plane (an onboarding service) provisions tenant API
+// keys here; the agent loop can only consume them via http.request's `auth`.
+func (s *AdminServer) SetCredentials(store *credentials.Store) {
+	s.credStore = store
 }
 
 // Start begins listening. Blocks until shutdown.
@@ -188,4 +200,85 @@ func (s *AdminServer) handleSessions(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(s.sessions())
+}
+
+// credUnavailable writes 503 when the credential store is not enabled.
+func (s *AdminServer) credUnavailable(w http.ResponseWriter) {
+	http.Error(w, "credentials not enabled", http.StatusServiceUnavailable)
+}
+
+// handleCredentials provisions (POST), lists (GET), or revokes (DELETE) a
+// tenant API key. Secret values are never returned in a response.
+func (s *AdminServer) handleCredentials(w http.ResponseWriter, r *http.Request) {
+	if s.credStore == nil {
+		s.credUnavailable(w)
+		return
+	}
+	switch r.Method {
+	case http.MethodPost:
+		var req struct {
+			User    string `json:"user"`
+			Service string `json:"service"`
+			Kind    string `json:"kind"`
+			Secret  string `json:"secret"`
+			Header  string `json:"header"`
+			Scheme  string `json:"scheme"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		kind := req.Kind
+		if kind == "" {
+			kind = "api_key"
+		}
+		if err := s.credStore.Put(r.Context(), req.User, req.Service, kind, req.Secret, req.Header, req.Scheme); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]any{"ok": true})
+
+	case http.MethodGet:
+		user := r.URL.Query().Get("user")
+		if user == "" {
+			http.Error(w, "missing user", http.StatusBadRequest)
+			return
+		}
+		refs, err := s.credStore.List(r.Context(), user)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"credentials": refs})
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleCredentialsDelete revokes a credential: DELETE /admin/credentials/{service}?user=<uuid>.
+func (s *AdminServer) handleCredentialsDelete(w http.ResponseWriter, r *http.Request) {
+	if s.credStore == nil {
+		s.credUnavailable(w)
+		return
+	}
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	service := strings.TrimPrefix(r.URL.Path, "/admin/credentials/")
+	user := r.URL.Query().Get("user")
+	if service == "" || user == "" {
+		http.Error(w, "missing service or user", http.StatusBadRequest)
+		return
+	}
+	if err := s.credStore.Delete(r.Context(), user, service); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }

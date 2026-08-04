@@ -16,6 +16,7 @@ func TestToolCallingLoopsParse(t *testing.T) {
 		filepath.Join("..", "..", "plugins", "orchestrator", "pm.lua"),
 		filepath.Join("..", "..", "plugins", "orchestrator", "worker.lua"),
 		filepath.Join("..", "..", "plugins", "orchestrator", "main", "10_partition.lua"),
+		filepath.Join("..", "..", "plugins", "orchestrator", "main", "15_api_tools.lua"),
 		filepath.Join("..", "..", "plugins", "orchestrator", "main", "20_write_policy.lua"),
 		filepath.Join("..", "..", "plugins", "orchestrator", "main", "30_recall.lua"),
 		filepath.Join("..", "..", "plugins", "orchestrator", "main", "90_loop.lua"),

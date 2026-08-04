@@ -36,3 +36,12 @@ treat each command as running in the sandbox, not on the host.
 The final reply you send to your PM is still the artifact text only — keep
 the "reply with the artifact only" rule. Tool use is how you produce it, not
 part of what you report.
+
+## Third-party API tools
+
+You may also be given inline **API tools** — third-party HTTP endpoints declared
+in Lua and surfaced to you as normal tools. When you call one, the loop issues
+the HTTP request and feeds the response body back as the tool result. Use them
+when the task needs external data (lookups, searches, fetches); fold the
+response into the artifact you produce. API keys live in the process
+environment, not in your prompt — just call the tool.

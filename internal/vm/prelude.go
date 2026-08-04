@@ -325,6 +325,36 @@ function shell.destroy(handle_id)
   return op({ type = "shell.destroy", shell_handle = handle_id })
 end
 
+-- http issues a single HTTP request and returns the full response. No
+-- streaming, no retry; a loop that wants retry wraps it. Secrets go in
+-- headers via os.env so they never sit in Lua source.
+http = {}
+function http.request(opts)
+  opts = opts or {}
+  return op({
+    type        = "http.request",
+    method      = opts.method or "GET",
+    url         = opts.url,
+    headers     = opts.headers,
+    body        = opts.body,
+    query       = opts.query,
+    json        = opts.json,
+    timeout     = opts.timeout,
+    auth        = opts.auth,   -- {service=...}: a stored credential, resolved by Go
+  })
+end
+function http.get(url, opts)
+  opts = opts or {}; opts.method = "GET"; opts.url = url; return http.request(opts)
+end
+function http.post(url, body, opts)
+  opts = opts or {}; opts.method = "POST"; opts.url = url; opts.body = body; return http.request(opts)
+end
+
+-- os.env reads a process environment variable at call time (for API keys and
+-- other secrets that must not be hardcoded in Lua source). Returns "" if unset.
+os = {}
+function os.env(name) return op({ type = "os.env", name = name }) end
+
 local function with_opts(req, opts)
   if opts then for k, v in pairs(opts) do req[k] = v end end
   return req

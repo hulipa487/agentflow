@@ -110,6 +110,20 @@ type Op struct {
 	Tool   string        `json:"tool,omitempty"`
 	Args   map[string]any `json:"args,omitempty"`
 
+	// HTTP op (http.request).
+	Method  string            `json:"method,omitempty"`
+	URL     string            `json:"url,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Body    string            `json:"body,omitempty"`
+	Json    map[string]any    `json:"json,omitempty"`
+	// QueryParams is the http.request ?key=value table.
+	QueryParams map[string]string `json:"query_params,omitempty"`
+	// EnvName is the os.env op's variable name.
+	EnvName string `json:"name,omitempty"`
+	// Auth names a stored credential to resolve at request time (never the
+	// secret itself). The loop references it; Go injects the resolved value.
+	Auth *CredentialRef `json:"auth,omitempty"`
+
 	// Multi-agent operations.
 	Address string         `json:"address,omitempty"`
 	Payload map[string]any `json:"payload,omitempty"`
@@ -145,6 +159,13 @@ type Op struct {
 	// Confirm bypass.
 	Confirmed bool   `json:"confirmed,omitempty"`
 	ConfirmID string `json:"confirm_id,omitempty"`
+}
+
+// CredentialRef names a stored credential to resolve at op-handler time. It
+// carries only the service name — never the secret — so a credential value
+// never crosses the Lua bridge. The resolver maps it to a per-user secret.
+type CredentialRef struct {
+	Service string `json:"service"`
 }
 
 // SchedulerService is implemented by the scheduler package and injected into
@@ -237,6 +258,7 @@ var blockingOps = map[string]bool{
 	"shell.exec":      true,
 	"shell.write":     true,
 	"shell.destroy":   true,
+	"http.request":    true,
 	"agent.send":      true,
 	"agent.request":   true,
 	"agent.reply":     true,
@@ -487,6 +509,8 @@ func (a *Actor) dispatchInline(ctx context.Context, op Op, current *Message) (re
 		return a.infoJSON(), true, true
 
 	default:
+		// Stamp the tenant user UUID for inline handlers, mirroring execBlocking.
+		ctx = WithUserUUID(ctx, userFromMessage(current))
 		if h, found := a.handlers[op.Type]; found {
 			r, ok := h(ctx, op)
 			return r, ok, true
@@ -520,6 +544,7 @@ func (a *Actor) dispatchBlocking(ctx context.Context, op Op, current *Message) (
 
 func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (string, bool) {
 	ctx = WithOwner(ctx, a.Name)
+	ctx = WithUserUUID(ctx, userFromMessage(current))
 	if op.Type == "send" {
 		if current.Channel == "" {
 			return `"no active message to reply to"`, false
@@ -756,6 +781,45 @@ func OwnerFromCtx(ctx context.Context) string {
 	v := ctx.Value(ownerKey)
 	s, _ := v.(string)
 	return s
+}
+
+type userKeyType struct{}
+
+var userKey userKeyType
+
+// WithUserUUID returns a context carrying the current tenant's user UUID.
+// It is stamped by the actor from the core-owned inbound message (never from
+// Lua), so handlers can resolve per-tenant credentials without trusting the
+// loop. Empty when no inbound user is in scope (e.g. proactive scheduler ops).
+func WithUserUUID(ctx context.Context, userUUID string) context.Context {
+	return context.WithValue(ctx, userKey, userUUID)
+}
+
+// UserUUIDFromCtx extracts the user UUID injected by WithUserUUID.
+func UserUUIDFromCtx(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v := ctx.Value(userKey)
+	s, _ := v.(string)
+	return s
+}
+
+// userFromMessage recovers the user UUID from an inbound message: prefer the
+// identity-stashed payload field, else strip "user:" from From.
+func userFromMessage(m *Message) string {
+	if m == nil {
+		return ""
+	}
+	if p, ok := m.Payload["user_uuid"].(string); ok && p != "" {
+		return p
+	}
+	if from := m.From; from != "" {
+		if u := strings.TrimPrefix(from, "user:"); u != from && u != "" {
+			return u
+		}
+	}
+	return ""
 }
 
 // isConfirmRequest checks whether a response JSON encodes a needs_confirm=true result.

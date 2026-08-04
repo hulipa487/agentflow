@@ -163,7 +163,7 @@ func TestSinkRewritesEnvelope(t *testing.T) {
 
 	in := router.Inbound{
 		Channel: "telegram",
-		Agent:   "anyi",
+		Agent:   "bot",
 		Message: session.Message{
 			ID:      "m1",
 			Type:    "user",
@@ -179,7 +179,7 @@ func TestSinkRewritesEnvelope(t *testing.T) {
 		t.Fatalf("inner got %d events, want 1", len(cap.got))
 	}
 	out := cap.got[0]
-	if out.Agent != "anyi" {
+	if out.Agent != "bot" {
 		t.Fatalf("agent: %q", out.Agent)
 	}
 	if out.Message.From == "user:telegram:123" {
@@ -189,8 +189,8 @@ func TestSinkRewritesEnvelope(t *testing.T) {
 	if out.Message.From != "user:"+uuid {
 		t.Fatalf("From=%q want user:%s", out.Message.From, uuid)
 	}
-	if out.Message.To != "agent:anyi" {
-		t.Fatalf("To=%q want agent:anyi", out.Message.To)
+	if out.Message.To != "agent:bot" {
+		t.Fatalf("To=%q want agent:bot", out.Message.To)
 	}
 	if out.Message.Payload["native_from"] != "user:telegram:123" {
 		t.Fatalf("native_from not stashed: %v", out.Message.Payload["native_from"])
@@ -210,7 +210,7 @@ func TestSinkFailOpenOnRegistryError(t *testing.T) {
 
 	sink.Submit(router.Inbound{
 		Channel: "telegram",
-		Agent:   "anyi",
+		Agent:   "bot",
 		Message: session.Message{From: "user:telegram:123", Type: "user", Channel: "telegram"},
 	})
 	if len(cap.got) != 1 {

@@ -6,21 +6,17 @@ import (
 	"testing"
 )
 
-// The loops that now drive native tool-calling must parse. A syntax slip in
-// the Lua would only surface at session boot; compile-check them here so the
-// gate catches it.
-func TestToolCallingLoopsParse(t *testing.T) {
-	files := []string{
-		filepath.Join("..", "builtins", "lua", "react.lua"),
-		filepath.Join("..", "..", "plugins", "orchestrator", "expert.lua"),
-		filepath.Join("..", "..", "plugins", "orchestrator", "pm.lua"),
-		filepath.Join("..", "..", "plugins", "orchestrator", "worker.lua"),
-		filepath.Join("..", "..", "plugins", "orchestrator", "main", "10_partition.lua"),
-		filepath.Join("..", "..", "plugins", "orchestrator", "main", "15_api_tools.lua"),
-		filepath.Join("..", "..", "plugins", "orchestrator", "main", "20_write_policy.lua"),
-		filepath.Join("..", "..", "plugins", "orchestrator", "main", "30_recall.lua"),
-		filepath.Join("..", "..", "plugins", "orchestrator", "main", "90_loop.lua"),
-		filepath.Join("..", "..", "routes", "singleton.lua"),
+// Loops shipped with the runtime must parse. A syntax slip would only surface
+// at session boot; compile-check them here so the gate catches it. Product
+// loops (e.g. an orchestrator) live outside this repo and are checked there.
+func TestShippedLoopsParse(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join("..", "..", "plugins", "examples", "*.lua"))
+	if err != nil {
+		t.Fatalf("glob plugins/examples: %v", err)
+	}
+	files := append([]string{filepath.Join("..", "builtins", "lua", "react.lua")}, paths...)
+	if len(files) == 0 {
+		t.Fatal("no loop files found to compile-check")
 	}
 	for _, f := range files {
 		code, err := os.ReadFile(f)

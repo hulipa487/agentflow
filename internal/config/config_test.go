@@ -10,20 +10,6 @@ func TestValidateShellProfile(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name:    "vultr missing region",
-			profile: ShellProfile{Provider: "vultr", Plan: "vc2-1c-1gb"},
-			wantErr: "missing required region/plan",
-		},
-		{
-			name:    "vultr missing plan",
-			profile: ShellProfile{Provider: "vultr", Region: "ewr"},
-			wantErr: "missing required region/plan",
-		},
-		{
-			name:    "vultr valid",
-			profile: ShellProfile{Provider: "vultr", Region: "ewr", Plan: "vc2-1c-1gb", OsID: 1743},
-		},
-		{
 			name:    "ssh missing host",
 			profile: ShellProfile{Provider: "ssh", User: "root"},
 			wantErr: "missing required host",

@@ -36,8 +36,8 @@ type SpawnOpts struct {
 	KeyFile  string
 
 	// ShellOpts is the generic escape hatch for provider-specific options that
-	// don't map to a typed field above (e.g. a Vultr region/plan/os_id, or a
-	// one-shot docker image override). Each provider reads the keys it knows.
+	// don't map to a typed field above (e.g. a per-spawn docker image override).
+	// Each provider reads the keys it knows.
 	ShellOpts map[string]any
 }
 

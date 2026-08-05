@@ -123,39 +123,39 @@ func TestManagerUnknownProvider(t *testing.T) {
 	}
 }
 
-// TestDockerOneShotFreshEnv proves the defining property of the one-shot
-// Docker driver: no filesystem state carries between Exec calls. Each command
-// runs in a brand-new container, so a file written in one call is absent in
-// the next. Skipped when no docker daemon is reachable (e.g. CI without
-// Docker Desktop).
-func TestDockerOneShotFreshEnv(t *testing.T) {
+// TestDockerPersistsStateAcrossCalls proves the defining property of the
+// persistent Docker driver: filesystem and environment state survive across
+// Exec calls within one handle. A file written (and an env var set at Spawn)
+// in one call is visible in the next. Skipped when no docker daemon is
+// reachable (e.g. CI without Docker Desktop).
+func TestDockerPersistsStateAcrossCalls(t *testing.T) {
 	if !dockerAvailable() {
-		t.Skip("docker daemon not reachable; skipping one-shot integration test")
+		t.Skip("docker daemon not reachable; skipping persistent-shell integration test")
 	}
 	p := NewDockerProvider(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ctx := context.Background()
 
-	h, err := p.Spawn(ctx, SpawnOpts{Image: "alpine:3.20"})
+	h, err := p.Spawn(ctx, SpawnOpts{
+		Image: "alpine:3.20",
+		Env:   map[string]string{"MSG": "persisted"},
+	})
 	if err != nil {
 		t.Fatalf("spawn: %v", err)
 	}
+	defer func() { _ = p.Destroy(ctx, h) }()
 
-	// Write a file in one container.
-	if _, err := p.Exec(ctx, h, "echo hello > /tmp/once && cat /tmp/once"); err != nil {
+	// Write a file using a spawn-time env var, in one Exec.
+	if _, err := p.Exec(ctx, h, "echo $MSG > /tmp/once && echo wrote"); err != nil {
 		t.Fatalf("exec write: %v", err)
 	}
 
-	// A subsequent command must NOT see /tmp/once — fresh container.
-	res, err := p.Exec(ctx, h, "test -f /tmp/once && echo present || echo absent")
+	// A subsequent Exec must see /tmp/once and the env var — same container.
+	res, err := p.Exec(ctx, h, "test -f /tmp/once && cat /tmp/once")
 	if err != nil {
 		t.Fatalf("exec check: %v", err)
 	}
-	if !strings.Contains(res.Stdout, "absent") {
-		t.Fatalf("one-shot violated: /tmp/once persisted across calls (stdout=%q)", res.Stdout)
-	}
-
-	if err := p.Destroy(ctx, h); err != nil {
-		t.Fatalf("destroy: %v", err)
+	if !strings.Contains(res.Stdout, "persisted") {
+		t.Fatalf("persistence violated: /tmp/once not preserved across calls (stdout=%q)", res.Stdout)
 	}
 }
 

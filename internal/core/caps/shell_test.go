@@ -72,7 +72,7 @@ func TestShellHandlerNoOwner(t *testing.T) {
 }
 
 // TestShellSpawnPassesShellOpts verifies the ShellOpts escape hatch flows from
-// op.ShellOpts through to SpawnOpts.ShellOpts (the seam vultr/docker read).
+// op.ShellOpts through to SpawnOpts.ShellOpts (the seam providers read).
 func TestShellSpawnPassesShellOpts(t *testing.T) {
 	tp := newTestShellProvider("docker")
 	mgr := shell.NewManager([]shell.ShellProvider{tp}, slog.New(slog.NewTextHandler(io.Discard, nil)))

@@ -90,14 +90,12 @@ func main() {
 	opPool := pool.New(*workers)
 	gw := gateway.NewRegistry(log)
 
-	// Shell manager. Docker is a one-shot Alpine shell (fresh container per
-	// command); ssh dials an existing host; vultr launches a VPS on demand via
-	// the Vultr API and SSHes into it. The Vultr API key is read from
-	// VULTR_API_KEY (env-var indirection; never committed).
+	// Shell manager. Docker runs a single long-lived container per handle
+	// (persistent fs/env/process state); SSH dials a remote host. Both are
+	// generic providers; vendor-specific launchers live outside the runtime.
 	shellMgr := shell.NewManager([]shell.ShellProvider{
 		shell.NewDockerProvider(log),
 		shell.NewSSHProvider(log),
-		shell.NewVultrProvider(log, os.Getenv("VULTR_API_KEY")),
 	}, log)
 
 	// Encrypted per-tenant credential store. Enabled via runtime.credentials;
@@ -574,15 +572,5 @@ func shellProfileMap(cfg *config.Config, name string) map[string]any {
 		"user":      p.User,
 		"password":  p.Password,
 		"key_file":  p.KeyFile,
-		// Vultr provisioning (provider: vultr). Passed through ShellOpts so the
-		// Vultr provider reads them at spawn. api_key is NOT included here — it
-		// is read from VULTR_API_KEY at process boot.
-		"region":    p.Region,
-		"plan":      p.Plan,
-		"os_id":     p.OsID,
-		"label":     p.Label,
-		"ssh_key":   p.SSHKey,
-		"sshkey_id": p.SSHKeyID,
-		"tags":      p.Tags,
 	}
 }

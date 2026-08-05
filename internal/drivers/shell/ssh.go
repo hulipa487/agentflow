@@ -15,9 +15,8 @@ import (
 
 // SSHProvider implements ShellProvider for a remote SSH connection to an
 // already-running host (the host is supplied in SpawnOpts; nothing here
-// provisions it). The Vultr provider reuses the shared sshExec/sshRead/
-// sshWrite/sshDial helpers below for its exec/read/write after it has
-// launched an instance.
+// provisions it). Exec/Read/Write reuse the shared sshExec/sshRead/sshWrite
+// helpers below for the life of the handle.
 type SSHProvider struct {
 	log *slog.Logger
 }
@@ -109,50 +108,6 @@ func sshDial(ctx context.Context, host, user string, opts SpawnOpts) (*ssh.Clien
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-}
-
-// sshDialWithSigner connects to host as user authenticating with the given
-// signer (used by the Vultr provider, which generates an ephemeral key). The
-// dial is retried on connection-refused for a short window so a freshly-booted
-// instance has time to bring up sshd.
-func sshDialWithSigner(ctx context.Context, host, user string, signer ssh.Signer) (*ssh.Client, error) {
-	cfg := &ssh.ClientConfig{
-		User:            user,
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         10 * time.Second,
-	}
-
-	deadline := time.Now().Add(45 * time.Second)
-	var lastErr error
-	for {
-		client, err := ssh.Dial("tcp", host, cfg)
-		if err == nil {
-			return client, nil
-		}
-		lastErr = err
-		if !isConnRefused(err) {
-			break
-		}
-		if time.Now().After(deadline) {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(3 * time.Second):
-		}
-	}
-	return nil, fmt.Errorf("ssh dial %s: %w", host, lastErr)
-}
-
-// isConnRefused reports whether err looks like a connection-refused (sshd not
-// up yet) vs. a permanent auth/network failure.
-func isConnRefused(err error) bool {
-	msg := err.Error()
-	return strings.Contains(msg, "connection refused") ||
-		strings.Contains(msg, "connect: connection refused") ||
-		strings.Contains(msg, "i/o timeout")
 }
 
 func sshAuth(opts SpawnOpts) ([]ssh.AuthMethod, error) {

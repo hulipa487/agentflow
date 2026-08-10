@@ -29,10 +29,11 @@ import (
 	"agentflow/internal/core/router"
 	"agentflow/internal/core/runtime"
 	"agentflow/internal/core/safety"
-	"agentflow/internal/core/session"
 	"agentflow/internal/core/scheduler"
+	"agentflow/internal/core/session"
 	"agentflow/internal/core/supervisor"
 	"agentflow/internal/core/tools"
+	"agentflow/internal/drivers/ghhook"
 	"agentflow/internal/drivers/llm"
 	"agentflow/internal/drivers/mcp"
 	"agentflow/internal/drivers/mongodb"
@@ -432,6 +433,14 @@ func main() {
 		case "telegram":
 			d := telegram.New(name, ch.Token, ch.Agent, ch.Mode, ch.AllowUsers, ch.Listen, ch.Path, sink, log)
 			if err := d.Start(ctx); err != nil {
+				log.Error("channel start failed", "channel", name, "err", err)
+				os.Exit(1)
+			}
+			gw.Register(d)
+			channels = append(channels, d)
+		case "ghhook":
+			d := ghhook.New(name, ch.Listen, ch.Path, ch.Agent, ch.Secret, sink, log)
+			if err := d.Start(); err != nil {
 				log.Error("channel start failed", "channel", name, "err", err)
 				os.Exit(1)
 			}

@@ -9,24 +9,24 @@ import (
 	"bytes"
 	"fmt"
 	"os"
-	"regexp"
 	"path/filepath"
+	"regexp"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	Version string              `yaml:"version"`
-	Runtime Runtime               `yaml:"runtime"`
-	Models  map[string]Model     `yaml:"models"`
-	Memory  Memory               `yaml:"memory"`
-	Profiles Profiles             `yaml:"profiles"`
-	Gateway Gateway                `yaml:"gateway"`
-	MCP     MCP                    `yaml:"mcp"`
-	Tools   Tools                  `yaml:"tools"`
-	Agents  map[string]Agent      `yaml:"agents"`
-	Plugins Plugins                `yaml:"plugins"`
+	Version  string           `yaml:"version"`
+	Runtime  Runtime          `yaml:"runtime"`
+	Models   map[string]Model `yaml:"models"`
+	Memory   Memory           `yaml:"memory"`
+	Profiles Profiles         `yaml:"profiles"`
+	Gateway  Gateway          `yaml:"gateway"`
+	MCP      MCP              `yaml:"mcp"`
+	Tools    Tools            `yaml:"tools"`
+	Agents   map[string]Agent `yaml:"agents"`
+	Plugins  Plugins          `yaml:"plugins"`
 }
 
 // Runtime contains instance-wide tuning and persistence.
@@ -41,9 +41,9 @@ type Runtime struct {
 	Reload struct {
 		Watch bool `yaml:"watch"`
 	} `yaml:"reload"`
-	Persistence string `yaml:"persistence"` // e.g. sqlite://./data/agentflow.db
-	Admin       AdminConfig `yaml:"admin"`
-	Identity    IdentityConfig `yaml:"identity"`
+	Persistence string            `yaml:"persistence"` // e.g. sqlite://./data/agentflow.db
+	Admin       AdminConfig       `yaml:"admin"`
+	Identity    IdentityConfig    `yaml:"identity"`
 	Credentials CredentialsConfig `yaml:"credentials"`
 }
 
@@ -53,7 +53,7 @@ type Runtime struct {
 // environment variable at boot (never from the config file).
 type CredentialsConfig struct {
 	Enabled      bool   `yaml:"enabled"`
-	Path         string `yaml:"path"` // sqlite path; "" = <runtime persistence dir>/credentials.db
+	Path         string `yaml:"path"`           // sqlite path; "" = <runtime persistence dir>/credentials.db
 	MasterKeyEnv string `yaml:"master_key_env"` // env var holding the master key; default "CREDENTIALS_MASTER_KEY"
 }
 
@@ -108,10 +108,10 @@ type Backend struct {
 // wiring; agent profiles are spawn templates whose grants can only be narrowed.
 // Safety profiles select the core-owned safety filter chain.
 type Profiles struct {
-	Memory  map[string]MemoryProfile `yaml:"memory"`
+	Memory map[string]MemoryProfile `yaml:"memory"`
 	Shell  map[string]ShellProfile  `yaml:"shell"`
 	Agent  map[string]SpawnProfile  `yaml:"agent"`
-	Safety map[string]SafetyProfile  `yaml:"safety"`
+	Safety map[string]SafetyProfile `yaml:"safety"`
 }
 
 // SafetyProfile configures the core-owned safety chain. An empty profile
@@ -220,9 +220,9 @@ type Tools struct {
 }
 
 type ToolsPolicy struct {
-	Default   string                    `yaml:"default"`
-	Write     string                    `yaml:"write"`
-	Forbidden []string                  `yaml:"forbidden"`
+	Default   string                      `yaml:"default"`
+	Write     string                      `yaml:"write"`
+	Forbidden []string                    `yaml:"forbidden"`
 	Overrides map[string]ToolSpecOverride `yaml:"overrides"`
 }
 
@@ -268,12 +268,13 @@ type Gateway struct {
 
 type Channel struct {
 	Name       string  `yaml:"name"`
-	Type       string  `yaml:"type"` // webhook | telegram
+	Type       string  `yaml:"type"` // webhook | telegram | ghhook
 	Mode       string  `yaml:"mode"` // telegram: polling (default) | webhook
 	Agent      string  `yaml:"agent"`
 	Listen     string  `yaml:"listen"`
 	Path       string  `yaml:"path"`
 	Token      string  `yaml:"token"`
+	Secret     string  `yaml:"secret"` // ghhook: webhook secret for HMAC verification (env-interpolated)
 	AllowUsers []int64 `yaml:"allow_users"`
 }
 

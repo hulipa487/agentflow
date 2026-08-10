@@ -61,6 +61,33 @@ func (r *Registry) Get(name string) (*Counter, bool) {
 	return c, ok
 }
 
+// global is the process-wide registry of default counters. Handlers across the
+// runtime increment through this; the admin server renders it. Wired in main.
+var global = NewRegistry()
+
+func init() {
+	for _, c := range DefaultCounters() {
+		global.Register(c)
+	}
+}
+
+// Global returns the process-wide counter registry.
+func Global() *Registry { return global }
+
+// Inc increments a named global counter by 1 (no-op if unregistered).
+func Inc(name string) {
+	if c, ok := global.Get(name); ok {
+		c.Inc()
+	}
+}
+
+// Add increments a named global counter by n (no-op if unregistered).
+func Add(name string, n int64) {
+	if c, ok := global.Get(name); ok {
+		c.Add(n)
+	}
+}
+
 // PrometheusFormat renders counters in Prometheus text exposition format.
 func (r *Registry) PrometheusFormat() string {
 	r.mu.RLock()

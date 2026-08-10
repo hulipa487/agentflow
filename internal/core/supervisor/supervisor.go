@@ -12,6 +12,7 @@ import (
 
 	"agentflow/internal/builtins"
 	"agentflow/internal/core/gateway"
+	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/pool"
 	"agentflow/internal/core/request"
 	"agentflow/internal/core/safety"
@@ -140,6 +141,7 @@ func (s *Supervisor) Deliver(agent, key string, msg session.Message) error {
 		s.sessions[skey] = a
 		s.cancels[skey] = cancel
 		go a.Run(actorCtx)
+		metrics.Inc("agentflow_sessions_active")
 		s.log.Info("session spawned", "session", skey)
 	}
 	s.mu.Unlock()
@@ -171,6 +173,8 @@ func (s *Supervisor) onActorExit(id session.Identity, reason session.EndReason) 
 	if ok && current.Identity.SessionID == id.SessionID {
 		delete(s.sessions, id.SessionID)
 		delete(s.cancels, id.SessionID)
+		metrics.Add("agentflow_sessions_active", -1)
+		metrics.Inc("agentflow_children_died")
 		if s.retired != nil {
 			s.retired[id.SessionID] = struct{}{}
 		}

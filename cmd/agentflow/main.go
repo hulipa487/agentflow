@@ -185,6 +185,9 @@ func main() {
 			}
 			am.Write = mp.Write
 			am.Recall = mp.Recall
+			am.EmbedModel = mp.EmbedModel
+			am.RerankModel = mp.RerankModel
+			am.Oversample = mp.Oversample
 			agentMemories = append(agentMemories, am)
 			amPtr = &am
 		}
@@ -259,8 +262,11 @@ func main() {
 		}
 
 		var amPtr *memory.AgentMemory
+		mp, hasProfile := cfg.Profiles.Memory[p.Memory]
 		if p.Memory == "builtin:conversational" {
-			mp := config.DefaultMemoryProfile()
+			mp, hasProfile = config.DefaultMemoryProfile(), true
+		}
+		if hasProfile {
 			profile := map[string]memory.Store{}
 			for sname, s := range mp.Stores {
 				profile[sname] = memoryFromConfig(s)
@@ -272,6 +278,9 @@ func main() {
 			}
 			am.Write = mp.Write
 			am.Recall = mp.Recall
+			am.EmbedModel = mp.EmbedModel
+			am.RerankModel = mp.RerankModel
+			am.Oversample = mp.Oversample
 			agentMemories = append(agentMemories, am)
 			amPtr = &am
 		}
@@ -542,6 +551,7 @@ func memoryFromConfig(s config.Store) memory.Store {
 		Table:      s.Table,
 		Collection: s.Collection,
 		Window:     s.Window,
+		Requires:   s.Requires,
 	}
 	if s.Retention != "" {
 		d, err := time.ParseDuration(s.Retention)

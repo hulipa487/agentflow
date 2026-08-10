@@ -36,6 +36,12 @@ func (m *Manager) BindForTable(am AgentMemory, table string) (BackendHandle, Sto
 	return h, b, nil
 }
 
+// Features reports the provider features of a named backend (nil when
+// unknown), so op handlers can gate capability-specific behavior.
+func (m *Manager) Features(backend string) []string {
+	return m.reg.Features(backend)
+}
+
 // StartGC runs retention/window enforcement on a ticker until stopped.
 func (m *Manager) StartGC(ctx context.Context, interval time.Duration, profiles []AgentMemory) {
 	if interval <= 0 {

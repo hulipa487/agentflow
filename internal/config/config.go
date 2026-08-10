@@ -125,6 +125,14 @@ type MemoryProfile struct {
 	Stores map[string]Store `yaml:"stores"`
 	Write  []string         `yaml:"write"`
 	Recall string           `yaml:"recall"`
+	// EmbedModel names a models: entry used to embed record text on write
+	// (memory.write attaches the vector) and queries under
+	// recall: builtin:semantic. RerankModel names a provider:"rerank"
+	// entry; when set, semantic recall oversamples vector hits by
+	// Oversample (default 4) and reranks down to k.
+	EmbedModel  string `yaml:"embed_model"`
+	RerankModel string `yaml:"rerank_model"`
+	Oversample  int    `yaml:"oversample"`
 }
 
 type Store struct {
@@ -546,7 +554,8 @@ func validateShellProfile(path, owner, name string, p ShellProfile) error {
 }
 
 // ResolveMemoryProfile returns the concrete memory profile for an agent.
-// It expands `builtin:conversational`.
+// It expands `builtin:conversational`, then named profiles.memory entries,
+// then inline profiles.
 func (c *Config) ResolveMemoryProfile(a Agent) MemoryProfile {
 	if a.Memory.Profile == "builtin:conversational" {
 		// Ensure the default backend is present if not already defined.
@@ -563,6 +572,11 @@ func (c *Config) ResolveMemoryProfile(a Agent) MemoryProfile {
 			}
 		}
 		return mp
+	}
+	if a.Memory.Profile != "" {
+		if mp, ok := c.Profiles.Memory[a.Memory.Profile]; ok {
+			return mp
+		}
 	}
 	if a.Memory.IsInline {
 		return a.Memory.Inline

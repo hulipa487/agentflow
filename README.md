@@ -94,7 +94,7 @@ holds only the runtime and generic, runnable examples.
 
 ## Documentation
 
-Full docs (project summary, architecture, config reference, Lua plugin design, hook specs, capability API) are a static site in [`docs/`](docs/). Serve locally:
+Full docs (install guide, architecture, config reference, comprehensive Lua plugin development guide, hook specs, capability API) are a static site in [`docs/`](docs/). Serve locally:
 
 ```bash
 cd docs && python -m http.server 8888

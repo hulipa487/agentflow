@@ -12,13 +12,14 @@ A static documentation website for AgentFlow, built with plain HTML/CSS/JS — n
 ## Content
 
 1. **Project Summary** — what AgentFlow is, design principles, tech stack, current status
-2. **Architecture** — vertical layer diagram (channels → gateway/safety → supervisor → actor → capabilities/drivers → egress) and a functional flow for one user turn
-3. **Quick Start** — build and run commands, connecting a real model
-4. **Configuration Guide** — YAML philosophy, strict parsing, file skeleton
-5. **Full Config Reference** — every config section: `runtime`, `models`, `memory.backends`, `profiles` (memory/safety/shell/agent), `gateway.channels`, `mcp.servers`, `tools.policy`, `agents`, `plugins`
-6. **Lua Plugin Design** — the contract, writing loops, support chunks, shadowing, restrictions
-7. **Hook Point Specs** — all hook tables: gateway, session, loop, memory, shell, safety (core-owned), core lifecycle
-8. **Capability API** — every Lua-facing table: `llm`, `session`, `agent`, `scheduler`, `memory`/`store`, `tools`, `shell`, core utilities
+2. **Install Guide** — per-OS setup (Windows, Linux, macOS), build, verify, troubleshooting
+3. **Architecture** — vertical layer diagram and functional flow for one user turn
+4. **Quick Start** — run the minimal example, connect a real model
+5. **Configuration Guide** — YAML philosophy, strict parsing, file skeleton
+6. **Full Config Reference** — every config section: `runtime`, `models`, `memory.backends`, `profiles` (memory/safety/shell/agent), `gateway.channels`, `mcp.servers`, `tools.policy`, `agents`, `plugins`
+7. **Lua Plugin Development** — comprehensive guide to writing loops, support chunks, and using every built-in Lua API
+8. **Hook Point Specs** — all hook tables: gateway, session, loop, memory, shell, safety (core-owned), core lifecycle
+9. **Capability API** — every Lua-facing table: `llm`, `session`, `agent`, `scheduler`, `memory`/`store`, `tools`, `shell`, `http`/`os`, `log`/`json`/`time`
 
 ## Serve locally
 

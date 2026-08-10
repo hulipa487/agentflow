@@ -26,11 +26,12 @@
 <aside id="sidebar">
   <ul class="nav-list">
     <li><a href="#summary" class="nav-link">Project Summary</a></li>
+    <li><a href="#install" class="nav-link">Install Guide</a></li>
     <li><a href="#architecture" class="nav-link">Architecture</a></li>
     <li><a href="#quickstart" class="nav-link">Quick Start</a></li>
     <li><a href="#config" class="nav-link">Configuration Guide</a></li>
     <li><a href="#config-ref" class="nav-link">Full Config Reference</a></li>
-    <li><a href="#lua" class="nav-link">Lua Plugin Design</a></li>
+    <li><a href="#lua" class="nav-link">Lua Plugin Development</a></li>
     <li><a href="#hooks" class="nav-link">Hook Point Specs</a></li>
     <li><a href="#caps" class="nav-link">Capability API</a></li>
   </ul>
@@ -68,6 +69,94 @@
   <div class="callout">
     <strong>Current status</strong>: <span>Phases 0–4 complete. The core runtime (actors, memory, tools, shell, multi-agent, scheduler, budget, safety, metrics) is implemented and tested. Every storage backend is a real provider — SQLite, Redis, MongoDB, and PostgreSQL for KV/document storage, and pgvector for vector recall (SQLite vector queries return an explicit unsupported error, never silent empties). LLM providers cover all three compatible API shapes: Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses, each targeting self-hosted/proxied endpoints via <code>base_url</code>. Channels: webhook, and Telegram in both polling and webhook modes.</span>
   </div>
+</section>
+
+<section id="install" class="section">
+  <h2>Install Guide</h2>
+
+  <h3>Prerequisites</h3>
+  <ul>
+    <li><strong>Go 1.25+</strong> — the runtime is built with Go modules.</li>
+    <li><strong>GNU make</strong> — drives the Luau static library + Go binary build.</li>
+    <li><strong>A C/C++ toolchain</strong> for the Luau cgo bridge. The Makefile auto-selects by host OS:
+      <ul>
+        <li><strong>Windows</strong>: <a href="https://ziglang.org/">zig</a> (hermetic; no system gcc required).</li>
+        <li><strong>Linux</strong>: system gcc (<code>cc</code>/<code>c++</code>/<code>ar</code>), usually from <code>build-essential</code>.</li>
+        <li><strong>macOS</strong>: Xcode / Apple Command Line Tools (<code>clang</code>/<code>clang++</code>/<code>ar</code>).</li>
+      </ul>
+    </li>
+  </ul>
+  <p>Luau itself is vendored under <code>third_party/luau/</code> (version 0.731, MIT), so a clean clone builds without fetching anything else.</p>
+
+  <h3>Windows</h3>
+  <ol>
+    <li>Install <a href="https://go.dev/dl/">Go</a> and ensure <code>go version</code> reports 1.25+.</li>
+    <li>Install <a href="https://git-scm.com/download/win">Git for Windows</a> (includes Git Bash).</li>
+    <li>Install <a href="https://ziglang.org/download/">zig</a> and add it to your PATH.</li>
+    <li>Install GNU make. The easiest route on Windows is <code>choco install make</code> via Chocolatey, or use the make bundled with Git Bash/MSYS2.</li>
+    <li>Clone and build from <strong>Git Bash</strong> (not cmd.exe):
+      <pre><code>git clone https://github.com/\&lt;you\&gt;/agentflow.git
+make            # compiles vendored Luau -> internal/vm/lib/libluau.a, then agentflow
+make test       # run the Go test suite
+make vet        # run go vet with cgo enabled</code></pre>
+    </li>
+  </ol>
+
+  <div class="callout warn">
+    <strong>Important</strong>: <span>The Makefile uses Unix shell recipes (<code>rm -rf</code>, <code>mkdir -p</code>, <code>./$(BIN)</code>). If you run <code>make</code> from cmd.exe you will see errors such as "The system cannot find the file specified." Run it from Git Bash, or force a bash shell with <code>make SHELL="C:\Program Files\Git\bin\bash.exe"</code>.</span>
+  </div>
+
+  <h3>Linux</h3>
+  <ol>
+    <li>Install Go and a C++ toolchain:
+      <pre><code># Debian/Ubuntu
+sudo apt update
+sudo apt install -y golang-go build-essential
+
+# Fedora
+sudo dnf install -y golang gcc gcc-c++ make</code></pre>
+    </li>
+    <li>Clone and build:
+      <pre><code>git clone https://github.com/\&lt;you\&gt;/agentflow.git
+make && make test</code></pre>
+    </li>
+  </ol>
+
+  <h3>macOS</h3>
+  <ol>
+    <li>Install Go from <a href="https://go.dev/dl/">go.dev</a> or Homebrew: <code>brew install go</code>.</li>
+    <li>Install Xcode Command Line Tools: <code>xcode-select --install</code>.</li>
+    <li>Clone and build:
+      <pre><code>git clone https://github.com/\&lt;you\&gt;/agentflow.git
+make && make test</code></pre>
+    </li>
+  </ol>
+
+  <h3>Verify the install</h3>
+  <p>Run the no-model echo example and hit it with curl:</p>
+  <pre><code>./agentflow -config examples/agentflow.minimal.yaml
+# in another terminal:
+curl -X POST localhost:8080/webhook -d '{"from":"alice","text":"hello"}'</code></pre>
+  <p>You should see <code>echo: hello</code> in the response. Also check the admin endpoints:</p>
+  <pre><code>curl http://127.0.0.1:9090/healthz
+curl http://127.0.0.1:9090/readyz</code></pre>
+
+  <h3>Troubleshooting</h3>
+  <table class="table config-table">
+    <thead><tr><th>Symptom</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr><td><code>undefined: State</code> or cgo errors from <code>internal/vm</code></td><td>Run commands through <code>make</code>; it sets <code>CGO_ENABLED=1</code> and the correct <code>CC</code>/<code>CXX</code>. Do not run plain <code>go build</code> before the Luau library exists.</td></tr>
+      <tr><td><code>Nothing to be done for 'all'</code></td><td>A stale binary exists. Run <code>make clean && make</code>.</td></tr>
+      <tr><td>Windows: <code>process_begin: CreateProcess(NULL, rm -rf ...) failed</code></td><td>You are in cmd.exe. Switch to Git Bash or use <code>make SHELL="C:\Program Files\Git\bin\bash.exe" clean</code>.</td></tr>
+      <tr><td><code>zig: command not found</code> on Windows</td><td>Add zig to PATH or install it. Verify with <code>zig version</code>.</td></tr>
+      <tr><td>Tests fail with SQLite / database locked</td><td>Run tests serially or remove stale <code>data/</code> directory between runs.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Updating</h3>
+  <p>When a new version lands, pull and rebuild cleanly:</p>
+  <pre><code>git pull
+make clean && make</code></pre>
 </section>
 
 <section id="architecture" class="section">
@@ -397,61 +486,227 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
 </section>
 
 <section id="lua" class="section">
-  <h2>Lua Plugin Design Guidelines</h2>
+  <h2>Lua Plugin Development</h2>
 
-  <p>Plugins are Luau scripts that hook into versioned interfaces exposed by the core. Every hook is exactly one kind: <strong>filter</strong> (transforms a value, chainable), <strong>handler</strong> (produces a result, exactly one per slot), or <strong>tap</strong> (observe-only, all attached taps run).</p>
-
-  <h3>The contract</h3>
+  <p>AgentFlow plugins are plain <a href="https://luau-lang.org/">Luau</a> scripts. YAML defines which plugin runs for which agent; the plugin defines the behavior. There are three kinds of plugin:</p>
   <ul>
-    <li><strong>One Luau state per session</strong> — a fresh sandbox per session, no <code>io</code>/<code>os</code>/<code>debug</code>. The registry injects exactly the capability tables granted by the manifest ∧ agent ∧ global ceiling.</li>
-    <li><strong>The async bridge is the only blocking primitive</strong> — <code>__af_op(json) → (json, ok)</code> yields the coroutine; Go executes on a worker pool; the coroutine resumes with the result. No OS thread is blocked.</li>
-    <li><strong>Identity is unforgeable</strong> — <code>from</code>, <code>to</code>, provenance, and request IDs are core-stamped. Lua payloads cannot set trusted sender metadata.</li>
-    <li><strong>Builtins are plugins</strong> — shipped in the binary, shadowable by name. Copy any builtin as a starting point.</li>
+    <li><strong>Loop plugin</strong> — defines a global <code>loop()</code> function that owns the session coroutine for its lifetime. The canonical pattern is <code>while true do local msg = session.inbox() ... end</code>.</li>
+    <li><strong>Support chunk</strong> — loaded into every session state <em>before</em> the loop plugin. Support chunks define globals and helper functions the loop reads. Builtins like <code>builtin:token_budget</code>, <code>builtin:routing_table</code>, <code>builtin:recency</code>, <code>builtin:fact_extractor</code>, <code>builtin:exec_policy</code>, and <code>builtin:ttl</code> are support chunks.</li>
+    <li><strong>Shadow</strong> — a user plugin placed in <code>plugins/</code> with the same name as a builtin. It replaces the builtin instance-wide at load time.</li>
   </ul>
 
+  <h3>The async bridge</h3>
+  <p>The only native primitive exposed to Luau is <code>__af_op(json_request)</code>. It yields the coroutine; Go executes the request (inline or on a worker pool); then the coroutine resumes with <code>(json_response, ok)</code>. The prelude wraps this raw primitive into the friendly tables documented below. Because every call yields, a busy instance stays cheap — no OS thread is blocked waiting for a model, database, or HTTP response.</p>
+  <pre><code>-- What the prelude does for you (conceptually):
+local function op(req)
+  local resp, ok = __af_op(json.encode(req))
+  if not ok then error(resp, 0) end
+  return json.decode(resp)
+end</code></pre>
+  <p>Blocking ops include <code>send</code>, <code>llm.chat</code>, <code>tools.run</code>, all <code>store.*</code>, all <code>shell.*</code>, <code>http.request</code>, <code>agent.*</code>, and <code>scheduler.*</code>. Fast ops like <code>inbox</code>, <code>log</code>, and <code>agent.info</code> run inline on the actor goroutine.</p>
+
+  <h3>Message lifecycle</h3>
+  <p><code>session.inbox()</code> parks the coroutine until the session mailbox receives a message. A message is a table with at least:</p>
+  <pre><code>{
+  id = "msg-...",
+  type = "user",           -- "user" | "system" | "timer" | "agent" | ...
+  from = "webhook:alice",  -- core-stamped sender
+  text = "hello",
+  channel = "webhook",
+  reply_to = "...",
+  ts = 1234567890
+}</code></pre>
+  <p><code>session.send(text)</code> replies through the active channel (the channel and reply target of the current message). <code>session.push(channel, reply_to, text)</code> sends proactively and requires the <code>channel.push</code> capability. <code>session.push_user(uuid, text)</code> pushes to a user by identity UUID. <code>session.exit()</code> terminates the session cleanly.</p>
+
   <h3>Writing a loop plugin</h3>
-  <p>A loop plugin is a Lua script that defines a <code>loop()</code> function. The core drives it: <code>session.inbox()</code> yields until a message arrives, then the loop processes it.</p>
-  <pre><code>-- my_agent.lua
-local history = {}
+  <p>A minimal echo loop looks like this (<code>plugins/examples/echo.lua</code>):</p>
+  <pre><code>log.info("echo agent online")
 
 function loop()
   while true do
     local msg = session.inbox()
+    log.info("message from " .. (msg.from or "?"))
+    time.sleep(0.3)
+    session.send("echo: " .. (msg.text or ""))
+  end
+end</code></pre>
+
+  <p>A ReAct-style loop that calls an LLM and optionally tools is the <code>builtin:react</code> plugin. You can copy it as a starting point for custom reasoning patterns.</p>
+
+  <h3>Built-in Lua API reference</h3>
+  <p>All tables below are injected only when the agent's capabilities allow them. Attempting to call a disabled API raises an error.</p>
+
+  <h4><code>session</code> — core</h4>
+  <pre><code>session.inbox() -> Message            -- parks until the next mailbox message
+session.send(text)                    -- reply to the active inbound message
+session.push(channel, reply_to, text) -- proactive egress; cap: channel.push
+session.push_user(uuid, text)         -- proactive egress to a user UUID; cap: channel.push
+session.exit()                        -- terminate this session</code></pre>
+
+  <h4><code>llm</code> — cap: <code>llm.chat</code></h4>
+  <pre><code>llm.chat(messages, opts?) -> { text, usage, tool_calls }
+llm.stream(messages, opts?) -> iterator
+
+-- opts: { model = "default", temperature = 0.7, max_tokens = 4096,
+--         tools = [...], tool_choice = "auto" | "none" }</code></pre>
+  <p>Messages are arrays of <code>{ role, content, tool_calls?, tool_call_id?, tool_result? }</code>. <code>llm.stream</code> returns a closure; call it directly (<code>local d = next_chunk()</code>), never in a generic <code>for ... in</code> — the iterator protocol cannot yield across the C boundary.</p>
+
+  <h4><code>agent</code> — caps: <code>agent.send</code>, <code>agent.request</code>, <code>agent.spawn</code></h4>
+  <pre><code>agent.info() -> { name, session_id, address, model, instructions,
+                  history_budget, memory, shell, skills, capabilities, ... }
+agent.send(address, payload)
+agent.request(address, payload, timeout?) -> Message
+agent.reply(request_id, payload)
+agent.list() -> [{ session_id, agent, parent_id }]
+agent.spawn(profile, spec?) -> { address, session_id, agent }</code></pre>
+
+  <h4><code>scheduler</code> — cap: <code>scheduler</code></h4>
+  <pre><code>scheduler.every(interval) -> timer_id    -- seconds; dies with session
+scheduler.after(delay) -> timer_id
+scheduler.cron(expr) -> timer_id          -- standard 5-field cron
+scheduler.cancel(timer_id)</code></pre>
+  <p>Timers enqueue a <code>Message{ type = "timer" }</code> into the owning session's mailbox. They never call Lua from a timer goroutine, so the VM stays single-threaded.</p>
+
+  <h4><code>memory</code> and <code>store</code> — cap: <code>memory</code> / <code>store.raw</code></h4>
+  <pre><code>memory.write(record) -> boolean          -- routed by builtin:routing_table
+memory.recall(query, opts?) -> {records} -- active recall handler
+
+store.put(table, key, value, opts?)      -- opts: { ttl = seconds }
+store.get(table, key) -> { value, found }
+store.query(table, query) -> { records }
+store.delete(table, key)</code></pre>
+  <p>Store queries accept <code>{ kind = "all" | "prefix" | "text" | "vector" | "time_range", ... }</code>. Prefer <code>memory.write</code>/<code>memory.recall</code> for agent memory; use <code>store.*</code> only when you need raw table access.</p>
+
+  <h4><code>tools</code> — cap: <code>tools</code></h4>
+  <pre><code>tools.list() -> [ToolSpec]
+tools.run(name, args, opts?) -> ToolResult
+-- opts: { confirmed = true, confirm_id = "..." }</code></pre>
+  <p>If a tool declares <code>needs_confirm: true</code>, the first call returns a <code>needs_confirm</code> response. The runtime asks the user, then re-invokes the tool with <code>opts.confirmed = true</code>. Your loop sees only the final result.</p>
+
+  <h4><code>shell</code> — cap: <code>shell.exec</code></h4>
+  <pre><code>shell.spawn(opts) -> { id, provider, state }
+shell.exec(id, cmd) -> { stdout, stderr, exit_code, duration_ms }
+shell.write(id, path, content)
+shell.read(id, path) -> content   -- capability table; also available as builtin:fs.read
+shell.destroy(id)
+
+-- spawn opts:
+-- { provider = "docker", image = "alpine:3.20", workdir = "/work",
+--   network = "none", mem_limit = "512m", cpu_limit = 1.0,
+--   env = { KEY = "val" },
+--   -- SSH only:
+--   host = "1.2.3.4:22", user = "root", password = "...", key_file = "/path" }</code></pre>
+  <p>Docker handles are persistent: files written in one <code>shell.exec</code> are visible in the next. Handles are owned by the session and reaped automatically when the session dies.</p>
+
+  <h4><code>http</code> and <code>os</code> — cap: <code>net.http</code></h4>
+  <pre><code>http.request(opts) -> { ok, status, headers, body, truncated? }
+http.get(url, opts?)
+http.post(url, body, opts?)
+
+-- opts: { method, url, headers, body, json, query, timeout, auth }
+-- auth = { service = "..." } resolves a stored credential at request time.
+
+os.env(name) -> string | nil</code></pre>
+
+  <h4>Core utilities</h4>
+  <pre><code>log.debug(msg) / log.info(msg) / log.warn(msg) / log.error(msg)
+json.encode(value) / json.decode(text)
+time.sleep(seconds)        -- yields; never blocks a thread</code></pre>
+
+  <h3>Writing support chunks</h3>
+  <p>Support chunks are evaluated into the session state before the loop plugin. They can define globals that the loop or other support chunks read. For example, to replace the default recall strategy, shadow <code>builtin:recency</code> with a file in <code>plugins/recency.lua</code> that defines <code>memory_recall_handler(query, opts)</code>.</p>
+  <pre><code>-- plugins/recency.lua (shadow example)
+function memory_recall_handler(query, opts)
+  local info = agent.info()
+  local store_name = (info.memory and info.memory.stores.dialogue) or "dialogue"
+  local res = store.query(store_name, { kind = "all" })
+  return res.records or {}
+end</code></pre>
+
+  <h3>Error handling</h3>
+  <p>Always wrap external calls in <code>pcall</code> so a sick provider or bad command does not crash-loop the session:</p>
+  <pre><code>local ok, reply = pcall(llm.chat, messages, { model = info.model })
+if not ok then
+  log.warn("llm.chat failed: " .. tostring(reply))
+  session.send("⚠️ I couldn't reach my model right now.")
+  return
+end</code></pre>
+  <p>The bridge returns errors as JSON strings; the prelude unwraps them so stack traces point to your code, not the prelude.</p>
+
+  <h3>Confirmation and permissions</h3>
+  <p>Tools and shell builtins can declare <code>needs_confirm</code>. The first <code>tools.run</code> returns a result with <code>needs_confirm = true</code> and a <code>confirm_id</code>; the actor asks the user, then re-invokes the tool with <code>opts.confirmed = true</code> and the same <code>confirm_id</code>. Your loop sees only the final result, so in most cases you do not need to handle confirmation manually.</p>
+
+  <h3>Restrictions and caveats</h3>
+  <ul>
+    <li><code>llm.stream</code> returns a closure — call it directly, never in a generic <code>for ... in</code>.</li>
+    <li>The standard library includes base, coroutine, table, string, math, bit32, utf8, and buffer. <code>io</code>, <code>os</code> (except the prelude's <code>os.env</code>), and <code>debug</code> are not available.</li>
+    <li>Raw network access from Lua is only through <code>http.request</code>. There is no socket library.</li>
+    <li>All values crossing the bridge are JSON-encoded. Tables must be serializable; functions and userdata cannot cross.</li>
+    <li>Plugins are hot-reloadable when <code>runtime.reload.watch</code> is true. Edits to a loop file or instructions file restart the session coroutine from scratch on the next turn.</li>
+  </ul>
+
+  <h3>Practical examples</h3>
+  <p>See <code>plugins/examples/</code> for runnable examples:</p>
+  <ul>
+    <li><code>plugins/examples/echo.lua</code> — simplest loop, inbox + send.</li>
+    <li><code>plugins/examples/stream.lua</code> — consuming <code>llm.stream</code> delta by delta.</li>
+    <li><code>plugins/examples/tool_loop.lua</code> — listing and invoking tools manually.</li>
+    <li><code>plugins/examples/shell_loop.lua</code> — spawning a Docker handle and running commands.</li>
+    <li><code>plugins/examples/agent_request.lua</code> — requesting another agent and printing its reply.</li>
+  </ul>
+
+  <h4>Tool loop</h4>
+  <pre><code>function loop()
+  while true do
+    local msg = session.inbox()
     if msg.type == "user" and msg.text then
       local info = agent.info()
-      local messages = {
-        { role = "system", content = info.instructions },
-        { role = "user", content = msg.text },
-      }
-      local ok, reply = pcall(llm.chat, messages, { model = info.model })
-      local text = ok and reply.text or ("error: " .. tostring(reply))
-      session.send(text)
-      history[#history + 1] = { role = "user", content = msg.text }
-      history[#history + 1] = { role = "assistant", content = text }
+      local tools = tools.list()
+      local ok, reply = pcall(llm.chat,
+        { { role = "user", content = msg.text } },
+        { model = info.model, tools = tools, tool_choice = "auto" })
+      if ok and reply.tool_calls then
+        for _, tc in ipairs(reply.tool_calls) do
+          local r = tools.run(tc.name, tc.args)
+          log.info("tool result: " .. json.encode(r))
+        end
+        session.send(reply.text or "done")
+      elseif ok then
+        session.send(reply.text or "")
+      else
+        session.send("error: " .. tostring(reply))
+      end
     end
   end
 end</code></pre>
 
-  <h3>Writing a support chunk</h3>
-  <p>Support chunks are <code>Eval</code>'d into every session state before the loop plugin. They define globals the loop reads. <code>builtin:token_budget</code>, <code>builtin:routing_table</code>, <code>builtin:recency</code>, <code>builtin:fact_extractor</code>, <code>builtin:exec_policy</code>, and <code>builtin:ttl</code> are all support chunks.</p>
-  <pre><code>-- my_recall.lua (loaded before the loop)
-function my_recall_handler(query, opts)
-  local info = agent.info()
-  local store = (info.memory and info.memory.stores and info.memory.stores.dialogue) or "dialogue"
-  local result = store.query(store, { kind = "all", table = store })
-  return result.records or {}
+  <h4>Shell loop</h4>
+  <pre><code>function loop()
+  while true do
+    local msg = session.inbox()
+    if msg.type == "user" and msg.text then
+      local h = shell.spawn({ provider = "docker", image = "alpine:3.20" })
+      local r = shell.exec(h.id, "echo hello from " .. msg.text)
+      shell.destroy(h.id)
+      session.send("exit=" .. r.exit_code .. " stdout=" .. r.stdout)
+    end
+  end
 end</code></pre>
 
-  <h3>Shadowing</h3>
-  <p>Drop a plugin file with the same name as a builtin in <code>plugins/</code> to shadow it instance-wide. The shadow is resolved at load time and logged at boot.</p>
-
-  <h3>Restrictions to remember</h3>
-  <ul>
-    <li><code>llm.stream</code> returns an iterator — call it directly (<code>local d = next_chunk()</code>), never in a generic-for. Luau inherits the Lua 5.1 restriction that the for-loop iterator protocol cannot yield across the bridge.</li>
-    <li>Errors crossing the bridge are JSON strings; the prelude unwraps them so user-facing bubbles don't carry prelude line numbers.</li>
-    <li>A sick provider must not crash-loop the session — use <code>pcall</code> around <code>llm.chat</code> and emit an honest error bubble.</li>
-    <li>Tool calls that need confirmation (<code>needs_confirm: true</code>) park the coroutine — the loop sees a normal tool result after the user confirms.</li>
-  </ul>
+  <h4>Multi-agent request</h4>
+  <pre><code>function loop()
+  while true do
+    local msg = session.inbox()
+    if msg.type == "user" and msg.text then
+      local ok, answer = pcall(agent.request, "agent:expert", { question = msg.text }, 30)
+      if ok then
+        session.send("expert says: " .. (answer.payload and answer.payload.answer or "?"))
+      else
+        session.send("expert unavailable: " .. tostring(answer))
+      end
+    end
+  end
+end</code></pre>
 </section>
 
 <section id="hooks" class="section">

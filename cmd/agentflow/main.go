@@ -199,7 +199,13 @@ func main() {
 		llmHandlers := caps.LLMHandlers(llmMgr)
 		if tokensPerDay := budgetTokens(a); tokensPerDay > 0 {
 			pool := budget.NewPool(tokensPerDay)
-			pool.StartDailyReset()
+			if w := budgetWindow(a); w > 0 {
+				// Rolling-window budget: usage drains continuously as commits age
+				// out, so there is no midnight cliff. Skip the daily reset.
+				pool.SetWindow(w)
+			} else {
+				pool.StartDailyReset()
+			}
 			llmHandlers = caps.MeteredLLMHandlers(llmMgr, pool)
 		}
 		for k, h := range llmHandlers {
@@ -543,6 +549,28 @@ func budgetTokens(a config.Agent) int64 {
 		return int64(n)
 	}
 	return 0
+}
+
+// budgetWindow extracts the optional rolling-window duration from the agent's
+// budget config (e.g. budget: { tokens: N, window: "168h" }). Returns 0 when
+// unset, which selects the daily-reset accounting mode.
+func budgetWindow(a config.Agent) time.Duration {
+	if a.Budget == nil {
+		return 0
+	}
+	v, ok := a.Budget["window"]
+	if !ok {
+		return 0
+	}
+	s, ok := v.(string)
+	if !ok {
+		return 0
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0
+	}
+	return d
 }
 
 func memoryFromConfig(s config.Store) memory.Store {

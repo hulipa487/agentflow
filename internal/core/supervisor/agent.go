@@ -175,7 +175,24 @@ func (s *Supervisor) deliverAgentMessage(ctx context.Context, source session.Ide
 		target, ok := s.sessions[dst.Session]
 		s.mu.Unlock()
 		if !ok {
-			return fmt.Errorf("unknown session %q", dst.Session)
+			// Unknown session: find-or-create it as a routed session of a static
+			// agent, keyed by the id's key segment (the same semantics the router
+			// path uses via Deliver). This is gated by the sender's can_contact
+			// exactly like contacting a live session, so a sender can only create
+			// sessions of agents it is already authorized to reach. Without this,
+			// chat->PM kickoff to a not-yet-running PM session would fail.
+			agentName, key, found := strings.Cut(dst.Session, "|")
+			if !found || key == "" {
+				return fmt.Errorf("unknown session %q", dst.Session)
+			}
+			if _, defined := s.defs[agentName]; !defined {
+				return fmt.Errorf("unknown session %q", dst.Session)
+			}
+			if !source.CanContact[agentName] && agentName != source.Agent {
+				return fmt.Errorf("agent %q may not contact %q", source.Agent, agentName)
+			}
+			msg := newAgentMessage(source, agentName, payload, requestID)
+			return s.Deliver(agentName, key, msg)
 		}
 		if dst.Session != source.SessionID && !source.CanContact[target.Identity.Agent] && target.Identity.ParentID != source.SessionID {
 			return fmt.Errorf("agent %q may not contact session %q", source.Agent, dst.Session)
@@ -186,7 +203,14 @@ func (s *Supervisor) deliverAgentMessage(ctx context.Context, source session.Ide
 		return fmt.Errorf("unsupported address kind %q", dst.Kind)
 	}
 
-	msg := session.Message{
+	msg := newAgentMessage(source, targetAgent, payload, requestID)
+	return s.Deliver(targetAgent, targetKey, msg)
+}
+
+// newAgentMessage builds the core-stamped agent message delivered to a target
+// agent. Source identity comes from the actor, never from Lua payloads.
+func newAgentMessage(source session.Identity, targetAgent string, payload map[string]any, requestID string) session.Message {
+	return session.Message{
 		ID:      newMessageID(),
 		Type:    "agent",
 		From:    "agent:" + source.Agent,
@@ -201,7 +225,6 @@ func (s *Supervisor) deliverAgentMessage(ctx context.Context, source session.Ide
 			RequestID: requestID,
 		},
 	}
-	return s.Deliver(targetAgent, targetKey, msg)
 }
 
 func newMessageID() string { return "ag-" + uuid.NewString() }

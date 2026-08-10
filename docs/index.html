@@ -33,7 +33,7 @@
     <li><a href="#config-ref" class="nav-link">Full Config Reference</a></li>
     <li><a href="#lua" class="nav-link">Lua Plugin Development</a></li>
     <li><a href="#hooks" class="nav-link">Hook Point Specs</a></li>
-    <li><a href="#caps" class="nav-link">Capability API</a></li>
+
   </ul>
 </aside>
 
@@ -183,12 +183,12 @@ make clean && make</code></pre>
             │ one mailbox per session
             ▼
 ┌─ Actor (1 goroutine + 1 Luau state per session) ───────────────────────────┐
-│  inbox ──► loop() ──► llm.chat / tools.run / shell.exec / agent.send / …     │
+│  inbox ──► loop() ──► llm.chat / llm.embed / llm.rerank / tools.run / shell.exec / … │
 └───────────┬──────────────────────────────────────────────────────────────────┘
             │ __af_op(json) yield ── Go worker pool resumes with result
             ▼
 ┌─ Capabilities &amp; Drivers ────────────────────────────────────────────────────┐
-│  llm:    anthropic · openai · openai-responses   (base_url → compatible host)│
+│  llm:    anthropic · openai · openai-responses · rerank  (base_url → host)  │
 │  memory: sqlite · redis · mongodb · postgres     pgvector (vector recall)    │
 │  shell:  docker · ssh                             tools: builtins + mcp      │
 └──────────────────────────────────────────────────────────────────────────────┘
@@ -326,7 +326,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
   <h3><code>models</code> — named LLM providers</h3>
   <pre><code>models:
   default:
-    provider: anthropic        # anthropic | openai | openai-responses
+    provider: anthropic        # anthropic | openai | openai-responses | rerank
     model: claude-sonnet-5
     api_key: ${ANTHROPIC_API_KEY}
     base_url: ~                # override endpoint host
@@ -600,7 +600,6 @@ tools.run(name, args, opts?) -> ToolResult
   <pre><code>shell.spawn(opts) -> { id, provider, state }
 shell.exec(id, cmd) -> { stdout, stderr, exit_code, duration_ms }
 shell.write(id, path, content)
-shell.read(id, path) -> content   -- capability table; also available as builtin:fs.read
 shell.destroy(id)
 
 -- spawn opts:
@@ -807,61 +806,7 @@ end</code></pre>
   </table>
 </section>
 
-<section id="caps" class="section">
-  <h2>Native Capability API</h2>
-  <p>These are the Lua-facing tables exposed by the prelude. Each wraps the single <code>__af_op</code> yield primitive. The capability a table requires must be in the agent's effective grants.</p>
 
-  <h3><code>llm</code> — cap: <code>llm.chat</code></h3>
-  <pre><code>llm.chat(messages, opts?) -> { text, usage }
-llm.stream(messages, opts?) -> iterator    -- yields chunks; call directly, not in for-in
-llm.embed(texts, opts?) -> { vectors, usage }      -- OpenAI-compatible /embeddings endpoints
-llm.rerank(query, documents, opts?) -> { results }  -- provider: rerank (POST /rerank)</code></pre>
-
-  <h3><code>session</code> — core</h3>
-  <pre><code>session.inbox() -> Message                    -- the loop's consumption point
-session.send(text_or_message)               -- egress through the active channel
-session.push(channel, reply_to, text)        -- proactive egress; cap: channel.push
-session.exit()                               -- terminate this session (no restart)</code></pre>
-
-  <h3><code>agent</code> — caps: <code>agent.send</code>, <code>agent.request</code>, <code>agent.spawn</code></h3>
-  <pre><code>agent.info() -> { name, session_id, address, model, instructions, history_budget, memory, shell, ... }
-agent.send(addr, payload)                    -- "agent:name" | "session:id"
-agent.request(addr, payload, timeout) -> Message   -- error on timeout
-agent.reply(request_id, payload)             -- resolve a parked request
-agent.spawn(profile, spec) -> { address, session_id, agent }
-agent.list() -> [{ session_id, agent, parent_id }]</code></pre>
-
-  <h3><code>scheduler</code> — cap: <code>scheduler</code></h3>
-  <pre><code>scheduler.every(interval, fn) -> Timer       -- dies with session
-scheduler.after(delay, fn) -> Timer
-scheduler.cron(expr, fn) -> Timer
-scheduler.cancel(timer)</code></pre>
-  <p>Timers enqueue <code>Message{Type:"timer"}</code> to the owning session's mailbox — they never invoke a Luau state from a timer goroutine.</p>
-
-  <h3><code>memory</code> — cap: <code>memory</code></h3>
-  <pre><code>memory.write(record) -> boolean             -- through memory.write chain
-memory.recall(query, opts?) -> {Memory}      -- active recall handler
-store.put(table, key, value, opts?)          -- low-level
-store.get(table, key) -> { value, found }
-store.query(table, query) -> { records }
-store.delete(table, key)</code></pre>
-
-  <h3><code>tools</code> — cap: <code>tools</code></h3>
-  <pre><code>tools.list() -> [ToolSpec]
-tools.run(name, args, opts?) -> ToolResult   -- same permission gate as LLM calls</code></pre>
-
-  <h3><code>shell</code> — cap: <code>shell.exec</code></h3>
-  <pre><code>shell.spawn(opts) -> ShellHandle              -- through shell.provision handler
-shell.exec(handle, cmd) -> ExecResult        -- through shell.before_exec filter
-shell.write(handle, path, content)
-shell.read(handle, path) -> content
-shell.destroy(handle)</code></pre>
-
-  <h3><code>core utilities</code> — core</h3>
-  <pre><code>log.debug/info/warn/error(msg, fields?)
-json.encode(value) / json.decode(text)
-time.sleep(seconds)            -- yields; never blocks a thread</code></pre>
-</section>
 
 <footer>
   <p>AgentFlow documentation — built from the implemented codebase.</p>

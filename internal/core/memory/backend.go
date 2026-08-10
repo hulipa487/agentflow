@@ -159,6 +159,10 @@ type StoreBinding struct {
 	Table     string
 	Window    int
 	Retention time.Duration
+	// Features are the backend provider's capabilities ("kv", "vector",
+	// ...), resolved at bind time so loops can adapt (e.g. only embed for
+	// vector-capable stores).
+	Features []string
 }
 
 // AgentMemory holds the resolved memory profile for an agent.
@@ -190,7 +194,7 @@ func (r *Registry) ResolveStores(profile map[string]Store) (AgentMemory, error) 
 		if err := r.checkRequires(sname, s); err != nil {
 			return AgentMemory{}, err
 		}
-		b := StoreBinding{Backend: s.Backend, Table: s.Table, Window: s.Window, Retention: s.Retention}
+		b := StoreBinding{Backend: s.Backend, Table: s.Table, Window: s.Window, Retention: s.Retention, Features: r.Features(s.Backend)}
 		out.Stores[sname] = b
 		out.Tables[s.Table] = b
 	}

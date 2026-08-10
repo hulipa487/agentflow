@@ -14,7 +14,11 @@ func TestShippedLoopsParse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("glob plugins/examples: %v", err)
 	}
-	files := append([]string{filepath.Join("..", "builtins", "lua", "react.lua")}, paths...)
+	builtinChunks, err := filepath.Glob(filepath.Join("..", "builtins", "lua", "*.lua"))
+	if err != nil {
+		t.Fatalf("glob builtins/lua: %v", err)
+	}
+	files := append(builtinChunks, paths...)
 	if len(files) == 0 {
 		t.Fatal("no loop files found to compile-check")
 	}

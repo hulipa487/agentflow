@@ -704,7 +704,7 @@ func (a *Actor) infoJSON() string {
 	if a.Info.Memory != nil {
 		stores := map[string]any{}
 		for name, bind := range a.Info.Memory.Stores {
-			stores[name] = map[string]any{"backend": bind.Backend, "table": bind.Table}
+			stores[name] = map[string]any{"backend": bind.Backend, "table": bind.Table, "features": bind.Features}
 		}
 		mem["stores"] = stores
 		mem["write"] = a.Info.Memory.Write

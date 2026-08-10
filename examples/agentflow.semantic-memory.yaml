@@ -2,12 +2,18 @@ version: "1"
 
 # Semantic memory: embeddings on write, vector recall, optional reranking.
 #
-# What happens with this config:
-#   - memory.write embeds each record's text (models.embed) and stores the
-#     vector in pgvector alongside the value.
+# Topology: turns/facts live in sqlite (recency recall), the "semantic"
+# store lives in pgvector. What happens with this config:
+#   - memory.write embeds record text (models.embed) for vector-capable
+#     stores and stores the vector in pgvector alongside the value; plain
+#     sqlite stores are untouched.
 #   - memory.recall({ text = "...", k = 5 }) runs builtin:semantic: embed the
 #     query -> cosine k-NN over pgvector -> rerank (models.rerank, when
-#     rerank_model is set) -> top-k records.
+#     rerank_model is set) -> top-k records. Queries without text (e.g. the
+#     react loop's kind="all" history fetch) fall back to recency recall.
+#   - To write into the semantic store, route explicitly:
+#       memory.write({ targets = {{ store = "semantic", key = "k1",
+#                     value = { text = "Paris is the capital of France" } } } })
 #
 # Defaults target a fully local stack:
 #   - Ollama for chat + embeddings (nomic-embed-text, 768 dims)
@@ -48,6 +54,10 @@ models:
 
 memory:
   backends:
+    main_db:
+      provider: builtin:sqlite
+      config:
+        path: ./data/agentflow-semantic.db
     vec:
       provider: builtin:pgvector
       config:
@@ -58,6 +68,16 @@ profiles:
   memory:
     semantic:
       stores:
+        dialogue:
+          backend: main_db
+          table: dialogue
+          retention: 720h # 30d
+          window: 1000
+          requires: ["kv"]
+        facts:
+          backend: main_db
+          table: facts
+          requires: ["kv", "text_search"]
         semantic:
           backend: vec
           table: semantic

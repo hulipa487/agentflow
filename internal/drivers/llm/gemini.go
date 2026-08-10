@@ -12,39 +12,37 @@ import (
 	"agentflow/internal/config"
 )
 
-// geminiOpen implements the Gemini generateContent API
-// (POST {base}/models/{model}:generateContent), the classic request/response
-// endpoint that supports Google Search grounding via tools:[{"google_search":{}}].
-// base_url should include the version prefix (e.g.
-// https://generativelanguage.googleapis.com/v1beta); the runtime appends
-// /models/{model}:generateContent. The API key goes in the x-goog-api-key
-// header.
+// geminiOpen implements the Gemini Interactions API
+// (POST {base}/interactions), the request/response endpoint that supports
+// server-side tools such as Google Search grounding via
+// tools:[{"type":"google_search"}]. base_url should include the version prefix
+// (e.g. https://generativelanguage.googleapis.com/v1beta); the runtime appends
+// /interactions. The model string rides in the body's "model" field, not the
+// URL; the key goes in the x-goog-api-key header.
 //
 // This API is non-streaming (no SSE), so the reply is emitted as a single text
-// delta followed by usage. Conversation turns flatten into contents[].parts;
-// the optional system message becomes system_instruction. Client-side function
-// tools are not mapped (the functionDeclarations schema differs); only
-// cfg.ServerTools are sent, as native grounding-tool objects — e.g.
-// server_tools:[google_search] -> tools:[{"google_search":{}}]. A server tool
-// whose name carries no special object shape is sent as {"<name>":{}}.
+// delta followed by usage. The conversation flattens into one "input" string
+// (system context first). Client-side function tools are not mapped (the
+// interactions tool schema differs); only cfg.ServerTools are sent, as
+// {"type":<name>} entries. The interactions API rejects max_output_tokens, so
+// no token cap is sent.
 func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs []Message, opts Opts) (<-chan event, bool, error) {
 	base := resolveBase(cfg, "https://generativelanguage.googleapis.com/v1beta")
-	url := base + "/models/" + cfg.Model + ":generateContent"
+	url := base + "/interactions"
 
-	system, contents := geminiContents(msgs)
-	body := map[string]any{"contents": contents}
-	if system != "" {
-		body["system_instruction"] = map[string]any{"parts": []map[string]any{{"text": system}}}
+	body := map[string]any{
+		"model": cfg.Model,
+		"input": geminiInput(msgs),
 	}
 	if len(cfg.ServerTools) > 0 {
 		tools := make([]map[string]any, 0, len(cfg.ServerTools))
 		for _, s := range cfg.ServerTools {
-			tools = append(tools, map[string]any{s: map[string]any{}})
+			tools = append(tools, map[string]any{"type": s})
 		}
 		body["tools"] = tools
 	}
 	if opts.Temperature != nil {
-		body["generationConfig"] = map[string]any{"temperature": *opts.Temperature}
+		body["temperature"] = *opts.Temperature
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(mustJSON(body)))
@@ -72,58 +70,46 @@ func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs
 	}
 
 	var out struct {
-		Candidates []struct {
-			Content struct {
-				Parts []struct {
-					Text string `json:"text"`
-				} `json:"parts"`
+		Steps []struct {
+			Type    string `json:"type"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
 			} `json:"content"`
-			GroundingMetadata *struct {
-				GroundingChunks []struct {
-					Web *struct {
-						URI   string `json:"uri"`
-						Title string `json:"title"`
-					} `json:"web"`
-				} `json:"groundingChunks"`
-			} `json:"groundingMetadata"`
-		} `json:"candidates"`
-		UsageMetadata *struct {
-			PromptTokenCount     int `json:"promptTokenCount"`
-			CandidatesTokenCount int `json:"candidatesTokenCount"`
-		} `json:"usageMetadata"`
+		} `json:"steps"`
+		Usage struct {
+			InputTokens       int `json:"input_tokens"`
+			OutputTokens      int `json:"output_tokens"`
+			TotalInputTokens  int `json:"total_input_tokens"`
+			TotalOutputTokens int `json:"total_output_tokens"`
+		} `json:"usage"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, false, fmt.Errorf("gemini: decode response: %w", err)
 	}
 
+	// The answer is the concatenation of text blocks in model_output steps.
 	var text string
-	var sources []string
-	if len(out.Candidates) > 0 {
-		c := out.Candidates[0]
-		for _, p := range c.Content.Parts {
-			text += p.Text
+	for _, st := range out.Steps {
+		if st.Type != "model_output" {
+			continue
 		}
-		if c.GroundingMetadata != nil {
-			for _, ch := range c.GroundingMetadata.GroundingChunks {
-				if ch.Web != nil && ch.Web.URI != "" {
-					sources = append(sources, ch.Web.URI)
-				}
+		for _, c := range st.Content {
+			if c.Type == "text" {
+				text += c.Text
 			}
 		}
 	}
-	// Append grounding sources so the caller sees citations alongside the answer.
-	if len(sources) > 0 {
-		text += "\n\nSources:\n"
-		for _, s := range sources {
-			text += "- " + s + "\n"
-		}
-		text = strings.TrimRight(text, "\n")
-	}
 
-	usage := Usage{}
-	if out.UsageMetadata != nil {
-		usage.Input = out.UsageMetadata.PromptTokenCount
-		usage.Output = out.UsageMetadata.CandidatesTokenCount
+	// Usage fields differ across interactions responses: prefer the explicit
+	// input/output pair, falling back to the total_* pair.
+	inTok := out.Usage.InputTokens
+	if inTok == 0 {
+		inTok = out.Usage.TotalInputTokens
+	}
+	outTok := out.Usage.OutputTokens
+	if outTok == 0 {
+		outTok = out.Usage.TotalOutputTokens
 	}
 
 	events := make(chan event, 2)
@@ -132,21 +118,16 @@ func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs
 		if text != "" {
 			events <- event{delta: text}
 		}
-		events <- event{usage: usage}
+		events <- event{usage: Usage{Input: inTok, Output: outTok}}
 	}()
 	return events, false, nil
 }
 
-// geminiContents flattens the conversation into generateContent's contents
-// array. The leading system message is returned separately (it maps to
-// system_instruction); subsequent turns become {role, parts:[{text}]}, with
-// assistant->model and tool results inlined as text. Roles must alternate
-// user/model; consecutive same-role turns are merged.
-func geminiContents(msgs []Message) (system string, contents []map[string]any) {
-	if len(msgs) > 0 && msgs[0].Role == "system" {
-		system = msgs[0].Content
-		msgs = msgs[1:]
-	}
+// geminiInput flattens the conversation into a single input string for the
+// interactions API. System messages are prefixed as context; each turn is
+// rendered "role: content". Tool turns are inlined as their result text.
+func geminiInput(msgs []Message) string {
+	var b strings.Builder
 	for _, m := range msgs {
 		content := m.Content
 		if m.Role == "tool" && m.ToolResult != nil {
@@ -155,21 +136,11 @@ func geminiContents(msgs []Message) (system string, contents []map[string]any) {
 		if content == "" {
 			continue
 		}
-		role := "user"
-		if m.Role == "assistant" {
-			role = "model"
+		role := m.Role
+		if role == "" {
+			role = "user"
 		}
-		// Merge into the previous part if the role repeats (generateContent
-		// requires strict user/model alternation).
-		if n := len(contents); n > 0 && contents[n-1]["role"] == role {
-			parts := contents[n-1]["parts"].([]map[string]any)
-			contents[n-1]["parts"] = append(parts, map[string]any{"text": content})
-			continue
-		}
-		contents = append(contents, map[string]any{
-			"role":  role,
-			"parts": []map[string]any{{"text": content}},
-		})
+		fmt.Fprintf(&b, "%s: %s\n\n", role, content)
 	}
-	return system, contents
+	return strings.TrimSpace(b.String())
 }

@@ -19,7 +19,7 @@ A static documentation website for AgentFlow, built with plain HTML/CSS/JS — n
 6. **Full Config Reference** — every config section: `runtime`, `models`, `memory.backends`, `profiles` (memory/safety/shell/agent), `gateway.channels`, `mcp.servers`, `tools.policy`, `agents`, `plugins`
 7. **Lua Plugin Development** — comprehensive guide to writing loops, support chunks, and using every built-in Lua API
 8. **Hook Point Specs** — all hook tables: gateway, session, loop, memory, shell, safety (core-owned), core lifecycle
-9. **Capability API** — every Lua-facing table: `llm`, `session`, `agent`, `scheduler`, `memory`/`store`, `tools`, `shell`, `http`/`os`, `log`/`json`/`time`
+9. **Lua Plugin Development** covers the full built-in Lua API reference (llm, session, agent, scheduler, memory/store, tools, shell, http/os, log/json/time)
 
 ## Serve locally
 

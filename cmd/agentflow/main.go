@@ -294,7 +294,22 @@ func main() {
 
 		agentSet := toolReg.Expose(p.Skills, cfg.Tools.Policy, false)
 		handlers := map[string]session.OpHandler{}
-		for k, h := range caps.LLMHandlers(llmMgr) {
+		// Budget metering for spawn profiles: a profile that declares
+		// budget.tokens_per_day gets a metered LLM pool shared by every child
+		// spawned from it. This is how a project type (pm_github, worker, ...)
+		// gets its own budget. (Static agents carve per-agent pools above;
+		// profile-level carve-down from the parent's pool is a follow-up.)
+		llmHandlers := caps.LLMHandlers(llmMgr)
+		if p.Budget.TokensPerDay > 0 {
+			pool := budget.NewPool(p.Budget.TokensPerDay)
+			if w, err := time.ParseDuration(p.Budget.Window); err == nil && w > 0 {
+				pool.SetWindow(w)
+			} else {
+				pool.StartDailyReset()
+			}
+			llmHandlers = caps.MeteredLLMHandlers(llmMgr, pool)
+		}
+		for k, h := range llmHandlers {
 			handlers[k] = h
 		}
 		for k, h := range caps.StoreHandlers(amPtr, memMgr) {
@@ -454,11 +469,10 @@ func main() {
 
 	// Metrics/admin: authenticated HTTP endpoint with health/readiness/metrics
 	// and a read-only sessions view. Binds to loopback by default; a non-empty
-	// ADMIN_TOKEN enables bearer-token auth for non-health endpoints.
-	metricReg := metrics.NewRegistry()
-	for _, c := range metrics.DefaultCounters() {
-		metricReg.Register(c)
-	}
+	// ADMIN_TOKEN enables bearer-token auth for non-health endpoints. Uses the
+	// shared global registry so counters incremented by handlers (LLM calls,
+	// budget denials, spawns, ...) show up here.
+	metricReg := metrics.Global()
 	adminAddr := cfg.Runtime.Admin.Listen
 	if adminAddr == "" {
 		adminAddr = "127.0.0.1:9090"

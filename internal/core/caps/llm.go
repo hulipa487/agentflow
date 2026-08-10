@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 
 	"agentflow/internal/core/budget"
+	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/session"
 	"agentflow/internal/drivers/llm"
 )
@@ -133,6 +134,7 @@ func MeteredLLMHandlers(m *llm.Manager, pool *budget.Pool) map[string]session.Op
 		}
 		lease, err := pool.Reserve(estimate)
 		if err != nil {
+			metrics.Inc("agentflow_budget_denied")
 			b, _ := json.Marshal(map[string]any{
 				"ok":     false,
 				"error":  "budget_exhausted",
@@ -158,6 +160,8 @@ func MeteredLLMHandlers(m *llm.Manager, pool *budget.Pool) map[string]session.Op
 			}
 		}
 		_ = pool.Commit(lease, actual)
+		metrics.Inc("agentflow_llm_calls")
+		metrics.Add("agentflow_llm_tokens", actual)
 		return resp, ok
 	}
 	base["llm.chat"] = metered

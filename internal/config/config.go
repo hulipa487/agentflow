@@ -184,6 +184,10 @@ type EphemeralLifecycle struct {
 
 type BudgetConfig struct {
 	TokensPerDay int64 `yaml:"tokens_per_day"`
+	// Window is an optional rolling-window duration (e.g. "168h") for spawn
+	// profile budgets. When set, usage drains continuously as commits age out
+	// instead of resetting daily.
+	Window string `yaml:"window"`
 }
 
 // AgentConfig can be a string profile reference or an inline profile.

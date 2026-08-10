@@ -378,6 +378,7 @@ func validate(path string, c *Config) error {
 		allowedCaps["agent.spawn"] = true
 		allowedCaps["agent.request"] = true
 		allowedCaps["channel.push"] = true
+		allowedCaps["net.mail"] = true
 	}
 
 	for name, a := range c.Agents {

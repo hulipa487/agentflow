@@ -529,7 +529,7 @@ func validate(path string, c *Config) error {
 
 	for name, m := range c.Models {
 		switch m.Provider {
-		case "anthropic", "openai", "openai-responses":
+		case "anthropic", "openai", "openai-responses", "gemini":
 		default:
 			return fmt.Errorf("%s: model %q has unsupported provider %q", path, name, m.Provider)
 		}

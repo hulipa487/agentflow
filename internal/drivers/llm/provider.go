@@ -26,6 +26,7 @@ func resolveBase(cfg config.Model, def string) string {
 //   - "anthropic"    — Anthropic Messages API (also compatible proxies)
 //   - "openai"       — OpenAI Chat Completions API (/v1/chat/completions)
 //   - "openai-responses" — OpenAI Responses API (/v1/responses)
+//   - "gemini"       — Gemini Interactions API (/v1beta/interactions)
 func openProvider(ctx context.Context, client *http.Client, cfg config.Model, msgs []Message, opts Opts) (<-chan event, bool, error) {
 	switch cfg.Provider {
 	case "anthropic":
@@ -34,8 +35,10 @@ func openProvider(ctx context.Context, client *http.Client, cfg config.Model, ms
 		return openaiChatOpen(ctx, client, cfg, msgs, opts)
 	case "openai-responses":
 		return openaiResponsesOpen(ctx, client, cfg, msgs, opts)
+	case "gemini":
+		return geminiOpen(ctx, client, cfg, msgs, opts)
 	}
-	return nil, false, fmt.Errorf("unsupported provider %q (use anthropic, openai, or openai-responses)", cfg.Provider)
+	return nil, false, fmt.Errorf("unsupported provider %q (use anthropic, openai, openai-responses, or gemini)", cfg.Provider)
 }
 
 // statusError classifies an HTTP error status. Retryable on 429 and 5xx.

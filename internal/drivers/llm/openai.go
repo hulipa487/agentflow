@@ -31,8 +31,8 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 			"include_usage": true,
 		},
 	}
-	if len(opts.Tools) > 0 {
-		body["tools"] = openaiTools(opts.Tools)
+	if len(opts.Tools) > 0 || len(cfg.ServerTools) > 0 {
+		body["tools"] = mergeServerTools(openaiTools(opts.Tools), cfg.ServerTools)
 		if opts.ToolChoice != "" {
 			body["tool_choice"] = opts.ToolChoice
 		}

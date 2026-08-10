@@ -45,7 +45,7 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 	if mt := maxTokensOf(cfg, opts); mt > 0 {
 		body["max_output_tokens"] = mt
 	}
-	if len(opts.Tools) > 0 {
+	if len(opts.Tools) > 0 || len(cfg.ServerTools) > 0 {
 		// Responses uses a flat function shape (no "function" wrapper).
 		tools := make([]map[string]any, 0, len(opts.Tools))
 		for _, t := range opts.Tools {
@@ -56,7 +56,7 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 				"parameters":  t.Parameters,
 			})
 		}
-		body["tools"] = tools
+		body["tools"] = mergeServerTools(tools, cfg.ServerTools)
 		if opts.ToolChoice != "" {
 			body["tool_choice"] = opts.ToolChoice
 		}

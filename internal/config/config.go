@@ -494,6 +494,10 @@ func validate(path string, c *Config) error {
 			if ch.Listen == "" {
 				return fmt.Errorf("%s: webhook channel %q has no listen", path, ch.Name)
 			}
+		case "ghhook":
+			if ch.Listen == "" {
+				return fmt.Errorf("%s: ghhook channel %q has no listen", path, ch.Name)
+			}
 		case "telegram":
 			if ch.Token == "" {
 				return fmt.Errorf("%s: telegram channel %q has no token", path, ch.Name)

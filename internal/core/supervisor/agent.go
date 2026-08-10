@@ -173,14 +173,21 @@ func (s *Supervisor) deliverAgentMessage(ctx context.Context, source session.Ide
 	case address.Session:
 		s.mu.Lock()
 		target, ok := s.sessions[dst.Session]
+		_, retired := s.retired[dst.Session]
 		s.mu.Unlock()
 		if !ok {
-			// Unknown session: find-or-create it as a routed session of a static
-			// agent, keyed by the id's key segment (the same semantics the router
-			// path uses via Deliver). This is gated by the sender's can_contact
+			// A session that ran and exited is gone for good: sending to it must
+			// fail, not silently resurrect a blank replacement (which would lose
+			// the in-flight conversation and can spawn loops of re-created actors).
+			if retired {
+				return fmt.Errorf("session %q has exited", dst.Session)
+			}
+			// Never-before-seen session: find-or-create it as a routed session of
+			// a static agent, keyed by the id's key segment (the same semantics
+			// the router path uses via Deliver). Gated by the sender's can_contact
 			// exactly like contacting a live session, so a sender can only create
 			// sessions of agents it is already authorized to reach. Without this,
-			// chat->PM kickoff to a not-yet-running PM session would fail.
+			// chat->PM kickoff to a not-yet-started PM session would fail.
 			agentName, key, found := strings.Cut(dst.Session, "|")
 			if !found || key == "" {
 				return fmt.Errorf("unknown session %q", dst.Session)

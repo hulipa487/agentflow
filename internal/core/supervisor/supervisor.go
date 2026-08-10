@@ -65,6 +65,11 @@ type Supervisor struct {
 	mu        sync.Mutex
 	sessions  map[string]*session.Actor
 	cancels   map[string]context.CancelFunc
+	// retired tracks session ids that ran and exited. A send to a retired
+	// session address must fail (the recipient is gone); find-or-create is only
+	// for session addresses that have never existed (e.g. a PM session that has
+	// not been started yet), never for resurrecting a dead one.
+	retired   map[string]struct{}
 	templates map[string]*SpawnTemplate
 	ctx       context.Context
 	requests  *request.Registry
@@ -84,6 +89,7 @@ func New(defs map[string]*AgentDef, gw *gateway.Registry, p *pool.Pool, shellMgr
 		shellMgr:  shellMgr,
 		sessions:  map[string]*session.Actor{},
 		cancels:   map[string]context.CancelFunc{},
+		retired:   map[string]struct{}{},
 		templates: templates,
 		requests:  request.New(),
 		log:       log.With("module", "supervisor"),
@@ -165,6 +171,9 @@ func (s *Supervisor) onActorExit(id session.Identity, reason session.EndReason) 
 	if ok && current.Identity.SessionID == id.SessionID {
 		delete(s.sessions, id.SessionID)
 		delete(s.cancels, id.SessionID)
+		if s.retired != nil {
+			s.retired[id.SessionID] = struct{}{}
+		}
 	}
 	if id.ParentID != "" {
 		parent = s.sessions[id.ParentID]

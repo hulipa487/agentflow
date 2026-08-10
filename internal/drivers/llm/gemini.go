@@ -40,9 +40,8 @@ func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs
 		}
 		body["tools"] = tools
 	}
-	if mt := maxTokensOf(cfg, opts); mt > 0 {
-		body["max_output_tokens"] = mt
-	}
+	// Note: the interactions API rejects max_output_tokens, so no token cap is
+	// sent (unlike the OpenAI providers).
 	if opts.Temperature != nil {
 		body["temperature"] = *opts.Temperature
 	}
@@ -82,12 +81,24 @@ func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs
 			} `json:"content"`
 		} `json:"steps"`
 		Usage struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
+			InputTokens       int `json:"input_tokens"`
+			OutputTokens      int `json:"output_tokens"`
+			TotalInputTokens  int `json:"total_input_tokens"`
+			TotalOutputTokens int `json:"total_output_tokens"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, false, fmt.Errorf("gemini: decode response: %w", err)
+	}
+	// Usage fields differ across interactions responses: prefer the explicit
+	// input/output pair, falling back to the total_* pair.
+	inTok := out.Usage.InputTokens
+	if inTok == 0 {
+		inTok = out.Usage.TotalInputTokens
+	}
+	outTok := out.Usage.OutputTokens
+	if outTok == 0 {
+		outTok = out.Usage.TotalOutputTokens
 	}
 	var text string
 	for _, st := range out.Steps {
@@ -107,7 +118,7 @@ func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs
 		if text != "" {
 			events <- event{delta: text}
 		}
-		events <- event{usage: Usage{Input: out.Usage.InputTokens, Output: out.Usage.OutputTokens}}
+		events <- event{usage: Usage{Input: inTok, Output: outTok}}
 	}()
 	return events, false, nil
 }

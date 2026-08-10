@@ -199,3 +199,82 @@ func TestSendToSpawnedChildSession(t *testing.T) {
 	}
 }
 
+// Send to a session address that has no live session yet must find-or-create
+// it as a routed session of the named static agent (keyed by the id's key
+// segment), gated by the sender's can_contact. This is what lets a chat agent
+// kick off a not-yet-running project-manager session.
+func TestSendFindOrCreatesRoutedSession(t *testing.T) {
+	sup := newTestSupervisor(t)
+	sup.defs["pm"] = &AgentDef{
+		Info:         &session.Info{Name: "pm", HistoryBudget: 100},
+		CanContact:   map[string]bool{"planner": true},
+		Capabilities: map[string]bool{"llm.chat": true},
+		Handlers:     map[string]session.OpHandler{},
+		LoopSrc:      "function loop() while true do session.inbox() end end",
+	}
+	parent := session.Identity{
+		SessionID:    "planner|x",
+		Agent:        "planner",
+		CanContact:   map[string]bool{"pm": true},
+		Capabilities: map[string]bool{"agent.send": true, "llm.chat": true},
+	}
+	if err := sup.Send(context.Background(), parent, "session:pm|proj:acme-web", map[string]any{"type": "brief"}); err != nil {
+		t.Fatalf("send to unknown pm session failed: %v", err)
+	}
+	sup.mu.Lock()
+	created := sup.sessions["pm|proj:acme-web"]
+	sup.mu.Unlock()
+	if created == nil {
+		t.Fatal("session was not find-or-created")
+	}
+	select {
+	case m := <-created.Mailbox:
+		if m.Payload == nil || m.Payload["type"] != "brief" {
+			t.Fatalf("created session got wrong message: %+v", m)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("created session never received the brief")
+	}
+}
+
+// Find-or-create must still enforce can_contact: a sender may not create a
+// session of an agent it is not authorized to reach.
+func TestSendFindOrCreateEnforcesACL(t *testing.T) {
+	sup := newTestSupervisor(t)
+	sup.defs["pm"] = &AgentDef{
+		Info:         &session.Info{Name: "pm", HistoryBudget: 100},
+		Capabilities: map[string]bool{"llm.chat": true},
+		Handlers:     map[string]session.OpHandler{},
+		LoopSrc:      "function loop() while true do session.inbox() end end",
+	}
+	parent := session.Identity{
+		SessionID:    "planner|x",
+		Agent:        "planner",
+		CanContact:   map[string]bool{"worker": true}, // not "pm"
+		Capabilities: map[string]bool{"agent.send": true, "llm.chat": true},
+	}
+	if err := sup.Send(context.Background(), parent, "session:pm|proj:acme-web", nil); err == nil {
+		t.Fatal("send to unauthorized agent session should have been rejected")
+	}
+	sup.mu.Lock()
+	_, created := sup.sessions["pm|proj:acme-web"]
+	sup.mu.Unlock()
+	if created {
+		t.Fatal("session must not be created for an unauthorized sender")
+	}
+}
+
+// A session id whose agent segment names no defined agent cannot be created.
+func TestSendFindOrCreateRejectsUnknownAgent(t *testing.T) {
+	sup := newTestSupervisor(t)
+	parent := session.Identity{
+		SessionID:    "planner|x",
+		Agent:        "planner",
+		CanContact:   map[string]bool{"ghost": true},
+		Capabilities: map[string]bool{"agent.send": true, "llm.chat": true},
+	}
+	if err := sup.Send(context.Background(), parent, "session:ghost|proj:x", nil); err == nil {
+		t.Fatal("send to undefined agent session should have been rejected")
+	}
+}
+

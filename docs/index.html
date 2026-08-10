@@ -67,7 +67,7 @@
   </table>
 
   <div class="callout">
-    <strong>Current status</strong>: <span>Phases 0–4 complete. The core runtime (actors, memory, tools, shell, multi-agent, scheduler, budget, safety, metrics) is implemented and tested. Every storage backend is a real provider — SQLite, Redis, MongoDB, and PostgreSQL for KV/document storage, and pgvector for vector recall (SQLite vector queries return an explicit unsupported error, never silent empties). LLM providers cover all three compatible API shapes: Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses, each targeting self-hosted/proxied endpoints via <code>base_url</code>. Channels: webhook, and Telegram in both polling and webhook modes.</span>
+    <strong>Current status</strong>: <span>Phases 0–4 complete. The core runtime (actors, memory, tools, shell, multi-agent, scheduler, budget, safety, metrics) is implemented and tested. Every storage backend is a real provider — SQLite, Redis, MongoDB, and PostgreSQL for KV/document storage, and pgvector for vector recall (SQLite vector queries return an explicit unsupported error, never silent empties). LLM providers cover all three compatible API shapes: Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses, each targeting self-hosted/proxied endpoints via <code>base_url</code>. Channels: webhook, and Telegram in both polling and webhook modes. Embeddings (<code>llm.embed</code>, OpenAI-compatible) and cross-encoder reranking (<code>llm.rerank</code>) close the semantic-memory loop: pgvector stores vectors on write and <code>builtin:semantic</code> recall pipelines embed -> vector k-NN -> rerank.</span>
   </div>
 </section>
 
@@ -344,7 +344,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
       <tr><td><code>builtin:redis</code></td><td>storage</td><td>kv, prefix_scan, ttl</td></tr>
       <tr><td><code>builtin:mongodb</code></td><td>storage</td><td>kv, prefix_scan, ttl</td></tr>
       <tr><td><code>builtin:postgres</code></td><td>storage</td><td>kv, prefix_scan, text_search, transaction</td></tr>
-      <tr><td><code>builtin:pgvector</code></td><td>vector</td><td>vector (cosine, 1536-dim embeddings)</td></tr>
+      <tr><td><code>builtin:pgvector</code></td><td>vector</td><td>vector (cosine k-NN; embedding dim configurable via <code>dim</code>, default 1536)</td></tr>
     </tbody>
   </table>
   <pre><code>memory:
@@ -364,7 +364,17 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
       dialogue: { backend: main_db, table: dialogue, window: 1000, retention: 30d }
       facts: { backend: main_db, table: facts, requires: [kv, text_search] }
     write: [builtin:routing_table]
-    recall: builtin:recency</code></pre>
+    recall: builtin:recency
+
+  memory/semantic:                        # embedding + rerank recall
+    stores:
+      semantic: { backend: vec, table: semantic, requires: [vector] }
+    write: [builtin:routing_table]
+    recall: builtin:semantic
+    embed_model: embed                    # models: entry; auto-embeds writes to vector stores
+    rerank_model: rerank                  # optional provider:"rerank" entry
+    oversample: 4                         # fetch k*4 vector hits, rerank down to k</code></pre>
+  <p>With <code>recall: builtin:semantic</code>, <code>memory.recall({ text = "...", k = 5 })</code> embeds the query, runs cosine k-NN over the vector store, and reranks when <code>rerank_model</code> is set. Queries without text fall back to recency recall. See <code>examples/agentflow.semantic-memory.yaml</code>.</p>
   <table class="table config-table">
     <thead><tr><th>Store key</th><th>Description</th></tr></thead>
     <tbody>
@@ -491,7 +501,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
   <p>AgentFlow plugins are plain <a href="https://luau-lang.org/">Luau</a> scripts. YAML defines which plugin runs for which agent; the plugin defines the behavior. There are three kinds of plugin:</p>
   <ul>
     <li><strong>Loop plugin</strong> — defines a global <code>loop()</code> function that owns the session coroutine for its lifetime. The canonical pattern is <code>while true do local msg = session.inbox() ... end</code>.</li>
-    <li><strong>Support chunk</strong> — loaded into every session state <em>before</em> the loop plugin. Support chunks define globals and helper functions the loop reads. Builtins like <code>builtin:token_budget</code>, <code>builtin:routing_table</code>, <code>builtin:recency</code>, <code>builtin:fact_extractor</code>, <code>builtin:exec_policy</code>, and <code>builtin:ttl</code> are support chunks.</li>
+    <li><strong>Support chunk</strong> — loaded into every session state <em>before</em> the loop plugin. Support chunks define globals and helper functions the loop reads. Builtins like <code>builtin:token_budget</code>, <code>builtin:routing_table</code>, <code>builtin:recency</code>, <code>builtin:semantic</code>, <code>builtin:fact_extractor</code>, <code>builtin:exec_policy</code>, and <code>builtin:ttl</code> are support chunks.</li>
     <li><strong>Shadow</strong> — a user plugin placed in <code>plugins/</code> with the same name as a builtin. It replaces the builtin instance-wide at load time.</li>
   </ul>
 
@@ -546,10 +556,13 @@ session.exit()                        -- terminate this session</code></pre>
   <h4><code>llm</code> — cap: <code>llm.chat</code></h4>
   <pre><code>llm.chat(messages, opts?) -> { text, usage, tool_calls }
 llm.stream(messages, opts?) -> iterator
+llm.embed(texts, opts?) -> { vectors, usage }     -- texts: string or array
+llm.rerank(query, documents, opts?) -> { results } -- results: [{ index, score }], 0-based
 
 -- opts: { model = "default", temperature = 0.7, max_tokens = 4096,
 --         tools = [...], tool_choice = "auto" | "none" }</code></pre>
   <p>Messages are arrays of <code>{ role, content, tool_calls?, tool_call_id?, tool_result? }</code>. <code>llm.stream</code> returns a closure; call it directly (<code>local d = next_chunk()</code>), never in a generic <code>for ... in</code> — the iterator protocol cannot yield across the C boundary.</p>
+  <p><code>llm.embed</code> works with any OpenAI-compatible <code>/embeddings</code> endpoint (Ollama, vLLM, TEI, OpenRouter); the Anthropic provider has no embeddings API and fails explicitly. <code>llm.rerank</code> requires a <code>provider: rerank</code> model entry speaking <code>POST {base_url}/rerank</code> (TEI, vLLM, Jina, Cohere). Both are token-metered when the agent declares a budget.</p>
 
   <h4><code>agent</code> — caps: <code>agent.send</code>, <code>agent.request</code>, <code>agent.spawn</code></h4>
   <pre><code>agent.info() -> { name, session_id, address, model, instructions,
@@ -571,11 +584,11 @@ scheduler.cancel(timer_id)</code></pre>
   <pre><code>memory.write(record) -> boolean          -- routed by builtin:routing_table
 memory.recall(query, opts?) -> {records} -- active recall handler
 
-store.put(table, key, value, opts?)      -- opts: { ttl = seconds }
+store.put(table, key, value, opts?)      -- opts: { ttl = seconds, vector = {...} }
 store.get(table, key) -> { value, found }
 store.query(table, query) -> { records }
 store.delete(table, key)</code></pre>
-  <p>Store queries accept <code>{ kind = "all" | "prefix" | "text" | "vector" | "time_range", ... }</code>. Prefer <code>memory.write</code>/<code>memory.recall</code> for agent memory; use <code>store.*</code> only when you need raw table access.</p>
+  <p>Store queries accept <code>{ kind = "all" | "prefix" | "text" | "vector" | "time_range", ... }</code>; vector queries take <code>{ kind = "vector", vector = {...}, k = n }</code>. Passing a <code>vector</code> to a store whose backend lacks the <code>vector</code> feature is an explicit error, never a silent drop. Prefer <code>memory.write</code>/<code>memory.recall</code> for agent memory; use <code>store.*</code> only when you need raw table access.</p>
 
   <h4><code>tools</code> — cap: <code>tools</code></h4>
   <pre><code>tools.list() -> [ToolSpec]
@@ -800,7 +813,9 @@ end</code></pre>
 
   <h3><code>llm</code> — cap: <code>llm.chat</code></h3>
   <pre><code>llm.chat(messages, opts?) -> { text, usage }
-llm.stream(messages, opts?) -> iterator    -- yields chunks; call directly, not in for-in</code></pre>
+llm.stream(messages, opts?) -> iterator    -- yields chunks; call directly, not in for-in
+llm.embed(texts, opts?) -> { vectors, usage }      -- OpenAI-compatible /embeddings endpoints
+llm.rerank(query, documents, opts?) -> { results }  -- provider: rerank (POST /rerank)</code></pre>
 
   <h3><code>session</code> — core</h3>
   <pre><code>session.inbox() -> Message                    -- the loop's consumption point

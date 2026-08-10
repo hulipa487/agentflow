@@ -61,6 +61,24 @@ func LLMHandlers(m *llm.Manager) map[string]session.OpHandler {
 			return string(b), true
 		},
 
+		"llm.embed": func(ctx context.Context, op session.Op) (string, bool) {
+			vectors, usage, err := m.Embed(ctx, op.Model, op.Inputs)
+			if err != nil {
+				return fail(err)
+			}
+			b, _ := json.Marshal(map[string]any{"vectors": vectors, "usage": usage})
+			return string(b), true
+		},
+
+		"llm.rerank": func(ctx context.Context, op session.Op) (string, bool) {
+			results, err := m.Rerank(ctx, op.Model, op.Text, op.Documents, op.TopN)
+			if err != nil {
+				return fail(err)
+			}
+			b, _ := json.Marshal(map[string]any{"results": results})
+			return string(b), true
+		},
+
 		"llm.stream.open": func(ctx context.Context, op session.Op) (string, bool) {
 			id, err := m.StreamOpen(ctx, op.Model, toLLM(op.Messages), optsOf(op))
 			if err != nil {
@@ -143,5 +161,41 @@ func MeteredLLMHandlers(m *llm.Manager, pool *budget.Pool) map[string]session.Op
 		return resp, ok
 	}
 	base["llm.chat"] = metered
+
+	// Embeddings consume input tokens only; reserve a modest per-text
+	// estimate, then commit the reported usage.
+	embed := base["llm.embed"]
+	meteredEmbed := func(ctx context.Context, op session.Op) (string, bool) {
+		n := len(op.Inputs)
+		if n < 1 {
+			n = 1
+		}
+		lease, err := pool.Reserve(int64(512 * n))
+		if err != nil {
+			b, _ := json.Marshal(map[string]any{
+				"ok":     false,
+				"error":  "budget_exhausted",
+				"detail": err.Error(),
+			})
+			return string(b), false
+		}
+		resp, ok := embed(ctx, op)
+		if !ok {
+			pool.Release(lease)
+			return resp, false
+		}
+		var result map[string]any
+		if err := json.Unmarshal([]byte(resp), &result); err == nil {
+			if usage, ok := result["usage"].(map[string]any); ok {
+				if in, _ := usage["input"].(float64); in > 0 {
+					_ = pool.Commit(lease, int64(in))
+					return resp, ok
+				}
+			}
+		}
+		_ = pool.Commit(lease, int64(512*n))
+		return resp, ok
+	}
+	base["llm.embed"] = meteredEmbed
 	return base
 }

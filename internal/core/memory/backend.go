@@ -19,6 +19,10 @@ type Record struct {
 // PutOpts carries optional parameters for Put.
 type PutOpts struct {
 	TTL time.Duration
+	// Vector, when set, is an embedding to store alongside the value.
+	// Only vector-capable backends (feature "vector") honor it; callers
+	// must gate on features before sending one.
+	Vector []float32
 }
 
 // Query describes a backend query.
@@ -125,6 +129,20 @@ func (r *Registry) Handle(name string) (BackendHandle, bool) {
 	return h, ok
 }
 
+// Features reports the provider features of a named backend (nil when the
+// backend or its provider is unknown).
+func (r *Registry) Features(name string) []string {
+	c, ok := r.config[name]
+	if !ok {
+		return nil
+	}
+	p, ok := r.providers[c.Provider]
+	if !ok {
+		return nil
+	}
+	return p.Features()
+}
+
 // Store describes a logical store binding (backend name + table/collection).
 type Store struct {
 	Backend    string
@@ -132,6 +150,7 @@ type Store struct {
 	Collection string
 	Window     int
 	Retention  time.Duration
+	Requires   []string // provider features the backend must offer
 }
 
 // StoreBinding is a resolved (backend, table) pair.
@@ -148,6 +167,13 @@ type AgentMemory struct {
 	Tables  map[string]StoreBinding // by physical table name
 	Write   []string
 	Recall  string
+	// EmbedModel names the models: entry used to embed record text on
+	// write (memory.write) and queries on semantic recall. RerankModel,
+	// when set, reranks oversampled vector hits on semantic recall.
+	// Oversample is the vector-fetch multiplier used before reranking.
+	EmbedModel  string
+	RerankModel string
+	Oversample  int
 }
 
 // ResolveStore resolves a profile's store names into backend handles.
@@ -161,9 +187,30 @@ func (r *Registry) ResolveStores(profile map[string]Store) (AgentMemory, error) 
 		if !ok {
 			return AgentMemory{}, fmt.Errorf("memory store %q references unknown backend %q", sname, s.Backend)
 		}
+		if err := r.checkRequires(sname, s); err != nil {
+			return AgentMemory{}, err
+		}
 		b := StoreBinding{Backend: s.Backend, Table: s.Table, Window: s.Window, Retention: s.Retention}
 		out.Stores[sname] = b
 		out.Tables[s.Table] = b
 	}
 	return out, nil
+}
+
+// checkRequires fails loudly when a store declares features its backend does
+// not provide, instead of degrading silently at query time.
+func (r *Registry) checkRequires(sname string, s Store) error {
+	if len(s.Requires) == 0 {
+		return nil
+	}
+	have := map[string]bool{}
+	for _, f := range r.Features(s.Backend) {
+		have[f] = true
+	}
+	for _, req := range s.Requires {
+		if !have[req] {
+			return fmt.Errorf("memory store %q requires feature %q, which backend %q does not provide", sname, req, s.Backend)
+		}
+	}
+	return nil
 }

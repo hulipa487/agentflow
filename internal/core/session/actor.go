@@ -97,6 +97,11 @@ type Op struct {
 	Tools       []ToolSpec    `json:"tools,omitempty"`
 	ToolChoice  string        `json:"tool_choice,omitempty"`
 
+	// Embedding / rerank ops (llm.embed, llm.rerank).
+	Inputs    []string `json:"inputs,omitempty"`    // embed: texts to embed
+	Documents []string `json:"documents,omitempty"` // rerank: candidate documents
+	TopN      int      `json:"top_n,omitempty"`     // rerank: keep at most this many
+
 	// Proactive channel egress (session.push).
 	Channel string `json:"channel,omitempty"`
 	ReplyTo string `json:"reply_to,omitempty"`
@@ -106,6 +111,7 @@ type Op struct {
 	Key    string        `json:"key,omitempty"`
 	Value  any           `json:"value,omitempty"`
 	TTL    float64       `json:"ttl,omitempty"`
+	Vector []float32     `json:"vector,omitempty"`
 	Query  memory.Query  `json:"query,omitempty"`
 	Tool   string        `json:"tool,omitempty"`
 	Args   map[string]any `json:"args,omitempty"`
@@ -247,6 +253,8 @@ var blockingOps = map[string]bool{
 	"session.push":    true,
 	"session.push_user": true,
 	"llm.chat":        true,
+	"llm.embed":       true,
+	"llm.rerank":      true,
 	"llm.stream.open": true,
 	"llm.stream.next": true,
 	"tools.run":       true,
@@ -701,6 +709,9 @@ func (a *Actor) infoJSON() string {
 		mem["stores"] = stores
 		mem["write"] = a.Info.Memory.Write
 		mem["recall"] = a.Info.Memory.Recall
+		mem["embed_model"] = a.Info.Memory.EmbedModel
+		mem["rerank_model"] = a.Info.Memory.RerankModel
+		mem["oversample"] = a.Info.Memory.Oversample
 	}
 	r, _ := jsonString(map[string]any{
 		"name":           a.Info.Name,

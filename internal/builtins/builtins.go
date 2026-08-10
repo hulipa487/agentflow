@@ -25,6 +25,9 @@ var routingTable string
 //go:embed lua/recency.lua
 var recency string
 
+//go:embed lua/semantic.lua
+var semantic string
+
 //go:embed lua/fact_extractor.lua
 var factExtractor string
 
@@ -40,6 +43,7 @@ var sources = map[string]string{
 	"token_budget":   tokenBudget,
 	"routing_table":  routingTable,
 	"recency":        recency,
+	"semantic":       semantic,
 	"fact_extractor": factExtractor,
 	"exec_policy":    execPolicy,
 	"ttl":            ttl,
@@ -48,7 +52,7 @@ var sources = map[string]string{
 // SupportChunks returns the support chunks loaded into every session state
 // before the loop plugin.
 func SupportChunks() []string {
-	return []string{tokenBudget, routingTable, recency, factExtractor, execPolicy, ttl}
+	return []string{tokenBudget, routingTable, recency, semantic, factExtractor, execPolicy, ttl}
 }
 
 // Resolve turns a loop/route reference into Lua source. "builtin:<name>"

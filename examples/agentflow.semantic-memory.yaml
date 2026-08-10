@@ -1,0 +1,84 @@
+version: "1"
+
+# Semantic memory: embeddings on write, vector recall, optional reranking.
+#
+# What happens with this config:
+#   - memory.write embeds each record's text (models.embed) and stores the
+#     vector in pgvector alongside the value.
+#   - memory.recall({ text = "...", k = 5 }) runs builtin:semantic: embed the
+#     query -> cosine k-NN over pgvector -> rerank (models.rerank, when
+#     rerank_model is set) -> top-k records.
+#
+# Defaults target a fully local stack:
+#   - Ollama for chat + embeddings (nomic-embed-text, 768 dims)
+#   - PostgreSQL with the pgvector extension
+#   - optional TEI/vLLM rerank server (commented out below)
+#
+# Environment variables (all optional; sensible local defaults):
+#   OPENAI_BASE_URL, OPENAI_API_KEY, OPENAI_MODEL   (chat)
+#   EMBED_BASE_URL, EMBED_API_KEY, EMBED_MODEL      (embeddings)
+#   RERANK_BASE_URL, RERANK_API_KEY, RERANK_MODEL   (rerank, optional)
+#   PG_URL                                          (postgres+pgvector DSN)
+#
+# Note: pgvector's embedding column width is fixed at table-creation time
+# (dim below, default 1536). It must match the embedding model's output.
+#
+#   curl -X POST localhost:8080/webhook -d '{"from":"alice","text":"hi"}'
+
+models:
+  default:
+    provider: openai
+    model: ${OPENAI_MODEL:-gpt-4o-mini}
+    base_url: ${OPENAI_BASE_URL:-http://127.0.0.1:11434/v1}
+    api_key: ${OPENAI_API_KEY:-}
+
+  embed:
+    provider: openai
+    model: ${EMBED_MODEL:-nomic-embed-text}
+    base_url: ${EMBED_BASE_URL:-http://127.0.0.1:11434/v1}
+    api_key: ${EMBED_API_KEY:-}
+
+  # Uncomment to enable cross-encoder reranking on recall. Any server
+  # speaking POST {base_url}/rerank works (TEI, vLLM, Jina, Cohere).
+  # rerank:
+  #   provider: rerank
+  #   model: ${RERANK_MODEL:-BAAI/bge-reranker-v2-m3}
+  #   base_url: ${RERANK_BASE_URL:-http://127.0.0.1:8081}
+  #   api_key: ${RERANK_API_KEY:-}
+
+memory:
+  backends:
+    vec:
+      provider: builtin:pgvector
+      config:
+        url: ${PG_URL:-postgres://postgres:postgres@127.0.0.1:5432/agentflow?sslmode=disable}
+        dim: 768 # nomic-embed-text; use 1536 for OpenAI text-embedding-3-small
+
+profiles:
+  memory:
+    semantic:
+      stores:
+        semantic:
+          backend: vec
+          table: semantic
+          requires: ["vector"] # fail at boot if the backend can't store vectors
+      write: ["builtin:routing_table"]
+      recall: builtin:semantic
+      embed_model: embed
+      # rerank_model: rerank  # uncomment with the rerank model above
+      oversample: 4 # fetch k*4 vector hits before reranking down to k
+
+agents:
+  bot:
+    loop: builtin:react
+    model: default
+    instructions: ./instructions/bot.md
+    capabilities: [llm.chat, memory, tools]
+    memory: semantic
+
+gateway:
+  channels:
+    - type: webhook
+      listen: ":8080"
+      path: /webhook
+      agent: bot

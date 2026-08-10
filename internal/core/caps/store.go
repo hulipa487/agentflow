@@ -41,6 +41,21 @@ func StoreHandlers(am *memory.AgentMemory, mgr *memory.Manager) map[string]sessi
 			if opts.TTL <= 0 && bind.Retention > 0 {
 				opts.TTL = bind.Retention
 			}
+			if len(op.Vector) > 0 {
+				// A vector sent to a non-vector backend must fail loudly:
+				// storing without it would silently poison later recall.
+				supported := false
+				for _, f := range mgr.Features(bind.Backend) {
+					if f == "vector" {
+						supported = true
+						break
+					}
+				}
+				if !supported {
+					return fail(fmt.Errorf("store %q: backend %q does not support vector storage", op.Table, bind.Backend))
+				}
+				opts.Vector = op.Vector
+			}
 			if err := h.Put(bind.Table, op.Key, op.Value, opts); err != nil {
 				return fail(err)
 			}

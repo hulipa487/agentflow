@@ -259,7 +259,7 @@ end
 store = {}
 function store.put(table, key, value, opts)
   opts = opts or {}
-  return op({ type = "store.put", table = table, key = key, value = value, ttl = opts.ttl })
+  return op({ type = "store.put", table = table, key = key, value = value, ttl = opts.ttl, vector = opts.vector })
 end
 function store.get(table, key)
   return op({ type = "store.get", table = table, key = key })
@@ -276,12 +276,34 @@ end
 memory = {}
 function memory.write(record)
   local targets = memory_routing_table(record)
+  -- When the memory profile names an embed_model, attach an embedding of
+  -- the record text so vector-capable backends can serve semantic recall.
+  local info = agent.info()
+  local embed_model = info.memory and info.memory.embed_model
   for _, t in ipairs(targets) do
-    store.put(t.store, t.key, t.value, { ttl = t.ttl })
+    local opts = { ttl = t.ttl }
+    if embed_model and embed_model ~= "" then
+      local text = t.value
+      if type(text) == "table" then text = text.text or json.encode(text) end
+      if type(text) == "string" and #text > 0 then
+        local r = llm.embed({ text }, { model = embed_model })
+        if r and r.vectors and r.vectors[1] then
+          opts.vector = r.vectors[1]
+        end
+      end
+    end
+    store.put(t.store, t.key, t.value, opts)
   end
   return true
 end
 function memory.recall(query, opts)
+  -- The memory profile selects the recall handler; builtin:semantic is
+  -- handled by its support chunk, everything else uses the default.
+  local info = agent.info()
+  local recall = info.memory and info.memory.recall
+  if recall == "builtin:semantic" and memory_semantic_recall_handler then
+    return memory_semantic_recall_handler(query, opts)
+  end
   return memory_recall_handler(query, opts)
 end
 
@@ -363,6 +385,21 @@ end
 llm = {}
 function llm.chat(messages, opts)
   return op(with_opts({ type = "llm.chat", messages = messages }, opts))
+end
+
+-- llm.embed(texts, opts) -> { vectors = { {..}, .. }, usage = { input = n } }
+-- texts may be a single string or an array of strings. opts.model names a
+-- models: entry whose provider supports embeddings (openai-compatible).
+function llm.embed(texts, opts)
+  local inputs = type(texts) == "table" and texts or { texts }
+  return op(with_opts({ type = "llm.embed", inputs = inputs }, opts))
+end
+
+-- llm.rerank(query, documents, opts) -> { results = { { index = i, score = s }, .. } }
+-- index is 0-based into documents. opts.model names a provider="rerank"
+-- models: entry; opts.top_n trims the ranked list.
+function llm.rerank(query, documents, opts)
+  return op(with_opts({ type = "llm.rerank", text = query, documents = documents }, opts))
 end
 
 -- llm.stream returns an iterator: for delta in llm.stream(msgs) do ... end

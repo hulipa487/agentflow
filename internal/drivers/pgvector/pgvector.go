@@ -26,10 +26,27 @@ func (Provider) Features() []string {
 	return []string{"vector"}
 }
 
+// defaultDim matches the embedding size of OpenAI's text-embedding-ada-002
+// family; most self-hosted models are smaller (e.g. nomic-embed-text: 768),
+// so dim is configurable per backend.
+const defaultDim = 1536
+
 func (Provider) Open(config map[string]any) (memory.BackendHandle, error) {
 	url, _ := config["url"].(string)
 	if url == "" {
 		return nil, fmt.Errorf("builtin:pgvector: url is required")
+	}
+	dim := defaultDim
+	switch v := config["dim"].(type) {
+	case int:
+		dim = v
+	case int64:
+		dim = int(v)
+	case float64:
+		dim = int(v)
+	}
+	if dim <= 0 {
+		return nil, fmt.Errorf("builtin:pgvector: dim must be positive, got %d", dim)
 	}
 	db, err := sql.Open("pgx", url)
 	if err != nil {
@@ -39,7 +56,7 @@ func (Provider) Open(config map[string]any) (memory.BackendHandle, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("builtin:pgvector: ping: %w", err)
 	}
-	h := &Handle{db: db}
+	h := &Handle{db: db, dim: dim}
 	if err := h.migrate(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("builtin:pgvector: migrate: %w", err)
@@ -48,7 +65,8 @@ func (Provider) Open(config map[string]any) (memory.BackendHandle, error) {
 }
 
 type Handle struct {
-	db *sql.DB
+	db  *sql.DB
+	dim int
 }
 
 func (h *Handle) migrate() error {
@@ -59,17 +77,19 @@ func (h *Handle) migrate() error {
 	if err != nil {
 		return fmt.Errorf("create extension vector: %w (is pgvector installed?)", err)
 	}
-	_, err = h.db.ExecContext(ctx, `
+	// The embedding column width is fixed at create time; changing dim on an
+	// existing database requires a manual ALTER TABLE (documented in docs).
+	_, err = h.db.ExecContext(ctx, fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS vec_kv (
 			table_name TEXT NOT NULL,
 			key        TEXT NOT NULL,
 			value      JSONB NOT NULL,
-			embedding  vector(1536),
+			embedding  vector(%d),
 			updated_at BIGINT NOT NULL,
 			PRIMARY KEY (table_name, key)
 		);
 		CREATE INDEX IF NOT EXISTS idx_vec_kv_embedding ON vec_kv USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
-	`)
+	`, h.dim))
 	return err
 }
 
@@ -81,9 +101,18 @@ func (h *Handle) Put(table, key string, value any, opts memory.PutOpts) error {
 	now := time.Now().Unix()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	// opts can carry an embedding via memory.Query.Vector on a special path;
-	// for now, the standard Put does not include a vector. Upsert the row
-	// without embedding (NULL). Use VectorUpsert for embeddings.
+	if len(opts.Vector) > 0 {
+		if len(opts.Vector) != h.dim {
+			return fmt.Errorf("builtin:pgvector: embedding has %d dimensions, backend configured for %d (set dim in the backend config to match the embedding model)", len(opts.Vector), h.dim)
+		}
+		_, err = h.db.ExecContext(ctx,
+			`INSERT INTO vec_kv (table_name, key, value, embedding, updated_at) VALUES ($1, $2, $3, $4::vector, $5)
+			 ON CONFLICT (table_name, key) DO UPDATE SET value = EXCLUDED.value, embedding = EXCLUDED.embedding, updated_at = EXCLUDED.updated_at`,
+			table, key, b, floatSliceToVector(opts.Vector), now)
+		return err
+	}
+	// No embedding supplied: upsert the value and keep any existing
+	// embedding for the key rather than NULLing it out.
 	_, err = h.db.ExecContext(ctx,
 		`INSERT INTO vec_kv (table_name, key, value, updated_at) VALUES ($1, $2, $3, $4)
 		 ON CONFLICT (table_name, key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,

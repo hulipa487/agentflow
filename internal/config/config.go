@@ -81,6 +81,13 @@ type Model struct {
 	Timeout   string `yaml:"timeout"`
 	Retry     int    `yaml:"retry"`
 	MaxTokens int    `yaml:"max_tokens"`
+	// ServerTools names provider-native server-side tools to enable on every
+	// request for this model (e.g. "web_search", "x_search", "google_search").
+	// Unlike client-side function tools (opts.Tools), these are executed by the
+	// provider inside the completion; the runtime only injects the native tool
+	// entry into the request body. The values are provider-specific strings,
+	// keeping the runtime generic.
+	ServerTools []string `yaml:"server_tools"`
 }
 
 func (m Model) TimeoutD() time.Duration {

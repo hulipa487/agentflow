@@ -130,6 +130,18 @@ type Op struct {
 	// secret itself). The loop references it; Go injects the resolved value.
 	Auth *CredentialRef `json:"auth,omitempty"`
 
+	// Mail ops (mail.imap.fetch, mail.smtp.send).
+	Mailbox  string   `json:"mailbox,omitempty"`   // IMAP: folder to fetch (default INBOX)
+	Limit    int      `json:"limit,omitempty"`     // IMAP: max messages to return (default 10)
+	Unseen   bool     `json:"unseen,omitempty"`     // IMAP: fetch only unread
+	MailFrom string   `json:"mail_from,omitempty"` // SMTP: From address
+	MailTo   []string `json:"mail_to,omitempty"`   // SMTP: recipients
+	Subject  string   `json:"subject,omitempty"`    // SMTP: subject
+	TextBody string   `json:"text_body,omitempty"`  // SMTP: plain body
+	MailHost string   `json:"mail_host,omitempty"`  // SMTP/IMAP: host
+	MailPort int      `json:"mail_port,omitempty"`  // SMTP/IMAP: port
+	MailUser string   `json:"mail_user,omitempty"`  // SMTP/IMAP: username (cred resolves password)
+
 	// Multi-agent operations.
 	Address string         `json:"address,omitempty"`
 	Payload map[string]any `json:"payload,omitempty"`

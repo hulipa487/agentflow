@@ -94,3 +94,27 @@ func openaiTools(tools []ToolDef) []map[string]any {
 	}
 	return out
 }
+
+// serverToolEntry builds the native request-body entry for a provider-side
+// tool. Most server tools (OpenAI/xAI web_search, x_search, etc.) take a bare
+// {type:<name>} entry with no function payload — the provider supplies and
+// executes the tool. Unknown names fall back to a function-shaped stub so a
+// typo doesn't silently produce a tool-less request.
+func serverToolEntry(name string) map[string]any {
+	switch name {
+	case "web_search", "x_search", "web_search_preview", "code_interpreter", "file_search", "image_generation", "mcp":
+		return map[string]any{"type": name}
+	default:
+		return map[string]any{"type": "function", "function": map[string]any{"name": name}}
+	}
+}
+
+// mergeServerTools appends provider-native server-side tool entries (from
+// cfg.ServerTools) to the client-side function tools list. Server tools run
+// inside the provider's completion; they carry no parameters from the client.
+func mergeServerTools(fns []map[string]any, server []string) []map[string]any {
+	for _, s := range server {
+		fns = append(fns, serverToolEntry(s))
+	}
+	return fns
+}

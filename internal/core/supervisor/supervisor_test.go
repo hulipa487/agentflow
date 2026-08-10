@@ -278,3 +278,54 @@ func TestSendFindOrCreateRejectsUnknownAgent(t *testing.T) {
 	}
 }
 
+// A send to a session that ran and exited must fail, not find-or-create a
+// blank replacement. Resurrecting a dead session would silently drop the
+// in-flight conversation and can spawn loops of re-created actors.
+func TestSendToExitedSessionFails(t *testing.T) {
+	sup := newTestSupervisor(t)
+	sup.defs["pm"] = &AgentDef{
+		Info:         &session.Info{Name: "pm", HistoryBudget: 100},
+		Capabilities: map[string]bool{"llm.chat": true},
+		Handlers:     map[string]session.OpHandler{},
+		// A loop that returns immediately so the session exits right away.
+		LoopSrc: "function loop() end",
+	}
+	parent := session.Identity{
+		SessionID:    "planner|x",
+		Agent:        "planner",
+		CanContact:   map[string]bool{"pm": true},
+		Capabilities: map[string]bool{"agent.send": true, "llm.chat": true},
+	}
+	// First send creates the never-before-seen session.
+	if err := sup.Send(context.Background(), parent, "session:pm|proj:y", map[string]any{"n": 1}); err != nil {
+		t.Fatalf("initial find-or-create failed: %v", err)
+	}
+	// The session exits (its loop returns). Give onActorExit a moment to retire it,
+	// then ensure termination with StopSession in case the loop is still parked.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		sup.StopSession("pm|proj:y")
+		sup.mu.Lock()
+		_, live := sup.sessions["pm|proj:y"]
+		_, retired := sup.retired["pm|proj:y"]
+		sup.mu.Unlock()
+		if !live && retired {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("session did not retire (live=%v retired=%v)", live, retired)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// A subsequent send must fail, not resurrect.
+	if err := sup.Send(context.Background(), parent, "session:pm|proj:y", map[string]any{"n": 2}); err == nil {
+		t.Fatal("send to exited session should have failed, not resurrected it")
+	}
+	sup.mu.Lock()
+	_, recreated := sup.sessions["pm|proj:y"]
+	sup.mu.Unlock()
+	if recreated {
+		t.Fatal("exited session must not be resurrected")
+	}
+}
+

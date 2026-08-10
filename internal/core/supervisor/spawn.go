@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 
 	"agentflow/internal/builtins"
+	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/session"
 )
 
@@ -88,6 +89,7 @@ func (s *Supervisor) Spawn(ctx context.Context, parent session.Identity, profile
 	s.mu.Unlock()
 
 	go a.Run(actorCtx)
+	metrics.Inc("agentflow_children_spawned")
 	s.log.Info("child spawned", "child", skey, "parent", parent.SessionID, "profile", profile)
 
 	return session.SpawnResult{

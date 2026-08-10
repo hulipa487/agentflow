@@ -10,17 +10,62 @@ import (
 )
 
 // Pool is a token budget. A parent pool may have child pools carved from it.
+//
+// Accounting has two modes:
+//   - Daily reset (default): `used` accumulates until ResetDaily zeroes it at
+//     the UTC day boundary. This is the historical tokens_per_day behavior.
+//   - Rolling window: when window > 0, every commit is appended to a timestamped
+//     log and the effective usage is the sum over the trailing window. Reserve
+//     and capacity checks read the windowed sum, so budget frees up continuously
+//     as old commits age out instead of only at midnight.
 type Pool struct {
-	mu      sync.Mutex
-	limit   int64
-	used    int64
+	mu       sync.Mutex
+	limit    int64
+	used     int64
 	reserved int64
-	parent  *Pool
+	parent   *Pool
+	window   time.Duration // 0 = daily-reset mode
+	commits  []commit      // windowed-mode commit log, oldest first
+	now      func() time.Time
+}
+
+type commit struct {
+	ts     time.Time
+	amount int64
 }
 
 // NewPool creates a root pool with the given daily token limit.
 func NewPool(limit int64) *Pool {
-	return &Pool{limit: limit}
+	return &Pool{limit: limit, now: time.Now}
+}
+
+// SetWindow enables rolling-window accounting over the given duration (e.g.
+// 168h for a weekly budget). The daily reset is a no-op in windowed mode;
+// usage drains continuously as commits age past the window.
+func (p *Pool) SetWindow(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.window = d
+}
+
+// windowedUsed prunes expired commits and returns the trailing-window sum.
+// Caller must hold p.mu.
+func (p *Pool) windowedUsed() int64 {
+	if p.window <= 0 {
+		return p.used
+	}
+	cutoff := p.now().Add(-p.window)
+	kept := p.commits[:0]
+	var sum int64
+	for _, c := range p.commits {
+		if c.ts.After(cutoff) {
+			kept = append(kept, c)
+			sum += c.amount
+		}
+	}
+	p.commits = kept
+	p.used = sum
+	return sum
 }
 
 // Carve creates a child pool with its own limit, drawing from the parent's
@@ -29,7 +74,7 @@ func NewPool(limit int64) *Pool {
 func (p *Pool) Carve(limit int64) (*Pool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	available := p.limit - p.used - p.reserved
+	available := p.limit - p.windowedUsed() - p.reserved
 	if limit > available {
 		return nil, fmt.Errorf("budget: cannot carve %d from parent with %d available", limit, available)
 	}
@@ -37,7 +82,8 @@ func (p *Pool) Carve(limit int64) (*Pool, error) {
 		return nil, fmt.Errorf("budget: child limit must be positive")
 	}
 	p.reserved += limit
-	return &Pool{limit: limit, parent: p}, nil
+	child := &Pool{limit: limit, parent: p, window: p.window, now: p.now}
+	return child, nil
 }
 
 // Lease represents a reservation that must be settled.
@@ -64,7 +110,7 @@ func (p *Pool) tryReserve(amount int64) bool {
 	// This is a simple two-level hierarchy; deeper nesting is not supported.
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.used+p.reserved+amount > p.limit {
+	if p.windowedUsed()+p.reserved+amount > p.limit {
 		return false
 	}
 	// Also check the parent has room for this child's reservation.
@@ -80,7 +126,7 @@ func (p *Pool) tryReserve(amount int64) bool {
 func (p *Pool) reserveFromChild(amount int64) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.used+p.reserved+amount > p.limit {
+	if p.windowedUsed()+p.reserved+amount > p.limit {
 		return false
 	}
 	p.reserved += amount
@@ -98,13 +144,21 @@ func (p *Pool) Commit(lease *Lease, actual int64) error {
 	if actual < 0 {
 		actual = 0
 	}
-	p.used += actual
+	p.recordLocked(actual)
 	p.mu.Unlock()
 	if p.parent != nil {
 		p.parent.releaseFromChild(lease.amount)
 		p.parent.commitFromChild(actual)
 	}
 	return nil
+}
+
+// recordLocked accounts actual usage. Caller must hold p.mu.
+func (p *Pool) recordLocked(actual int64) {
+	if p.window > 0 {
+		p.commits = append(p.commits, commit{ts: p.now(), amount: actual})
+	}
+	p.used += actual
 }
 
 // Release cancels a lease without consuming any budget.
@@ -129,7 +183,7 @@ func (p *Pool) releaseFromChild(amount int64) {
 
 func (p *Pool) commitFromChild(actual int64) {
 	p.mu.Lock()
-	p.used += actual
+	p.recordLocked(actual)
 	p.mu.Unlock()
 }
 
@@ -137,21 +191,26 @@ func (p *Pool) commitFromChild(actual int64) {
 func (p *Pool) Remaining() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.limit - p.used - p.reserved
+	return p.limit - p.windowedUsed() - p.reserved
 }
 
-// Used returns the committed usage.
+// Used returns the committed usage (the trailing-window sum in windowed mode).
 func (p *Pool) Used() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.used
+	return p.windowedUsed()
 }
 
-// ResetDaily resets the used counter at day boundaries (UTC).
+// ResetDaily resets the used counter at day boundaries (UTC). In windowed mode
+// this is a no-op: usage drains continuously as commits age past the window, so
+// there is no daily cliff to reset.
 func (p *Pool) ResetDaily() {
 	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.window > 0 {
+		return
+	}
 	p.used = 0
-	p.mu.Unlock()
 }
 
 // StartDailyReset starts a goroutine that resets usage at the next UTC midnight

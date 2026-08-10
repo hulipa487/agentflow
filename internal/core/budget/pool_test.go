@@ -25,6 +25,70 @@ func TestReserveCommitRelease(t *testing.T) {
 	}
 }
 
+// windowedPool returns a windowed pool whose clock the test controls.
+func windowedPool(limit int64, window time.Duration) (*Pool, *time.Time) {
+	p := NewPool(limit)
+	p.SetWindow(window)
+	now := time.Now()
+	p.now = func() time.Time { return *(&now) }
+	return p, &now
+}
+
+func TestWindowFreesBudgetAsCommitsAge(t *testing.T) {
+	p, now := windowedPool(1000, time.Hour)
+	l, _ := p.Reserve(600)
+	if err := p.Commit(l, 600); err != nil {
+		t.Fatal(err)
+	}
+	if p.Remaining() != 400 {
+		t.Fatalf("remaining=%d, want 400", p.Remaining())
+	}
+	// Advance past the window: the old commit ages out and budget frees up.
+	*now = now.Add(2 * time.Hour)
+	if p.Remaining() != 1000 {
+		t.Fatalf("remaining after window=%d, want 1000", p.Remaining())
+	}
+	if p.Used() != 0 {
+		t.Fatalf("used after window=%d, want 0", p.Used())
+	}
+}
+
+func TestWindowReserveRespectsTrailingSum(t *testing.T) {
+	p, now := windowedPool(1000, time.Hour)
+	l, _ := p.Reserve(700)
+	p.Commit(l, 700)
+	// Within the window, only 300 remain.
+	if _, err := p.Reserve(400); err == nil {
+		t.Fatal("reserve beyond windowed budget should fail")
+	}
+	// After the window, the full budget is available again.
+	*now = now.Add(2 * time.Hour)
+	if _, err := p.Reserve(1000); err != nil {
+		t.Fatalf("reserve after window should succeed: %v", err)
+	}
+}
+
+func TestWindowResetDailyIsNoop(t *testing.T) {
+	p, _ := windowedPool(1000, time.Hour)
+	l, _ := p.Reserve(500)
+	p.Commit(l, 500)
+	p.ResetDaily()
+	if p.Used() != 500 {
+		t.Fatalf("ResetDaily must not clear windowed usage; used=%d", p.Used())
+	}
+}
+
+func TestWindowCarveInheritsWindow(t *testing.T) {
+	p, _ := windowedPool(1000, time.Hour)
+	child, err := p.Carve(400)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.window != time.Hour {
+		t.Fatalf("carved child should inherit window; got %v", child.window)
+	}
+}
+
 func TestReserveExhausted(t *testing.T) {
 	p := NewPool(100)
 	if _, err := p.Reserve(50); err != nil {

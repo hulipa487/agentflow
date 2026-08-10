@@ -31,7 +31,9 @@ function memory_semantic_recall_handler(query, opts)
 
   local text = query.text or query.q
   if not text or text == "" then
-    error("semantic recall requires query.text", 2)
+    -- Non-semantic query (e.g. a loop's kind="all" history fetch): defer to
+    -- the default recency handler so mixed profiles keep working.
+    return memory_recall_handler(query, opts)
   end
 
   local embed_model = opts.model or mem.embed_model

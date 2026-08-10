@@ -276,19 +276,30 @@ end
 memory = {}
 function memory.write(record)
   local targets = memory_routing_table(record)
-  -- When the memory profile names an embed_model, attach an embedding of
-  -- the record text so vector-capable backends can serve semantic recall.
   local info = agent.info()
-  local embed_model = info.memory and info.memory.embed_model
+  local mem = info.memory or {}
+  local embed_model = mem.embed_model
+  local stores = mem.stores or {}
   for _, t in ipairs(targets) do
     local opts = { ttl = t.ttl }
+    -- Embed only when the profile names an embed_model AND the target
+    -- store's backend can hold vectors; other stores get plain puts.
     if embed_model and embed_model ~= "" then
-      local text = t.value
-      if type(text) == "table" then text = text.text or json.encode(text) end
-      if type(text) == "string" and #text > 0 then
-        local r = llm.embed({ text }, { model = embed_model })
-        if r and r.vectors and r.vectors[1] then
-          opts.vector = r.vectors[1]
+      local can_vector = false
+      local s = stores[t.store]
+      if s and s.features then
+        for _, f in ipairs(s.features) do
+          if f == "vector" then can_vector = true; break end
+        end
+      end
+      if can_vector then
+        local text = t.value
+        if type(text) == "table" then text = text.text or json.encode(text) end
+        if type(text) == "string" and #text > 0 then
+          local r = llm.embed({ text }, { model = embed_model })
+          if r and r.vectors and r.vectors[1] then
+            opts.vector = r.vectors[1]
+          end
         end
       end
     end

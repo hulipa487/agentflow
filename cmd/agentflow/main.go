@@ -224,6 +224,9 @@ func main() {
 		for k, h := range caps.HTTPHandlers(log, credStore) {
 			handlers[k] = h
 		}
+		for k, h := range caps.MailHandlers(log, credStore) {
+			handlers[k] = h
+		}
 
 		effectiveCaps := capabilitySet(a.Capabilities)
 		canContact := stringSet(a.CanContact)
@@ -322,6 +325,9 @@ func main() {
 			handlers[k] = h
 		}
 		for k, h := range caps.HTTPHandlers(log, credStore) {
+			handlers[k] = h
+		}
+		for k, h := range caps.MailHandlers(log, credStore) {
 			handlers[k] = h
 		}
 

@@ -562,7 +562,7 @@ llm.rerank(query, documents, opts?) -> { results } -- results: [{ index, score }
 -- opts: { model = "default", temperature = 0.7, max_tokens = 4096,
 --         tools = [...], tool_choice = "auto" | "none" }</code></pre>
   <p>Messages are arrays of <code>{ role, content, tool_calls?, tool_call_id?, tool_result? }</code>. <code>llm.stream</code> returns a closure; call it directly (<code>local d = next_chunk()</code>), never in a generic <code>for ... in</code> — the iterator protocol cannot yield across the C boundary.</p>
-  <p><code>llm.embed</code> works with any OpenAI-compatible <code>/embeddings</code> endpoint (Ollama, vLLM, TEI, OpenRouter); the Anthropic provider has no embeddings API and fails explicitly. <code>llm.rerank</code> requires a <code>provider: rerank</code> model entry speaking <code>POST {base_url}/rerank</code> (TEI, vLLM, Jina, Cohere). Both are token-metered when the agent declares a budget.</p>
+  <p><code>llm.embed</code> works with any OpenAI-compatible <code>/embeddings</code> endpoint (Ollama, vLLM, TEI, OpenRouter); the Anthropic provider has no embeddings API and fails explicitly. <code>llm.rerank</code> requires a <code>provider: rerank</code> model entry speaking <code>POST {base_url}/rerank</code> (TEI, vLLM, Jina, Cohere). <code>llm.embed</code> is token-metered when the agent declares a budget.</p>
 
   <h4><code>agent</code> — caps: <code>agent.send</code>, <code>agent.request</code>, <code>agent.spawn</code></h4>
   <pre><code>agent.info() -> { name, session_id, address, model, instructions,

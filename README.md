@@ -9,6 +9,7 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 - **Actor-model sessions** — per-session Luau state, message-passing only, hot reload of loops and instructions.
 - **Multi-agent** — `agent.send` / `agent.request` / `agent.reply` / `agent.spawn`, address authority with `can_contact` ACLs, ephemeral children with budget/lifetime limits.
 - **Memory** — provider → backend → store layering; `builtin:conversational` preset; retention/window GC.
+- **Embeddings & reranking** — `llm.embed` (OpenAI-compatible `/embeddings`) and `llm.rerank` (Jina/Cohere/TEI/vLLM `/rerank`); pgvector ingest on write and a `builtin:semantic` recall pipeline (embed → vector k-NN → rerank).
 - **Tools** — filesystem & git inside shell handles, honest-degradation `web_search`, and MCP stdio servers discovered at boot.
 - **Shell** — Docker and SSH providers with resource limits and an exec-policy filter.
 - **HTTP** — `http.request` / `os.env` Lua ops with scheme validation, body cap, and secret-header redaction.
@@ -22,7 +23,7 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 
 | Domain | Providers |
 |---|---|
-| LLM | `anthropic` (Messages API), `openai` (Chat Completions), `openai-responses` (Responses API) — all pointed at compatible endpoints via `base_url` |
+| LLM | `anthropic` (Messages API), `openai` (Chat Completions + Embeddings), `openai-responses` (Responses API), `rerank` (cross-encoder rerank) — all pointed at compatible endpoints via `base_url` |
 | Storage | SQLite, Redis, MongoDB, PostgreSQL |
 | Vector | pgvector (cosine similarity) |
 | Channels | webhook, Telegram (polling + webhook) |
@@ -81,6 +82,7 @@ models:
 | `examples/agentflow.keyless-chat.yaml` | Local keyless model over webhook |
 | `examples/agentflow.memory-default.yaml` | `builtin:conversational` memory (auto sqlite backend) |
 | `examples/agentflow.memory-tools.yaml` | Memory + tools + webhook |
+| `examples/agentflow.semantic-memory.yaml` | Embedding writes + pgvector recall + optional rerank |
 | `examples/agentflow.stream.yaml` | `llm.stream` delta-by-delta consumption |
 | `examples/agentflow.shell-tools.yaml` | Shell (Docker) + filesystem/git tools |
 | `examples/agentflow.telegram.yaml` | Anthropic + Telegram polling |

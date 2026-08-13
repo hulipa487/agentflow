@@ -388,6 +388,43 @@ end
 os = {}
 function os.env(name) return op({ type = "os.env", name = name }) end
 
+-- mail: IMAP fetch and SMTP send, in-process via the net.mail runtime cap.
+-- Like http.request, auth={service=...} names a stored credential resolved by
+-- Go; the password never crosses the Lua bridge. Host/port/username come from
+-- the loop (typically via os.env) and never sit in Lua source.
+mail = {}
+-- mail.imap_fetch{host, port, user, mailbox, unseen, limit, auth} ->
+--   {ok, mailbox, count, messages:[{seq,uid,flags,subject,from,to,date,body}]}
+function mail.imap_fetch(opts)
+  opts = opts or {}
+  return op({
+    type     = "mail.imap.fetch",
+    mail_host = opts.host,
+    mail_port = opts.port,
+    mail_user = opts.user,
+    mailbox   = opts.mailbox,
+    unseen    = opts.unseen,
+    limit     = opts.limit,
+    auth      = opts.auth,   -- {service=...}: stored IMAP password
+  })
+end
+-- mail.smtp_send{host, port, user, from, to, subject, text_body, auth} ->
+--   {ok, sent}
+function mail.smtp_send(opts)
+  opts = opts or {}
+  return op({
+    type      = "mail.smtp.send",
+    mail_host = opts.host,
+    mail_port = opts.port,
+    mail_user = opts.user,
+    mail_from = opts.from,
+    mail_to   = opts.to,     -- array of recipient addresses
+    subject   = opts.subject,
+    text_body = opts.text_body or opts.body,
+    auth      = opts.auth,   -- {service=...}: stored SMTP password
+  })
+end
+
 local function with_opts(req, opts)
   if opts then for k, v in pairs(opts) do req[k] = v end end
   return req

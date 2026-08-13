@@ -1,46 +1,51 @@
 // Package telegram is the Telegram channel driver.
 //
-// Two modes are supported, selected by the "mode" channel config:
+// Three modes, selected by the "mode" channel config:
 //   - "polling" (default): long-poll getUpdates in, sendMessage out.
-//   - "webhook": receives POST updates at a path, sendMessage out.
+//   - "webhook": receives POST updates at a path, sendMessage out. Requires
+//     public_url to be set (the runtime must be externally reachable).
+//   - "auto": health-probe the public_url at startup — setWebhook if
+//     reachable, otherwise deleteWebhook and long-poll. Falls back to polling
+//     without the webhook host dying silently.
 //
-// Access control (allow_users) is enforced in both modes before any Lua runs.
+// Access control (allow_users) is enforced in all modes before any Lua runs.
 package telegram
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"agentflow/internal/core/router"
 	"agentflow/internal/core/session"
+	"agentflow/internal/drivers/httpd"
 )
 
 // Driver is the Telegram channel driver. It implements gateway.Driver for
 // replies (sendMessage) and either polls or serves a webhook for inbound.
 type Driver struct {
-	name    string
-	token   string
-	agent   string
-	allow   map[int64]bool // empty = allow all
-	mode    string          // "polling" | "webhook"
-	listen  string          // webhook mode only
-	path    string          // webhook mode only
-	sink    router.Sink
-	log     *slog.Logger
-	client  *http.Client
-	seq     int64
-	srv     *http.Server
+	name      string
+	token     string
+	agent     string
+	allow     map[int64]bool // empty = allow all
+	mode      string          // "polling" | "webhook" | "auto"
+	path      string          // webhook mode only
+	publicURL string          // webhook/auto: external base that routes to this process
+	apiBase   string          // override for the Telegram API host (tests); empty = api.telegram.org
+	sink      router.Sink
+	log       *slog.Logger
+	client    *http.Client
+	seq       int64
 }
 
-func New(name, token, agent, mode string, allowUsers []int64, listen, path string, sink router.Sink, log *slog.Logger) *Driver {
+func New(name, token, agent, mode string, allowUsers []int64, path, publicURL string, sink router.Sink, srv *httpd.Server, log *slog.Logger) *Driver {
 	allow := map[int64]bool{}
 	for _, id := range allowUsers {
 		allow[id] = true
@@ -48,45 +53,136 @@ func New(name, token, agent, mode string, allowUsers []int64, listen, path strin
 	if mode == "" {
 		mode = "polling"
 	}
-	return &Driver{
-		name:    name,
-		token:   token,
-		agent:   agent,
-		allow:   allow,
-		mode:    mode,
-		listen:  listen,
-		path:     path,
-		sink:    sink,
-		log:     log.With("driver", "telegram", "channel", name, "mode", mode),
-		client:  &http.Client{Timeout: 40 * time.Second},
+	d := &Driver{
+		name:      name,
+		token:     token,
+		agent:     agent,
+		allow:     allow,
+		mode:      mode,
+		path:      path,
+		publicURL: publicURL,
+		sink:      sink,
+		log:       log.With("driver", "telegram", "channel", name, "mode", mode),
+		client:    &http.Client{Timeout: 40 * time.Second},
 	}
+	// webhook mode pre-registers its handler; polling/auto defer the decision.
+	if mode == "webhook" || mode == "auto" {
+		if d.path == "" {
+			d.path = "/webhook/telegram/"
+		}
+		if mode == "webhook" {
+			srv.Handle(d.path, d.handleWebhook)
+		}
+		// auto: handler attached lazily in Start once the probe decides webhook
+		// is viable — avoids registering a route that receivers will never hit.
+	}
+	return d
 }
 
 func (d *Driver) Name() string { return d.name }
 
-// Start launches the driver. In polling mode, it runs a long-poll loop. In
-// webhook mode, it starts an HTTP server receiving updates at the configured path.
-func (d *Driver) Start(ctx context.Context) error {
+// Start launches the driver by mode. polling/webhook are synchronous; auto
+// probes publicURL/health first and branches to webhook or polling.
+func (d *Driver) Start(ctx context.Context, srv *httpd.Server) error {
 	switch d.mode {
 	case "polling":
 		go d.poll(ctx)
 		return nil
 	case "webhook":
-		return d.startWebhook(ctx)
+		if d.publicURL == "" {
+			return fmt.Errorf("telegram webhook mode requires gateway.public_url")
+		}
+		if err := d.setWebhook(d.publicURL + strings.TrimRight(d.path, "/") + "/"); err != nil {
+			return fmt.Errorf("setWebhook: %w", err)
+		}
+		d.log.Info("telegram webhook registered", "url", d.publicURL+d.path)
+		return nil
+	case "auto":
+		return d.startAuto(ctx, srv)
 	default:
-		return fmt.Errorf("telegram: unknown mode %q (use polling or webhook)", d.mode)
+		return fmt.Errorf("telegram: unknown mode %q (use polling, webhook, or auto)", d.mode)
 	}
 }
 
-// Stop shuts down the webhook server if running.
-func (d *Driver) Stop(ctx context.Context) {
-	if d.srv != nil {
-		_ = d.srv.Shutdown(ctx)
+// startAuto implements the health-gated webhook→polling fallback.
+func (d *Driver) startAuto(ctx context.Context, srv *httpd.Server) error {
+	if d.publicURL == "" {
+		d.log.Info("auto: no public_url, polling")
+		go d.poll(ctx)
+		return nil
 	}
+	r := httpd.Probe(ctx, d.publicURL)
+	d.log.Info("auto: health probe", "url", d.publicURL, "ok", r.OK, "latency_ms", r.Latency.Milliseconds(), "err", r.Err)
+	if !r.OK {
+		// Webhook host is unreachable: ensure Telegram isn't holding a stale
+		// webhook URL against us, then long-poll. This is the documented
+		// fallback — a failed GET to the domain disables webhook.
+		if err := d.deleteWebhook(); err != nil {
+			d.log.Warn("auto: deleteWebhook failed", "err", err)
+		}
+		d.log.Info("auto: webhook unreachable, falling back to polling")
+		go d.poll(ctx)
+		return nil
+	}
+	// healthy: register the webhook with Telegram and attach the handler.
+	hookURL := d.publicURL + strings.TrimRight(d.path, "/") + "/"
+	if err := d.setWebhook(hookURL); err != nil {
+		d.log.Warn("auto: setWebhook failed, polling instead", "err", err)
+		go d.poll(ctx)
+		return nil
+	}
+	srv.Handle(d.path, d.handleWebhook)
+	d.log.Info("auto: webhook registered", "url", hookURL)
+	return nil
 }
+
+// Stop is a no-op now; the shared httpd.Server owns the listener lifetime and
+// polling exits via ctx cancellation. Method retained for the Driver surface.
+func (d *Driver) Stop(_ context.Context) {}
 
 func (d *Driver) apiURL(method string) string {
-	return "https://api.telegram.org/bot" + d.token + "/" + method
+	base := d.apiBase
+	if base == "" {
+		base = "https://api.telegram.org"
+	}
+	return base + "/bot" + d.token + "/" + method
+}
+
+// setWebhook registers hookURL with Telegram so updates are pushed there.
+// An empty URL clears the webhook (see deleteWebhook). drain is false so we
+// don't drop in-flight updates on the switch.
+func (d *Driver) setWebhook(hookURL string) error {
+	body, _ := json.Marshal(map[string]any{
+		"url":             hookURL,
+		"allowed_updates": []string{"message"},
+	})
+	return d.postAPI("setWebhook", body)
+}
+
+// deleteWebhook clears any registered webhook URL so Telegram stops pushing.
+func (d *Driver) deleteWebhook() error {
+	body, _ := json.Marshal(map[string]any{"drop_pending_updates": false})
+	return d.postAPI("deleteWebhook", body)
+}
+
+func (d *Driver) postAPI(method string, body []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.apiURL(method), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return fmt.Errorf("%s: %d: %s", method, resp.StatusCode, b)
+	}
+	return nil
 }
 
 type update struct {
@@ -167,25 +263,6 @@ func (d *Driver) getUpdates(ctx context.Context, offset int64) ([]update, error)
 
 // --- webhook mode ---
 
-func (d *Driver) startWebhook(ctx context.Context) error {
-	if d.listen == "" {
-		return fmt.Errorf("telegram webhook: listen is required")
-	}
-	if d.path == "" {
-		d.path = "/telegram/" + d.name
-	}
-	mux := http.NewServeMux()
-	mux.HandleFunc(d.path, d.handleWebhook)
-	d.srv = &http.Server{Addr: d.listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-	d.log.Info("telegram webhook listening", "addr", d.listen, "path", d.path)
-	go func() {
-		if err := d.srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			d.log.Error("telegram webhook server died", "err", err)
-		}
-	}()
-	return nil
-}
-
 func (d *Driver) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
@@ -228,7 +305,7 @@ func (d *Driver) handleUpdate(u update) {
 				"chat_id":  chatID,
 				"user_id":  m.From.ID,
 				"username": m.From.Username,
-				"name":      m.From.FirstName,
+				"name":     m.From.FirstName,
 			},
 		},
 	})

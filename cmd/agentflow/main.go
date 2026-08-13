@@ -34,6 +34,7 @@ import (
 	"agentflow/internal/core/supervisor"
 	"agentflow/internal/core/tools"
 	"agentflow/internal/drivers/ghhook"
+	"agentflow/internal/drivers/httpd"
 	"agentflow/internal/drivers/llm"
 	"agentflow/internal/drivers/mcp"
 	"agentflow/internal/drivers/mongodb"
@@ -434,9 +435,12 @@ func main() {
 		log.Info("identity layer enabled", "db", idPath)
 	}
 
-	// Channels. "webhooks" collects all channel drivers that need graceful
-	// shutdown (webhook + telegram-webhook).
-	var channels []channelStopper
+	// Channels. All HTTP channels (webhook, ghhook, telegram-webhook/auto)
+	// now attach to one shared httpd.Server on a single listener, instead of
+	// each spinning up its own port. The server starts after every channel
+	// has registered its path, so a path panic surfaces before we bind.
+	httpdLog := log.With("module", "httpd")
+	httpSrv := httpd.New(cfg.Gateway.Listen, httpdLog)
 	for i, ch := range cfg.Gateway.Channels {
 		name := ch.Name
 		if name == "" {
@@ -444,30 +448,25 @@ func main() {
 		}
 		switch ch.Type {
 		case "webhook":
-			d := webhook.New(name, ch.Listen, ch.Path, ch.Agent, sink, log)
-			if err := d.Start(); err != nil {
-				log.Error("channel start failed", "channel", name, "err", err)
-				os.Exit(1)
-			}
+			d := webhook.New(name, ch.Path, ch.Agent, sink, httpSrv, log)
 			gw.Register(d)
-			channels = append(channels, d)
 		case "telegram":
-			d := telegram.New(name, ch.Token, ch.Agent, ch.Mode, ch.AllowUsers, ch.Listen, ch.Path, sink, log)
-			if err := d.Start(ctx); err != nil {
+			d := telegram.New(name, ch.Token, ch.Agent, ch.Mode, ch.AllowUsers, ch.Path, cfg.Gateway.PublicURL, sink, httpSrv, log)
+			if err := d.Start(ctx, httpSrv); err != nil {
 				log.Error("channel start failed", "channel", name, "err", err)
 				os.Exit(1)
 			}
 			gw.Register(d)
-			channels = append(channels, d)
 		case "ghhook":
-			d := ghhook.New(name, ch.Listen, ch.Path, ch.Agent, ch.Secret, sink, log)
-			if err := d.Start(); err != nil {
-				log.Error("channel start failed", "channel", name, "err", err)
-				os.Exit(1)
-			}
+			d := ghhook.New(name, ch.Path, ch.Agent, ch.Secret, sink, httpSrv, log)
 			gw.Register(d)
-			channels = append(channels, d)
 		}
+	}
+	// Bind the shared listener now that every path is mounted. A bind failure
+	// (port in use, bad addr) is fatal and must surface before "agentflow up".
+	if err := httpSrv.Start(); err != nil {
+		log.Error("httpd server failed to start", "listen", cfg.Gateway.Listen, "err", err)
+		os.Exit(1)
 	}
 
 	watcher := reload.New(sup, log)
@@ -517,16 +516,10 @@ func main() {
 	adminStopCtx, adminCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer adminCancel()
 	_ = admin.Stop(adminStopCtx)
+	// The shared httpd.Server owns the one listener; stop it once here.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	for _, d := range channels {
-		d.Stop(shutdownCtx)
-	}
-}
-
-// channelStopper is the shutdown interface for channel drivers.
-type channelStopper interface {
-	Stop(context.Context)
+	httpSrv.Stop(shutdownCtx)
 }
 
 func capabilitySet(caps []string) map[string]bool {

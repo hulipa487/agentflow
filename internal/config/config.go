@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -273,17 +274,19 @@ type Agent struct {
 }
 
 type Gateway struct {
-	Route    string    `yaml:"route"`
-	Channels []Channel `yaml:"channels"`
+	Route     string    `yaml:"route"`
+	Listen    string    `yaml:"listen"`     // the single shared HTTP listener (default :8080)
+	PublicURL string    `yaml:"public_url"` // external base, e.g. https://agentflow.example.com
+	Channels  []Channel `yaml:"channels"`
 }
 
 type Channel struct {
 	Name       string  `yaml:"name"`
 	Type       string  `yaml:"type"` // webhook | telegram | ghhook
-	Mode       string  `yaml:"mode"` // telegram: polling (default) | webhook
+	Mode       string  `yaml:"mode"` // telegram: polling (default) | webhook | auto
 	Agent      string  `yaml:"agent"`
-	Listen     string  `yaml:"listen"`
-	Path       string  `yaml:"path"`
+	Path       string  `yaml:"path"` // route mounted on the shared server, e.g. /webhook/<chan>/<uuid>/
+	Prefix     string  `yaml:"prefix"` // reserved for future per-channel secret-prefix use
 	Token      string  `yaml:"token"`
 	Secret     string  `yaml:"secret"` // ghhook: webhook secret for HMAC verification (env-interpolated)
 	AllowUsers []int64 `yaml:"allow_users"`
@@ -494,6 +497,18 @@ func validate(path string, c *Config) error {
 		}
 	}
 
+	// The shared HTTP listener: one port for every HTTP channel now. Default
+	// to :8080 when unset; operators typically bind loopback behind a proxy.
+	if c.Gateway.Listen == "" {
+		c.Gateway.Listen = ":8080"
+	}
+	if c.Gateway.PublicURL != "" {
+		if !strings.HasPrefix(c.Gateway.PublicURL, "http://") && !strings.HasPrefix(c.Gateway.PublicURL, "https://") {
+			return fmt.Errorf("%s: gateway.public_url must start with http:// or https:// (got %q)", path, c.Gateway.PublicURL)
+		}
+	}
+
+	seenPaths := map[string]string{} // path -> channel name, for collision detection
 	for i, ch := range c.Gateway.Channels {
 		if ch.Agent == "" {
 			return fmt.Errorf("%s: channel #%d (%s) has no agent", path, i, ch.Type)
@@ -503,12 +518,14 @@ func validate(path string, c *Config) error {
 		}
 		switch ch.Type {
 		case "webhook":
-			if ch.Listen == "" {
-				return fmt.Errorf("%s: webhook channel %q has no listen", path, ch.Name)
+			// path defaults are applied by the driver; here we only require that
+			// any explicit path ends in "/" so the subtree match covers the UUID.
+			if ch.Path != "" && !strings.HasSuffix(ch.Path, "/") {
+				return fmt.Errorf("%s: webhook channel %q path must end with / (got %q)", path, ch.Name, ch.Path)
 			}
 		case "ghhook":
-			if ch.Listen == "" {
-				return fmt.Errorf("%s: ghhook channel %q has no listen", path, ch.Name)
+			if ch.Path != "" && !strings.HasSuffix(ch.Path, "/") {
+				return fmt.Errorf("%s: ghhook channel %q path must end with / (got %q)", path, ch.Name, ch.Path)
 			}
 		case "telegram":
 			if ch.Token == "" {
@@ -517,14 +534,26 @@ func validate(path string, c *Config) error {
 			if ch.Mode == "" {
 				ch.Mode = "polling"
 			}
-			if ch.Mode != "polling" && ch.Mode != "webhook" {
-				return fmt.Errorf("%s: telegram channel %q has unsupported mode %q (use polling or webhook)", path, ch.Name, ch.Mode)
+			if ch.Mode != "polling" && ch.Mode != "webhook" && ch.Mode != "auto" {
+				return fmt.Errorf("%s: telegram channel %q has unsupported mode %q (use polling, webhook, or auto)", path, ch.Name, ch.Mode)
 			}
-			if ch.Mode == "webhook" && ch.Listen == "" {
-				return fmt.Errorf("%s: telegram channel %q webhook mode requires listen", path, ch.Name)
+			if ch.Mode == "webhook" && c.Gateway.PublicURL == "" {
+				return fmt.Errorf("%s: telegram channel %q webhook mode requires gateway.public_url", path, ch.Name)
+			}
+			if ch.Path != "" && !strings.HasSuffix(ch.Path, "/") {
+				return fmt.Errorf("%s: telegram channel %q path must end with / (got %q)", path, ch.Name, ch.Path)
 			}
 		default:
-			return fmt.Errorf("%s: unsupported channel type %q", path, ch.Type)
+			return fmt.Errorf("%s: unsupported channel type %q (channel %q)", path, ch.Type, ch.Name)
+		}
+		// path collision check — the shared mux panics on dupes, but a config
+		// error is friendlier and names both colliding channels.
+		key := ch.Path
+		if key != "" {
+			if prev, dup := seenPaths[key]; dup {
+				return fmt.Errorf("%s: channels %q and %q mount the same path %q", path, prev, ch.Name, key)
+			}
+			seenPaths[key] = ch.Name
 		}
 	}
 

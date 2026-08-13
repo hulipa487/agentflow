@@ -1,12 +1,12 @@
 // Package webhook is the HTTP channel driver: POST {"from","text"} in,
 // synchronous reply out. Inbound events go to the router; the session's
-// reply resolves the pending request by correlation id.
+// reply resolves the pending request by correlation id. It attaches to the
+// shared httpd.Server (see internal/drivers/httpd) rather than listening on
+// its own port.
 package webhook
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -16,62 +16,44 @@ import (
 
 	"agentflow/internal/core/router"
 	"agentflow/internal/core/session"
+	"agentflow/internal/drivers/httpd"
 )
 
 // Driver accepts webhooks and implements gateway.Driver for replies.
 type Driver struct {
-	name   string
-	listen string
-	path   string
-	agent  string
-	sink   router.Sink
-	log    *slog.Logger
+	name  string
+	path  string
+	agent string
+	sink  router.Sink
+	log   *slog.Logger
 
 	seq     atomic.Uint64
 	mu      sync.Mutex
 	pending map[string]chan string // request id → reply waiter
-	srv     *http.Server
 }
 
-func New(name, listen, path, agent string, sink router.Sink, log *slog.Logger) *Driver {
+func New(name, path, agent string, sink router.Sink, srv *httpd.Server, log *slog.Logger) *Driver {
 	if path == "" {
-		path = "/webhook"
+		path = "/webhook/"
 	}
-	return &Driver{
+	d := &Driver{
 		name:    name,
-		listen:  listen,
 		path:    path,
 		agent:   agent,
 		sink:    sink,
 		log:     log.With("driver", "webhook", "channel", name),
 		pending: map[string]chan string{},
 	}
+	srv.Handle(path, d.handle)
+	return d
 }
 
 func (d *Driver) Name() string { return d.name }
+func (d *Driver) Path() string  { return d.path }
 
 type inbound struct {
 	From string `json:"from"`
 	Text string `json:"text"`
-}
-
-func (d *Driver) Start() error {
-	mux := http.NewServeMux()
-	mux.HandleFunc(d.path, d.handle)
-	d.srv = &http.Server{Addr: d.listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-	d.log.Info("webhook listening", "addr", d.listen, "path", d.path)
-	go func() {
-		if err := d.srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			d.log.Error("webhook server died", "err", err)
-		}
-	}()
-	return nil
-}
-
-func (d *Driver) Stop(ctx context.Context) {
-	if d.srv != nil {
-		_ = d.srv.Shutdown(ctx)
-	}
 }
 
 func (d *Driver) handle(w http.ResponseWriter, r *http.Request) {

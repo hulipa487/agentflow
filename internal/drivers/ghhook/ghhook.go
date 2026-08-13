@@ -5,8 +5,9 @@
 // the router as an agent-typed message whose payload is the decoded event. The
 // route then delivers it to the owning project-manager session by repo slug.
 //
-// It implements the intake half only; there is nothing to reply to, so Deliver
-// reports an error (events never carry a chat target).
+// It attaches to the shared httpd.Server; the intake half only — there is
+// nothing to reply to, so Deliver reports an error (events never carry a chat
+// target).
 package ghhook
 
 import (
@@ -15,7 +16,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -24,39 +24,40 @@ import (
 
 	"agentflow/internal/core/router"
 	"agentflow/internal/core/session"
+	"agentflow/internal/drivers/httpd"
 )
 
 // Driver receives GitHub webhooks and forwards them as agent events.
 type Driver struct {
 	name   string
-	listen string
 	path   string
 	agent  string
 	secret string // webhook secret for HMAC verification; empty = skip verify (dev)
 	sink   router.Sink
 	log    *slog.Logger
-
-	srv *http.Server
 }
 
-// New builds the driver. secret is the GitHub webhook secret; when empty the
-// signature check is skipped (local development only — never in production).
-func New(name, listen, path, agent, secret string, sink router.Sink, log *slog.Logger) *Driver {
+// New builds the driver and attaches its handler to the shared httpd.Server.
+// secret is the GitHub webhook secret; when empty the signature check is
+// skipped (local development only — never in production).
+func New(name, path, agent, secret string, sink router.Sink, srv *httpd.Server, log *slog.Logger) *Driver {
 	if path == "" {
-		path = "/hooks/github"
+		path = "/hooks/github/"
 	}
-	return &Driver{
+	d := &Driver{
 		name:   name,
-		listen: listen,
 		path:   path,
 		agent:  agent,
 		secret: secret,
 		sink:   sink,
 		log:    log.With("driver", "ghhook", "channel", name),
 	}
+	srv.Handle(path, d.handle)
+	return d
 }
 
 func (d *Driver) Name() string { return d.name }
+func (d *Driver) Path() string  { return d.path }
 
 // Deliver implements gateway.Driver. Events have no chat target, so there is
 // nothing to deliver; this is always an error.
@@ -127,21 +128,6 @@ func (d *Driver) handle(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (d *Driver) Start() error {
-	mux := http.NewServeMux()
-	mux.HandleFunc(d.path, d.handle)
-	d.srv = &http.Server{Addr: d.listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-	d.log.Info("github webhook listening", "addr", d.listen, "path", d.path)
-	go func() {
-		if err := d.srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			d.log.Error("github webhook server died", "err", err)
-		}
-	}()
-	return nil
-}
-
-func (d *Driver) Stop(ctx context.Context) {
-	if d.srv != nil {
-		_ = d.srv.Shutdown(ctx)
-	}
-}
+// Stop is a no-op now; the shared httpd.Server owns the listener lifetime. Kept
+// as a method so callers that haven't been fully migrated don't break the build.
+func (d *Driver) Stop(_ context.Context) {}

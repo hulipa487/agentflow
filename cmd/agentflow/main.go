@@ -437,10 +437,14 @@ func main() {
 
 	// Channels. All HTTP channels (webhook, ghhook, telegram-webhook/auto)
 	// now attach to one shared httpd.Server on a single listener, instead of
-	// each spinning up its own port. The server starts after every channel
-	// has registered its path, so a path panic surfaces before we bind.
+	// each spinning up its own port. Two phases:
+	//   1. construct drivers (this mounts every path on the mux),
+	//   2. bind the listener, then Start the telegram drivers — because auto
+	//      probes <public_url>/health, which round-trips through the public
+	//      proxy back to this listener, and a probe before bind always fails.
 	httpdLog := log.With("module", "httpd")
 	httpSrv := httpd.New(cfg.Gateway.Listen, httpdLog)
+	var telegramDrivers []*telegram.Driver
 	for i, ch := range cfg.Gateway.Channels {
 		name := ch.Name
 		if name == "" {
@@ -452,21 +456,26 @@ func main() {
 			gw.Register(d)
 		case "telegram":
 			d := telegram.New(name, ch.Token, ch.Agent, ch.Mode, ch.AllowUsers, ch.Path, cfg.Gateway.PublicURL, sink, httpSrv, log)
-			if err := d.Start(ctx, httpSrv); err != nil {
-				log.Error("channel start failed", "channel", name, "err", err)
-				os.Exit(1)
-			}
 			gw.Register(d)
+			telegramDrivers = append(telegramDrivers, d)
 		case "ghhook":
 			d := ghhook.New(name, ch.Path, ch.Agent, ch.Secret, sink, httpSrv, log)
 			gw.Register(d)
 		}
 	}
-	// Bind the shared listener now that every path is mounted. A bind failure
-	// (port in use, bad addr) is fatal and must surface before "agentflow up".
+	// Bind the shared listener now that every path is mounted, BEFORE the
+	// telegram auto probe runs (a probe before bind would fail and force
+	// polling). A bind failure (port in use, bad addr) is fatal and must
+	// surface before "agentflow up".
 	if err := httpSrv.Start(); err != nil {
 		log.Error("httpd server failed to start", "listen", cfg.Gateway.Listen, "err", err)
 		os.Exit(1)
+	}
+	for _, d := range telegramDrivers {
+		if err := d.Start(ctx); err != nil {
+			log.Error("channel start failed", "channel", d.Name(), "err", err)
+			os.Exit(1)
+		}
 	}
 
 	watcher := reload.New(sup, log)

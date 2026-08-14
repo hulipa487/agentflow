@@ -4,28 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
-
-	"agentflow/internal/drivers/httpd"
 )
-
-// freePort returns an addr for the httpd server in tests (no real listener
-// is bound; Start is only called if we need a live socket, which these tests
-// don't).
-func freePort(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	return ln.Addr().String()
-}
 
 // mockTG is a minimal Telegram API server for testing setWebhook/deleteWebhook
 // and the auto-mode probe decision. It records the calls it received.
@@ -81,7 +65,7 @@ func TestAutoNoPublicURLPolls(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
-	if err := d.Start(ctx, nil); err != nil {
+	if err := d.Start(ctx); err != nil {
 		t.Fatalf("auto start: %v", err)
 	}
 }
@@ -111,7 +95,7 @@ func TestAutoHealthySetsWebhook(t *testing.T) {
 		log:       testLogger(),
 		client:    &http.Client{Timeout: 5 * time.Second},
 	}
-	if err := d.Start(context.Background(), httpd.New(freePort(t), nil)); err != nil {
+	if err := d.Start(context.Background()); err != nil {
 		t.Fatalf("auto start: %v", err)
 	}
 	if m.sets != 1 {
@@ -137,7 +121,7 @@ func TestAutoUnreachableFallsBackToPolling(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
-	if err := d.Start(ctx, nil); err != nil {
+	if err := d.Start(ctx); err != nil {
 		t.Fatalf("auto start: %v", err)
 	}
 	// unreachable should call deleteWebhook and not setWebhook

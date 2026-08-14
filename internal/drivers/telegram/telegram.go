@@ -65,25 +65,26 @@ func New(name, token, agent, mode string, allowUsers []int64, path, publicURL st
 		log:       log.With("driver", "telegram", "channel", name, "mode", mode),
 		client:    &http.Client{Timeout: 40 * time.Second},
 	}
-	// webhook mode pre-registers its handler; polling/auto defer the decision.
+	// webhook and auto both serve the webhook path, so both attach their handler
+	// up front. auto may later fall back to polling, but the mounted path is
+	// then simply unused (Telegram won't call it after deleteWebhook) — harmless,
+	// and it lets the listener bind before the probe runs.
 	if mode == "webhook" || mode == "auto" {
 		if d.path == "" {
 			d.path = "/webhook/telegram/"
 		}
-		if mode == "webhook" {
-			srv.Handle(d.path, d.handleWebhook)
-		}
-		// auto: handler attached lazily in Start once the probe decides webhook
-		// is viable — avoids registering a route that receivers will never hit.
+		srv.Handle(d.path, d.handleWebhook)
 	}
 	return d
 }
 
 func (d *Driver) Name() string { return d.name }
 
-// Start launches the driver by mode. polling/webhook are synchronous; auto
-// probes publicURL/health first and branches to webhook or polling.
-func (d *Driver) Start(ctx context.Context, srv *httpd.Server) error {
+// Start launches the driver by mode. It must be called AFTER the shared
+// httpd.Server has bound its listener (see main.go), because auto probes
+// <public_url>/health — which round-trips through the public proxy back to that
+// listener — and a probe before bind would always fail.
+func (d *Driver) Start(ctx context.Context) error {
 	switch d.mode {
 	case "polling":
 		go d.poll(ctx)
@@ -98,14 +99,14 @@ func (d *Driver) Start(ctx context.Context, srv *httpd.Server) error {
 		d.log.Info("telegram webhook registered", "url", d.publicURL+d.path)
 		return nil
 	case "auto":
-		return d.startAuto(ctx, srv)
+		return d.startAuto(ctx)
 	default:
 		return fmt.Errorf("telegram: unknown mode %q (use polling, webhook, or auto)", d.mode)
 	}
 }
 
 // startAuto implements the health-gated webhook→polling fallback.
-func (d *Driver) startAuto(ctx context.Context, srv *httpd.Server) error {
+func (d *Driver) startAuto(ctx context.Context) error {
 	if d.publicURL == "" {
 		d.log.Info("auto: no public_url, polling")
 		go d.poll(ctx)
@@ -124,14 +125,14 @@ func (d *Driver) startAuto(ctx context.Context, srv *httpd.Server) error {
 		go d.poll(ctx)
 		return nil
 	}
-	// healthy: register the webhook with Telegram and attach the handler.
+	// healthy: register the webhook with Telegram. The handler is already
+	// mounted (New attaches it for auto too), so no registration here.
 	hookURL := d.publicURL + strings.TrimRight(d.path, "/") + "/"
 	if err := d.setWebhook(hookURL); err != nil {
 		d.log.Warn("auto: setWebhook failed, polling instead", "err", err)
 		go d.poll(ctx)
 		return nil
 	}
-	srv.Handle(d.path, d.handleWebhook)
 	d.log.Info("auto: webhook registered", "url", hookURL)
 	return nil
 }

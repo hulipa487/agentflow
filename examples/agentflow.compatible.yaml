@@ -48,8 +48,9 @@ agents:
     history_budget: 6000
 
 gateway:
+  # one shared listener; channels mount paths on it
+  listen: ":8080"
   channels:
     - type: webhook
-      listen: ":8080"
-      path: /webhook
+      path: /webhook/
       agent: bot

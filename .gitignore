@@ -36,3 +36,4 @@ coverage.*
 # claude dev notes (design docs, progress tracking) and local agent settings
 claude_dev/
 .claude/
+agentflow-test.exe

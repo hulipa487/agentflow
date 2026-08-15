@@ -31,10 +31,11 @@ agents:
     memory: builtin:conversational
 
 gateway:
+  # one shared listener; channels mount paths on it
+  listen: ":8080"
   channels:
     - type: webhook
-      listen: ":8080"
-      path: /webhook
+      path: /webhook/
       agent: bot
 
 tools:

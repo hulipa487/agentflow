@@ -123,6 +123,59 @@ agentflow/
 └── third_party/luau/   # vendored Luau 0.731 (MIT, committed)
 ```
 
+## Breaking changes
+
+### Unified webhook listener (per-channel `listen` removed)
+
+All HTTP channels now mount paths on **one shared HTTP server** instead of each
+binding its own port. The per-channel `listen:` field is gone — configs that
+still carry it fail to load with
+`field listen not found in type config.Channel`.
+
+**Before** (one server per channel):
+
+```yaml
+gateway:
+  channels:
+    - type: webhook
+      listen: ":8080"        # removed
+      path: /webhook
+      agent: bot
+    - type: ghhook
+      listen: ":8081"        # removed — was needed to dodge port clashes
+      path: /hooks/github
+      agent: bot
+```
+
+**After** (one listener, many paths):
+
+```yaml
+gateway:
+  listen: ":8080"            # the single shared listener (default :8080)
+  public_url: ""             # optional external base, e.g. https://bot.example.com
+  channels:
+    - type: webhook
+      path: /webhook/dev/<uuid>/   # paths must end in /
+      agent: bot
+    - type: ghhook
+      path: /webhook/github/<uuid>/
+      agent: bot
+```
+
+Migration checklist:
+
+- Move each channel's `listen:` value to `gateway.listen` (one value now; pick
+  one port — behind a reverse proxy, loopback is typical).
+- Give every HTTP channel a `path` ending in `/`; the UUID-style segment is an
+  unguessable secret prefix (recommended — with an empty default the subtree
+  stays open).
+- Set `gateway.public_url` to your externally-reachable base if you want
+  webhooks registered for you. Telegram's new `mode: auto` health-probes
+  `<public_url>/health` at startup and calls `setWebhook` when reachable,
+  falling back to `deleteWebhook` + long-poll when not.
+- The shared server serves `GET /health` → `200 {"ok":true}` for probes and
+  reverse-proxy health checks.
+
 ## Notes
 
 - **Vendored Luau** (0.731) is committed under `third_party/luau/`, so the repo builds from a clean clone. To upgrade it, replace that directory with a newer release and re-run `make`.

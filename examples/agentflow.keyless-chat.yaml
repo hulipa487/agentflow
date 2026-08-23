@@ -3,7 +3,7 @@ version: "1"
 # Keyless chatbot: builtin:react loop + a local OpenAI-compatible model + webhook.
 # Defaults to Ollama (http://127.0.0.1:11434/v1); no api_key needed locally.
 #   export OPENAI_MODEL=gpt-4o-mini   # or your local model name
-#   curl -X POST localhost:8080/webhook -d '{"from":"alice","text":"hello"}'
+#   curl -X POST localhost:8080/webhook/ -d '{"from":"alice","text":"hello"}'
 #
 # Two different "from" users get independent sessions/history (per_chat).
 

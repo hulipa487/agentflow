@@ -1,7 +1,7 @@
 version: "1"
 
 # Phase-0 regression example: file-based echo loop, no LLM.
-#   curl -X POST localhost:8080/webhook -d '{"from":"alice","text":"hi"}'
+#   curl -X POST localhost:8080/webhook/ -d '{"from":"alice","text":"hi"}'
 
 agents:
   echo:

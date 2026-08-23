@@ -421,7 +421,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
   agent/coder:
     model: default
     loop: builtin:react
-    skills: [builtin:fs.read, builtin:git.status]
+    skills: [builtin:fs.read, builtin:fs.write]
     capabilities: [llm.chat, tools]
     can_contact: []
     ephemeral:

@@ -1,6 +1,6 @@
 version: "1"
 
-# Shell + fs/git tools example.
+# Shell + fs tools example.
 # Requires Docker installed and running for shell.spawn(provider=docker), and
 # a local OpenAI-compatible model (Ollama by default).
 
@@ -31,11 +31,6 @@ agents:
       - builtin:web_search
       - builtin:fs.read
       - builtin:fs.write
-      - builtin:git.status
-      - builtin:git.diff
-      - builtin:git.log
-      - builtin:git.commit
-      - builtin:git.push
     memory: builtin:conversational
     shell: sandboxed
 

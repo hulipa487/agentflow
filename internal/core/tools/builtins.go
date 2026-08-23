@@ -3,7 +3,6 @@ package tools
 
 import (
 	"context"
-	"strings"
 
 	"agentflow/internal/core/session"
 	"agentflow/internal/drivers/shell"
@@ -31,7 +30,6 @@ func RegisterBuiltins(r *Registry) {
 // RegisterShellBuiltins adds tools that operate inside shell handles.
 func RegisterShellBuiltins(r *Registry, mgr *shell.Manager) {
 	registerFSBuiltins(r, mgr)
-	registerGitBuiltins(r, mgr)
 }
 
 func registerFSBuiltins(r *Registry, mgr *shell.Manager) {
@@ -78,78 +76,6 @@ func registerFSBuiltins(r *Registry, mgr *shell.Manager) {
 			return map[string]any{"ok": true, "path": path}, nil
 		},
 	})
-}
-
-func registerGitBuiltins(r *Registry, mgr *shell.Manager) {
-	gitRead := []struct {
-		name string
-		desc string
-		cmd  string
-	}{
-		{"builtin:git.status", "Run git status inside a shell handle.", "git status --short"},
-		{"builtin:git.diff", "Run git diff inside a shell handle.", "git diff --"},
-		{"builtin:git.log", "Run git log inside a shell handle.", "git log --oneline -20"},
-	}
-	for _, gt := range gitRead {
-		gt := gt
-		r.Register(ToolSpec{
-			Name:        gt.name,
-			Description: gt.desc,
-			Parameters: objectSchema(map[string]any{
-				"handle_id": map[string]any{"type": "string", "description": "Shell handle ID"},
-				"args":      map[string]any{"type": "string", "description": "Optional extra git args"},
-			}, []string{"handle_id"}),
-			Permission: "read",
-			Autonomous: true,
-			Invoke: func(ctx context.Context, args map[string]any) (any, error) {
-				return runGit(ctx, mgr, args, gt.cmd, false)
-			},
-		})
-	}
-
-	gitWrite := []struct {
-		name string
-		desc string
-		cmd  string
-	}{
-		{"builtin:git.commit", "Create a git commit inside a shell handle.", "git commit"},
-		{"builtin:git.push", "Push commits inside a shell handle.", "git push"},
-	}
-	for _, gt := range gitWrite {
-		gt := gt
-		r.Register(ToolSpec{
-			Name:        gt.name,
-			Description: gt.desc,
-			Parameters: objectSchema(map[string]any{
-				"handle_id": map[string]any{"type": "string", "description": "Shell handle ID"},
-				"args":      map[string]any{"type": "string", "description": "Extra git args"},
-			}, []string{"handle_id"}),
-			Permission:   "write",
-			NeedsConfirm: true,
-			Autonomous:   false,
-			Invoke: func(ctx context.Context, args map[string]any) (any, error) {
-				return runGit(ctx, mgr, args, gt.cmd, true)
-			},
-		})
-	}
-}
-
-func runGit(ctx context.Context, mgr *shell.Manager, args map[string]any, base string, write bool) (any, error) {
-	owner := session.OwnerFromCtx(ctx)
-	handleID, _ := args["handle_id"].(string)
-	extra, _ := args["args"].(string)
-	cmd := base
-	if extra != "" {
-		cmd += " " + extra
-	}
-	if write && strings.Contains(cmd, "--no-verify") {
-		return map[string]any{"ok": false, "error": "--no-verify is not allowed"}, nil
-	}
-	res, err := mgr.Exec(ctx, owner, handleID, cmd)
-	if err != nil {
-		return map[string]any{"ok": false, "error": err.Error()}, nil
-	}
-	return map[string]any{"ok": res.ExitCode == 0, "stdout": res.Stdout, "stderr": res.Stderr, "exit_code": res.ExitCode}, nil
 }
 
 func objectSchema(props map[string]any, required []string) map[string]any {

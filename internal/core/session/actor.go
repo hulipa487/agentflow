@@ -17,6 +17,7 @@ import (
 
 	"agentflow/internal/builtins"
 	"agentflow/internal/core/address"
+	"agentflow/internal/core/media"
 	"agentflow/internal/core/memory"
 	"agentflow/internal/core/pool"
 	"agentflow/internal/core/safety"
@@ -42,25 +43,31 @@ type Identity struct {
 }
 
 // Message is the unified mailbox envelope (user/timer/agent/confirm/system).
+// Inbound media rides Attachments as small part descriptors (blob-store
+// handles or inline data) — never raw bytes.
 type Message struct {
-	ID         string         `json:"id"`
-	Type       string         `json:"type"`
-	From       string         `json:"from"`
-	To         string         `json:"to,omitempty"`
-	Text       string         `json:"text,omitempty"`
-	Channel    string         `json:"channel,omitempty"`
-	ReplyTo    string         `json:"reply_to,omitempty"`
-	Payload    map[string]any `json:"payload,omitempty"`
-	Provenance *Provenance    `json:"provenance,omitempty"`
-	Ts         int64          `json:"ts,omitempty"`
+	ID          string         `json:"id"`
+	Type        string         `json:"type"`
+	From        string         `json:"from"`
+	To          string         `json:"to,omitempty"`
+	Text        string         `json:"text,omitempty"`
+	Channel     string         `json:"channel,omitempty"`
+	ReplyTo     string         `json:"reply_to,omitempty"`
+	Payload     map[string]any `json:"payload,omitempty"`
+	Attachments []media.Part   `json:"attachments,omitempty"`
+	Provenance  *Provenance    `json:"provenance,omitempty"`
+	Ts          int64          `json:"ts,omitempty"`
 }
 
 // ChatMessage is one llm.chat turn crossing the bridge. Plain turns use
-// Role+Content. An assistant turn that requested tools sets ToolCalls; a
-// "tool" role turn carrying a result sets ToolCallID (+ ToolResult or Content).
+// Role+Content. Multimodal turns carry Parts (text + media descriptors);
+// Content stays the plain-text fast path and existing loops are unaffected.
+// An assistant turn that requested tools sets ToolCalls; a "tool" role turn
+// carrying a result sets ToolCallID (+ ToolResult or Content).
 type ChatMessage struct {
 	Role       string         `json:"role"`
 	Content    string         `json:"content,omitempty"`
+	Parts      []media.Part   `json:"parts,omitempty"`
 	ToolCalls  []ToolCallSpec `json:"tool_calls,omitempty"`
 	ToolCallID string         `json:"tool_call_id,omitempty"`
 	ToolResult any            `json:"tool_result,omitempty"`
@@ -105,6 +112,10 @@ type Op struct {
 	// Proactive channel egress (session.push).
 	Channel string `json:"channel,omitempty"`
 	ReplyTo string `json:"reply_to,omitempty"`
+
+	// Attachments are media parts for egress (session.send / session.push).
+	// Loops forward inbound part descriptors (blob-store handles) here.
+	Attachments []media.Part `json:"attachments,omitempty"`
 
 	// Store / memory / tool ops.
 	Table  string         `json:"table,omitempty"`
@@ -195,9 +206,11 @@ type SchedulerService interface {
 	Cancel(owner string, timerID string) error
 }
 
-// Gateway is the egress half of the channel registry.
+// Gateway is the egress half of the channel registry. Attachments carry
+// media parts (typically blob-store handles); a channel that cannot deliver
+// media returns an error rather than silently dropping it.
 type Gateway interface {
-	Send(channel, replyTo, text string) error
+	Send(channel, replyTo, text string, attachments []media.Part) error
 }
 
 // UserResolver resolves a user UUID to a delivery target for proactive push
@@ -571,7 +584,7 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 		if current.Channel == "" {
 			return `"no active message to reply to"`, false
 		}
-		return a.egress(ctx, current.Channel, current.ReplyTo, op.Text)
+		return a.egress(ctx, current.Channel, current.ReplyTo, op.Text, op.Attachments)
 	}
 	if op.Type == "session.push" {
 		// Proactive egress: send to an explicit channel/recipient without an
@@ -582,7 +595,7 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 		if op.Channel == "" {
 			return `"session.push requires a channel"`, false
 		}
-		return a.egress(ctx, op.Channel, op.ReplyTo, op.Text)
+		return a.egress(ctx, op.Channel, op.ReplyTo, op.Text, op.Attachments)
 	}
 	if op.Type == "session.push_user" {
 		// Proactive egress to a user by identity UUID. Channel-agnostic: the
@@ -603,7 +616,7 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 		if !ok {
 			return `"unknown user"`, false
 		}
-		return a.egress(ctx, channel, replyTo, op.Text)
+		return a.egress(ctx, channel, replyTo, op.Text, op.Attachments)
 	}
 	if a.agents != nil {
 		switch op.Type {
@@ -683,7 +696,9 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 
 // egress runs text through the safety dispatcher and delivers it to a
 // channel recipient via the gateway. A safety drop means nothing is sent.
-func (a *Actor) egress(ctx context.Context, channel, replyTo, text string) (string, bool) {
+// Attachments are not safety-screened (the filters are text-only by design);
+// the text (caption) always is. Media allow-lists gate them at ingestion.
+func (a *Actor) egress(ctx context.Context, channel, replyTo, text string, attachments []media.Part) (string, bool) {
 	if a.safety != nil {
 		res := a.safety.Egress(ctx, safety.EgressInput{
 			Text:   text,
@@ -696,7 +711,7 @@ func (a *Actor) egress(ctx context.Context, channel, replyTo, text string) (stri
 		text = res.Text
 	}
 	if a.gw != nil {
-		if err := a.gw.Send(channel, replyTo, text); err != nil {
+		if err := a.gw.Send(channel, replyTo, text, attachments); err != nil {
 			a.log.Warn("egress failed", "err", err)
 			r, _ := jsonString(err.Error())
 			return r, false
@@ -877,7 +892,7 @@ func (a *Actor) doConfirm(ctx context.Context, op Op, current *Message, respJSON
 		ci.Tool, ci.ConfirmID,
 	)
 	if a.gw != nil && current != nil && current.Channel != "" {
-		if err := a.gw.Send(current.Channel, current.ReplyTo, prompt); err != nil {
+		if err := a.gw.Send(current.Channel, current.ReplyTo, prompt, nil); err != nil {
 			a.log.Warn("confirm prompt send failed", "err", err)
 		}
 	}

@@ -14,17 +14,43 @@ import (
 	"time"
 
 	"agentflow/internal/config"
+	"agentflow/internal/core/media"
 )
 
-// Message is a single chat turn. Content is plain text. ToolCalls is set on
-// an assistant turn that requested tools; ToolCallID and ToolResult are set
-// on a "tool" role turn that carries a tool's result back to the model.
+// Message is a single chat turn. Content is plain text; Parts carries
+// multimodal content (text + media descriptors) when set — the plain-text
+// path is untouched for existing callers. ToolCalls is set on an assistant
+// turn that requested tools; ToolCallID and ToolResult are set on a "tool"
+// role turn that carries a tool's result back to the model.
 type Message struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	ToolResult any        `json:"tool_result,omitempty"`
+	Role       string       `json:"role"`
+	Content    string       `json:"content,omitempty"`
+	Parts      []media.Part `json:"parts,omitempty"`
+	ToolCalls  []ToolCall   `json:"tool_calls,omitempty"`
+	ToolCallID string       `json:"tool_call_id,omitempty"`
+	ToolResult any          `json:"tool_result,omitempty"`
+}
+
+// hasMedia reports whether any message in the list carries non-text parts.
+func hasMedia(msgs []Message) bool {
+	for _, m := range msgs {
+		for _, p := range m.Parts {
+			if p.Type != "text" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// dataURI renders a media part as a data: URL. Requires Data (base64) to be
+// resolved; MIME defaults to application/octet-stream.
+func dataURI(p media.Part) string {
+	mime := p.MIME
+	if mime == "" {
+		mime = "application/octet-stream"
+	}
+	return "data:" + mime + ";base64," + p.Data
 }
 
 // ToolCall is one tool invocation the model requested. Args is the parsed

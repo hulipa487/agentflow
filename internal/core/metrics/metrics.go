@@ -23,20 +23,20 @@ import (
 
 // Counter is an atomic int64 metric.
 type Counter struct {
-	name   string
-	help   string
-	value  atomic.Int64
+	name  string
+	help  string
+	value atomic.Int64
 }
 
 func NewCounter(name, help string) *Counter {
 	return &Counter{name: name, help: help}
 }
 
-func (c *Counter) Inc()          { c.value.Add(1) }
-func (c *Counter) Add(n int64)   { c.value.Add(n) }
-func (c *Counter) Value() int64  { return c.value.Load() }
-func (c *Counter) Name() string  { return c.name }
-func (c *Counter) Help() string  { return c.help }
+func (c *Counter) Inc()         { c.value.Add(1) }
+func (c *Counter) Add(n int64)  { c.value.Add(n) }
+func (c *Counter) Value() int64 { return c.value.Load() }
+func (c *Counter) Name() string { return c.name }
+func (c *Counter) Help() string { return c.help }
 
 // Registry holds all metrics.
 type Registry struct {
@@ -104,21 +104,24 @@ func (r *Registry) PrometheusFormat() string {
 // DefaultCounters creates the standard set of runtime counters.
 func DefaultCounters() map[string]*Counter {
 	return map[string]*Counter{
-		"agentflow_ingress_total":     NewCounter("agentflow_ingress_total", "Total inbound messages"),
-		"agentflow_ingress_dropped":   NewCounter("agentflow_ingress_dropped", "Inbound messages dropped"),
-		"agentflow_egress_total":      NewCounter("agentflow_egress_total", "Total outbound replies"),
-		"agentflow_egress_failed":     NewCounter("agentflow_egress_failed", "Outbound replies that failed delivery"),
-		"agentflow_sessions_active":   NewCounter("agentflow_sessions_active", "Currently active sessions (gauge)"),
-		"agentflow_children_spawned":  NewCounter("agentflow_children_spawned", "Total spawned child agents"),
-		"agentflow_children_died":     NewCounter("agentflow_children_died", "Total child agent deaths"),
-		"agentflow_requests_pending":  NewCounter("agentflow_requests_pending", "Pending agent.request calls (gauge)"),
-		"agentflow_timers_pending":    NewCounter("agentflow_timers_pending", "Pending timers (gauge)"),
+		"agentflow_ingress_total":      NewCounter("agentflow_ingress_total", "Total inbound messages"),
+		"agentflow_ingress_dropped":    NewCounter("agentflow_ingress_dropped", "Inbound messages dropped"),
+		"agentflow_egress_total":       NewCounter("agentflow_egress_total", "Total outbound replies"),
+		"agentflow_egress_failed":      NewCounter("agentflow_egress_failed", "Outbound replies that failed delivery"),
+		"agentflow_sessions_active":    NewCounter("agentflow_sessions_active", "Currently active sessions (gauge)"),
+		"agentflow_children_spawned":   NewCounter("agentflow_children_spawned", "Total spawned child agents"),
+		"agentflow_children_died":      NewCounter("agentflow_children_died", "Total child agent deaths"),
+		"agentflow_requests_pending":   NewCounter("agentflow_requests_pending", "Pending agent.request calls (gauge)"),
+		"agentflow_timers_pending":     NewCounter("agentflow_timers_pending", "Pending timers (gauge)"),
 		"agentflow_tool_confirmations": NewCounter("agentflow_tool_confirmations", "Tool confirmations requested"),
-		"agentflow_llm_calls":         NewCounter("agentflow_llm_calls", "Total LLM calls"),
-		"agentflow_llm_tokens":        NewCounter("agentflow_llm_tokens", "Total LLM tokens consumed"),
-		"agentflow_budget_denied":     NewCounter("agentflow_budget_denied", "LLM calls denied by budget"),
-		"agentflow_safety_drops":      NewCounter("agentflow_safety_drops", "Messages/replies dropped by safety"),
-		"agentflow_channel_errors":   NewCounter("agentflow_channel_errors", "Channel delivery errors"),
+		"agentflow_llm_calls":          NewCounter("agentflow_llm_calls", "Total LLM calls"),
+		"agentflow_llm_tokens":         NewCounter("agentflow_llm_tokens", "Total LLM tokens consumed"),
+		"agentflow_budget_denied":      NewCounter("agentflow_budget_denied", "LLM calls denied by budget"),
+		"agentflow_safety_drops":       NewCounter("agentflow_safety_drops", "Messages/replies dropped by safety"),
+		"agentflow_channel_errors":     NewCounter("agentflow_channel_errors", "Channel delivery errors"),
+		"agentflow_media_ingested":     NewCounter("agentflow_media_ingested", "Inbound messages carrying media that were stored"),
+		"agentflow_media_bytes":        NewCounter("agentflow_media_bytes", "Bytes of inbound media stored (gauge-style sum)"),
+		"agentflow_media_unsupported":  NewCounter("agentflow_media_unsupported", "Media parts rejected (policy, provider, or transport)"),
 	}
 }
 

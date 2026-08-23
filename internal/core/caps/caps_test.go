@@ -158,7 +158,7 @@ data: [DONE]
 	mgr := llm.NewManager(map[string]config.Model{
 		"default": {Provider: "openai", Model: "m", BaseURL: srv.URL},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	h := LLMHandlers(mgr)
+	h := LLMHandlers(mgr, nil)
 
 	tools := []session.ToolSpec{{
 		Name:        "get_weather",

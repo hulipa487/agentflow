@@ -29,7 +29,10 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 	// The Responses API takes an "input" array of items. System messages map to
 	// a top-level "instructions" field; assistant tool_calls become function_call
 	// items and "tool" turns become function_call_output items.
-	system, items := responsesItems(msgs)
+	system, items, err := responsesItems(msgs)
+	if err != nil {
+		return nil, false, err
+	}
 
 	body := map[string]any{
 		"model":  cfg.Model,
@@ -211,8 +214,10 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 // API "input" shape: the leading system message becomes "instructions"
 // (returned as the first result); an assistant turn with tool_calls becomes
 // function_call items; a "tool" turn becomes a function_call_output item.
-// Plain turns become {type:"message", role, content} items.
-func responsesItems(msgs []Message) (system string, items []map[string]any) {
+// Plain turns become {type:"message", role, content} items; multimodal turns
+// become message items whose content is an array of input_text / input_image /
+// input_file / input_audio parts.
+func responsesItems(msgs []Message) (system string, items []map[string]any, err error) {
 	if len(msgs) > 0 && msgs[0].Role == "system" {
 		system = msgs[0].Content
 		msgs = msgs[1:]
@@ -242,8 +247,70 @@ func responsesItems(msgs []Message) (system string, items []map[string]any) {
 				"output":  output,
 			})
 		default:
-			items = append(items, map[string]any{"type": "message", "role": m.Role, "content": m.Content})
+			if len(m.Parts) > 0 {
+				content, cerr := responsesContentParts(m)
+				if cerr != nil {
+					return system, nil, cerr
+				}
+				items = append(items, map[string]any{"type": "message", "role": m.Role, "content": content})
+			} else {
+				items = append(items, map[string]any{"type": "message", "role": m.Role, "content": m.Content})
+			}
 		}
 	}
-	return system, items
+	return system, items, nil
+}
+
+// responsesContentParts builds the content array for one multimodal message
+// item: input_text, input_image (URL or data: URI), input_file (PDF as a
+// data: URL), input_audio (base64 wav/mp3). Video is rejected honestly.
+func responsesContentParts(m Message) ([]map[string]any, error) {
+	var out []map[string]any
+	if m.Content != "" {
+		out = append(out, map[string]any{"type": "input_text", "text": m.Content})
+	}
+	for _, p := range m.Parts {
+		switch p.Type {
+		case "text":
+			if p.Text != "" {
+				out = append(out, map[string]any{"type": "input_text", "text": p.Text})
+			}
+		case "image":
+			url := p.URL
+			if url == "" {
+				if p.Data == "" {
+					return nil, fmt.Errorf("openai-responses: image part has neither url nor data")
+				}
+				url = dataURI(p)
+			}
+			out = append(out, map[string]any{"type": "input_image", "image_url": url})
+		case "file":
+			if p.Data == "" {
+				return nil, fmt.Errorf("openai-responses: file part requires inline base64 data")
+			}
+			item := map[string]any{"type": "input_file", "file_data": dataURI(p)}
+			if p.Name != "" {
+				item["filename"] = p.Name
+			}
+			out = append(out, item)
+		case "audio":
+			if p.Data == "" {
+				return nil, fmt.Errorf("openai-responses: audio part requires inline base64 data")
+			}
+			format := audioFormat(p.MIME)
+			if format == "" {
+				return nil, fmt.Errorf("openai-responses: input_audio supports wav and mp3 only (got %q)", p.MIME)
+			}
+			out = append(out, map[string]any{
+				"type":        "input_audio",
+				"input_audio": map[string]any{"data": p.Data, "format": format},
+			})
+		default:
+			return nil, fmt.Errorf("openai-responses does not support %s parts", p.Type)
+		}
+	}
+	if len(out) == 0 {
+		out = append(out, map[string]any{"type": "input_text", "text": ""})
+	}
+	return out, nil
 }

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"agentflow/internal/config"
+	"agentflow/internal/core/media"
 )
 
 // Anthropic Messages API, always called with stream=true (Chat buffers it).
@@ -18,7 +19,10 @@ import (
 func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs []Message, opts Opts) (<-chan event, bool, error) {
 	base := resolveBase(cfg, "https://api.anthropic.com")
 	url := base + "/v1/messages"
-	system, turns := anthropicTurns(msgs)
+	system, turns, err := anthropicTurns(msgs)
+	if err != nil {
+		return nil, false, err
+	}
 
 	body := map[string]any{
 		"model":      cfg.Model,
@@ -87,14 +91,14 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 				Type         string `json:"type"`
 				Index        int    `json:"index"`
 				ContentBlock *struct {
-					Type  string `json:"type"`
-					ID    string `json:"id"`
-					Name  string `json:"name"`
-					Text  string `json:"text"`
+					Type string `json:"type"`
+					ID   string `json:"id"`
+					Name string `json:"name"`
+					Text string `json:"text"`
 				} `json:"content_block"`
 				Delta struct {
-					Type       string `json:"type"`
-					Text       string `json:"text"`
+					Type        string `json:"type"`
+					Text        string `json:"text"`
 					PartialJSON string `json:"partial_json"`
 				} `json:"delta"`
 				Usage struct {
@@ -158,7 +162,8 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 // remaining turns are reshaped so that assistant tool_calls become tool_use
 // content blocks and "tool" role turns become user tool_result blocks. Adjacent
 // tool results are merged into one user message, as Anthropic requires.
-func anthropicTurns(msgs []Message) (system string, turns []map[string]any) {
+// Multimodal turns carry Parts as image/document content blocks.
+func anthropicTurns(msgs []Message) (system string, turns []map[string]any, err error) {
 	if len(msgs) > 0 && msgs[0].Role == "system" {
 		system = msgs[0].Content
 		msgs = msgs[1:]
@@ -194,8 +199,57 @@ func anthropicTurns(msgs []Message) (system string, turns []map[string]any) {
 			}
 			turns = append(turns, map[string]any{"role": "user", "content": []map[string]any{block}})
 		default:
-			turns = append(turns, map[string]any{"role": m.Role, "content": m.Content})
+			if len(m.Parts) > 0 {
+				content := []map[string]any{}
+				if m.Content != "" {
+					content = append(content, map[string]any{"type": "text", "text": m.Content})
+				}
+				for _, p := range m.Parts {
+					blk, perr := anthropicPart(p)
+					if perr != nil {
+						return system, nil, perr
+					}
+					content = append(content, blk)
+				}
+				turns = append(turns, map[string]any{"role": m.Role, "content": content})
+			} else {
+				turns = append(turns, map[string]any{"role": m.Role, "content": m.Content})
+			}
 		}
 	}
-	return system, turns
+	return system, turns, nil
+}
+
+// anthropicPart maps one media part to an Anthropic content block. Images
+// accept base64 or URL sources; PDFs are document blocks (base64 only).
+// Audio and video are rejected honestly — the Messages API has no block type
+// for them.
+func anthropicPart(p media.Part) (map[string]any, error) {
+	switch p.Type {
+	case "text":
+		return map[string]any{"type": "text", "text": p.Text}, nil
+	case "image":
+		src := map[string]any{"type": "base64", "media_type": p.MIME, "data": p.Data}
+		if p.Data == "" && p.URL != "" {
+			src = map[string]any{"type": "url", "url": p.URL}
+		}
+		return map[string]any{"type": "image", "source": src}, nil
+	case "file":
+		if p.MIME != "application/pdf" {
+			return nil, fmt.Errorf("anthropic: document blocks support application/pdf only (got %q)", p.MIME)
+		}
+		if p.Data == "" {
+			return nil, fmt.Errorf("anthropic: pdf part requires inline base64 data")
+		}
+		return map[string]any{
+			"type": "document",
+			"source": map[string]any{
+				"type":       "base64",
+				"media_type": "application/pdf",
+				"data":       p.Data,
+			},
+		}, nil
+	default:
+		return nil, fmt.Errorf("anthropic does not support %s parts", p.Type)
+	}
 }

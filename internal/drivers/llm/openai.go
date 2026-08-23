@@ -200,8 +200,10 @@ func openaiMessages(msgs []Message) ([]map[string]any, error) {
 
 // openaiContentParts builds the Chat Completions content array for one
 // multimodal turn. Images take image_url (data: URI or remote URL); audio
-// takes input_audio (base64, wav/mp3). PDFs and video are rejected honestly
-// — Chat Completions has no inline form for them (they need the Files API).
+// takes input_audio (base64, wav/mp3); video takes video_url (URL, base64,
+// or a provider file ref like mm_file:// / ms:// — MiniMax/Kimi/GLM
+// convention); files take file_url (URL source only — GLM). Unsupported
+// sources error honestly.
 func openaiContentParts(m Message) ([]map[string]any, error) {
 	var out []map[string]any
 	if m.Content != "" {
@@ -234,6 +236,26 @@ func openaiContentParts(m Message) ([]map[string]any, error) {
 				"type":        "input_audio",
 				"input_audio": map[string]any{"data": p.Data, "format": format},
 			})
+		case "video":
+			// De-facto standard across MiniMax / Kimi / GLM (and now OpenAI
+			// itself): video_url with a remote URL, base64, or a provider
+			// file reference (mm_file://, ms://). Passed through verbatim.
+			url := p.URL
+			if url == "" {
+				if p.Data == "" {
+					return nil, fmt.Errorf("openai: video part has neither url nor data")
+				}
+				url = dataURI(p)
+			}
+			out = append(out, map[string]any{"type": "video_url", "video_url": map[string]any{"url": url}})
+		case "file":
+			// GLM supports file_url (pdf/txt/word/xlsx) with a URL source.
+			// Base64 is not accepted by the reference implementations, so
+			// require a URL.
+			if p.URL == "" {
+				return nil, fmt.Errorf("openai: file part requires a url source (glm file_url; base64 not supported)")
+			}
+			out = append(out, map[string]any{"type": "file_url", "file_url": map[string]any{"url": p.URL}})
 		default:
 			return nil, fmt.Errorf("openai (chat completions) does not support %s parts; use the responses provider or pre-process the file", p.Type)
 		}

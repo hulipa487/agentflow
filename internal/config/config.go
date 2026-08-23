@@ -281,15 +281,24 @@ type Gateway struct {
 }
 
 type Channel struct {
-	Name       string  `yaml:"name"`
-	Type       string  `yaml:"type"` // webhook | telegram | ghhook
-	Mode       string  `yaml:"mode"` // telegram: polling (default) | webhook | auto
-	Agent      string  `yaml:"agent"`
-	Path       string  `yaml:"path"`   // route mounted on the shared server, e.g. /webhook/<chan>/<uuid>/
-	Prefix     string  `yaml:"prefix"` // reserved for future per-channel secret-prefix use
-	Token      string  `yaml:"token"`
-	Secret     string  `yaml:"secret"` // ghhook: webhook secret for HMAC verification (env-interpolated)
-	AllowUsers []int64 `yaml:"allow_users"`
+	Name       string       `yaml:"name"`
+	Type       string       `yaml:"type"` // webhook | telegram | ghhook
+	Mode       string       `yaml:"mode"` // telegram: polling (default) | webhook | auto
+	Agent      string       `yaml:"agent"`
+	Path       string       `yaml:"path"`   // route mounted on the shared server, e.g. /webhook/<chan>/<uuid>/
+	Prefix     string       `yaml:"prefix"` // reserved for future per-channel secret-prefix use
+	Token      string       `yaml:"token"`
+	Secret     string       `yaml:"secret"` // ghhook: webhook secret for HMAC verification (env-interpolated)
+	AllowUsers []int64      `yaml:"allow_users"`
+	Media      ChannelMedia `yaml:"media"` // inbound media policy; absent = media disabled
+}
+
+// ChannelMedia gates inbound media on a channel. Media is opt-in: with no
+// media block (or an empty allow list) attachments are dropped and only the
+// text/caption flows. max_bytes defaults to 8 MiB when allow is set.
+type ChannelMedia struct {
+	MaxBytes int      `yaml:"max_bytes"`
+	Allow    []string `yaml:"allow"` // MIME patterns: image/*, application/pdf, audio/mpeg, ...
 }
 
 // DefaultCapabilities is what an agent gets if capabilities are omitted.
@@ -552,6 +561,12 @@ func validate(path string, c *Config) error {
 			}
 		default:
 			return fmt.Errorf("%s: unsupported channel type %q (channel %q)", path, ch.Type, ch.Name)
+		}
+		// media policy sanity: max_bytes must be positive when set; an allow
+		// list with no patterns is the same as media disabled (allowed, but
+		// flag obvious mistakes like a negative ceiling).
+		if ch.Media.MaxBytes < 0 {
+			return fmt.Errorf("%s: channel %q media.max_bytes must be >= 0", path, ch.Name)
 		}
 		// path collision check — the shared mux panics on dupes, but a config
 		// error is friendlier and names both colliding channels.

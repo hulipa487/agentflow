@@ -9,43 +9,56 @@
 //     without the webhook host dying silently.
 //
 // Access control (allow_users) is enforced in all modes before any Lua runs.
+//
+// Media (photos, documents, voice, audio, video) is ingested when the
+// channel's media policy allows it: the file is downloaded via getFile and
+// landed in the blob store; the message carries small part descriptors
+// (handles), never the bytes. Replies carrying attachments upload them via
+// multipart (sendPhoto/sendAudio/sendVideo/sendDocument).
 package telegram
 
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"agentflow/internal/core/media"
+	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/router"
 	"agentflow/internal/core/session"
 	"agentflow/internal/drivers/httpd"
 )
 
 // Driver is the Telegram channel driver. It implements gateway.Driver for
-// replies (sendMessage) and either polls or serves a webhook for inbound.
+// replies (sendMessage / sendPhoto / ...) and either polls or serves a
+// webhook for inbound.
 type Driver struct {
 	name      string
 	token     string
 	agent     string
 	allow     map[int64]bool // empty = allow all
-	mode      string          // "polling" | "webhook" | "auto"
-	path      string          // webhook mode only
-	publicURL string          // webhook/auto: external base that routes to this process
-	apiBase   string          // override for the Telegram API host (tests); empty = api.telegram.org
+	mode      string         // "polling" | "webhook" | "auto"
+	path      string         // webhook mode only
+	publicURL string         // webhook/auto: external base that routes to this process
+	apiBase   string         // override for the Telegram API host (tests); empty = api.telegram.org
+	store     *media.Store   // nil = media policy disabled
+	pol       media.Policy
 	sink      router.Sink
 	log       *slog.Logger
 	client    *http.Client
 	seq       int64
 }
 
-func New(name, token, agent, mode string, allowUsers []int64, path, publicURL string, sink router.Sink, srv *httpd.Server, log *slog.Logger) *Driver {
+func New(name, token, agent, mode string, allowUsers []int64, path, publicURL string, sink router.Sink, srv *httpd.Server, store *media.Store, pol media.Policy, log *slog.Logger) *Driver {
 	allow := map[int64]bool{}
 	for _, id := range allowUsers {
 		allow[id] = true
@@ -61,6 +74,8 @@ func New(name, token, agent, mode string, allowUsers []int64, path, publicURL st
 		mode:      mode,
 		path:      path,
 		publicURL: publicURL,
+		store:     store,
+		pol:       pol,
 		sink:      sink,
 		log:       log.With("driver", "telegram", "channel", name, "mode", mode),
 		client:    &http.Client{Timeout: 40 * time.Second},
@@ -187,20 +202,55 @@ func (d *Driver) postAPI(method string, body []byte) error {
 }
 
 type update struct {
-	UpdateID int64 `json:"update_id"`
-	Message  *struct {
-		MessageID int64 `json:"message_id"`
-		Text      string `json:"text"`
-		From      struct {
-			ID        int64  `json:"id"`
-			Username  string `json:"username"`
-			FirstName string `json:"first_name"`
-		} `json:"from"`
-		Chat struct {
-			ID   int64  `json:"id"`
-			Type string `json:"type"`
-		} `json:"chat"`
-	} `json:"message"`
+	UpdateID int64      `json:"update_id"`
+	Message  *tgMessage `json:"message"`
+}
+
+// tgMessage is the message portion of a Telegram update, including media.
+type tgMessage struct {
+	MessageID int64  `json:"message_id"`
+	Text      string `json:"text"`
+	Caption   string `json:"caption"`
+	From      struct {
+		ID        int64  `json:"id"`
+		Username  string `json:"username"`
+		FirstName string `json:"first_name"`
+	} `json:"from"`
+	Chat struct {
+		ID   int64  `json:"id"`
+		Type string `json:"type"`
+	} `json:"chat"`
+	Photo []photoSize `json:"photo"`
+	Doc   *struct {
+		FileID   string `json:"file_id"`
+		FileName string `json:"file_name"`
+		MIME     string `json:"mime_type"`
+		FileSize int64  `json:"file_size"`
+	} `json:"document"`
+	Voice *struct {
+		FileID   string `json:"file_id"`
+		Duration int    `json:"duration"`
+		MIME     string `json:"mime_type"`
+	} `json:"voice"`
+	Audio *struct {
+		FileID   string `json:"file_id"`
+		FileName string `json:"file_name"`
+		MIME     string `json:"mime_type"`
+		FileSize int64  `json:"file_size"`
+	} `json:"audio"`
+	Video *struct {
+		FileID   string `json:"file_id"`
+		FileName string `json:"file_name"`
+		MIME     string `json:"mime_type"`
+		FileSize int64  `json:"file_size"`
+	} `json:"video"`
+}
+
+type photoSize struct {
+	FileID   string `json:"file_id"`
+	Width    int    `json:"width"`
+	Height   int    `json:"height"`
+	FileSize int64  `json:"file_size"`
 }
 
 type updatesResponse struct {
@@ -282,7 +332,15 @@ func (d *Driver) handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 func (d *Driver) handleUpdate(u update) {
 	m := u.Message
-	if m == nil || m.Text == "" {
+	if m == nil {
+		return
+	}
+	text := m.Text
+	if text == "" {
+		text = m.Caption
+	}
+	atts := d.ingestMedia(m)
+	if text == "" && len(atts) == 0 {
 		return
 	}
 	if len(d.allow) > 0 && !d.allow[m.From.ID] {
@@ -295,13 +353,14 @@ func (d *Driver) handleUpdate(u update) {
 		Channel: d.name,
 		Agent:   d.agent,
 		Message: session.Message{
-			ID:      fmt.Sprintf("tg-%d", u.UpdateID),
-			Type:    "user",
-			From:    "user:telegram:" + strconv.FormatInt(m.From.ID, 10),
-			Text:    m.Text,
-			Channel: d.name,
-			ReplyTo: chatID,
-			Ts:      time.Now().Unix(),
+			ID:          fmt.Sprintf("tg-%d", u.UpdateID),
+			Type:        "user",
+			From:        "user:telegram:" + strconv.FormatInt(m.From.ID, 10),
+			Text:        text,
+			Channel:     d.name,
+			ReplyTo:     chatID,
+			Attachments: atts,
+			Ts:          time.Now().Unix(),
 			Payload: map[string]any{
 				"chat_id":  chatID,
 				"user_id":  m.From.ID,
@@ -312,8 +371,172 @@ func (d *Driver) handleUpdate(u update) {
 	})
 }
 
-// Deliver implements gateway.Driver: sendMessage to the chat.
-func (d *Driver) Deliver(replyTo, text string) error {
+// ingestMedia downloads the update's media (photo/document/voice/audio/video)
+// into the blob store and returns part descriptors. With media disabled
+// (nil store / empty policy) every part is dropped and nil returned — the
+// message still flows with its caption text.
+func (d *Driver) ingestMedia(m *tgMessage) []media.Part {
+	if d.store == nil || !d.pol.Enabled() {
+		return nil
+	}
+	var parts []media.Part
+	add := func(fileID, mime, name string, size int64) {
+		p, err := d.downloadFile(fileID, mime, name, size)
+		if err != nil {
+			d.log.Warn("media ingest failed", "err", err)
+			metrics.Inc("agentflow_media_unsupported")
+			return
+		}
+		parts = append(parts, p)
+	}
+	switch {
+	case len(m.Photo) > 0:
+		// Telegram sends several sizes; the largest is last.
+		best := m.Photo[len(m.Photo)-1]
+		add(best.FileID, "image/jpeg", "photo.jpg", best.FileSize)
+	case m.Doc != nil:
+		add(m.Doc.FileID, m.Doc.MIME, m.Doc.FileName, m.Doc.FileSize)
+	case m.Voice != nil:
+		add(m.Voice.FileID, orDefault(m.Voice.MIME, "audio/ogg"), "voice.ogg", 0)
+	case m.Audio != nil:
+		add(m.Audio.FileID, orDefault(m.Audio.MIME, "audio/mpeg"), orDefault(m.Audio.FileName, "audio"), m.Audio.FileSize)
+	case m.Video != nil:
+		add(m.Video.FileID, orDefault(m.Video.MIME, "video/mp4"), orDefault(m.Video.FileName, "video.mp4"), m.Video.FileSize)
+	}
+	if len(parts) > 0 {
+		metrics.Inc("agentflow_media_ingested")
+	}
+	return parts
+}
+
+func orDefault(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
+}
+
+// downloadFile fetches a Telegram file by id (getFile → file download URL)
+// and lands it in the blob store under the channel policy.
+func (d *Driver) downloadFile(fileID, mime, name string, size int64) (media.Part, error) {
+	if mime == "" {
+		mime = "application/octet-stream"
+	}
+	if !d.pol.Allows(mime) {
+		return media.Part{}, fmt.Errorf("telegram: mime %q not allowed by channel media policy", mime)
+	}
+	limit := d.pol.MaxBytes
+	if limit <= 0 {
+		limit = 8 << 20
+	}
+	if size > 0 && size > limit {
+		return media.Part{}, fmt.Errorf("telegram: file %d bytes exceeds limit %d", size, limit)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	// getFile
+	furl := d.apiURL("getFile") + "?file_id=" + fileID
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, furl, nil)
+	if err != nil {
+		return media.Part{}, err
+	}
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return media.Part{}, err
+	}
+	var fr struct {
+		OK     bool `json:"ok"`
+		Result *struct {
+			FileID       string `json:"file_id"`
+			FileUniqueID string `json:"file_unique_id"`
+			FileSize     int64  `json:"file_size"`
+			FilePath     string `json:"file_path"`
+		} `json:"result"`
+		Description string `json:"description"`
+	}
+	err = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&fr)
+	resp.Body.Close()
+	if err != nil {
+		return media.Part{}, err
+	}
+	if !fr.OK || fr.Result == nil || fr.Result.FilePath == "" {
+		return media.Part{}, fmt.Errorf("getFile: %s", fr.Description)
+	}
+
+	// file download: {apiBase}/file/bot{token}/{file_path}
+	base := d.apiBase
+	if base == "" {
+		base = "https://api.telegram.org"
+	}
+	dlURL := base + "/file/bot" + d.token + "/" + fr.Result.FilePath
+	req, err = http.NewRequestWithContext(ctx, http.MethodGet, dlURL, nil)
+	if err != nil {
+		return media.Part{}, err
+	}
+	resp, err = d.client.Do(req)
+	if err != nil {
+		return media.Part{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return media.Part{}, fmt.Errorf("file download: %d", resp.StatusCode)
+	}
+
+	ref, err := d.store.Put(resp.Body, mime, d.pol)
+	if err != nil {
+		return media.Part{}, err
+	}
+	metrics.Add("agentflow_media_bytes", ref.Size)
+	return media.Part{Type: media.Classify(mime), MIME: mime, Handle: ref.Handle, Name: name}, nil
+}
+
+// Deliver implements gateway.Driver: sendMessage to the chat, uploading any
+// attachments via the matching send* method (multipart). The first image
+// attachment's caption carries the text; text alongside non-image attachments
+// is sent as a separate sendMessage first.
+func (d *Driver) Deliver(replyTo, text string, attachments []media.Part) error {
+	if len(attachments) == 0 {
+		return d.sendText(replyTo, text)
+	}
+	// Text with non-leading image attachments: send it as its own message
+	// first so nothing is silently lost (only sendPhoto takes a caption).
+	if text != "" && attachments[0].Type != "image" {
+		if err := d.sendText(replyTo, text); err != nil {
+			return err
+		}
+		text = ""
+	}
+	for i, att := range attachments {
+		method, field := sendMethodFor(att.Type)
+		caption := ""
+		if i == 0 && text != "" && method == "sendPhoto" {
+			caption = text
+			if len(caption) > 1024 {
+				caption = caption[:1024]
+			}
+		}
+		if err := d.uploadMedia(replyTo, method, field, att, caption); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sendMethodFor(partType string) (method, fileField string) {
+	switch partType {
+	case "image":
+		return "sendPhoto", "photo"
+	case "audio":
+		return "sendAudio", "audio"
+	case "video":
+		return "sendVideo", "video"
+	default:
+		return "sendDocument", "document"
+	}
+}
+
+func (d *Driver) sendText(replyTo, text string) error {
 	body, _ := json.Marshal(map[string]any{
 		"chat_id": replyTo,
 		"text":    text,
@@ -335,4 +558,100 @@ func (d *Driver) Deliver(replyTo, text string) error {
 		return fmt.Errorf("sendMessage: %d: %s", resp.StatusCode, b)
 	}
 	return nil
+}
+
+// uploadMedia POSTs one attachment as multipart/form-data. Bytes come from
+// the blob store (handle) or inline base64 (data); URL-only parts are an
+// error — resolve or download them first.
+func (d *Driver) uploadMedia(replyTo, method, field string, att media.Part, caption string) error {
+	var payload []byte
+	switch {
+	case att.Handle != "" && d.store != nil:
+		b, err := d.store.ReadAll(att.Handle, 50<<20)
+		if err != nil {
+			return fmt.Errorf("%s: %w", method, err)
+		}
+		payload = b
+	case att.Data != "":
+		b, err := base64Decode(att.Data)
+		if err != nil {
+			return fmt.Errorf("%s: bad base64: %w", method, err)
+		}
+		payload = b
+	default:
+		return fmt.Errorf("%s: attachment has no resolvable source (need handle or data)", method)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	_ = w.WriteField("chat_id", replyTo)
+	if caption != "" {
+		_ = w.WriteField("caption", caption)
+	}
+	name := att.Name
+	if name == "" {
+		name = "file"
+		if att.MIME != "" {
+			name += mimeExtension(att.MIME)
+		}
+	}
+	fw, err := w.CreateFormFile(field, name)
+	if err != nil {
+		return err
+	}
+	if _, err := fw.Write(payload); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.apiURL(method), &buf)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return fmt.Errorf("%s: %d: %s", method, resp.StatusCode, b)
+	}
+	return nil
+}
+
+// base64Decode is std base64; used for inline data parts.
+func base64Decode(s string) ([]byte, error) {
+	return base64.StdEncoding.DecodeString(s)
+}
+
+// mimeExtension maps common MIME types to a sane fallback filename extension.
+func mimeExtension(mime string) string {
+	switch strings.ToLower(mime) {
+	case "image/jpeg":
+		return ".jpg"
+	case "image/png":
+		return ".png"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	case "audio/ogg":
+		return ".ogg"
+	case "audio/mpeg":
+		return ".mp3"
+	case "audio/wav":
+		return ".wav"
+	case "video/mp4":
+		return ".mp4"
+	case "application/pdf":
+		return ".pdf"
+	default:
+		return ".bin"
+	}
 }

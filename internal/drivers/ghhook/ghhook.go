@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"time"
 
+	"agentflow/internal/core/media"
 	"agentflow/internal/core/router"
 	"agentflow/internal/core/session"
 	"agentflow/internal/drivers/httpd"
@@ -57,11 +58,11 @@ func New(name, path, agent, secret string, sink router.Sink, srv *httpd.Server, 
 }
 
 func (d *Driver) Name() string { return d.name }
-func (d *Driver) Path() string  { return d.path }
+func (d *Driver) Path() string { return d.path }
 
 // Deliver implements gateway.Driver. Events have no chat target, so there is
 // nothing to deliver; this is always an error.
-func (d *Driver) Deliver(replyTo, text string) error {
+func (d *Driver) Deliver(replyTo string, text string, attachments []media.Part) error {
 	return fmt.Errorf("ghhook channel %q does not support replies", d.name)
 }
 

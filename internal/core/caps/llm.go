@@ -3,24 +3,44 @@ package caps
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 
 	"agentflow/internal/core/budget"
+	"agentflow/internal/core/media"
 	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/session"
 	"agentflow/internal/drivers/llm"
 )
 
-// LLMHandlers exposes the llm driver as session op handlers.
-func LLMHandlers(m *llm.Manager) map[string]session.OpHandler {
-	toLLM := func(ms []session.ChatMessage) []llm.Message {
-		out := make([]llm.Message, len(ms))
-		for i, mm := range ms {
+// maxInlineMedia bounds a single resolved media part handed to a provider
+// (decoded bytes). Larger blobs fail the call with an explicit error instead
+// of silently OOM-ing a worker.
+const maxInlineMedia = 20 << 20 // 20 MiB
+
+// LLMHandlers exposes the llm driver as session op handlers. ms is the blob
+// store used to resolve part handles to inline base64 just before the
+// provider request; nil disables handle resolution (handle parts error).
+func LLMHandlers(m *llm.Manager, ms *media.Store) map[string]session.OpHandler {
+	toLLM := func(ms0 []session.ChatMessage) ([]llm.Message, error) {
+		out := make([]llm.Message, len(ms0))
+		for i, mm := range ms0 {
 			out[i] = llm.Message{
 				Role:       mm.Role,
 				Content:    mm.Content,
 				ToolCallID: mm.ToolCallID,
 				ToolResult: mm.ToolResult,
+			}
+			if len(mm.Parts) > 0 {
+				parts := make([]media.Part, len(mm.Parts))
+				copy(parts, mm.Parts)
+				for j := range parts {
+					if err := resolvePart(&parts[j], ms); err != nil {
+						return nil, err
+					}
+				}
+				out[i].Parts = parts
 			}
 			if len(mm.ToolCalls) > 0 {
 				calls := make([]llm.ToolCall, len(mm.ToolCalls))
@@ -30,7 +50,7 @@ func LLMHandlers(m *llm.Manager) map[string]session.OpHandler {
 				out[i].ToolCalls = calls
 			}
 		}
-		return out
+		return out, nil
 	}
 	toToolDefs := func(specs []session.ToolSpec) []llm.ToolDef {
 		out := make([]llm.ToolDef, len(specs))
@@ -51,16 +71,33 @@ func LLMHandlers(m *llm.Manager) map[string]session.OpHandler {
 		b, _ := json.Marshal(err.Error())
 		return string(b), false
 	}
+	chatOf := func(ctx context.Context, op session.Op) (string, bool) {
+		msgs, err := toLLM(op.Messages)
+		if err != nil {
+			return fail(err)
+		}
+		text, toolCalls, usage, err := m.Chat(ctx, op.Model, msgs, optsOf(op))
+		if err != nil {
+			return fail(err)
+		}
+		b, _ := json.Marshal(map[string]any{"text": text, "usage": usage, "tool_calls": toolCalls})
+		return string(b), true
+	}
+	streamOf := func(ctx context.Context, op session.Op) (string, bool) {
+		msgs, err := toLLM(op.Messages)
+		if err != nil {
+			return fail(err)
+		}
+		id, err := m.StreamOpen(ctx, op.Model, msgs, optsOf(op))
+		if err != nil {
+			return fail(err)
+		}
+		b, _ := json.Marshal(map[string]any{"id": id})
+		return string(b), true
+	}
 
 	return map[string]session.OpHandler{
-		"llm.chat": func(ctx context.Context, op session.Op) (string, bool) {
-			text, toolCalls, usage, err := m.Chat(ctx, op.Model, toLLM(op.Messages), optsOf(op))
-			if err != nil {
-				return fail(err)
-			}
-			b, _ := json.Marshal(map[string]any{"text": text, "usage": usage, "tool_calls": toolCalls})
-			return string(b), true
-		},
+		"llm.chat": chatOf,
 
 		"llm.embed": func(ctx context.Context, op session.Op) (string, bool) {
 			vectors, usage, err := m.Embed(ctx, op.Model, op.Inputs)
@@ -80,14 +117,7 @@ func LLMHandlers(m *llm.Manager) map[string]session.OpHandler {
 			return string(b), true
 		},
 
-		"llm.stream.open": func(ctx context.Context, op session.Op) (string, bool) {
-			id, err := m.StreamOpen(ctx, op.Model, toLLM(op.Messages), optsOf(op))
-			if err != nil {
-				return fail(err)
-			}
-			b, _ := json.Marshal(map[string]any{"id": id})
-			return string(b), true
-		},
+		"llm.stream.open": streamOf,
 
 		"llm.stream.next": func(ctx context.Context, op session.Op) (string, bool) {
 			delta, done, usage, toolCalls, err := m.StreamNext(ctx, op.Stream)
@@ -111,6 +141,45 @@ func LLMHandlers(m *llm.Manager) map[string]session.OpHandler {
 	}
 }
 
+// resolvePart dereferences a blob-store handle into inline base64 data.
+// Already-inline (Data) and URL parts pass through untouched — providers
+// decide what they can consume. This is the single point where media bytes
+// enter a provider request; Lua never sees them.
+func resolvePart(p *media.Part, ms *media.Store) error {
+	if p.Handle == "" || p.Data != "" {
+		return nil
+	}
+	if ms == nil {
+		return fmt.Errorf("media handle %q but no media store configured", p.Handle)
+	}
+	if !media.ValidHandle(p.Handle) {
+		return fmt.Errorf("malformed media handle %q", p.Handle)
+	}
+	b, err := ms.ReadAll(p.Handle, maxInlineMedia)
+	if err != nil {
+		return err
+	}
+	if p.MIME == "" {
+		p.MIME = "application/octet-stream"
+	}
+	p.Data = base64.StdEncoding.EncodeToString(b)
+	return nil
+}
+
+// countMediaParts totals the media (non-text) parts across a message list,
+// for budget surcharges.
+func countMediaParts(ms []session.ChatMessage) int {
+	n := 0
+	for _, m := range ms {
+		for _, p := range m.Parts {
+			if p.Type != "text" {
+				n++
+			}
+		}
+	}
+	return n
+}
+
 func errString(err error) any {
 	if err == nil {
 		return nil
@@ -120,11 +189,13 @@ func errString(err error) any {
 
 // MeteredLLMHandlers wraps LLMHandlers with budget reserve/commit/release.
 // Before each llm.chat call, it reserves a conservative estimate (the model's
-// MaxTokens or a default). After the call, it commits the actual reported usage
-// and releases unused reservation. On exhaustion, the call returns a structured
-// error instead of reaching the provider.
-func MeteredLLMHandlers(m *llm.Manager, pool *budget.Pool) map[string]session.OpHandler {
-	base := LLMHandlers(m)
+// MaxTokens or a default, plus a flat surcharge per media part — images and
+// PDFs cost real input tokens even before any text). After the call, it
+// commits the actual reported usage and releases unused reservation. On
+// exhaustion, the call returns a structured error instead of reaching the
+// provider.
+func MeteredLLMHandlers(m *llm.Manager, ms *media.Store, pool *budget.Pool) map[string]session.OpHandler {
+	base := LLMHandlers(m, ms)
 	chat := base["llm.chat"]
 	metered := func(ctx context.Context, op session.Op) (string, bool) {
 		// Reserve a conservative estimate before the call.
@@ -132,6 +203,9 @@ func MeteredLLMHandlers(m *llm.Manager, pool *budget.Pool) map[string]session.Op
 		if estimate <= 0 {
 			estimate = 4096
 		}
+		// Media surcharge: provider-reported usage arrives after the call, but
+		// reserve up front so a media-heavy turn cannot blow past the budget.
+		estimate += int64(1600 * countMediaParts(op.Messages))
 		lease, err := pool.Reserve(estimate)
 		if err != nil {
 			metrics.Inc("agentflow_budget_denied")

@@ -22,6 +22,7 @@ import (
 	"agentflow/internal/core/credentials"
 	"agentflow/internal/core/gateway"
 	"agentflow/internal/core/identity"
+	"agentflow/internal/core/media"
 	"agentflow/internal/core/memory"
 	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/pool"
@@ -154,6 +155,16 @@ func main() {
 		}
 	}
 
+	// Media blob store: one per process, rooted beside the runtime
+	// persistence data. Channels with a media policy land inbound media here;
+	// llm caps resolve handles to inline base64 at request time.
+	mediaDir := filepath.Join(filepath.Dir(cfg.PersistencePath()), "media")
+	mediaStore, err := media.Open(mediaDir)
+	if err != nil {
+		log.Error("media store failed", "err", err)
+		os.Exit(1)
+	}
+
 	// Resolve per-agent memory and build handler maps.
 	agentMemories := []memory.AgentMemory{}
 	defs := map[string]*supervisor.AgentDef{}
@@ -198,7 +209,7 @@ func main() {
 		handlers := map[string]session.OpHandler{}
 		// Budget metering: if the agent declares tokens_per_day, wrap LLM
 		// handlers with reserve/commit/release.
-		llmHandlers := caps.LLMHandlers(llmMgr)
+		llmHandlers := caps.LLMHandlers(llmMgr, mediaStore)
 		if tokensPerDay := budgetTokens(a); tokensPerDay > 0 {
 			pool := budget.NewPool(tokensPerDay)
 			if w := budgetWindow(a); w > 0 {
@@ -208,7 +219,7 @@ func main() {
 			} else {
 				pool.StartDailyReset()
 			}
-			llmHandlers = caps.MeteredLLMHandlers(llmMgr, pool)
+			llmHandlers = caps.MeteredLLMHandlers(llmMgr, mediaStore, pool)
 		}
 		for k, h := range llmHandlers {
 			handlers[k] = h
@@ -303,7 +314,7 @@ func main() {
 		// spawned from it — e.g. a manager variant or worker pool gets its
 		// own budget. (Static agents carve per-agent pools above; profile-
 		// level carve-down from the parent's pool is a follow-up.)
-		llmHandlers := caps.LLMHandlers(llmMgr)
+		llmHandlers := caps.LLMHandlers(llmMgr, mediaStore)
 		if p.Budget.TokensPerDay > 0 {
 			pool := budget.NewPool(p.Budget.TokensPerDay)
 			if w, err := time.ParseDuration(p.Budget.Window); err == nil && w > 0 {
@@ -311,7 +322,7 @@ func main() {
 			} else {
 				pool.StartDailyReset()
 			}
-			llmHandlers = caps.MeteredLLMHandlers(llmMgr, pool)
+			llmHandlers = caps.MeteredLLMHandlers(llmMgr, mediaStore, pool)
 		}
 		for k, h := range llmHandlers {
 			handlers[k] = h
@@ -442,6 +453,13 @@ func main() {
 	//   2. bind the listener, then Start the telegram drivers — because auto
 	//      probes <public_url>/health, which round-trips through the public
 	//      proxy back to this listener, and a probe before bind always fails.
+	mediaPol := func(ch config.Channel) (media.Policy, bool) {
+		if len(ch.Media.Allow) == 0 {
+			return media.Policy{}, false
+		}
+		return media.Policy{MaxBytes: int64(ch.Media.MaxBytes), Allow: ch.Media.Allow}, true
+	}
+
 	httpdLog := log.With("module", "httpd")
 	httpSrv := httpd.New(cfg.Gateway.Listen, httpdLog)
 	var telegramDrivers []*telegram.Driver
@@ -450,12 +468,17 @@ func main() {
 		if name == "" {
 			name = fmt.Sprintf("%s-%d", ch.Type, i)
 		}
+		mpol, mok := mediaPol(ch)
+		var mstore *media.Store
+		if mok {
+			mstore = mediaStore
+		}
 		switch ch.Type {
 		case "webhook":
-			d := webhook.New(name, ch.Path, ch.Agent, sink, httpSrv, log)
+			d := webhook.New(name, ch.Path, ch.Agent, sink, httpSrv, mstore, mpol, log)
 			gw.Register(d)
 		case "telegram":
-			d := telegram.New(name, ch.Token, ch.Agent, ch.Mode, ch.AllowUsers, ch.Path, cfg.Gateway.PublicURL, sink, httpSrv, log)
+			d := telegram.New(name, ch.Token, ch.Agent, ch.Mode, ch.AllowUsers, ch.Path, cfg.Gateway.PublicURL, sink, httpSrv, mstore, mpol, log)
 			gw.Register(d)
 			telegramDrivers = append(telegramDrivers, d)
 		case "ghhook":

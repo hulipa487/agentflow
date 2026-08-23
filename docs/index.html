@@ -67,7 +67,7 @@
   </table>
 
   <div class="callout">
-    <strong>Current status</strong>: <span>The core runtime (actors, memory, tools, shell, multi-agent, scheduler, budget, safety, metrics) is implemented and tested. Every storage backend is a real provider — SQLite, Redis, MongoDB, and PostgreSQL for KV/document storage, an in-memory volatile store for ephemeral data, and pgvector for vector recall (SQLite vector queries return an explicit unsupported error, never silent empties). LLM providers cover four API shapes: Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, and the Gemini Interactions API, each targeting self-hosted/proxied endpoints via <code>base_url</code>; per-model <code>server_tools</code> enable provider-native server-side tools such as Google Search grounding. Channels — webhook, GitHub webhook (<code>ghhook</code>), and Telegram (polling, webhook, and self-configuring <code>auto</code> mode) — all mount on one shared HTTP listener with a built-in <code>/health</code> probe. An in-process mail capability (<code>mail.imap_fetch</code> / <code>mail.smtp_send</code>) resolves passwords from the credential store at call time. Embeddings (<code>llm.embed</code>, OpenAI-compatible) and cross-encoder reranking (<code>llm.rerank</code>) close the semantic-memory loop: pgvector stores vectors on write and <code>builtin:semantic</code> recall pipelines embed -> vector k-NN -> rerank. Token budgets support daily reset or rolling-window accounting, and spawn profiles carry their own shared metered pool.</span>
+    <strong>Current status</strong>: <span>The core runtime (actors, memory, tools, shell, multi-agent, scheduler, budget, safety, metrics) is implemented and tested. Every storage backend is a real provider — SQLite, Redis, MongoDB, and PostgreSQL for KV/document storage, an in-memory volatile store for ephemeral data, and pgvector for vector recall (SQLite vector queries return an explicit unsupported error, never silent empties). LLM providers cover four API shapes: Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, and the Gemini Interactions API, each targeting self-hosted/proxied endpoints via <code>base_url</code>; per-model <code>server_tools</code> enable provider-native server-side tools such as Google Search grounding. Channels — webhook, GitHub webhook (<code>ghhook</code>), and Telegram (polling, webhook, and self-configuring <code>auto</code> mode) — all mount on one shared HTTP listener with a built-in <code>/health</code> probe. An in-process mail capability (<code>mail.imap_fetch</code> / <code>mail.smtp_send</code>) resolves passwords from the credential store at call time. <strong>Multimodal</strong> is supported: channels ingest media into a content-addressed blob store (per-channel allow-list + size ceiling), loops forward part descriptors into <code>llm.chat</code>, and the runtime resolves blob handles to inline base64 at request time — Chat Completions takes images + audio, Anthropic/Responses/Gemini take images + PDFs (Gemini also video). Embeddings (<code>llm.embed</code>, OpenAI-compatible) and cross-encoder reranking (<code>llm.rerank</code>) close the semantic-memory loop: pgvector stores vectors on write and <code>builtin:semantic</code> recall pipelines embed -> vector k-NN -> rerank. Token budgets support daily reset or rolling-window accounting, and spawn profiles carry their own shared metered pool.</span>
   </div>
 </section>
 
@@ -168,7 +168,7 @@ make clean && make</code></pre>
   <pre class="diagram"><code>┌─ Channels (bytes in / replies out) ──────────────────────────────────────────┐
 │  webhook          ghhook                telegram: polling | webhook | auto     │
 │  (POST handler)   (GitHub HMAC event)   (getUpdates | POST path | probe+pick)  │
-│  ── all HTTP channels mount on one shared httpd listener; GET /health probe ── │
+│  media: per-channel allow-list → blob store;  ── one shared httpd listener ── │
 └───────────┬───────────────────┬──────────────────────┬───────────────────────┘
             │                   │                      │
             ▼                   ▼                      ▼
@@ -456,6 +456,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
     </tbody>
   </table>
   <p>Every HTTP channel <code>path</code> must end in <code>/</code> (a subtree mount). A UUID-style path segment is a recommended unguessable secret prefix. Two channels mounting the same path are a boot error. Telegram's <code>token</code> and ghhook's <code>secret</code> are env-interpolated.</p>
+  <p><strong>Inbound media</strong> is opt-in per channel via a <code>media:</code> block — an allow-list of MIME patterns (<code>image/*</code>, <code>application/pdf</code>, <code>audio/*</code>, …) plus <code>max_bytes</code> (default 8 MiB). Telegram downloads the file (getFile), webhook accepts base64 <code>attachments</code>; bytes land in the content-addressed blob store (<code>data/media/</code>) and the message carries tiny part descriptors. With no media block, attachments are dropped and only the text/caption flows.</p>
   <pre><code>gateway:
   listen: ":8080"               # the single shared listener (default :8080)
   public_url: ""                # external base, e.g. https://bot.example.com
@@ -463,6 +464,9 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
     - type: webhook
       path: /webhook/dev/9f2c.../   # subtree; UUID segment = secret prefix
       agent: bot
+#     media:                        # optional — media ingestion off by default
+#       max_bytes: 8388608
+#       allow: [image/*, application/pdf]
     - type: ghhook
       path: /webhook/github/9f2c.../
       secret: ${GITHUB_WEBHOOK_SECRET}   # HMAC key; empty skips verify (dev only)
@@ -471,7 +475,10 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
       token: ${TG_TOKEN}
       mode: auto                 # polling (default) | webhook | auto
       allow_users: [123456789]
-      agent: bot</code></pre>
+      agent: bot
+      media:
+        max_bytes: 8388608
+        allow: [image/*, application/pdf]   # photos + docs feed the vision model</code></pre>
   <div class="callout warn">
     <strong>Breaking change</strong>: <span>the per-channel <code>listen:</code> field was removed. Configs that still carry it fail to load with <code>field listen not found in type config.Channel</code>. Move each channel's port to the single <code>gateway.listen</code>, give every HTTP channel a <code>path</code> ending in <code>/</code>, and set <code>gateway.public_url</code> for telegram webhook/auto. See the README migration checklist.</span>
   </div>
@@ -583,9 +590,16 @@ end</code></pre>
   <h4><code>session</code> — core</h4>
   <pre><code>session.inbox() -> Message            -- parks until the next mailbox message
 session.send(text)                    -- reply to the active inbound message
+session.send(text, { attachments = parts }) -- send with media (see below)
 session.push(channel, reply_to, text) -- proactive egress; cap: channel.push
+session.push(channel, reply_to, text, { attachments = parts })
 session.push_user(uuid, text)         -- proactive egress to a user UUID; cap: channel.push
 session.exit()                        -- terminate this session</code></pre>
+  <p>Messages carry an <code>attachments</code> array of media part descriptors
+  (<code>{type, mime, handle, name}</code>) when the channel ingested media.
+  Forward them unchanged into <code>llm.chat</code> or <code>session.send</code>;
+  the runtime resolves blob handles ("media:&lt;sha256&gt;") to bytes at the
+  provider / channel boundary — raw media never enters Lua.</p>
 
   <h4><code>llm</code> — cap: <code>llm.chat</code></h4>
   <pre><code>llm.chat(messages, opts?) -> { text, usage, tool_calls }
@@ -595,7 +609,21 @@ llm.rerank(query, documents, opts?) -> { results } -- results: [{ index, score }
 
 -- opts: { model = "default", temperature = 0.7, max_tokens = 4096,
 --         tools = [...], tool_choice = "auto" | "none" }</code></pre>
-  <p>Messages are arrays of <code>{ role, content, tool_calls?, tool_call_id?, tool_result? }</code>. <code>llm.stream</code> returns a closure; call it directly (<code>local d = next_chunk()</code>), never in a generic <code>for ... in</code> — the iterator protocol cannot yield across the C boundary.</p>
+  <p>Messages are arrays of <code>{ role, content, tool_calls?, tool_call_id?, tool_result? }</code>. <strong>Multimodal turns</strong> use <code>{ role, parts = {...} }</code>; each part is a table:</p>
+  <pre><code>{ type = "text",  text = "..." }
+{ type = "image"|"audio"|"video"|"file", mime = "image/png", handle = "media:...",
+  name = "photo.jpg" }   -- handle from msg.attachments (data base64 / url also valid)</code></pre>
+  <p>Provider support matrix (unsupported part types error honestly):</p>
+  <table class="table config-table">
+    <thead><tr><th>Provider</th><th>image</th><th>audio</th><th>video</th><th>PDF (file)</th></tr></thead>
+    <tbody>
+      <tr><td>anthropic</td><td>✅ base64/url</td><td>❌</td><td>❌</td><td>✅ document</td></tr>
+      <tr><td>openai</td><td>✅ image_url</td><td>✅ input_audio</td><td>❌</td><td>❌</td></tr>
+      <tr><td>openai-responses</td><td>✅ input_image</td><td>✅ input_audio</td><td>❌</td><td>✅ input_file</td></tr>
+      <tr><td>gemini (interactions)</td><td>✅ inline_data</td><td>✅ inline_data</td><td>✅ inline_data</td><td>✅ inline_data</td></tr>
+    </tbody>
+  </table>
+  <p>Only <code>data</code> (base64) sources work for gemini; anthropic/openai also accept <code>url</code> sources. Blob-store <code>handle</code>s are resolved to base64 automatically. <code>llm.stream</code> returns a closure; call it directly (<code>local d = next_chunk()</code>), never in a generic <code>for ... in</code> — the iterator protocol cannot yield across the C boundary.</p>
   <p><code>llm.embed</code> works with any OpenAI-compatible <code>/embeddings</code> endpoint (Ollama, vLLM, TEI, OpenRouter); the Anthropic and Gemini providers have no embeddings API here and fail explicitly. <code>llm.rerank</code> requires a <code>provider: rerank</code> model entry speaking <code>POST {base_url}/rerank</code> (TEI, vLLM, Jina, Cohere). <code>llm.embed</code> is token-metered when the agent declares a budget. The <code>gemini</code> provider (Interactions API) is non-streaming: <code>llm.stream</code> over it yields the full reply as a single delta.</p>
 
   <h4><code>agent</code> — caps: <code>agent.send</code>, <code>agent.request</code>, <code>agent.spawn</code></h4>
@@ -711,6 +739,7 @@ end</code></pre>
     <li><code>plugins/examples/tool_loop.lua</code> — listing and invoking tools manually.</li>
     <li><code>plugins/examples/shell_loop.lua</code> — spawning a Docker handle and running commands.</li>
     <li><code>plugins/examples/agent_request.lua</code> — requesting another agent and printing its reply.</li>
+    <li><code>plugins/examples/multimodal.lua</code> — forwarding inbound media attachments into <code>llm.chat</code> (see <code>examples/agentflow.multimodal.yaml</code>).</li>
   </ul>
 
   <h4>Tool loop</h4>

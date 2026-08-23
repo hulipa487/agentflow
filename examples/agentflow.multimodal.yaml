@@ -1,0 +1,50 @@
+version: "1"
+
+# Multimodal chatbot: Telegram in + understanding + out.
+#
+# Requires:
+#   export ANTHROPIC_API_KEY=... TG_TOKEN=...
+#   ./agentflow -config examples/agentflow.multimodal.yaml
+#
+# inbound media: the telegram channel's media block opts into image/audio/pdf
+# ingestion. Files are downloaded to the blob store (data/media/) and reach
+# the loop as msg.attachments descriptors (handles, never bytes).
+#
+# The loop (plugins/examples/multimodal.lua) forwards attachments into
+# llm.chat as parts; this config uses anthropic, which understands images and
+# PDFs but returns an honest error for audio/video.
+#
+# outbound media: session.send(text, {attachments = {...}}) delivers on
+# telegram via sendPhoto/sendDocument (the attachments you revce via
+# msg.attachments are already valid). To regenerate an image and send it,
+# the loop builds a part inline and passes data/handle — see the plugin.
+
+models:
+  default:
+    provider: anthropic
+    model: claude-sonnet-5
+    api_key: ${ANTHROPIC_API_KEY}
+    timeout: 60s
+    retry: 2
+
+agents:
+  bot:
+    loop: builtin:react           # or: ./plugins/examples/multimodal.lua
+    model: default
+    instructions: ./instructions/bot.md
+    capabilities: [llm.chat, memory, tools, net.http]
+    memory: builtin:conversational
+
+gateway:
+  public_url: ${PUBLIC_URL:-}     # set for webhook/auto mode
+  channels:
+    - type: telegram
+      token: ${TG_TOKEN}
+      mode: auto                  # setWebhook if PUBLIC_URL is reachable, else polling
+      allow_users: []             # telegram user ids; empty = allow all
+      agent: bot
+      media:                      # inbound media policy (opt-in; empty = off)
+        max_bytes: 8388608        # 8 MiB per file
+        allow:
+          - image/*               # photos (also stickers become images)
+          - application/pdf       # documents

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"agentflow/internal/core/media"
 	"agentflow/internal/core/pool"
 )
 
@@ -23,7 +24,7 @@ type fakeGW struct {
 	sends []sendRec
 }
 
-func (f *fakeGW) Send(channel, replyTo, text string) error {
+func (f *fakeGW) Send(channel, replyTo, text string, _ []media.Part) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.sends = append(f.sends, sendRec{channel, replyTo, text})

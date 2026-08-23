@@ -3,17 +3,26 @@
 // reply resolves the pending request by correlation id. It attaches to the
 // shared httpd.Server (see internal/drivers/httpd) rather than listening on
 // its own port.
+//
+// Inbound media: an optional "attachments" array of {mime, name, data
+// (base64)} objects is accepted when the channel media policy allows the
+// mime; parts land in the blob store and ride the message as descriptors.
 package webhook
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"agentflow/internal/core/media"
+	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/router"
 	"agentflow/internal/core/session"
 	"agentflow/internal/drivers/httpd"
@@ -25,6 +34,8 @@ type Driver struct {
 	path  string
 	agent string
 	sink  router.Sink
+	store *media.Store // nil = media policy disabled
+	pol   media.Policy
 	log   *slog.Logger
 
 	seq     atomic.Uint64
@@ -32,7 +43,7 @@ type Driver struct {
 	pending map[string]chan string // request id → reply waiter
 }
 
-func New(name, path, agent string, sink router.Sink, srv *httpd.Server, log *slog.Logger) *Driver {
+func New(name, path, agent string, sink router.Sink, srv *httpd.Server, store *media.Store, pol media.Policy, log *slog.Logger) *Driver {
 	if path == "" {
 		path = "/webhook/"
 	}
@@ -41,6 +52,8 @@ func New(name, path, agent string, sink router.Sink, srv *httpd.Server, log *slo
 		path:    path,
 		agent:   agent,
 		sink:    sink,
+		store:   store,
+		pol:     pol,
 		log:     log.With("driver", "webhook", "channel", name),
 		pending: map[string]chan string{},
 	}
@@ -49,12 +62,22 @@ func New(name, path, agent string, sink router.Sink, srv *httpd.Server, log *slo
 }
 
 func (d *Driver) Name() string { return d.name }
-func (d *Driver) Path() string  { return d.path }
+func (d *Driver) Path() string { return d.path }
 
 type inbound struct {
-	From string `json:"from"`
-	Text string `json:"text"`
+	From        string          `json:"from"`
+	Text        string          `json:"text"`
+	Attachments []inboundAttach `json:"attachments"`
 }
+
+type inboundAttach struct {
+	MIME string `json:"mime"`
+	Name string `json:"name"`
+	Data string `json:"data"` // base64; the only supported webhook source
+}
+
+// maxRequestBytes bounds the whole POST body (text + inline base64 media).
+const maxRequestBytes = 24 << 20 // 24 MiB
 
 func (d *Driver) handle(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -62,7 +85,7 @@ func (d *Driver) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in inbound
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxRequestBytes)).Decode(&in); err != nil {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
@@ -82,13 +105,14 @@ func (d *Driver) handle(w http.ResponseWriter, r *http.Request) {
 		Channel: d.name,
 		Agent:   d.agent,
 		Message: session.Message{
-			ID:      id,
-			Type:    "user",
-			From:    "user:webhook:" + in.From,
-			Text:    in.Text,
-			Channel: d.name,
-			ReplyTo: id,
-			Ts:      time.Now().Unix(),
+			ID:          id,
+			Type:        "user",
+			From:        "user:webhook:" + in.From,
+			Text:        in.Text,
+			Channel:     d.name,
+			ReplyTo:     id,
+			Attachments: d.ingestAttachments(in.Attachments),
+			Ts:          time.Now().Unix(),
 		},
 	})
 
@@ -102,9 +126,51 @@ func (d *Driver) handle(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// ingestAttachments stores inline base64 attachments per the channel media
+// policy. Parts that fail the policy or decode are skipped with a log line —
+// the text still flows (honest degradation at the channel boundary).
+func (d *Driver) ingestAttachments(in []inboundAttach) []media.Part {
+	if len(in) == 0 || d.store == nil || !d.pol.Enabled() {
+		return nil
+	}
+	var out []media.Part
+	for _, a := range in {
+		mime := a.MIME
+		if mime == "" {
+			mime = "application/octet-stream"
+		}
+		if !d.pol.Allows(mime) {
+			d.log.Warn("webhook attachment dropped: mime not allowed", "mime", mime)
+			metrics.Inc("agentflow_media_unsupported")
+			continue
+		}
+		raw, err := base64.StdEncoding.DecodeString(a.Data)
+		if err != nil {
+			d.log.Warn("webhook attachment dropped: bad base64", "name", a.Name)
+			metrics.Inc("agentflow_media_unsupported")
+			continue
+		}
+		ref, err := d.store.Put(bytes.NewReader(raw), mime, d.pol)
+		if err != nil {
+			d.log.Warn("webhook attachment store failed", "err", err)
+			continue
+		}
+		metrics.Add("agentflow_media_bytes", ref.Size)
+		out = append(out, media.Part{Type: media.Classify(mime), MIME: mime, Handle: ref.Handle, Name: a.Name})
+	}
+	if len(out) > 0 {
+		metrics.Inc("agentflow_media_ingested")
+	}
+	return out
+}
+
 // Deliver implements gateway.Driver: resolves the reply for the pending
-// request this message belongs to.
-func (d *Driver) Deliver(replyToID string, text string) error {
+// request this message belongs to. Media replies are not supported on this
+// channel (the response body is text) — they fail loudly, never silently.
+func (d *Driver) Deliver(replyToID string, text string, attachments []media.Part) error {
+	if len(attachments) > 0 {
+		return fmt.Errorf("webhook channel %q does not support media replies", d.name)
+	}
 	d.mu.Lock()
 	ch, ok := d.pending[replyToID]
 	d.mu.Unlock()

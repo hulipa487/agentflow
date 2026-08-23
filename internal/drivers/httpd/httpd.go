@@ -82,6 +82,10 @@ func (s *Server) Handle(path string, fn http.HandlerFunc) {
 
 func (s *Server) Listen() string { return s.listen }
 
+// Handler returns the underlying mux, so embedders and tests can serve it
+// through their own server instead of Start (e.g. httptest.NewServer).
+func (s *Server) Handler() http.Handler { return s.mux }
+
 // Start begins serving. It returns once the server is bound; ListenAndServe
 // runs in a goroutine so callers can proceed to wire the rest of the runtime.
 func (s *Server) Start() error {

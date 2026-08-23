@@ -22,10 +22,14 @@ import (
 func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs []Message, opts Opts) (<-chan event, bool, error) {
 	base := resolveBase(cfg, "https://api.openai.com/v1")
 	url := base + "/chat/completions"
+	msgsOut, err := openaiMessages(msgs)
+	if err != nil {
+		return nil, false, err
+	}
 
 	body := map[string]any{
 		"model":    cfg.Model,
-		"messages": openaiMessages(msgs), // openai takes system inline
+		"messages": msgsOut, // openai takes system inline
 		"stream":   true,
 		"stream_options": map[string]any{
 			"include_usage": true,
@@ -89,8 +93,8 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 						Content   string `json:"content"`
 						ToolCalls []struct {
 							Index    int    `json:"index"`
-							ID        string `json:"id"`
-							Function  struct {
+							ID       string `json:"id"`
+							Function struct {
 								Name      string `json:"name"`
 								Arguments string `json:"arguments"`
 							} `json:"function"`
@@ -154,8 +158,9 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 // native tool-turn representation: an assistant turn with tool_calls becomes
 // {role:"assistant", content, tool_calls:[...]}; a "tool" role turn becomes
 // {role:"tool", tool_call_id, content:json(tool_result)}. Plain turns pass
-// through unchanged.
-func openaiMessages(msgs []Message) []map[string]any {
+// through unchanged. Multimodal turns become content arrays of text /
+// image_url / input_audio parts (vision + audio models).
+func openaiMessages(msgs []Message) ([]map[string]any, error) {
 	out := make([]map[string]any, 0, len(msgs))
 	for _, m := range msgs {
 		switch {
@@ -179,8 +184,74 @@ func openaiMessages(msgs []Message) []map[string]any {
 			}
 			out = append(out, map[string]any{"role": "tool", "tool_call_id": m.ToolCallID, "content": content})
 		default:
-			out = append(out, map[string]any{"role": m.Role, "content": m.Content})
+			if len(m.Parts) > 0 {
+				content, err := openaiContentParts(m)
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, map[string]any{"role": m.Role, "content": content})
+			} else {
+				out = append(out, map[string]any{"role": m.Role, "content": m.Content})
+			}
 		}
 	}
-	return out
+	return out, nil
+}
+
+// openaiContentParts builds the Chat Completions content array for one
+// multimodal turn. Images take image_url (data: URI or remote URL); audio
+// takes input_audio (base64, wav/mp3). PDFs and video are rejected honestly
+// — Chat Completions has no inline form for them (they need the Files API).
+func openaiContentParts(m Message) ([]map[string]any, error) {
+	var out []map[string]any
+	if m.Content != "" {
+		out = append(out, map[string]any{"type": "text", "text": m.Content})
+	}
+	for _, p := range m.Parts {
+		switch p.Type {
+		case "text":
+			if p.Text != "" {
+				out = append(out, map[string]any{"type": "text", "text": p.Text})
+			}
+		case "image":
+			url := p.URL
+			if url == "" {
+				if p.Data == "" {
+					return nil, fmt.Errorf("openai: image part has neither url nor data")
+				}
+				url = dataURI(p)
+			}
+			out = append(out, map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}})
+		case "audio":
+			if p.Data == "" {
+				return nil, fmt.Errorf("openai: audio part requires inline base64 data")
+			}
+			format := audioFormat(p.MIME)
+			if format == "" {
+				return nil, fmt.Errorf("openai: input_audio supports wav and mp3 only (got %q)", p.MIME)
+			}
+			out = append(out, map[string]any{
+				"type":        "input_audio",
+				"input_audio": map[string]any{"data": p.Data, "format": format},
+			})
+		default:
+			return nil, fmt.Errorf("openai (chat completions) does not support %s parts; use the responses provider or pre-process the file", p.Type)
+		}
+	}
+	if len(out) == 0 {
+		out = append(out, map[string]any{"type": "text", "text": ""})
+	}
+	return out, nil
+}
+
+// audioFormat maps a MIME type to OpenAI's input_audio format string.
+func audioFormat(mime string) string {
+	switch strings.ToLower(strings.TrimSpace(mime)) {
+	case "audio/wav", "audio/wave", "audio/x-wav":
+		return "wav"
+	case "audio/mpeg", "audio/mp3":
+		return "mp3"
+	default:
+		return ""
+	}
 }

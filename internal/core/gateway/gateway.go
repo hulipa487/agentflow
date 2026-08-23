@@ -6,14 +6,18 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+
+	"agentflow/internal/core/media"
 )
 
 // Driver is a live channel's delivery half (webhook, telegram, ...).
 type Driver interface {
 	Name() string
-	// Deliver sends text to a channel-specific target (chat id, pending
-	// webhook request id, ...).
-	Deliver(replyTo string, text string) error
+	// Deliver sends text (plus optional media attachments) to a
+	// channel-specific target (chat id, pending webhook request id, ...).
+	// A channel that cannot deliver media returns an error, never a silent
+	// drop.
+	Deliver(replyTo string, text string, attachments []media.Part) error
 }
 
 // Registry maps channel names to drivers.
@@ -40,12 +44,12 @@ func (r *Registry) Register(d Driver) {
 // Send delivers text to the message's origin channel. A reply to an unknown
 // channel is an error the session should hear about (op failure), not a
 // silent drop.
-func (r *Registry) Send(channel, replyTo, text string) error {
+func (r *Registry) Send(channel, replyTo, text string, attachments []media.Part) error {
 	r.mu.RLock()
 	d, ok := r.drivers[channel]
 	r.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("unknown channel %q", channel)
 	}
-	return d.Deliver(replyTo, text)
+	return d.Deliver(replyTo, text, attachments)
 }

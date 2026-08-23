@@ -189,13 +189,23 @@ af = { op = op }
 
 session = {}
 function session.inbox() return op({ type = "inbox" }) end
-function session.send(text) op({ type = "send", text = text }) end
+-- session.send(text, opts?) replies to the active inbound message. opts may
+-- carry attachments = array of part tables ({type="image", mime=..., handle=...})
+-- — typically msg.attachments forwarded from the inbound message. Channels
+-- that cannot deliver media fail the op (honest, never a silent drop).
+function session.send(text, opts)
+  local req = { type = "send", text = text }
+  if opts and opts.attachments then req.attachments = opts.attachments end
+  op(req)
+end
 -- session.push sends to an explicit channel/recipient without an active
 -- inbound message (proactive/background egress). Requires the channel.push
 -- capability. reply_to is the channel-specific recipient (e.g. telegram
--- chat id).
-function session.push(channel, reply_to, text)
-  return op({ type = "session.push", channel = channel, reply_to = reply_to, text = text })
+-- chat id). opts.attachments as in session.send.
+function session.push(channel, reply_to, text, opts)
+  local req = { type = "session.push", channel = channel, reply_to = reply_to, text = text }
+  if opts and opts.attachments then req.attachments = opts.attachments end
+  return op(req)
 end
 -- session.push_user sends to a user by identity UUID. Channel-agnostic: pass
 -- the UUID from msg.from ("user:<uuid>" -> strip the prefix) of a prior turn.
@@ -431,6 +441,13 @@ local function with_opts(req, opts)
 end
 
 llm = {}
+-- llm.chat(messages, opts): messages are {role, content} tables, or
+-- {role, parts = {...}} for multimodal turns. Parts are tables:
+--   {type="text", text="..."} or
+--   {type="image"|"audio"|"video"|"file", mime="...", handle="media:...",
+--    name="..."} — media parts typically come from msg.attachments and the
+--   runtime resolves the handle to bytes; data (base64) and url also work.
+-- Providers that cannot take a part type fail the call with a clear error.
 function llm.chat(messages, opts)
   return op(with_opts({ type = "llm.chat", messages = messages }, opts))
 end

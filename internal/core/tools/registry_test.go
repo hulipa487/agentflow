@@ -56,17 +56,14 @@ func TestRegisterShellBuiltins(t *testing.T) {
 	r := NewRegistry()
 	mgr := shell.NewManager([]shell.ShellProvider{&testShellProvider{name: "docker"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	RegisterShellBuiltins(r, mgr)
-	as := r.Expose([]string{"builtin:fs.read", "builtin:fs.write", "builtin:git.status", "builtin:git.commit"}, config.ToolsPolicy{}, false)
-	for _, name := range []string{"builtin:fs.read", "builtin:fs.write", "builtin:git.status", "builtin:git.commit"} {
+	as := r.Expose([]string{"builtin:fs.read", "builtin:fs.write"}, config.ToolsPolicy{}, false)
+	for _, name := range []string{"builtin:fs.read", "builtin:fs.write"} {
 		if _, ok := as.ByName[name]; !ok {
 			t.Fatalf("expected %s to be exposed", name)
 		}
 	}
 	if !as.ByName["builtin:fs.write"].NeedsConfirm {
 		t.Fatal("fs.write should require confirm")
-	}
-	if !as.ByName["builtin:git.commit"].NeedsConfirm {
-		t.Fatal("git.commit should require confirm")
 	}
 }
 

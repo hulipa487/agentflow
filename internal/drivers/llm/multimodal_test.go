@@ -152,7 +152,84 @@ func TestOpenAIChatPDFRejected(t *testing.T) {
 	multimodalChat(t, "openai", []Message{{
 		Role:  "user",
 		Parts: []media.Part{{Type: "file", MIME: "application/pdf", Data: pngB64}},
-	}}, "does not support file parts")
+	}}, "requires a url source")
+}
+
+func TestOpenAIChatVideoURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(b), `"type":"video_url"`) ||
+			!strings.Contains(string(b), `"url":"https://cdn.example.com/v.mp4"`) {
+			t.Errorf("body missing video_url\nbody: %s", b)
+		}
+		simpleReply()(w, r)
+	}))
+	defer srv.Close()
+	multimodalChatOn(t, "openai", srv, []Message{{
+		Role:  "user",
+		Parts: []media.Part{{Type: "video", MIME: "video/mp4", URL: "https://cdn.example.com/v.mp4"}},
+	}})
+}
+
+func TestOpenAIChatFileURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(b), `"type":"file_url"`) ||
+			!strings.Contains(string(b), `"url":"https://cdn.example.com/doc.pdf"`) {
+			t.Errorf("body missing file_url\nbody: %s", b)
+		}
+		simpleReply()(w, r)
+	}))
+	defer srv.Close()
+	multimodalChatOn(t, "openai", srv, []Message{{
+		Role:  "user",
+		Parts: []media.Part{{Type: "file", MIME: "application/pdf", URL: "https://cdn.example.com/doc.pdf"}},
+	}})
+}
+
+func TestAnthropicVideoPart(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		for _, want := range []string{
+			`"type":"video"`,
+			`"media_type":"video/mp4"`,
+			`"data":"aGVsbG8="`,
+		} {
+			if !strings.Contains(string(b), want) {
+				t.Errorf("body missing %q\nbody: %s", want, b)
+			}
+		}
+		simpleReply()(w, r)
+	}))
+	defer srv.Close()
+	multimodalChatOn(t, "anthropic", srv, []Message{{
+		Role:  "user",
+		Parts: []media.Part{{Type: "video", MIME: "video/mp4", Data: pngB64}},
+	}})
+}
+
+func TestResponsesVideoURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		for _, want := range []string{`"type":"input_video"`, `"video_url":"ms://file_xyz"`} {
+			if !strings.Contains(string(b), want) {
+				t.Errorf("body missing %q\nbody: %s", want, b)
+			}
+		}
+		simpleReply()(w, r)
+	}))
+	defer srv.Close()
+	multimodalChatOn(t, "openai-responses", srv, []Message{{
+		Role:  "user",
+		Parts: []media.Part{{Type: "video", MIME: "video/mp4", URL: "ms://file_xyz"}},
+	}})
+}
+
+func TestResponsesPDFRequiresSource(t *testing.T) {
+	multimodalChat(t, "openai-responses", []Message{{
+		Role:  "user",
+		Parts: []media.Part{{Type: "file", MIME: "application/pdf"}},
+	}}, "requires data or url")
 }
 
 func TestResponsesImageAndPDF(t *testing.T) {
@@ -177,11 +254,11 @@ func TestResponsesImageAndPDF(t *testing.T) {
 	})
 }
 
-func TestResponsesVideoRejected(t *testing.T) {
+func TestResponsesVideoRequiresURL(t *testing.T) {
 	multimodalChat(t, "openai-responses", []Message{{
 		Role:  "user",
 		Parts: []media.Part{{Type: "video", MIME: "video/mp4", Data: pngB64}},
-	}}, "does not support video parts")
+	}}, "requires a url source")
 }
 
 func TestGeminiMediaParts(t *testing.T) {

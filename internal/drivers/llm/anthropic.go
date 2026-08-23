@@ -222,8 +222,10 @@ func anthropicTurns(msgs []Message) (system string, turns []map[string]any, err 
 
 // anthropicPart maps one media part to an Anthropic content block. Images
 // accept base64 or URL sources; PDFs are document blocks (base64 only).
-// Audio and video are rejected honestly — the Messages API has no block type
-// for them.
+// Video follows the MiniMax-compatible extension: a source block with
+// mimetype and base64 data/video (url and mm_file:// file_id references are
+// passed through as opaque strings). Audio is rejected honestly — the
+// standard Messages API has no audio block type.
 func anthropicPart(p media.Part) (map[string]any, error) {
 	switch p.Type {
 	case "text":
@@ -234,6 +236,14 @@ func anthropicPart(p media.Part) (map[string]any, error) {
 			src = map[string]any{"type": "url", "url": p.URL}
 		}
 		return map[string]any{"type": "image", "source": src}, nil
+	case "video":
+		// MiniMax M3 Anthropic-compatible API: type:"video" with a source
+		// that may be base64 inline data, a URL, or an mm_file:// reference.
+		src := map[string]any{"type": "base64", "media_type": p.MIME, "data": p.Data}
+		if p.Data == "" && p.URL != "" {
+			src = map[string]any{"type": "url", "url": p.URL}
+		}
+		return map[string]any{"type": "video", "source": src}, nil
 	case "file":
 		if p.MIME != "application/pdf" {
 			return nil, fmt.Errorf("anthropic: document blocks support application/pdf only (got %q)", p.MIME)

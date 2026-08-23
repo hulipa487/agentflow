@@ -613,16 +613,17 @@ llm.rerank(query, documents, opts?) -> { results } -- results: [{ index, score }
   <pre><code>{ type = "text",  text = "..." }
 { type = "image"|"audio"|"video"|"file", mime = "image/png", handle = "media:...",
   name = "photo.jpg" }   -- handle from msg.attachments (data base64 / url also valid)</code></pre>
-  <p>Provider support matrix (unsupported part types error honestly):</p>
+  <p>Provider support matrix (unsupported part types error honestly; sources are base64 <code>data</code>, <code>url</code>, or a provider file reference):</p>
   <table class="table config-table">
-    <thead><tr><th>Provider</th><th>image</th><th>audio</th><th>video</th><th>PDF (file)</th></tr></thead>
+    <thead><tr><th>Provider</th><th>image</th><th>audio</th><th>video</th><th>PDF / files</th></tr></thead>
     <tbody>
-      <tr><td>anthropic</td><td>✅ base64/url</td><td>❌</td><td>❌</td><td>✅ document</td></tr>
-      <tr><td>openai</td><td>✅ image_url</td><td>✅ input_audio</td><td>❌</td><td>❌</td></tr>
-      <tr><td>openai-responses</td><td>✅ input_image</td><td>✅ input_audio</td><td>❌</td><td>✅ input_file</td></tr>
+      <tr><td>anthropic</td><td>✅ base64/url</td><td>❌</td><td>✅ base64/url (MiniMax video block)</td><td>✅ document (base64)</td></tr>
+      <tr><td>openai (chat)</td><td>✅ image_url</td><td>✅ input_audio (wav/mp3)</td><td>✅ video_url — MiniMax/Kimi/GLM convention</td><td>✅ file_url (url) — GLM</td></tr>
+      <tr><td>openai-responses</td><td>✅ input_image</td><td>✅ input_audio (wav/mp3)</td><td>✅ input_video (url/file ref)</td><td>✅ input_file (data or file_id)</td></tr>
       <tr><td>gemini (interactions)</td><td>✅ inline_data</td><td>✅ inline_data</td><td>✅ inline_data</td><td>✅ inline_data</td></tr>
     </tbody>
   </table>
+  <p>Video sources follow the ecosystem conventions — MiniMax <code>mm_file://&lt;file_id&gt;</code>, Kimi <code>ms://&lt;file_id&gt;</code> — and are passed through verbatim as URL/file references. Blob-store <code>handle</code>s are resolved to base64 automatically.</p>
   <p>Only <code>data</code> (base64) sources work for gemini; anthropic/openai also accept <code>url</code> sources. Blob-store <code>handle</code>s are resolved to base64 automatically. <code>llm.stream</code> returns a closure; call it directly (<code>local d = next_chunk()</code>), never in a generic <code>for ... in</code> — the iterator protocol cannot yield across the C boundary.</p>
   <p><code>llm.embed</code> works with any OpenAI-compatible <code>/embeddings</code> endpoint (Ollama, vLLM, TEI, OpenRouter); the Anthropic and Gemini providers have no embeddings API here and fail explicitly. <code>llm.rerank</code> requires a <code>provider: rerank</code> model entry speaking <code>POST {base_url}/rerank</code> (TEI, vLLM, Jina, Cohere). <code>llm.embed</code> is token-metered when the agent declares a budget. The <code>gemini</code> provider (Interactions API) is non-streaming: <code>llm.stream</code> over it yields the full reply as a single delta.</p>
 

@@ -262,8 +262,9 @@ func responsesItems(msgs []Message) (system string, items []map[string]any, err 
 }
 
 // responsesContentParts builds the content array for one multimodal message
-// item: input_text, input_image (URL or data: URI), input_file (PDF as a
-// data: URL), input_audio (base64 wav/mp3). Video is rejected honestly.
+// item: input_text, input_image (URL or data: URI), input_file (PDF base64
+// or a provider file reference), input_video (URL/file reference), and
+// input_audio (base64 wav/mp3). Matchable to the Responses API input shapes.
 func responsesContentParts(m Message) ([]map[string]any, error) {
 	var out []map[string]any
 	if m.Content != "" {
@@ -285,14 +286,26 @@ func responsesContentParts(m Message) ([]map[string]any, error) {
 			}
 			out = append(out, map[string]any{"type": "input_image", "image_url": url})
 		case "file":
-			if p.Data == "" {
-				return nil, fmt.Errorf("openai-responses: file part requires inline base64 data")
+			item := map[string]any{"type": "input_file"}
+			switch {
+			case p.Data != "":
+				item["file_data"] = dataURI(p)
+			case p.URL != "":
+				item["file_id"] = p.URL // provider file reference / file URL
+			default:
+				return nil, fmt.Errorf("openai-responses: file part requires data or url")
 			}
-			item := map[string]any{"type": "input_file", "file_data": dataURI(p)}
 			if p.Name != "" {
 				item["filename"] = p.Name
 			}
 			out = append(out, item)
+		case "video":
+			// Responses video inputs accept a URL or provider file reference
+			// (MiniMax mm_file://, Kimi ms://), not inline base64.
+			if p.URL == "" {
+				return nil, fmt.Errorf("openai-responses: video part requires a url source")
+			}
+			out = append(out, map[string]any{"type": "input_video", "video_url": p.URL, "file_id": p.URL})
 		case "audio":
 			if p.Data == "" {
 				return nil, fmt.Errorf("openai-responses: audio part requires inline base64 data")

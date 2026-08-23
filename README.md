@@ -14,7 +14,7 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 - **Shell** — Docker and SSH providers with resource limits and an exec-policy filter.
 - **HTTP** — `http.request` / `os.env` Lua ops with scheme validation, body cap, and secret-header redaction.
 - **Mail** — `mail.imap_fetch` / `mail.smtp_send` Lua ops (cap `net.mail`); passwords resolve from the credential store at call time and never cross the Lua bridge.
-- **Multimodal** — channels ingest media into a blob store (per-channel allow-list + size ceiling); loops forward part descriptors into `llm.chat` and the runtime resolves them at request time. Chat Completions: images + audio; Responses/Anthropic/Gemini: images + PDFs (Gemini also video). Opt-in via `media:` on a channel.
+- **Multimodal** — channels ingest media into a blob store (per-channel allow-list + size ceiling); loops forward part descriptors into `llm.chat` and the runtime resolves them at request time. Every provider covers images + PDFs; audio on the OpenAI shapes (input_audio) and Gemini; video via the MiniMax/Kimi/GLM `video_url` convention on the OpenAI shapes, a video block on Anthropic, and inline_data on Gemini. Opt-in via `media:` on a channel.
 - **Credentials** — encrypted-at-rest, per-tenant credential store; loops reference a key by `{service=...}` and Go resolves and injects it at request time.
 - **Scheduler** — `scheduler.every/after/cron`; timers arrive as mailbox messages, never a cross-goroutine Luau call.
 - **Budget** — per-agent token pools with reserve/commit/release around LLM calls; daily reset or rolling-window accounting; spawn profiles get their own shared pool.

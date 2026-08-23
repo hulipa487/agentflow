@@ -285,7 +285,7 @@ type Channel struct {
 	Type       string  `yaml:"type"` // webhook | telegram | ghhook
 	Mode       string  `yaml:"mode"` // telegram: polling (default) | webhook | auto
 	Agent      string  `yaml:"agent"`
-	Path       string  `yaml:"path"` // route mounted on the shared server, e.g. /webhook/<chan>/<uuid>/
+	Path       string  `yaml:"path"`   // route mounted on the shared server, e.g. /webhook/<chan>/<uuid>/
 	Prefix     string  `yaml:"prefix"` // reserved for future per-channel secret-prefix use
 	Token      string  `yaml:"token"`
 	Secret     string  `yaml:"secret"` // ghhook: webhook secret for HMAC verification (env-interpolated)
@@ -427,10 +427,17 @@ func validate(path string, c *Config) error {
 			if a.Memory.Profile == "builtin:conversational" {
 				continue
 			}
+			// Resolve the store set: a named profiles.memory reference or an
+			// inline profile. Either way, every store's backend must exist.
+			stores := a.Memory.Inline.Stores
 			if !a.Memory.IsInline {
-				return fmt.Errorf("%s: agent %q memory profile %q is not a builtin preset", path, name, a.Memory.Profile)
+				mp, ok := c.Profiles.Memory[a.Memory.Profile]
+				if !ok {
+					return fmt.Errorf("%s: agent %q references unknown memory profile %q", path, name, a.Memory.Profile)
+				}
+				stores = mp.Stores
 			}
-			for sname, store := range a.Memory.Inline.Stores {
+			for sname, store := range stores {
 				if _, ok := c.Memory.Backends[store.Backend]; !ok {
 					return fmt.Errorf("%s: agent %q store %q references unknown backend %q", path, name, sname, store.Backend)
 				}
@@ -559,7 +566,7 @@ func validate(path string, c *Config) error {
 
 	for name, m := range c.Models {
 		switch m.Provider {
-		case "anthropic", "openai", "openai-responses", "gemini":
+		case "anthropic", "openai", "openai-responses", "gemini", "rerank":
 		default:
 			return fmt.Errorf("%s: model %q has unsupported provider %q", path, name, m.Provider)
 		}

@@ -5,7 +5,7 @@ version: "1"
 # The web_search builtin returns honest-unavailable when no search backend is
 # configured, so this still exercises the tools path end-to-end.
 #
-#   curl -X POST localhost:8080/webhook -d '{"from":"alice","text":"hello"}'
+#   curl -X POST localhost:8080/webhook/ -d '{"from":"alice","text":"hello"}'
 
 models:
   default:

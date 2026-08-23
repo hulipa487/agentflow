@@ -34,10 +34,10 @@ type Provenance struct {
 
 // Identity is the runtime-owned authority attached to an actor's operations.
 type Identity struct {
-	SessionID  string
-	Agent      string
-	ParentID   string
-	CanContact map[string]bool
+	SessionID    string
+	Agent        string
+	ParentID     string
+	CanContact   map[string]bool
 	Capabilities map[string]bool
 }
 
@@ -107,13 +107,13 @@ type Op struct {
 	ReplyTo string `json:"reply_to,omitempty"`
 
 	// Store / memory / tool ops.
-	Table  string        `json:"table,omitempty"`
-	Key    string        `json:"key,omitempty"`
-	Value  any           `json:"value,omitempty"`
-	TTL    float64       `json:"ttl,omitempty"`
-	Vector []float32     `json:"vector,omitempty"`
-	Query  memory.Query  `json:"query,omitempty"`
-	Tool   string        `json:"tool,omitempty"`
+	Table  string         `json:"table,omitempty"`
+	Key    string         `json:"key,omitempty"`
+	Value  any            `json:"value,omitempty"`
+	TTL    float64        `json:"ttl,omitempty"`
+	Vector []float32      `json:"vector,omitempty"`
+	Query  memory.Query   `json:"query,omitempty"`
+	Tool   string         `json:"tool,omitempty"`
 	Args   map[string]any `json:"args,omitempty"`
 
 	// HTTP op (http.request).
@@ -133,14 +133,14 @@ type Op struct {
 	// Mail ops (mail.imap.fetch, mail.smtp.send).
 	Mailbox  string   `json:"mailbox,omitempty"`   // IMAP: folder to fetch (default INBOX)
 	Limit    int      `json:"limit,omitempty"`     // IMAP: max messages to return (default 10)
-	Unseen   bool     `json:"unseen,omitempty"`     // IMAP: fetch only unread
+	Unseen   bool     `json:"unseen,omitempty"`    // IMAP: fetch only unread
 	MailFrom string   `json:"mail_from,omitempty"` // SMTP: From address
 	MailTo   []string `json:"mail_to,omitempty"`   // SMTP: recipients
-	Subject  string   `json:"subject,omitempty"`    // SMTP: subject
-	TextBody string   `json:"text_body,omitempty"`  // SMTP: plain body
-	MailHost string   `json:"mail_host,omitempty"`  // SMTP/IMAP: host
-	MailPort int      `json:"mail_port,omitempty"`  // SMTP/IMAP: port
-	MailUser string   `json:"mail_user,omitempty"`  // SMTP/IMAP: username (cred resolves password)
+	Subject  string   `json:"subject,omitempty"`   // SMTP: subject
+	TextBody string   `json:"text_body,omitempty"` // SMTP: plain body
+	MailHost string   `json:"mail_host,omitempty"` // SMTP/IMAP: host
+	MailPort int      `json:"mail_port,omitempty"` // SMTP/IMAP: port
+	MailUser string   `json:"mail_user,omitempty"` // SMTP/IMAP: username (cred resolves password)
 
 	// Multi-agent operations.
 	Address string         `json:"address,omitempty"`
@@ -151,28 +151,28 @@ type Op struct {
 	Request string         `json:"request,omitempty"`
 
 	// Scheduler operations.
-	Interval  float64 `json:"interval,omitempty"`
-	Delay     float64 `json:"delay,omitempty"`
-	Cron      string  `json:"cron,omitempty"`
-	TimerID   string  `json:"timer_id,omitempty"`
+	Interval float64 `json:"interval,omitempty"`
+	Delay    float64 `json:"delay,omitempty"`
+	Cron     string  `json:"cron,omitempty"`
+	TimerID  string  `json:"timer_id,omitempty"`
 
 	// Shell ops.
-	ShellHandle string            `json:"shell_handle,omitempty"`
-	Cmd         string            `json:"cmd,omitempty"`
-	Path        string            `json:"path,omitempty"`
-	Content     string            `json:"content,omitempty"`
-	Image       string            `json:"image,omitempty"`
-	ShellProvider string          `json:"provider,omitempty"`
-	WorkDir     string            `json:"workdir,omitempty"`
-	Net         string            `json:"network,omitempty"`
-	MemLimit    string            `json:"mem_limit,omitempty"`
-	CPULimit    float64           `json:"cpu_limit,omitempty"`
-	ShellEnv    map[string]string `json:"env,omitempty"`
-	ShellOpts   map[string]any    `json:"shell_opts,omitempty"`
-	Host        string            `json:"host,omitempty"`
-	User        string            `json:"user,omitempty"`
-	Password    string            `json:"password,omitempty"`
-	KeyFile     string            `json:"key_file,omitempty"`
+	ShellHandle   string            `json:"shell_handle,omitempty"`
+	Cmd           string            `json:"cmd,omitempty"`
+	Path          string            `json:"path,omitempty"`
+	Content       string            `json:"content,omitempty"`
+	Image         string            `json:"image,omitempty"`
+	ShellProvider string            `json:"provider,omitempty"`
+	WorkDir       string            `json:"workdir,omitempty"`
+	Net           string            `json:"network,omitempty"`
+	MemLimit      string            `json:"mem_limit,omitempty"`
+	CPULimit      float64           `json:"cpu_limit,omitempty"`
+	ShellEnv      map[string]string `json:"env,omitempty"`
+	ShellOpts     map[string]any    `json:"shell_opts,omitempty"`
+	Host          string            `json:"host,omitempty"`
+	User          string            `json:"user,omitempty"`
+	Password      string            `json:"password,omitempty"`
+	KeyFile       string            `json:"key_file,omitempty"`
 
 	// Confirm bypass.
 	Confirmed bool   `json:"confirmed,omitempty"`
@@ -261,33 +261,35 @@ func (b *StringBox) Store(s string) { b.v.Store(s) }
 
 // blockingOps run on the worker pool; everything else is inline.
 var blockingOps = map[string]bool{
-	"send":            true,
-	"session.push":    true,
+	"send":              true,
+	"session.push":      true,
 	"session.push_user": true,
-	"llm.chat":        true,
-	"llm.embed":       true,
-	"llm.rerank":      true,
-	"llm.stream.open": true,
-	"llm.stream.next": true,
-	"tools.run":       true,
-	"store.put":       true,
-	"store.get":       true,
-	"store.query":     true,
-	"store.delete":    true,
-	"shell.spawn":     true,
-	"shell.exec":      true,
-	"shell.write":     true,
-	"shell.destroy":   true,
-	"http.request":    true,
-	"agent.send":      true,
-	"agent.request":   true,
-	"agent.reply":     true,
-	"agent.spawn":     true,
-	"agent.list":      true,
-	"scheduler.every":  true,
-	"scheduler.after":  true,
-	"scheduler.cron":   true,
-	"scheduler.cancel": true,
+	"llm.chat":          true,
+	"llm.embed":         true,
+	"llm.rerank":        true,
+	"llm.stream.open":   true,
+	"llm.stream.next":   true,
+	"tools.run":         true,
+	"store.put":         true,
+	"store.get":         true,
+	"store.query":       true,
+	"store.delete":      true,
+	"shell.spawn":       true,
+	"shell.exec":        true,
+	"shell.write":       true,
+	"shell.destroy":     true,
+	"http.request":      true,
+	"mail.imap.fetch":   true,
+	"mail.smtp.send":    true,
+	"agent.send":        true,
+	"agent.request":     true,
+	"agent.reply":       true,
+	"agent.spawn":       true,
+	"agent.list":        true,
+	"scheduler.every":   true,
+	"scheduler.after":   true,
+	"scheduler.cron":    true,
+	"scheduler.cancel":  true,
 }
 
 // EndReason identifies why an actor left the supervisor.
@@ -304,9 +306,9 @@ type Actor struct {
 	Identity    Identity
 	Info        *Info
 	OnExit      func(Identity, EndReason)
-	LoopFile    string // re-read on restart; empty for builtins
-	LoopSrc     string // source used when LoopFile is empty
-	SupportSrc  string // extra chunk loaded before the plugin (builtin:token_budget)
+	LoopFile    string   // re-read on restart; empty for builtins
+	LoopSrc     string   // source used when LoopFile is empty
+	SupportSrc  string   // extra chunk loaded before the plugin (builtin:token_budget)
 	SupportSrcs []string // support chunks loaded before the loop plugin
 	InstrBudget int64
 
@@ -345,7 +347,7 @@ func New(name string, identity Identity, info *Info, gw Gateway, agents AgentSer
 		sched:       sched,
 		users:       users,
 		safety:      safe,
-		handlers:     handlers,
+		handlers:    handlers,
 		pool:        p,
 		reload:      make(chan struct{}, 1),
 		log:         log.With("session", name),

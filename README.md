@@ -13,20 +13,22 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 - **Tools** — filesystem & git inside shell handles, honest-degradation `web_search`, and MCP stdio servers discovered at boot.
 - **Shell** — Docker and SSH providers with resource limits and an exec-policy filter.
 - **HTTP** — `http.request` / `os.env` Lua ops with scheme validation, body cap, and secret-header redaction.
+- **Mail** — `mail.imap_fetch` / `mail.smtp_send` Lua ops (cap `net.mail`); passwords resolve from the credential store at call time and never cross the Lua bridge.
 - **Credentials** — encrypted-at-rest, per-tenant credential store; loops reference a key by `{service=...}` and Go resolves and injects it at request time.
 - **Scheduler** — `scheduler.every/after/cron`; timers arrive as mailbox messages, never a cross-goroutine Luau call.
-- **Budget** — per-agent token pools with reserve/commit/release around LLM calls, daily reset.
+- **Budget** — per-agent token pools with reserve/commit/release around LLM calls; daily reset or rolling-window accounting; spawn profiles get their own shared pool.
 - **Safety** — core-owned ingress/egress chain (source-attribution, signal-gate, steady-directive, support-offer, affect-guard) that cannot be uninstalled from Lua.
-- **Observability** — `/healthz`, `/readyz`, `/metrics`, `/v1/sessions` on loopback with optional bearer-token auth.
+- **Observability** — `/healthz`, `/readyz`, `/metrics`, `/v1/sessions` on loopback with optional bearer-token auth; shared channel listener serves `GET /health`.
 
 ### Driver set
 
 | Domain | Providers |
 |---|---|
-| LLM | `anthropic` (Messages API), `openai` (Chat Completions + Embeddings), `openai-responses` (Responses API), `rerank` (cross-encoder rerank) — all pointed at compatible endpoints via `base_url` |
-| Storage | SQLite, Redis, MongoDB, PostgreSQL |
+| LLM | `anthropic` (Messages API), `openai` (Chat Completions + Embeddings), `openai-responses` (Responses API), `gemini` (Interactions API), `rerank` (cross-encoder rerank) — all pointed at compatible endpoints via `base_url` |
+| Storage | SQLite, Redis, MongoDB, PostgreSQL, in-memory volatile |
 | Vector | pgvector (cosine similarity) |
-| Channels | webhook, Telegram (polling + webhook) |
+| Channels | webhook, GitHub webhook (`ghhook`), Telegram (polling + webhook + auto) |
+| Mail | IMAP fetch + SMTP send (in-process, cap `net.mail`) |
 | Shell | Docker, SSH |
 | Tools | builtins + MCP stdio |
 
@@ -59,8 +61,12 @@ No model needed — the minimal example replies with a file-based echo loop:
 
 ```bash
 ./agentflow -config examples/agentflow.minimal.yaml
-curl -X POST localhost:8080/webhook -d '{"from":"alice","text":"hello"}'
+curl -X POST localhost:8080/webhook/ -d '{"from":"alice","text":"hello"}'
 ```
+
+> The webhook path ends in `/` (a subtree mount). Posting to `/webhook` without
+> the slash returns a `307` redirect, which `curl -d` does not follow — include
+> the trailing slash (or pass `-L`).
 
 For an LLM-backed bot, point a compatible endpoint at it (OpenAI-compatible local endpoints like Ollama work out of the box):
 
@@ -71,7 +77,10 @@ models:
     model: gpt-4o-mini
     base_url: http://127.0.0.1:11434/v1   # Ollama / vLLM / LiteLLM / OpenRouter
     api_key: ${OPENAI_API_KEY}            # may be empty for keyless local endpoints
+    server_tools: []                      # provider-native tools, e.g. [google_search] on gemini
 ```
+
+`provider` selects the request/response shape (`anthropic` | `openai` | `openai-responses` | `gemini` | `rerank`); `base_url` selects the host. `server_tools` injects provider-native, server-side tools (e.g. Google Search grounding on `gemini`, `web_search` on `openai-responses`) that run inside the provider's completion.
 
 ## Examples
 
@@ -113,7 +122,7 @@ agentflow/
 ├── cmd/agentflow/      # main entrypoint
 ├── internal/           # core runtime + drivers (not importable — internal module)
 │   ├── core/           # actor, supervisor, router, scheduler, safety, memory, budget, metrics, credentials, ...
-│   ├── drivers/        # llm, memory backends, telegram, webhook, shell, mcp
+│   ├── drivers/        # llm, memory backends, telegram, webhook, ghhook, httpd, shell, mcp
 │   ├── builtins/       # embedded Lua builtins (react loop, per_chat route, support chunks)
 │   └── vm/             # Luau cgo bridge + embedded prelude
 ├── plugins/examples/   # example Lua loop plugins

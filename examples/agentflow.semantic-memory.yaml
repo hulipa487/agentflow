@@ -29,7 +29,7 @@ version: "1"
 # Note: pgvector's embedding column width is fixed at table-creation time
 # (dim below, default 1536). It must match the embedding model's output.
 #
-#   curl -X POST localhost:8080/webhook -d '{"from":"alice","text":"hi"}'
+#   curl -X POST localhost:8080/webhook/ -d '{"from":"alice","text":"hi"}'
 
 models:
   default:

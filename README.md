@@ -51,7 +51,7 @@ Luau is vendored under `third_party/luau/` (currently **0.731**, MIT license —
 make            # compile vendored Luau -> internal/vm/lib/libluau.a, then the agentflow binary
 make test       # go test with the host C/C++ toolchain
 make vet        # go vet
-make run        # build, then run (CONFIG=examples/agentflow.minimal.yaml by default)
+make run        # build, then run (CONFIG=config.yaml by default)
 make clean      # remove build objects, static lib, and binary
 ```
 
@@ -59,10 +59,25 @@ The Makefile detects the host via `go env GOHOSTOS`/`GOHOSTARCH` and picks the c
 
 ## Quick start
 
-No model needed — the minimal example replies with a file-based echo loop:
+No model needed — a file-based echo loop replies out of the box. Save this as `config.yaml`:
+
+```yaml
+version: "1"
+
+agents:
+  echo:
+    loop: ./plugins/examples/echo.lua
+
+gateway:
+  listen: ":8080"            # one shared listener; channels mount paths on it
+  channels:
+    - type: webhook
+      path: /webhook/
+      agent: echo
+```
 
 ```bash
-./agentflow -config examples/agentflow.minimal.yaml
+./agentflow -config config.yaml
 curl -X POST localhost:8080/webhook/ -d '{"from":"alice","text":"hello"}'
 ```
 
@@ -70,7 +85,7 @@ curl -X POST localhost:8080/webhook/ -d '{"from":"alice","text":"hello"}'
 > the slash returns a `307` redirect, which `curl -d` does not follow — include
 > the trailing slash (or pass `-L`).
 
-For an LLM-backed bot, point a compatible endpoint at it (OpenAI-compatible local endpoints like Ollama work out of the box):
+For an LLM-backed bot, add a compatible endpoint (OpenAI-compatible local endpoints like Ollama work out of the box) and point an agent's `model` at it:
 
 ```yaml
 models:
@@ -83,22 +98,6 @@ models:
 ```
 
 `provider` selects the request/response shape (`anthropic` | `openai` | `openai-responses` | `gemini` | `rerank`); `base_url` selects the host. `server_tools` injects provider-native, server-side tools (e.g. Google Search grounding on `gemini`, `web_search` on `openai-responses`) that run inside the provider's completion.
-
-## Examples
-
-| Config | Demonstrates |
-|---|---|
-| `examples/agentflow.minimal.yaml` | Webhook + file-based echo loop, no LLM |
-| `examples/agentflow.compatible.yaml` | Anthropic/OpenAI-compatible model endpoints |
-| `examples/agentflow.keyless-chat.yaml` | Local keyless model over webhook |
-| `examples/agentflow.memory-default.yaml` | `builtin:conversational` memory (auto sqlite backend) |
-| `examples/agentflow.memory-tools.yaml` | Memory + tools + webhook |
-| `examples/agentflow.semantic-memory.yaml` | Embedding writes + pgvector recall + optional rerank |
-| `examples/agentflow.stream.yaml` | `llm.stream` delta-by-delta consumption |
-| `examples/agentflow.shell-tools.yaml` | Shell (Docker) + filesystem tools |
-| `examples/agentflow.telegram.yaml` | Anthropic + Telegram polling |
-| `examples/agentflow.multimodal.yaml` | Telegram with image/PDF media ingestion → vision chat |
-| `examples/agentflow.openai-telegram.yaml` | OpenAI-compatible + Telegram |
 
 The runtime ships as a standalone engine. Reference product apps built on top
 of agentflow — for example a full multi-agent orchestrator (main + expert +
@@ -131,8 +130,6 @@ agentflow/
 │   ├── webui/          # embedded operator console (SPA + JSON API on the admin server)
 │   └── vm/             # Luau cgo bridge + embedded prelude
 ├── plugins/examples/   # example Lua loop plugins
-├── examples/           # runnable YAML configs
-├── instructions/       # agent system-prompt guidance (see instructions/README.md)
 ├── docs/               # documentation website (GitHub Pages-ready)
 └── third_party/luau/   # vendored Luau 0.731 (MIT, committed)
 ```

@@ -76,7 +76,7 @@ func (r *Router) runOnce(ctx context.Context) bool {
 	st := vm.New(5_000_000)
 	defer st.Close()
 	if err := st.LoadBase(); err != nil {
-		r.log.Error("prelude load failed", "err", err)
+		r.log.Warn("prelude load failed", "err", err)
 		return true
 	}
 
@@ -89,7 +89,7 @@ func (r *Router) runOnce(ctx context.Context) bool {
 			r.log.Info("router loop finished")
 			return false
 		case vm.Failed:
-			r.log.Error("router loop error", "err", msg)
+			r.log.Warn("router loop error", "err", msg)
 			return true
 		}
 
@@ -102,7 +102,7 @@ func (r *Router) runOnce(ctx context.Context) bool {
 			Message session.Message `json:"message"`
 		}
 		if err := json.Unmarshal([]byte(msg), &op); err != nil {
-			r.log.Error("bad op from router lua", "err", err, "raw", msg)
+			r.log.Warn("bad op from router lua", "err", err, "raw", msg)
 			return true
 		}
 

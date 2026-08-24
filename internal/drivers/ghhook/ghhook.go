@@ -105,6 +105,7 @@ func (d *Driver) handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
+	d.log.Debug("ghhook event received", "event", event, "delivery", r.Header.Get("X-GitHub-Delivery"))
 
 	// Acknowledge immediately; the event is processed asynchronously downstream.
 	w.WriteHeader(http.StatusOK)

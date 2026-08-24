@@ -6,6 +6,8 @@ package memory
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"time"
 )
 
@@ -73,6 +75,7 @@ type Registry struct {
 	providers map[string]BackendProvider
 	backends  map[string]BackendHandle
 	config    map[string]BackendConfig
+	log       *slog.Logger
 }
 
 type BackendConfig struct {
@@ -80,11 +83,20 @@ type BackendConfig struct {
 	Config   map[string]any
 }
 
-func NewRegistry() *Registry {
+// NewRegistry creates a registry. log is optional; when given, every backend
+// operation (Put/Get/Delete/Query) is logged at DEBUG via a decorator, giving
+// the interaction log (MongoDB insert, pgvector lookup, ...) for all
+// providers from one place.
+func NewRegistry(log ...*slog.Logger) *Registry {
+	l := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if len(log) > 0 && log[0] != nil {
+		l = log[0]
+	}
 	return &Registry{
 		providers: map[string]BackendProvider{},
 		backends:  map[string]BackendHandle{},
 		config:    map[string]BackendConfig{},
+		log:       l.With("module", "memory"),
 	}
 }
 
@@ -107,10 +119,46 @@ func (r *Registry) Open(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("open memory backend %q: %w", name, err)
 		}
-		r.backends[name] = h
+		r.backends[name] = &loggingHandle{h: h, backend: name, log: r.log}
 	}
 	return nil
 }
+
+// loggingHandle decorates a BackendHandle with DEBUG interaction logs. Query
+// results are counted lazily (iterators pull), so the log line fires at query
+// issue time with the query shape, not the hit count.
+type loggingHandle struct {
+	h       BackendHandle
+	backend string
+	log     *slog.Logger
+}
+
+func (l *loggingHandle) Put(table, key string, value any, opts PutOpts) error {
+	l.log.Debug("memory put", "backend", l.backend, "table", table, "key", key, "vector", len(opts.Vector) > 0)
+	return l.h.Put(table, key, value, opts)
+}
+
+func (l *loggingHandle) Get(table, key string) (any, bool, error) {
+	v, ok, err := l.h.Get(table, key)
+	l.log.Debug("memory get", "backend", l.backend, "table", table, "key", key, "hit", ok)
+	return v, ok, err
+}
+
+func (l *loggingHandle) Delete(table, key string) error {
+	l.log.Debug("memory delete", "backend", l.backend, "table", table, "key", key)
+	return l.h.Delete(table, key)
+}
+
+func (l *loggingHandle) Query(table string, q Query) (Iterator, error) {
+	l.log.Debug("memory query", "backend", l.backend, "table", table, "kind", q.Kind, "k", q.K)
+	return l.h.Query(table, q)
+}
+
+func (l *loggingHandle) GC(table string, window int) error {
+	return l.h.GC(table, window)
+}
+
+func (l *loggingHandle) Close() error { return l.h.Close() }
 
 // Close closes all opened backends.
 func (r *Registry) Close() error {

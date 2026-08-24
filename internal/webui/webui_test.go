@@ -28,7 +28,7 @@ models:
     api_key: sk-testsecret1234
 agents:
   bot:
-    loop: builtin:react
+    loop: ./loop.lua
 `
 
 // fixture builds a UI against a temp config file and returns the pieces the
@@ -342,7 +342,7 @@ func TestConfigValidate(t *testing.T) {
 	if v := decode(t, rec); v["ok"] != true {
 		t.Fatalf("valid config rejected: %v", v)
 	}
-	bad := strings.Replace(testConfig, "loop: builtin:react", "loop: builtin:react\n    bogus_field: 1", 1)
+	bad := strings.Replace(testConfig, "loop: ./loop.lua", "loop: ./loop.lua\n    bogus_field: 1", 1)
 	rec = do(t, api, http.MethodPost, "/admin/api/config/validate", map[string]any{"raw": bad})
 	v := decode(t, rec)
 	if v["ok"] != false || !strings.Contains(v["error"].(string), "bogus_field") {

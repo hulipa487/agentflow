@@ -59,14 +59,25 @@ The Makefile detects the host via `go env GOHOSTOS`/`GOHOSTARCH` and picks the c
 
 ## Quick start
 
-No model needed — a file-based echo loop replies out of the box. Save this as `config.yaml`:
+No model needed — a file-based echo loop replies out of the box. Save the loop as `echo.lua`:
+
+```lua
+function loop()
+  while true do
+    local msg = session.inbox()
+    session.send("echo: " .. (msg.text or ""))
+  end
+end
+```
+
+and this as `config.yaml`:
 
 ```yaml
 version: "1"
 
 agents:
   echo:
-    loop: ./plugins/examples/echo.lua
+    loop: ./echo.lua
 
 gateway:
   listen: ":8080"            # one shared listener; channels mount paths on it
@@ -125,11 +136,10 @@ agentflow/
 ├── internal/           # core runtime + drivers (not importable — internal module)
 │   ├── core/           # actor, supervisor, router, scheduler, safety, memory, budget, metrics, credentials, ...
 │   ├── drivers/        # llm, memory backends, telegram, webhook, ghhook, httpd, shell, mcp
-│   ├── builtins/       # embedded Lua builtins (react loop, per_chat route, support chunks)
+│   ├── builtins/       # embedded Lua builtins (per_chat route + support chunks)
 │   ├── tui/            # terminal dashboard (bubbletea): sessions, stats, logs
 │   ├── webui/          # embedded operator console (SPA + JSON API on the admin server)
 │   └── vm/             # Luau cgo bridge + embedded prelude
-├── plugins/examples/   # example Lua loop plugins
 ├── docs/               # documentation website (GitHub Pages-ready)
 └── third_party/luau/   # vendored Luau 0.731 (MIT, committed)
 ```

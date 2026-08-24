@@ -100,7 +100,20 @@ func LLMHandlers(m *llm.Manager, ms *media.Store) map[string]session.OpHandler {
 		"llm.chat": chatOf,
 
 		"llm.embed": func(ctx context.Context, op session.Op) (string, bool) {
-			vectors, usage, err := m.Embed(ctx, op.Model, op.Inputs)
+			// Resolve blob handles to inline base64 before the request, the
+			// same rule as llm.chat parts — bytes only enter at the wire.
+			parts := make([]media.Part, len(op.Inputs))
+			copy(parts, op.Inputs)
+			for i := range parts {
+				if err := resolvePart(&parts[i], ms); err != nil {
+					return fail(err)
+				}
+			}
+			vectors, usage, err := m.EmbedParts(ctx, op.Model, parts, llm.EmbedOpts{
+				Task:       op.Task,
+				Dimensions: op.Dimensions,
+				Merged:     op.Merged,
+			})
 			if err != nil {
 				return fail(err)
 			}
@@ -241,14 +254,21 @@ func MeteredLLMHandlers(m *llm.Manager, ms *media.Store, pool *budget.Pool) map[
 	base["llm.chat"] = metered
 
 	// Embeddings consume input tokens only; reserve a modest per-text
-	// estimate, then commit the reported usage.
+	// estimate (plus a media surcharge — images/audio embed far above text),
+	// then commit the reported usage.
 	embed := base["llm.embed"]
 	meteredEmbed := func(ctx context.Context, op session.Op) (string, bool) {
 		n := len(op.Inputs)
 		if n < 1 {
 			n = 1
 		}
-		lease, err := pool.Reserve(int64(512 * n))
+		estimate := int64(512 * n)
+		for _, p := range op.Inputs {
+			if p.Type != "text" {
+				estimate += 2048
+			}
+		}
+		lease, err := pool.Reserve(estimate)
 		if err != nil {
 			b, _ := json.Marshal(map[string]any{
 				"ok":     false,
@@ -271,7 +291,7 @@ func MeteredLLMHandlers(m *llm.Manager, ms *media.Store, pool *budget.Pool) map[
 				}
 			}
 		}
-		_ = pool.Commit(lease, int64(512*n))
+		_ = pool.Commit(lease, estimate)
 		return resp, ok
 	}
 	base["llm.embed"] = meteredEmbed

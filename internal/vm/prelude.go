@@ -305,7 +305,22 @@ function memory.write(record)
       if can_vector then
         local text = t.value
         if type(text) == "table" then text = text.text or json.encode(text) end
-        if type(text) == "string" and #text > 0 then
+        -- Multimodal records: attachments ride alongside the text as one
+        -- merged embedding (Jina content group), so recall by text finds the
+        -- media too. Requires an omni embedding model (e.g.
+        -- jina-embeddings-v5-omni-small); text-only models error honestly.
+        local atts = record.attachments
+        if atts and #atts > 0 then
+          local parts = {}
+          if type(text) == "string" and #text > 0 then
+            table.insert(parts, text)
+          end
+          for _, att in ipairs(atts) do table.insert(parts, att) end
+          local r = llm.embed(parts, { model = embed_model, merged = true })
+          if r and r.vectors and r.vectors[1] then
+            opts.vector = r.vectors[1]
+          end
+        elseif type(text) == "string" and #text > 0 then
           local r = llm.embed({ text }, { model = embed_model })
           if r and r.vectors and r.vectors[1] then
             opts.vector = r.vectors[1]
@@ -452,12 +467,27 @@ function llm.chat(messages, opts)
   return op(with_opts({ type = "llm.chat", messages = messages }, opts))
 end
 
--- llm.embed(texts, opts) -> { vectors = { {..}, .. }, usage = { input = n } }
--- texts may be a single string or an array of strings. opts.model names a
--- models: entry whose provider supports embeddings (openai-compatible).
-function llm.embed(texts, opts)
-  local inputs = type(texts) == "table" and texts or { texts }
-  return op(with_opts({ type = "llm.embed", inputs = inputs }, opts))
+-- llm.embed(inputs, opts) -> { vectors = { {..}, .. }, usage = { input = n } }
+-- inputs may be a single string, an array of strings, or a mixed array of
+-- strings and part tables ({type="image", handle="media:...", url=...}) for
+-- multimodal embeddings (Jina jina-embeddings-v5-omni-*: text+image+video+
+-- audio+pdf in one vector space). Strings normalize to text parts.
+-- opts: model, task (retrieval.query | retrieval.passage | text-matching |
+-- clustering | classification), dimensions (Matryoshka truncation),
+-- merged = true (fold all inputs into ONE embedding).
+-- Text-only batches serialize as plain strings on the wire — vanilla
+-- OpenAI/Ollama/vLLM endpoints see the exact historical request.
+function llm.embed(inputs, opts)
+  local arr = type(inputs) == "table" and inputs or { inputs }
+  local parts = {}
+  for _, item in ipairs(arr) do
+    if type(item) == "string" then
+      table.insert(parts, { type = "text", text = item })
+    elseif type(item) == "table" then
+      table.insert(parts, item)
+    end
+  end
+  return op(with_opts({ type = "llm.embed", inputs = parts }, opts))
 end
 
 -- llm.rerank(query, documents, opts) -> { results = { { index = i, score = s }, .. } }

@@ -1,8 +1,8 @@
-// Package store implements the builtin:sqlite memory backend provider.
+// Package sqlite implements the builtin:sqlite memory backend provider.
 // It stores JSON values keyed by (table, key) with optional TTL, supports
 // prefix and text search (via FTS5), and keeps recent insertion order for
 // recency queries.
-package store
+package sqlite
 
 import (
 	"context"

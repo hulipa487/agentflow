@@ -127,6 +127,7 @@ agentflow/
 │   ├── core/           # actor, supervisor, router, scheduler, safety, memory, budget, metrics, credentials, ...
 │   ├── drivers/        # llm, memory backends, telegram, webhook, ghhook, httpd, shell, mcp
 │   ├── builtins/       # embedded Lua builtins (react loop, per_chat route, support chunks)
+│   ├── tui/            # terminal dashboard (bubbletea): sessions, stats, logs
 │   ├── webui/          # embedded operator console (SPA + JSON API on the admin server)
 │   └── vm/             # Luau cgo bridge + embedded prelude
 ├── plugins/examples/   # example Lua loop plugins

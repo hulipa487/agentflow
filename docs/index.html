@@ -133,8 +133,19 @@ make && make test</code></pre>
   </ol>
 
   <h3>Verify the install</h3>
-  <p>Run the no-model echo example and hit it with curl:</p>
-  <pre><code>./agentflow -config examples/agentflow.minimal.yaml
+  <p>Save a minimal no-model config (a file-based echo loop over a webhook) as <code>config.yaml</code>:</p>
+  <pre><code>version: "1"
+agents:
+  echo:
+    loop: ./plugins/examples/echo.lua
+gateway:
+  listen: ":8080"
+  channels:
+    - type: webhook
+      path: /webhook/
+      agent: echo</code></pre>
+  <p>Run it and hit the webhook with curl:</p>
+  <pre><code>./agentflow -config config.yaml
 # in another terminal:
 curl -X POST localhost:8080/webhook/ -d '{"from":"alice","text":"hello"}'</code></pre>
   <p>You should see <code>echo: hello</code> in the response. Note the trailing slash — the webhook mounts the <code>/webhook/</code> subtree, and a POST to bare <code>/webhook</code> returns a <code>307</code> redirect that <code>curl -d</code> will not follow. Also check the admin endpoints and the shared listener's health probe:</p>
@@ -268,10 +279,10 @@ project launch: user ──► main ──[directive: start_project]──► ag
 make test   # go test with the cgo/zig toolchain</code></pre>
 
   <h3>Run</h3>
-  <p>The fastest path needs no model — the echo example replies with a file-based loop:</p>
-  <pre><code>./agentflow -config examples/agentflow.minimal.yaml
+  <p>The fastest path needs no model — a file-based echo loop replies out of the box. Point the binary at your config:</p>
+  <pre><code>./agentflow -config config.yaml
 curl -X POST localhost:8080/webhook/ -d '{"from":"alice","text":"hello"}'   # note trailing /</code></pre>
-  <p>For an LLM-backed bot, point a real model at it (next block) and use <code>examples/agentflow.compatible.yaml</code> as a template.</p>
+  <p>For an LLM-backed bot, point a real model at it (next block) and set an agent's <code>model</code> to that entry.</p>
 
   <h3>Connect a real model</h3>
   <p>AgentFlow targets Anthropic/OpenAI-compatible proxies and gateways — not the official APIs. Set <code>base_url</code> to your endpoint:</p>
@@ -410,7 +421,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
     embed_model: embed                    # models: entry; auto-embeds writes to vector stores
     rerank_model: rerank                  # optional provider:"rerank" entry
     oversample: 4                         # fetch k*4 vector hits, rerank down to k</code></pre>
-  <p>With <code>recall: builtin:semantic</code>, <code>memory.recall({ text = "...", k = 5 })</code> embeds the query, runs cosine k-NN over the vector store, and reranks when <code>rerank_model</code> is set. Queries without text fall back to recency recall. See <code>examples/agentflow.semantic-memory.yaml</code>.</p>
+  <p>With <code>recall: builtin:semantic</code>, <code>memory.recall({ text = "...", k = 5 })</code> embeds the query, runs cosine k-NN over the vector store, and reranks when <code>rerank_model</code> is set. Queries without text fall back to recency recall.</p>
   <table class="table config-table">
     <thead><tr><th>Store key</th><th>Description</th></tr></thead>
     <tbody>
@@ -529,7 +540,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
   bot:
     loop: builtin:react
     model: default
-    instructions: ./instructions/bot.md
+    instructions: ./prompts/bot.md
     capabilities: [llm.chat, memory, tools, agent.send, shell.exec, net.mail]
     skills: [builtin:web_search, builtin:fs.read]
     memory: builtin:conversational     # preset, or inline
@@ -773,7 +784,7 @@ end</code></pre>
     <li><code>plugins/examples/tool_loop.lua</code> — listing and invoking tools manually.</li>
     <li><code>plugins/examples/shell_loop.lua</code> — spawning a Docker handle and running commands.</li>
     <li><code>plugins/examples/agent_request.lua</code> — requesting another agent and printing its reply.</li>
-    <li><code>plugins/examples/multimodal.lua</code> — forwarding inbound media attachments into <code>llm.chat</code> (see <code>examples/agentflow.multimodal.yaml</code>).</li>
+    <li><code>plugins/examples/multimodal.lua</code> — forwarding inbound media attachments into <code>llm.chat</code>.</li>
   </ul>
 
   <h4>Tool loop</h4>

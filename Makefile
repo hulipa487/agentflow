@@ -5,7 +5,7 @@
 #   make build      # just the Go binary (requires libluau.a)
 #   make test       # go test with the cgo toolchain
 #   make vet        # go vet with the cgo toolchain
-#   make run        # build, then run with CONFIG (default: examples/agentflow.minimal.yaml)
+#   make run        # build, then run with CONFIG (default: config.yaml)
 #   make clean      # remove objects, static lib, and binary
 #
 # Toolchain is auto-selected by host OS:
@@ -57,8 +57,8 @@ endif
 # Output binary. On Windows you may want: make BIN=agentflow.exe
 BIN     ?= agentflow
 
-# Config used by `make run`
-CONFIG  ?= examples/agentflow.minimal.yaml
+# Config used by `make run` (your local instance config; gitignored)
+CONFIG  ?= config.yaml
 
 # ---- Luau static library ---------------------------------------------------
 LUAU    := third_party/luau

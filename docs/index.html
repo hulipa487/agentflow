@@ -342,6 +342,20 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
   </ul>
   <p><b>Auth:</b> every console API route (and <code>/metrics</code>, <code>/v1/sessions</code>, <code>/admin/credentials</code>) requires a bearer token — even on loopback. Set <code>ADMIN_TOKEN</code> to pin it; otherwise a random per-boot token is generated and printed once to the console. The static SPA files are served open but are inert without the token. Secrets are write-only throughout: list endpoints return metadata and fingerprints, never values, and the config view masks sensitive keys while preserving <code>${VAR}</code> placeholders.</p>
 
+  <h3>Logging</h3>
+  <p>Logs use five <b>additive</b> levels — selecting one prints it and everything above. Choose with <code>-log-level</code> (default <code>info</code>):</p>
+  <table>
+    <thead><tr><th>Level</th><th>What goes here</th><th>Examples</th></tr></thead>
+    <tbody>
+      <tr><td><code>ERR</code></td><td>The runtime exits or cannot continue</td><td>config load failure, memory backend open failure, port bind failure</td></tr>
+      <tr><td><code>WARN</code></td><td>Degraded but continuing</td><td>upstream 429/502 + retry, channel delivery error, loop crash (restarting), reload compile failure (keeping old)</td></tr>
+      <tr><td><code>INFO</code></td><td>Lifecycle</td><td>runtime launch, channel registered, telegram webhook set, session spawned/exited, hot reload accepted</td></tr>
+      <tr><td><code>DEBUG</code></td><td>Every interaction</td><td>LLM API request, memory put/get/query (MongoDB insert, pgvector lookup), telegram update received, webhook/ghhook inbound, op dispatch, imap fetch / smtp send</td></tr>
+      <tr><td><code>DEV</code></td><td>Temporary development logs</td><td>scratch instrumentation added while debugging — <code>llog.Dev(log, ...)</code>; never committed on purpose</td></tr>
+    </tbody>
+  </table>
+  <p>The same records feed the TUI log pane and the web console's log tail (short tags <code>ERR/WRN/INF/DBG/DEV</code>).</p>
+
   <h3><code>models</code> — named LLM providers</h3>
   <pre><code>models:
   default:

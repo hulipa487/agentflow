@@ -343,6 +343,7 @@ func (d *Driver) handleUpdate(u update) {
 	if text == "" && len(atts) == 0 {
 		return
 	}
+	d.log.Debug("telegram update received", "update_id", u.UpdateID, "chat_id", m.Chat.ID, "user_id", m.From.ID, "text_len", len(text), "media", len(atts))
 	if len(d.allow) > 0 && !d.allow[m.From.ID] {
 		d.log.Warn("dropping message from non-allowed user", "user_id", m.From.ID)
 		return

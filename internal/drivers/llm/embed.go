@@ -274,6 +274,7 @@ func (m *Manager) doWithRetry(ctx context.Context, cfg config.Model, what string
 			}
 		}
 		attemptCtx, cancel := context.WithTimeout(ctx, cfg.TimeoutD())
+		m.log.Debug("llm: request", "op", what, "provider", cfg.Provider, "model", cfg.Model, "attempt", attempt)
 		retryable, err := fn(attemptCtx)
 		cancel()
 		if err == nil {

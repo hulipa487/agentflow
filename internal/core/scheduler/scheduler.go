@@ -176,7 +176,7 @@ func (s *Service) registerWithID(id TimerID, owner string, kind string, run func
 	s.byOwner[owner][id] = true
 	s.mu.Unlock()
 	go run(ctx)
-	s.log.Info("timer registered", "id", id, "owner", owner, "kind", kind)
+	s.log.Debug("timer registered", "id", id, "owner", owner, "kind", kind)
 	return id, nil
 }
 

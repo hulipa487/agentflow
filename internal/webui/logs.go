@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+
+	"agentflow/internal/llog"
 )
 
 // LogRing is a fixed-depth ring of formatted log lines with fan-out
@@ -84,7 +86,7 @@ func (h *TeeHandler) Enabled(ctx context.Context, level slog.Level) bool {
 func (h *TeeHandler) Handle(ctx context.Context, r slog.Record) error {
 	var sb strings.Builder
 	sb.WriteString(r.Time.Format("15:04:05"))
-	sb.WriteString(" " + logLevelTag(r.Level) + " " + r.Message)
+	sb.WriteString(" " + llog.ShortName(r.Level) + " " + r.Message)
 	r.Attrs(func(a slog.Attr) bool {
 		sb.WriteString(fmt.Sprintf(" %s=%v", a.Key, a.Value))
 		return true
@@ -106,19 +108,6 @@ func (h *TeeHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 
 func (h *TeeHandler) WithGroup(name string) slog.Handler {
 	return &TeeHandler{downstream: h.downstream.WithGroup(name), ring: h.ring}
-}
-
-func logLevelTag(l slog.Level) string {
-	switch {
-	case l >= slog.LevelError:
-		return "ERR"
-	case l >= slog.LevelWarn:
-		return "WRN"
-	case l >= slog.LevelInfo:
-		return "INF"
-	default:
-		return "DBG"
-	}
 }
 
 // handleLogs streams the log tail as SSE: first the ring's recent lines, then

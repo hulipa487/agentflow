@@ -89,6 +89,7 @@ func (d *Driver) handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
+	d.log.Debug("webhook received", "from", in.From, "text_len", len(in.Text), "attachments", len(in.Attachments))
 
 	id := fmt.Sprintf("wh-%d", d.seq.Add(1))
 	replyCh := make(chan string, 1)

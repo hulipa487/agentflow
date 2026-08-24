@@ -139,11 +139,11 @@ func (w *Watcher) changed(path string) bool {
 func (w *Watcher) reloadLoop(agent, path string) {
 	src, err := readLoop(path)
 	if err != nil {
-		w.log.Error("reload: cannot read loop", "file", path, "err", err)
+		w.log.Warn("reload: cannot read loop", "file", path, "err", err)
 		return
 	}
 	if err := vm.CompileCheck("@"+path, src); err != nil {
-		w.log.Error("reload: compile failed, keeping old version", "file", path, "err", err)
+		w.log.Warn("reload: compile failed, keeping old version", "file", path, "err", err)
 		return
 	}
 	w.log.Info("reload: new version accepted, restarting sessions", "file", path, "agent", agent)
@@ -186,7 +186,7 @@ func readLoop(path string) (string, error) {
 func (w *Watcher) reloadInstructions(agent string, def *supervisor.AgentDef) {
 	b, err := os.ReadFile(def.InstructionsPath)
 	if err != nil {
-		w.log.Error("reload: cannot read instructions", "file", def.InstructionsPath, "err", err)
+		w.log.Warn("reload: cannot read instructions", "file", def.InstructionsPath, "err", err)
 		return
 	}
 	def.Info.Instructions.Store(string(b))

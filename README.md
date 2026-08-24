@@ -195,3 +195,11 @@ Migration checklist:
 - **Vendored Luau** (0.731) is committed under `third_party/luau/`, so the repo builds from a clean clone. To upgrade it, replace that directory with a newer release and re-run `make`.
 - **`config.yaml`** is gitignored — it's the local instance config and may contain credentials. Keep secrets in it or in environment variables, never in tracked files.
 - Runtime state (sqlite stores) lives under `data/` and is gitignored.
+
+## License
+
+AgentFlow is released under the [MIT License](LICENSE).
+
+The vendored Luau interpreter under `third_party/luau/` is licensed separately
+under its own MIT license — see `third_party/luau/LICENSE.txt` (Copyright
+Roblox Corporation and Lua.org/PUC-Rio).

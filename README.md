@@ -9,7 +9,7 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 - **Actor-model sessions** — per-session Luau state, message-passing only, hot reload of loops and instructions.
 - **Multi-agent** — `agent.send` / `agent.request` / `agent.reply` / `agent.spawn`, address authority with `can_contact` ACLs, ephemeral children with budget/lifetime limits.
 - **Memory** — provider → backend → store layering; `builtin:conversational` preset; retention/window GC.
-- **Embeddings & reranking** — `llm.embed` (OpenAI-compatible `/embeddings`) and `llm.rerank` (Jina/Cohere/TEI/vLLM `/rerank`); pgvector ingest on write and a `builtin:semantic` recall pipeline (embed → vector k-NN → rerank).
+- **Embeddings & reranking** — `llm.embed` (OpenAI-compatible `/embeddings`) and `llm.rerank` (Jina/Cohere/TEI/vLLM `/rerank`); pgvector ingest on write and a `builtin:semantic` recall pipeline (embed → vector k-NN → rerank). Multimodal embeddings follow the Jina convention (`jina-embeddings-v5-omni-small`: text + image/video/audio/pdf in one vector space); `memory.write` embeds attachment-carrying records as one merged vector.
 - **Tools** — filesystem ops inside shell handles, honest-degradation `web_search`, and MCP stdio servers discovered at boot. Arbitrary commands (git, package managers, …) run through `shell.exec`.
 - **Shell** — Docker and SSH providers with resource limits and an exec-policy filter.
 - **HTTP** — `http.request` / `os.env` Lua ops with scheme validation, body cap, and secret-header redaction.

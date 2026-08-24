@@ -604,7 +604,7 @@ session.exit()                        -- terminate this session</code></pre>
   <h4><code>llm</code> — cap: <code>llm.chat</code></h4>
   <pre><code>llm.chat(messages, opts?) -> { text, usage, tool_calls }
 llm.stream(messages, opts?) -> iterator
-llm.embed(texts, opts?) -> { vectors, usage }     -- texts: string or array
+llm.embed(inputs, opts?) -> { vectors, usage }   -- strings and/or part tables
 llm.rerank(query, documents, opts?) -> { results } -- results: [{ index, score }], 0-based
 
 -- opts: { model = "default", temperature = 0.7, max_tokens = 4096,
@@ -625,7 +625,16 @@ llm.rerank(query, documents, opts?) -> { results } -- results: [{ index, score }
   </table>
   <p>Video sources follow the ecosystem conventions — MiniMax <code>mm_file://&lt;file_id&gt;</code>, Kimi <code>ms://&lt;file_id&gt;</code> — and are passed through verbatim as URL/file references. Blob-store <code>handle</code>s are resolved to base64 automatically.</p>
   <p>Only <code>data</code> (base64) sources work for gemini; anthropic/openai also accept <code>url</code> sources. Blob-store <code>handle</code>s are resolved to base64 automatically. <code>llm.stream</code> returns a closure; call it directly (<code>local d = next_chunk()</code>), never in a generic <code>for ... in</code> — the iterator protocol cannot yield across the C boundary.</p>
-  <p><code>llm.embed</code> works with any OpenAI-compatible <code>/embeddings</code> endpoint (Ollama, vLLM, TEI, OpenRouter); the Anthropic and Gemini providers have no embeddings API here and fail explicitly. <code>llm.rerank</code> requires a <code>provider: rerank</code> model entry speaking <code>POST {base_url}/rerank</code> (TEI, vLLM, Jina, Cohere). <code>llm.embed</code> is token-metered when the agent declares a budget. The <code>gemini</code> provider (Interactions API) is non-streaming: <code>llm.stream</code> over it yields the full reply as a single delta.</p>
+  <p><strong>Multimodal embeddings</strong> follow the Jina convention: <code>llm.embed</code> accepts a mixed array of strings and part tables, and batches carrying media serialize each item as a typed doc (<code>{"text"}</code>, <code>{"image"|"video"|"audio"|"pdf": url|base64}</code>) — the shape used by <code>jina-embeddings-v5-omni-small</code> (text, image, video, audio, and PDF in one vector space) and <code>jina-clip-v2</code>. Text-only batches stay plain strings, so any OpenAI-compatible <code>/embeddings</code> endpoint (OpenAI, Ollama, vLLM, TEI, OpenRouter) sees the exact historical request. Opts: <code>task</code> (<code>retrieval.query</code> | <code>retrieval.passage</code> | <code>text-matching</code> | <code>clustering</code> | <code>classification</code>), <code>dimensions</code> (Matryoshka truncation), <code>merged = true</code> (fold all inputs into one embedding — a Jina content group; PDFs are single-input only). The Anthropic and Gemini providers have no embeddings API here and fail explicitly. <code>llm.rerank</code> requires a <code>provider: rerank</code> model entry speaking <code>POST {base_url}/rerank</code> (TEI, vLLM, Jina, Cohere). <code>llm.embed</code> is token-metered when the agent declares a budget. The <code>gemini</code> provider (Interactions API) is non-streaming: <code>llm.stream</code> over it yields the full reply as a single delta.</p>
+  <pre><code>-- multimodal embed (jina-embeddings-v5-omni-small via api.jina.ai/v1)
+local r = llm.embed({
+    "find me the cat photo",                    -- text
+    { type = "image", handle = msg.attachments[1].handle },  -- blob-store media
+  }, { model = "omni", task = "retrieval.query", dimensions = 512 })
+
+-- one vector for a whole multimodal record (memory.write does this for
+-- records carrying attachments when the profile names an omni embed_model):
+local r = llm.embed({ "trip to the beach", img_part }, { model = "omni", merged = true })</code></pre>
 
   <h4><code>agent</code> — caps: <code>agent.send</code>, <code>agent.request</code>, <code>agent.spawn</code></h4>
   <pre><code>agent.info() -> { name, session_id, address, model, instructions,

@@ -52,6 +52,17 @@ models:
   #   base_url: ${RERANK_BASE_URL:-http://127.0.0.1:8081}
   #   api_key: ${RERANK_API_KEY:-}
 
+  # Multimodal embeddings (Jina convention): swap the embed model above for
+  # jina-embeddings-v5-omni-small and records carrying attachments embed as
+  # one merged vector (text + image/video/audio/pdf), so text queries recall
+  # media too. Requires a channel media policy that ingests the media and a
+  # pgvector dim matching the model (1024 for v5-omni).
+  # omni:
+  #   provider: openai
+  #   model: jina-embeddings-v5-omni-small
+  #   base_url: https://api.jina.ai/v1
+  #   api_key: ${JINA_API_KEY}
+
 memory:
   backends:
     main_db:

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+
+	"agentflow/internal/llog"
 )
 
 // TeeHandler is an slog.Handler that forwards every record to a downstream
@@ -28,7 +30,7 @@ func (h *TeeHandler) Enabled(ctx context.Context, level slog.Level) bool {
 func (h *TeeHandler) Handle(ctx context.Context, r slog.Record) error {
 	var sb strings.Builder
 	sb.WriteString(r.Time.Format("15:04:05"))
-	sb.WriteString(" " + levelTag(r.Level) + " " + r.Message)
+	sb.WriteString(" " + llog.ShortName(r.Level) + " " + r.Message)
 	r.Attrs(func(a slog.Attr) bool {
 		sb.WriteString(fmt.Sprintf(" %s=%v", a.Key, a.Value))
 		return true
@@ -43,17 +45,4 @@ func (h *TeeHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 
 func (h *TeeHandler) WithGroup(name string) slog.Handler {
 	return &TeeHandler{downstream: h.downstream.WithGroup(name), push: h.push}
-}
-
-func levelTag(l slog.Level) string {
-	switch {
-	case l >= slog.LevelError:
-		return "ERR"
-	case l >= slog.LevelWarn:
-		return "WRN"
-	case l >= slog.LevelInfo:
-		return "INF"
-	default:
-		return "DBG"
-	}
 }

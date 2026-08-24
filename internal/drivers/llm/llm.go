@@ -292,6 +292,7 @@ func (m *Manager) openWithRetry(ctx context.Context, cfg config.Model, msgs []Me
 				return nil, ctx.Err()
 			}
 		}
+		m.log.Debug("llm: chat request", "provider", cfg.Provider, "model", cfg.Model, "messages", len(msgs), "media", hasMedia(msgs), "attempt", attempt)
 		events, retryable, err := m.open(ctx, cfg, msgs, opts)
 		if err == nil {
 			return events, nil

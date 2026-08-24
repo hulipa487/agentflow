@@ -49,6 +49,7 @@ import (
 	"agentflow/internal/drivers/store/volatile"
 	"agentflow/internal/drivers/telegram"
 	"agentflow/internal/drivers/webhook"
+	"agentflow/internal/llog"
 	"agentflow/internal/ui"
 	"agentflow/internal/webui"
 )
@@ -59,13 +60,19 @@ var version = "dev"
 func main() {
 	cfgPath := flag.String("config", "agentflow.yaml", "path to agentflow.yaml")
 	workers := flag.Int("workers", 8, "op worker pool size")
+	logLevel := flag.String("log-level", "info", "minimum log level: dev|debug|info|warn|error (additive)")
 	noTUI := flag.Bool("no-tui", false, "disable the terminal dashboard (plain stderr logs)")
 	noWebUI := flag.Bool("no-webui", false, "disable the web console (admin server keeps token-optional loopback behavior)")
 	flag.Parse()
 
 	startedAt := time.Now()
 
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	lvl, err := llog.ParseLevel(*logLevel)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "agentflow:", err)
+		os.Exit(2)
+	}
+	log := slog.New(llog.NewTextHandler(os.Stderr, lvl))
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
@@ -78,7 +85,7 @@ func main() {
 
 	// Memory backends. Pre-resolve default profiles so builtin:conversational
 	// adds its default backend before we open the registry.
-	memReg := memory.NewRegistry()
+	memReg := memory.NewRegistry(log)
 	memReg.RegisterProvider(store.Provider{})
 	memReg.RegisterProvider(redis.Provider{})
 	memReg.RegisterProvider(mongodb.Provider{})
@@ -166,7 +173,7 @@ func main() {
 		}
 		for _, t := range mts {
 			toolReg.Register(t)
-			log.Info("mcp tool registered", "tool", t.Name)
+			log.Debug("mcp tool registered", "tool", t.Name)
 		}
 	}
 
@@ -429,7 +436,7 @@ func main() {
 				return out
 			},
 		})
-		log = slog.New(dash.LogHandler(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug})))
+		log = slog.New(dash.LogHandler(llog.NewTextHandler(io.Discard, lvl)))
 		slog.SetDefault(log)
 		defer dash.Stop()
 	}

@@ -437,25 +437,25 @@ func (a *Actor) loadSource() (string, error) {
 func (a *Actor) runOnce(ctx context.Context) (crashed bool) {
 	src, err := a.loadSource()
 	if err != nil {
-		a.log.Error("cannot read loop plugin", "err", err)
+		a.log.Warn("cannot read loop plugin", "err", err)
 		return true
 	}
 
 	st := vm.New(a.InstrBudget)
 	defer st.Close()
 	if err := st.LoadBase(); err != nil {
-		a.log.Error("prelude load failed", "err", err)
+		a.log.Warn("prelude load failed", "err", err)
 		return true
 	}
 	if a.SupportSrc != "" {
 		if err := st.Eval("@builtin:token_budget", a.SupportSrc); err != nil {
-			a.log.Error("support chunk load failed", "err", err)
+			a.log.Warn("support chunk load failed", "err", err)
 			return true
 		}
 	}
 	for i, chunk := range a.SupportSrcs {
 		if err := st.Eval(fmt.Sprintf("@builtin:support:%d", i), chunk); err != nil {
-			a.log.Error("support chunk load failed", "idx", i, "err", err)
+			a.log.Warn("support chunk load failed", "idx", i, "err", err)
 			return true
 		}
 	}
@@ -470,15 +470,16 @@ func (a *Actor) runOnce(ctx context.Context) (crashed bool) {
 			a.log.Info("loop finished")
 			return false
 		case vm.Failed:
-			a.log.Error("loop error", "err", msg)
+			a.log.Warn("loop error", "err", msg)
 			return true
 		}
 
 		var op Op
 		if err := json.Unmarshal([]byte(msg), &op); err != nil {
-			a.log.Error("bad op from lua", "err", err, "raw", msg)
+			a.log.Warn("bad op from lua", "err", err, "raw", msg)
 			return true
 		}
+		a.log.Debug("op dispatch", "op", op.Type, "model", op.Model, "tool", op.Tool, "blocking", blockingOps[op.Type])
 
 		var resp string
 		var ok, proceed bool

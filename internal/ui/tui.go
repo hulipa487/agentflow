@@ -24,15 +24,27 @@ type snapshotMsg struct {
 	idle   int
 }
 
+// metricsMsg carries the latest counter values plus per-counter sample
+// windows for the stats panel.
+type metricsMsg struct {
+	latest map[string]int64
+	sparks map[string][]int64
+}
+
 // logMsg carries one formatted slog line into the model.
 type logMsg string
 
 // tickMsg drives the periodic snapshot poll.
 type tickMsg time.Time
 
-// Source provides the data the TUI renders.
+// Source provides the data the TUI renders. Metrics and Spark are optional:
+// when Metrics is nil the stats panel is hidden (tests and minimal setups).
 type Source struct {
 	Snapshot func() (rows []supervisor.SessionStatus, active, idle int)
+	// Metrics returns the latest value per counter.
+	Metrics func() map[string]int64
+	// Spark returns recent samples for one counter, oldest first.
+	Spark func(name string) []int64
 }
 
 // Model is the Bubbletea model for the dashboard.
@@ -44,6 +56,8 @@ type Model struct {
 	rows   []supervisor.SessionStatus
 	active int
 	idle   int
+	latest map[string]int64
+	sparks map[string][]int64
 	logs   []string
 	width  int
 	height int
@@ -94,7 +108,7 @@ func (m *Model) drainPending() {
 }
 
 func (m *Model) Init() tea.Cmd {
-	return tea.Batch(poll(m.src), tick())
+	return tea.Batch(poll(m.src), pollMetrics(m.src), tick())
 }
 
 func tick() tea.Cmd {
@@ -105,6 +119,24 @@ func poll(src Source) tea.Cmd {
 	return func() tea.Msg {
 		rows, active, idle := src.Snapshot()
 		return snapshotMsg{rows: rows, active: active, idle: idle}
+	}
+}
+
+// pollMetrics samples the counters and sparkline windows. It returns nil when
+// the source has no metrics, which tea.Batch safely ignores.
+func pollMetrics(src Source) tea.Cmd {
+	if src.Metrics == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		msg := metricsMsg{latest: src.Metrics()}
+		if src.Spark != nil {
+			msg.sparks = map[string][]int64{}
+			for _, d := range statDefs {
+				msg.sparks[d.Name] = src.Spark(d.Name)
+			}
+		}
+		return msg
 	}
 }
 
@@ -119,11 +151,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 	case tickMsg:
-		return m, tea.Batch(poll(m.src), tick())
+		return m, tea.Batch(poll(m.src), pollMetrics(m.src), tick())
 	case snapshotMsg:
 		m.rows = msg.rows
 		m.active = msg.active
 		m.idle = msg.idle
+	case metricsMsg:
+		m.latest = msg.latest
+		m.sparks = msg.sparks
 	case logMsg:
 		m.logs = append(m.logs, string(msg))
 		if len(m.logs) > maxLogs {
@@ -166,6 +201,13 @@ func (m *Model) View() string {
 	b.WriteString(m.renderTree())
 	b.WriteString("\n")
 
+	// Stats panel (only when a metrics source is wired).
+	if m.src.Metrics != nil {
+		b.WriteString(titleStyle.Render("Stats") + "\n")
+		b.WriteString(m.renderStats())
+		b.WriteString("\n")
+	}
+
 	// Log tail.
 	logHeight := m.logHeight()
 	b.WriteString(titleStyle.Render("Logs") + "\n")
@@ -185,6 +227,9 @@ func (m *Model) View() string {
 func (m *Model) logHeight() int {
 	// header(2) + blank + projects title + tree lines + blank + logs title + footer
 	used := 2 + 1 + 1 + len(m.rows) + 1 + 1 + 2
+	if m.src.Metrics != nil {
+		used += 1 + len(statDefs) + 1 // stats title + rows + blank
+	}
 	h := m.height - used - 2
 	if h < 3 {
 		h = 3

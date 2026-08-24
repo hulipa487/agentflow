@@ -101,6 +101,90 @@ func (r *Registry) PrometheusFormat() string {
 	return b.String()
 }
 
+// Snapshot returns a copy of all counter values.
+func (r *Registry) Snapshot() map[string]int64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string]int64, len(r.counters))
+	for name, c := range r.counters {
+		out[name] = c.Value()
+	}
+	return out
+}
+
+// Point is one sampled counter value (unix seconds).
+type Point struct {
+	At    int64 `json:"at"`
+	Value int64 `json:"v"`
+}
+
+// History is a fixed-depth ring of counter samples, giving the built-in web
+// UI trend sparklines without an external TSDB. /metrics remains the
+// integration point for serious monitoring.
+type History struct {
+	mu     sync.RWMutex
+	depth  int
+	series map[string][]Point
+}
+
+// StartSampler samples every registered counter each interval until ctx is
+// done, keeping at most depth points per series (oldest dropped first).
+// Counters registered after Start are picked up on their first tick.
+func (r *Registry) StartSampler(ctx context.Context, interval time.Duration, depth int) *History {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	if depth <= 0 {
+		depth = 1440 // 2h at 5s
+	}
+	h := &History{depth: depth, series: map[string][]Point{}}
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-t.C:
+				snap := r.Snapshot()
+				h.mu.Lock()
+				for name, v := range snap {
+					pts := append(h.series[name], Point{At: now.Unix(), Value: v})
+					if len(pts) > h.depth {
+						pts = pts[len(pts)-h.depth:]
+					}
+					h.series[name] = pts
+				}
+				h.mu.Unlock()
+			}
+		}
+	}()
+	return h
+}
+
+// All returns a copy of every series.
+func (h *History) All() map[string][]Point {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make(map[string][]Point, len(h.series))
+	for name, pts := range h.series {
+		cp := make([]Point, len(pts))
+		copy(cp, pts)
+		out[name] = cp
+	}
+	return out
+}
+
+// Series returns a copy of one counter's samples (nil when unknown).
+func (h *History) Series(name string) []Point {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	pts := h.series[name]
+	cp := make([]Point, len(pts))
+	copy(cp, pts)
+	return cp
+}
+
 // DefaultCounters creates the standard set of runtime counters.
 func DefaultCounters() map[string]*Counter {
 	return map[string]*Counter{
@@ -129,6 +213,7 @@ func DefaultCounters() map[string]*Counter {
 // default; remote binding requires a bearer token.
 type AdminServer struct {
 	srv       *http.Server
+	mux       *http.ServeMux
 	reg       *Registry
 	token     string
 	readyz    func() bool
@@ -158,9 +243,27 @@ func NewAdminServer(addr, token string, reg *Registry, log *slog.Logger) *AdminS
 	mux.HandleFunc("/v1/sessions", s.auth(s.handleSessions))
 	mux.HandleFunc("/admin/credentials", s.auth(s.handleCredentials))
 	mux.HandleFunc("/admin/credentials/", s.auth(s.handleCredentialsDelete))
+	s.mux = mux
 	s.srv = &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	return s
 }
+
+// Mount attaches h at pattern (ServeMux semantics). With requireAuth, the
+// same bearer-token check as the built-in endpoints applies. Must be called
+// before Start.
+func (s *AdminServer) Mount(pattern string, h http.Handler, requireAuth bool) {
+	if requireAuth {
+		s.mux.Handle(pattern, http.HandlerFunc(s.auth(h.ServeHTTP)))
+		return
+	}
+	s.mux.Handle(pattern, h)
+}
+
+// Token returns the configured bearer token ("" when auth is disabled).
+func (s *AdminServer) Token() string { return s.token }
+
+// Handler exposes the mux, letting tests serve it via httptest.
+func (s *AdminServer) Handler() http.Handler { return s.mux }
 
 // SetReady sets the readiness check. The runtime calls this once boot is complete.
 func (s *AdminServer) SetReady(ready bool) {

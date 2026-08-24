@@ -40,11 +40,15 @@ type Secret struct {
 }
 
 // ServiceRef is a credential's metadata — never its value — used by the admin
-// list endpoint.
+// list endpoint. Fingerprint is the last 4 characters of the secret (the same
+// convention as Stripe/GitHub), enough to tell two keys apart without
+// revealing anything usable.
 type ServiceRef struct {
-	Service   string `json:"service"`
-	Kind      string `json:"kind"`
-	CreatedAt int64  `json:"created_at"`
+	Service     string `json:"service"`
+	Kind        string `json:"kind"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+	CreatedAt   int64  `json:"created_at"`
+	UpdatedAt   int64  `json:"updated_at"`
 }
 
 // Open opens (creating if needed) the credential store at path. masterKey is
@@ -186,7 +190,7 @@ func (s *Store) Delete(ctx context.Context, userUUID, service string) error {
 // List returns service metadata (never values) for a user.
 func (s *Store) List(ctx context.Context, userUUID string) ([]ServiceRef, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT service, kind, created_at FROM credentials WHERE user_uuid = ? AND revoked = 0 ORDER BY service`,
+		`SELECT service, kind, secret, created_at, updated_at FROM credentials WHERE user_uuid = ? AND revoked = 0 ORDER BY service`,
 		userUUID)
 	if err != nil {
 		return nil, fmt.Errorf("credentials: list %s: %w", userUUID, err)
@@ -195,10 +199,36 @@ func (s *Store) List(ctx context.Context, userUUID string) ([]ServiceRef, error)
 	out := []ServiceRef{}
 	for rows.Next() {
 		var r ServiceRef
-		if err := rows.Scan(&r.Service, &r.Kind, &r.CreatedAt); err != nil {
+		var ctBlob []byte
+		if err := rows.Scan(&r.Service, &r.Kind, &ctBlob, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("credentials: list scan: %w", err)
 		}
+		// Best-effort fingerprint: a decrypt failure (wrong master key) must
+		// not fail the listing — the row just shows no fingerprint.
+		if val, err := s.decrypt(ctBlob); err == nil && len(val) >= 4 {
+			r.Fingerprint = "…" + val[len(val)-4:]
+		}
 		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ListUsers returns the distinct user UUIDs that hold at least one
+// non-revoked credential, for the admin UI's per-user browsing.
+func (s *Store) ListUsers(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT DISTINCT user_uuid FROM credentials WHERE revoked = 0 ORDER BY user_uuid`)
+	if err != nil {
+		return nil, fmt.Errorf("credentials: list users: %w", err)
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var u string
+		if err := rows.Scan(&u); err != nil {
+			return nil, fmt.Errorf("credentials: list users scan: %w", err)
+		}
+		out = append(out, u)
 	}
 	return out, rows.Err()
 }

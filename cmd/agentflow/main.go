@@ -3,6 +3,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -48,13 +50,20 @@ import (
 	"agentflow/internal/drivers/telegram"
 	"agentflow/internal/drivers/webhook"
 	"agentflow/internal/ui"
+	"agentflow/internal/webui"
 )
+
+// version is stamped via -ldflags "-X main.version=..." on release builds.
+var version = "dev"
 
 func main() {
 	cfgPath := flag.String("config", "agentflow.yaml", "path to agentflow.yaml")
 	workers := flag.Int("workers", 8, "op worker pool size")
 	noTUI := flag.Bool("no-tui", false, "disable the terminal dashboard (plain stderr logs)")
+	noWebUI := flag.Bool("no-webui", false, "disable the web console (admin server keeps token-optional loopback behavior)")
 	flag.Parse()
+
+	startedAt := time.Now()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
@@ -409,6 +418,14 @@ func main() {
 	}
 
 	sup = supervisor.New(defs, gw, opPool, shellMgr, log)
+
+	// Web-console log tail: mirror every record into a ring buffer so the web
+	// UI's SSE endpoint can stream it. Wraps whichever handler is current
+	// (plain stderr, or the TUI tee) so both views see the same lines.
+	logRing := webui.NewLogRing(500)
+	log = slog.New(webui.NewTeeHandler(log.Handler(), logRing))
+	slog.SetDefault(log)
+
 	sup.SetScheduler(schedSvc)
 	sup.Start(ctx)
 
@@ -505,26 +522,59 @@ func main() {
 	watcher.Start()
 
 	// Metrics/admin: authenticated HTTP endpoint with health/readiness/metrics
-	// and a read-only sessions view. Binds to loopback by default; a non-empty
-	// ADMIN_TOKEN enables bearer-token auth for non-health endpoints. Uses the
-	// shared global registry so counters incremented by handlers (LLM calls,
-	// budget denials, spawns, ...) show up here.
+	// and a read-only sessions view. Binds to loopback by default. The web
+	// console (on by default, -no-webui to disable) mounts its SPA and JSON API
+	// here and requires the bearer token on every API route — with no
+	// ADMIN_TOKEN set, a per-boot token is generated and printed once.
+	// A sampler keeps ~2h of counter history in-process for the console's
+	// sparklines; /metrics stays the Prometheus integration point.
 	metricReg := metrics.Global()
+	history := metricReg.StartSampler(ctx, 5*time.Second, 1440)
 	adminAddr := cfg.Runtime.Admin.Listen
 	if adminAddr == "" {
 		adminAddr = "127.0.0.1:9090"
 	}
 	adminToken := os.Getenv("ADMIN_TOKEN")
+	if !*noWebUI && adminToken == "" {
+		b := make([]byte, 16)
+		if _, err := rand.Read(b); err != nil {
+			log.Error("admin token generation failed", "err", err)
+			os.Exit(1)
+		}
+		adminToken = hex.EncodeToString(b)
+		log.Info("web console admin token (set ADMIN_TOKEN to pin it)", "token", adminToken)
+	}
 	admin := metrics.NewAdminServer(adminAddr, adminToken, metricReg, log)
 	admin.SetReady(true)
 	admin.SetSessions(func() []metrics.SessionInfo {
 		infos := []metrics.SessionInfo{}
 		for _, a := range sup.Agents() {
+			if a.Info == nil {
+				continue // __spawn__ templates carry no session Info
+			}
 			infos = append(infos, metrics.SessionInfo{Agent: a.Info.Name})
 		}
 		return infos
 	})
 	admin.SetCredentials(credStore)
+	if !*noWebUI {
+		console := webui.New(webui.Deps{
+			ConfigPath: *cfgPath,
+			Cfg:        cfg,
+			Models:     llmMgr,
+			History:    history,
+			Creds:      credStore,
+			Logs:       logRing,
+			Version:    version,
+			StartedAt:  startedAt,
+			Snapshot: func() ([]supervisor.SessionStatus, int, int) {
+				return sup.Snapshot()
+			},
+		})
+		admin.Mount("/admin/api/", console.API(), true)
+		admin.Mount("/", console.Static(), false)
+		log.Info("web console enabled", "url", "http://"+adminAddr+"/")
+	}
 	go func() {
 		if err := admin.Start(); err != nil {
 			log.Warn("admin server stopped", "err", err)

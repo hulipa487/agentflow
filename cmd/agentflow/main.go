@@ -102,6 +102,12 @@ func main() {
 	opPool := pool.New(*workers)
 	gw := gateway.NewRegistry(log)
 
+	// Metrics registry + in-process history sampler. Created early so both the
+	// terminal dashboard (stats panel) and the web console can read them; the
+	// admin server mounts later. ~2h at 5s per counter, ring-bounded.
+	metricReg := metrics.Global()
+	history := metricReg.StartSampler(ctx, 5*time.Second, 1440)
+
 	// Shell manager. Docker runs a single long-lived container per handle
 	// (persistent fs/env/process state); SSH dials a remote host. Both are
 	// generic providers; vendor-specific launchers live outside the runtime.
@@ -406,12 +412,23 @@ func main() {
 	var sup *supervisor.Supervisor
 	var dash *ui.Dashboard
 	if !*noTUI && isatty.IsTerminal(os.Stdout.Fd()) {
-		dash = ui.Start(ui.Source{Snapshot: func() ([]supervisor.SessionStatus, int, int) {
-			if sup == nil {
-				return nil, 0, 0
-			}
-			return sup.Snapshot()
-		}})
+		dash = ui.Start(ui.Source{
+			Snapshot: func() ([]supervisor.SessionStatus, int, int) {
+				if sup == nil {
+					return nil, 0, 0
+				}
+				return sup.Snapshot()
+			},
+			Metrics: metricReg.Snapshot,
+			Spark: func(name string) []int64 {
+				pts := history.Series(name)
+				out := make([]int64, len(pts))
+				for i, p := range pts {
+					out[i] = p.Value
+				}
+				return out
+			},
+		})
 		log = slog.New(dash.LogHandler(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug})))
 		slog.SetDefault(log)
 		defer dash.Stop()
@@ -526,10 +543,6 @@ func main() {
 	// console (on by default, -no-webui to disable) mounts its SPA and JSON API
 	// here and requires the bearer token on every API route — with no
 	// ADMIN_TOKEN set, a per-boot token is generated and printed once.
-	// A sampler keeps ~2h of counter history in-process for the console's
-	// sparklines; /metrics stays the Prometheus integration point.
-	metricReg := metrics.Global()
-	history := metricReg.StartSampler(ctx, 5*time.Second, 1440)
 	adminAddr := cfg.Runtime.Admin.Listen
 	if adminAddr == "" {
 		adminAddr = "127.0.0.1:9090"

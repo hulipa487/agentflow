@@ -105,9 +105,18 @@ type Op struct {
 	ToolChoice  string        `json:"tool_choice,omitempty"`
 
 	// Embedding / rerank ops (llm.embed, llm.rerank).
-	Inputs    []string `json:"inputs,omitempty"`    // embed: texts to embed
-	Documents []string `json:"documents,omitempty"` // rerank: candidate documents
-	TopN      int      `json:"top_n,omitempty"`     // rerank: keep at most this many
+	// Embed inputs are parts: plain texts ride as {type:"text"}; media
+	// parts (image/video/audio/pdf) ride as descriptors resolved at
+	// request time (Jina multimodal embeddings convention).
+	Inputs    []media.Part `json:"inputs,omitempty"`    // embed: input parts
+	Documents []string     `json:"documents,omitempty"` // rerank: candidate documents
+	TopN      int          `json:"top_n,omitempty"`     // rerank: keep at most this many
+	// Embedding request options (llm.embed opts): task selects the Jina
+	// task adapter; dimensions is a Matryoshka truncation; merged folds all
+	// inputs into ONE embedding (Jina MergedContentGroup).
+	Task       string `json:"task,omitempty"`
+	Dimensions int    `json:"dimensions,omitempty"`
+	Merged     bool   `json:"merged,omitempty"`
 
 	// Proactive channel egress (session.push).
 	Channel string `json:"channel,omitempty"`

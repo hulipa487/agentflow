@@ -16,6 +16,9 @@ data/
 # Custom plugins
 plugins/orchestrator/
 
+# local loop plugins (instance-specific, e.g. loops/react.lua)
+loops/
+
 # local instance config (may carry secrets)
 config.yaml
 

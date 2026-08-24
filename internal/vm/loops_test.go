@@ -6,19 +6,15 @@ import (
 	"testing"
 )
 
-// Loops shipped with the runtime must parse. A syntax slip would only surface
-// at session boot; compile-check them here so the gate catches it. Product
-// loops (e.g. an orchestrator) live outside this repo and are checked there.
+// Builtin loops shipped with the runtime must parse. A syntax slip would only
+// surface at session boot; compile-check them here so the gate catches it.
+// Product loops (e.g. an orchestrator) live outside this repo and are checked
+// there.
 func TestShippedLoopsParse(t *testing.T) {
-	paths, err := filepath.Glob(filepath.Join("..", "..", "plugins", "examples", "*.lua"))
-	if err != nil {
-		t.Fatalf("glob plugins/examples: %v", err)
-	}
-	builtinChunks, err := filepath.Glob(filepath.Join("..", "builtins", "lua", "*.lua"))
+	files, err := filepath.Glob(filepath.Join("..", "builtins", "lua", "*.lua"))
 	if err != nil {
 		t.Fatalf("glob builtins/lua: %v", err)
 	}
-	files := append(builtinChunks, paths...)
 	if len(files) == 0 {
 		t.Fatal("no loop files found to compile-check")
 	}

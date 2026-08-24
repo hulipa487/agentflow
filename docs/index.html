@@ -133,11 +133,18 @@ make && make test</code></pre>
   </ol>
 
   <h3>Verify the install</h3>
-  <p>Save a minimal no-model config (a file-based echo loop over a webhook) as <code>config.yaml</code>:</p>
+  <p>Save a minimal echo loop as <code>echo.lua</code>:</p>
+  <pre><code>function loop()
+  while true do
+    local msg = session.inbox()
+    session.send("echo: " .. (msg.text or ""))
+  end
+end</code></pre>
+  <p>and a no-model config that wires it to a webhook as <code>config.yaml</code>:</p>
   <pre><code>version: "1"
 agents:
   echo:
-    loop: ./plugins/examples/echo.lua
+    loop: ./echo.lua
 gateway:
   listen: ":8080"
   channels:
@@ -455,7 +462,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
   <pre><code>profiles:
   agent/coder:
     model: default
-    loop: builtin:react
+    loop: ./loop.lua
     skills: [builtin:fs.read, builtin:fs.write]
     capabilities: [llm.chat, tools]
     can_contact: []
@@ -538,7 +545,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
   <h3><code>agents</code></h3>
   <pre><code>agents:
   bot:
-    loop: builtin:react
+    loop: ./loop.lua
     model: default
     instructions: ./prompts/bot.md
     capabilities: [llm.chat, memory, tools, agent.send, shell.exec, net.mail]
@@ -605,7 +612,7 @@ end</code></pre>
   <p><code>session.send(text)</code> replies through the active channel (the channel and reply target of the current message). <code>session.push(channel, reply_to, text)</code> sends proactively and requires the <code>channel.push</code> capability. <code>session.push_user(uuid, text)</code> pushes to a user by identity UUID. <code>session.exit()</code> terminates the session cleanly.</p>
 
   <h3>Writing a loop plugin</h3>
-  <p>A minimal echo loop looks like this (<code>plugins/examples/echo.lua</code>):</p>
+  <p>A minimal echo loop looks like this:</p>
   <pre><code>log.info("echo agent online")
 
 function loop()
@@ -617,7 +624,7 @@ function loop()
   end
 end</code></pre>
 
-  <p>A ReAct-style loop that calls an LLM and optionally tools is the <code>builtin:react</code> plugin. You can copy it as a starting point for custom reasoning patterns.</p>
+  <p>A ReAct-style loop calls an LLM and optionally tools: fetch history with <code>memory.recall</code>, pass tool definitions from <code>tools.list</code> to <code>llm.chat</code>, invoke any returned tool calls with <code>tools.run</code>, and reply with <code>session.send</code>. Write it as a plain loop file and point <code>loop:</code> at it.</p>
 
   <h3>Built-in Lua API reference</h3>
   <p>All tables below are injected only when the agent's capabilities allow them. Attempting to call a disabled API raises an error.</p>
@@ -777,15 +784,7 @@ end</code></pre>
   </ul>
 
   <h3>Practical examples</h3>
-  <p>See <code>plugins/examples/</code> for runnable examples:</p>
-  <ul>
-    <li><code>plugins/examples/echo.lua</code> — simplest loop, inbox + send.</li>
-    <li><code>plugins/examples/stream.lua</code> — consuming <code>llm.stream</code> delta by delta.</li>
-    <li><code>plugins/examples/tool_loop.lua</code> — listing and invoking tools manually.</li>
-    <li><code>plugins/examples/shell_loop.lua</code> — spawning a Docker handle and running commands.</li>
-    <li><code>plugins/examples/agent_request.lua</code> — requesting another agent and printing its reply.</li>
-    <li><code>plugins/examples/multimodal.lua</code> — forwarding inbound media attachments into <code>llm.chat</code>.</li>
-  </ul>
+  <p>Drop any of these into a loop file and point an agent's <code>loop:</code> at it:</p>
 
   <h4>Tool loop</h4>
   <pre><code>function loop()
@@ -868,11 +867,11 @@ end</code></pre>
   </table>
 
   <h3>Loop</h3>
-  <p>The <code>loop</code> handler owns the session coroutine for its lifetime. The remaining hooks fire <em>inside</em> <code>builtin:react</code> — custom loops may honor them voluntarily.</p>
+  <p>The <code>loop</code> handler owns the session coroutine for its lifetime. The remaining hooks fire <em>inside</em> the loop — a loop may honor them voluntarily.</p>
   <table class="table hook-table">
     <thead><tr><th>Hook</th><th>Kind</th><th>Signature</th><th>Notes</th></tr></thead>
     <tbody>
-      <tr><td><code>loop</code></td><td>handler</td><td><code>(session) -> ()</code></td><td><code>builtin:react</code></td></tr>
+      <tr><td><code>loop</code></td><td>handler</td><td><code>(session) -> ()</code></td><td>your loop file</td></tr>
       <tr><td><code>loop.before_turn</code></td><td>filter</td><td><code>(turn, ctx) -> TurnCtx</code></td><td>Inject context, cost checks</td></tr>
       <tr><td><code>loop.on_tool_call</code></td><td>filter</td><td><code>(call, ctx) -> "allow" | "deny" | ToolCall</code></td><td>Permission gating, rewrite</td></tr>
       <tr><td><code>loop.on_tool_result</code></td><td>filter</td><td><code>(result, ctx) -> ToolResult</code></td><td>Honest degradation, truncation</td></tr>

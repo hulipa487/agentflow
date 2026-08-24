@@ -10,9 +10,6 @@ import (
 	"strings"
 )
 
-//go:embed lua/react.lua
-var react string
-
 //go:embed lua/per_chat.lua
 var perChat string
 
@@ -38,7 +35,6 @@ var execPolicy string
 var ttl string
 
 var sources = map[string]string{
-	"react":          react,
 	"per_chat":       perChat,
 	"token_budget":   tokenBudget,
 	"routing_table":  routingTable,

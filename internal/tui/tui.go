@@ -2,7 +2,7 @@
 // per-agent status (active/idle/spawned), the PM→worker project tree, and a
 // scrolling log tail. It is fed by a supervisor Snapshot poller and a tee'd
 // slog handler; it owns the terminal only when attached to a TTY.
-package ui
+package tui
 
 import (
 	"fmt"

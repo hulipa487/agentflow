@@ -45,12 +45,12 @@ import (
 	"agentflow/internal/drivers/postgres"
 	"agentflow/internal/drivers/redis"
 	"agentflow/internal/drivers/shell"
-	"agentflow/internal/drivers/store"
-	"agentflow/internal/drivers/store/volatile"
+	"agentflow/internal/drivers/sqlite"
 	"agentflow/internal/drivers/telegram"
+	"agentflow/internal/drivers/volatile"
 	"agentflow/internal/drivers/webhook"
 	"agentflow/internal/llog"
-	"agentflow/internal/ui"
+	"agentflow/internal/tui"
 	"agentflow/internal/webui"
 )
 
@@ -86,7 +86,7 @@ func main() {
 	// Memory backends. Pre-resolve default profiles so builtin:conversational
 	// adds its default backend before we open the registry.
 	memReg := memory.NewRegistry(log)
-	memReg.RegisterProvider(store.Provider{})
+	memReg.RegisterProvider(sqlite.Provider{})
 	memReg.RegisterProvider(redis.Provider{})
 	memReg.RegisterProvider(mongodb.Provider{})
 	memReg.RegisterProvider(postgres.Provider{})
@@ -417,9 +417,9 @@ func main() {
 	// the plain stderr logger stays. The snapshot closure reads sup lazily so
 	// the dashboard can be created before the supervisor.
 	var sup *supervisor.Supervisor
-	var dash *ui.Dashboard
+	var dash *tui.Dashboard
 	if !*noTUI && isatty.IsTerminal(os.Stdout.Fd()) {
-		dash = ui.Start(ui.Source{
+		dash = tui.Start(tui.Source{
 			Snapshot: func() ([]supervisor.SessionStatus, int, int) {
 				if sup == nil {
 					return nil, 0, 0

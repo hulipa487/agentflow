@@ -322,7 +322,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
       <tr><td><code>scheduler.workers</code></td><td>int</td><td>8</td><td>Op worker pool size</td></tr>
       <tr><td><code>reload.watch</code></td><td>bool</td><td>true</td><td>Hot reload for plugins and instructions</td></tr>
       <tr><td><code>persistence</code></td><td>string</td><td>sqlite://./data/agentflow.db</td><td>Runtime metadata (timers, budgets, child records)</td></tr>
-      <tr><td><code>admin.listen</code></td><td>string</td><td>127.0.0.1:9090</td><td>Metrics/admin HTTP endpoint</td></tr>
+      <tr><td><code>admin.listen</code></td><td>string</td><td>127.0.0.1:9090</td><td>Metrics/admin HTTP endpoint; also serves the web console</td></tr>
       <tr><td><code>identity.enabled</code></td><td>bool</td><td>false</td><td>Mint a stable user UUID per inbound; rewrites <code>from</code> to <code>user:&lt;uuid&gt;</code>, enabling <code>session.push_user</code></td></tr>
       <tr><td><code>identity.persistence</code></td><td>string</td><td>&lt;persistence dir&gt;/identity.db</td><td>sqlite path for the identity registry</td></tr>
       <tr><td><code>credentials.enabled</code></td><td>bool</td><td>false</td><td>Encrypted per-tenant credential store backing <code>auth={service=...}</code></td></tr>
@@ -330,7 +330,17 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
       <tr><td><code>credentials.master_key_env</code></td><td>string</td><td>CREDENTIALS_MASTER_KEY</td><td>Env var holding the master key (read at boot, never from the file)</td></tr>
     </tbody>
   </table>
-  <p>The admin server exposes <code>GET /healthz</code>, <code>GET /readyz</code>, <code>GET /metrics</code> (Prometheus text format), <code>GET /v1/sessions</code>, and <code>/admin/credentials</code>; all but the health endpoints take an optional <code>ADMIN_TOKEN</code> bearer. Live counters include <code>agentflow_sessions_active</code>, <code>agentflow_children_spawned</code>/<code>died</code>, <code>agentflow_llm_calls</code>, <code>agentflow_llm_tokens</code>, and <code>agentflow_budget_denied</code>.</p>
+  <p>The admin server exposes <code>GET /healthz</code>, <code>GET /readyz</code>, <code>GET /metrics</code> (Prometheus text format), <code>GET /v1/sessions</code>, and <code>/admin/credentials</code>. Live counters include <code>agentflow_sessions_active</code>, <code>agentflow_children_spawned</code>/<code>died</code>, <code>agentflow_llm_calls</code>, <code>agentflow_llm_tokens</code>, and <code>agentflow_budget_denied</code>.</p>
+
+  <h3>Web console</h3>
+  <p>The admin server also hosts an embedded <b>web console</b> (on by default; <code>-no-webui</code> to disable) at <code>http://&lt;admin.listen&gt;/</code> — a single-page UI for the operator, no build step or separate port. It has four tabs:</p>
+  <ul>
+    <li><b>Dashboard</b> — instance info, live sessions, agents/channels, an API-key manager over the credential store (per-user create/revoke, write-only secrets), and a streaming log tail.</li>
+    <li><b>Models</b> — list every named model (key masked to a last-4 fingerprint), edit/add/remove, and a <i>test</i> button that makes a 1-token call through the live manager and classifies the result (auth / not_found / unreachable / …). Edits <b>hot-apply to the running process</b> immediately, then an explicit <i>Persist to config</i> writes them into the file (backup kept as <code>.bak</code>) and <i>Revert</i> reloads from the file. A drift badge shows whenever runtime and file disagree.</li>
+    <li><b>Config</b> — a raw YAML editor with boot-equivalent <i>Validate</i> (strict fields, env expansion, cross-references — errors name the line), an atomic <i>Save</i> that backs up first and refuses if the file changed on disk underneath you, and a masked structured view. Saving prompts a restart; the runtime never silently live-reloads topology.</li>
+    <li><b>Metrics</b> — the counters as sparklines, sampled in-process (~2h at 5s) so no external TSDB is needed; <code>/metrics</code> stays the Prometheus integration point.</li>
+  </ul>
+  <p><b>Auth:</b> every console API route (and <code>/metrics</code>, <code>/v1/sessions</code>, <code>/admin/credentials</code>) requires a bearer token — even on loopback. Set <code>ADMIN_TOKEN</code> to pin it; otherwise a random per-boot token is generated and printed once to the console. The static SPA files are served open but are inert without the token. Secrets are write-only throughout: list endpoints return metadata and fingerprints, never values, and the config view masks sensitive keys while preserving <code>${VAR}</code> placeholders.</p>
 
   <h3><code>models</code> — named LLM providers</h3>
   <pre><code>models:

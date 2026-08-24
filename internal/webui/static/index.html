@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agentflow console</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header>
+  <div class="brand">agentflow <span class="muted">console</span></div>
+  <nav id="tabs">
+    <button data-tab="dashboard" class="active">Dashboard</button>
+    <button data-tab="models">Models</button>
+    <button data-tab="config">Config</button>
+    <button data-tab="metrics">Metrics</button>
+  </nav>
+  <div class="header-right">
+    <span id="conn" class="badge warn">connecting</span>
+    <button id="lockBtn" title="Change admin token">🔑</button>
+  </div>
+</header>
+
+<main>
+  <section id="tab-dashboard" class="tab active">
+    <div class="grid">
+      <div class="card">
+        <h2>Instance</h2>
+        <dl id="instanceInfo" class="kv"></dl>
+      </div>
+      <div class="card">
+        <h2>Sessions <span id="sessCounts" class="muted"></span></h2>
+        <table id="sessionsTable"><thead><tr><th>Session</th><th>Agent</th><th>Parent</th><th>State</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div class="card">
+        <h2>Agents</h2>
+        <table id="agentsTable"><thead><tr><th>Name</th><th>Model</th><th>Loop</th><th>Kind</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div class="card">
+        <h2>Channels</h2>
+        <table id="channelsTable"><thead><tr><th>Name</th><th>Type</th><th>Agent</th><th>Path</th><th>Media</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div class="card wide">
+        <h2>API keys <span class="muted">per user (credential store)</span></h2>
+        <div id="credDisabled" class="muted hidden">Credential store not enabled — set <code>runtime.credentials.enabled: true</code>.</div>
+        <div id="credPane">
+          <div class="row">
+            <select id="credUser"></select>
+            <input id="credUserNew" placeholder="or new user UUID" class="grow">
+            <button id="credRefresh">Refresh</button>
+          </div>
+          <table id="credTable"><thead><tr><th>Service</th><th>Kind</th><th>Key</th><th>Updated</th><th></th></tr></thead><tbody></tbody></table>
+          <details class="addbox">
+            <summary>Add / replace a key</summary>
+            <div class="row wrap">
+              <input id="credService" placeholder="service (e.g. openai)">
+              <input id="credKind" placeholder="kind (api_key)" value="api_key">
+              <input id="credSecret" placeholder="secret value" type="password" class="grow">
+              <input id="credHeader" placeholder="header (Authorization)">
+              <input id="credScheme" placeholder="scheme (Bearer)">
+              <button id="credAdd">Save key</button>
+            </div>
+            <p class="muted small">Secrets are write-only: they are encrypted at rest and never returned by the API.</p>
+          </details>
+        </div>
+      </div>
+      <div class="card wide">
+        <h2>Logs</h2>
+        <pre id="logTail" class="logtail"></pre>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-models" class="tab">
+    <div id="driftBanner" class="banner warn hidden">
+      Runtime models differ from the config file.
+      <button id="persistBtn">Persist to config</button>
+      <button id="revertBtn" class="secondary">Revert to file</button>
+    </div>
+    <div class="card">
+      <h2>Models <button id="newModelBtn" class="small">+ Add model</button></h2>
+      <table id="modelsTable"><thead><tr>
+        <th>Name</th><th>Provider</th><th>Model</th><th>Base URL</th><th>Key</th><th>State</th><th></th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+    <div id="modelEditor" class="card hidden">
+      <h2 id="modelEditorTitle">Edit model</h2>
+      <div class="form">
+        <label>Name <input id="mName" placeholder="default"></label>
+        <label>Provider
+          <select id="mProvider">
+            <option>openai</option><option>openai-responses</option>
+            <option>anthropic</option><option>gemini</option><option>rerank</option>
+          </select></label>
+        <label>Model <input id="mModel" placeholder="gpt-4o-mini"></label>
+        <label>Base URL <input id="mBaseURL" placeholder="https://api.openai.com/v1"></label>
+        <label>API key <input id="mAPIKey" placeholder="sk-… or ${VAR}" autocomplete="off"></label>
+        <label>Timeout <input id="mTimeout" placeholder="60s"></label>
+        <label>Retry <input id="mRetry" type="number" min="0" value="0"></label>
+        <label>Max tokens <input id="mMaxTokens" type="number" min="0" value="0"></label>
+        <label>Server tools <input id="mServerTools" placeholder="comma-separated, e.g. google_search"></label>
+      </div>
+      <p class="muted small">Use <code>${ENV_VAR}</code> in the key field to keep the secret out of the file. Saving applies to the live runtime immediately; use “Persist to config” to keep it across restarts.</p>
+      <div class="row">
+        <button id="mSave">Apply (runtime)</button>
+        <button id="mTest" class="secondary">Test</button>
+        <button id="mCancel" class="secondary">Cancel</button>
+        <span id="mTestResult" class="muted"></span>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-config" class="tab">
+    <div id="restartBanner" class="banner info hidden">Config saved (previous kept as .bak). <b>Restart agentflow</b> to apply.</div>
+    <div id="conflictBanner" class="banner err hidden">The file changed on disk since you loaded it. <button id="reloadConfigBtn">Reload</button></div>
+    <div class="grid">
+      <div class="card">
+        <h2>Editor <span id="configPath" class="muted small"></span></h2>
+        <textarea id="configEditor" spellcheck="false"></textarea>
+        <div class="row">
+          <button id="validateBtn" class="secondary">Validate</button>
+          <button id="saveConfigBtn">Save</button>
+          <span id="configStatus" class="muted"></span>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Effective view <span class="muted small">(secrets masked)</span></h2>
+        <pre id="configView" class="tree"></pre>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-metrics" class="tab">
+    <div id="metricsGrid" class="grid"></div>
+  </section>
+</main>
+
+<div id="tokenOverlay" class="overlay hidden">
+  <div class="dialog">
+    <h2>Admin token required</h2>
+    <p class="muted">Every API route on this console is authenticated. Paste the token — the one printed at boot, or your <code>ADMIN_TOKEN</code>.</p>
+    <input id="tokenInput" type="password" placeholder="admin token" autocomplete="off">
+    <div class="row"><button id="tokenSave">Unlock</button><span id="tokenErr" class="err-text"></span></div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

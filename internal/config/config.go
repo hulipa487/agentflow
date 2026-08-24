@@ -73,22 +73,23 @@ type IdentityConfig struct {
 	Persistence string `yaml:"persistence"` // sqlite path; "" = <runtime persistence dir>/identity.db
 }
 
-// Model is a named LLM provider configuration.
+// Model is a named LLM provider configuration. The omitempty tags keep the
+// web console's persist output clean (only set fields are written back).
 type Model struct {
 	Provider  string `yaml:"provider"`
 	Model     string `yaml:"model"`
-	APIKey    string `yaml:"api_key"`
-	BaseURL   string `yaml:"base_url"`
-	Timeout   string `yaml:"timeout"`
-	Retry     int    `yaml:"retry"`
-	MaxTokens int    `yaml:"max_tokens"`
+	APIKey    string `yaml:"api_key,omitempty"`
+	BaseURL   string `yaml:"base_url,omitempty"`
+	Timeout   string `yaml:"timeout,omitempty"`
+	Retry     int    `yaml:"retry,omitempty"`
+	MaxTokens int    `yaml:"max_tokens,omitempty"`
 	// ServerTools names provider-native server-side tools to enable on every
 	// request for this model (e.g. "web_search", "x_search", "google_search").
 	// Unlike client-side function tools (opts.Tools), these are executed by the
 	// provider inside the completion; the runtime only injects the native tool
 	// entry into the request body. The values are provider-specific strings,
 	// keeping the runtime generic.
-	ServerTools []string `yaml:"server_tools"`
+	ServerTools []string `yaml:"server_tools,omitempty"`
 }
 
 func (m Model) TimeoutD() time.Duration {

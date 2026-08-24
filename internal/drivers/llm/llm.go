@@ -94,7 +94,11 @@ type event struct {
 }
 
 // Manager resolves model names to provider clients and owns live streams.
+// The model set is hot-swappable (Upsert/Remove/SetAll, e.g. from the admin
+// web UI): resolution happens per call, so an edit takes effect on the next
+// request without touching live sessions.
 type Manager struct {
+	mmu    sync.RWMutex // guards models
 	models map[string]config.Model
 	http   *http.Client
 	log    *slog.Logger
@@ -106,23 +110,69 @@ type Manager struct {
 
 func NewManager(models map[string]config.Model, log *slog.Logger) *Manager {
 	return &Manager{
-		models:  models,
+		models:  cloneModels(models),
 		http:    &http.Client{}, // per-request ctx carries the timeout
 		log:     log.With("driver", "llm"),
 		streams: map[string]*Stream{},
 	}
 }
 
+// cloneModels copies a model set, always returning a non-nil map so runtime
+// Upsert can never assign into a nil map (a config with no models: key yields
+// a nil map at boot).
+func cloneModels(models map[string]config.Model) map[string]config.Model {
+	out := make(map[string]config.Model, len(models))
+	for k, v := range models {
+		out[k] = v
+	}
+	return out
+}
+
 func (m *Manager) resolve(name string) (config.Model, error) {
 	if name == "" {
 		name = "default"
 	}
+	m.mmu.RLock()
 	cfg, ok := m.models[name]
+	m.mmu.RUnlock()
 	if !ok {
 		return config.Model{}, fmt.Errorf("unknown model %q", name)
 	}
 	return cfg, nil
 }
+
+// Upsert adds or replaces a named model at runtime. In-flight requests keep
+// the config they resolved with; the next call sees the new one.
+func (m *Manager) Upsert(name string, cfg config.Model) {
+	m.mmu.Lock()
+	m.models[name] = cfg
+	m.mmu.Unlock()
+}
+
+// Remove deletes a named model. In-flight requests are unaffected.
+func (m *Manager) Remove(name string) {
+	m.mmu.Lock()
+	delete(m.models, name)
+	m.mmu.Unlock()
+}
+
+// SetAll replaces the entire model set (e.g. reverting to the config file's
+// models: section).
+func (m *Manager) SetAll(models map[string]config.Model) {
+	m.mmu.Lock()
+	m.models = cloneModels(models)
+	m.mmu.Unlock()
+}
+
+// List returns a copy of the current model set, keyed by name.
+func (m *Manager) List() map[string]config.Model {
+	m.mmu.RLock()
+	defer m.mmu.RUnlock()
+	return cloneModels(m.models)
+}
+
+// Get returns the live config for a named model ("" resolves to "default").
+func (m *Manager) Get(name string) (config.Model, error) { return m.resolve(name) }
 
 // Chat performs a full completion and returns the buffered text plus any
 // tool_calls the model requested at stream end.

@@ -140,7 +140,7 @@ agentflow/
 │   ├── tui/            # terminal dashboard (bubbletea): sessions, stats, logs
 │   ├── webui/          # embedded operator console (SPA + JSON API) + docs site (at /docs/)
 │   └── vm/             # Luau cgo bridge + embedded prelude
-└── third_party/luau/   # vendored Luau 0.731 (MIT, committed)
+└── third_party/luau/   # vendored Luau 0.731, trimmed to the 5 compiled components (MIT, committed)
 ```
 
 ## Breaking changes
@@ -199,7 +199,7 @@ Migration checklist:
 ## Notes
 
 - **Log levels** — five additive levels, selected with `-log-level` (default `info`): `error` (runtime cannot continue), `warn` (degraded: upstream 429/502, retries), `info` (lifecycle: launch, channels, webhooks), `debug` (every interaction: LLM API request, memory put/query, telegram update, op dispatch), `dev` (temporary development logs). Setting a level prints it and everything above.
-- **Vendored Luau** (0.731) is committed under `third_party/luau/`, so the repo builds from a clean clone. To upgrade it, replace that directory with a newer release and re-run `make`.
+- **Vendored Luau** (0.731) is committed under `third_party/luau/`, so the repo builds from a clean clone. Only the five components the build compiles are vendored (`VM`, `Common`, `Ast`, `Bytecode`, `Compiler`, plus their includes and the license files) — the upstream tests/bench/CLI/CodeGen/etc. are not. To upgrade, replace those components with a newer release and re-run `make`.
 - **`config.yaml`** is gitignored — it's the local instance config and may contain credentials. Keep secrets in it or in environment variables, never in tracked files.
 - Runtime state (sqlite stores) lives under `data/` and is gitignored.
 

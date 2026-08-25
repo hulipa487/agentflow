@@ -66,7 +66,7 @@ func (u *UI) Static() http.Handler {
 			path = "index.html"
 		}
 		switch path {
-		case "index.html", "app.js", "styles.css":
+		case "index.html", "app.js", "styles.css", "shared/tokens.css", "shared/theme.js":
 		default:
 			http.NotFound(w, r)
 			return
@@ -103,7 +103,7 @@ func (u *UI) Docs() http.Handler {
 			path = "index.html"
 		}
 		switch path {
-		case "index.html", "css/styles.css", "js/nav.js", "js/theme.js":
+		case "index.html", "css/styles.css", "js/nav.js":
 		default:
 			http.NotFound(w, r)
 			return

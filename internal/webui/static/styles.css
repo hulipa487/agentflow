@@ -35,6 +35,8 @@ nav button {
 nav button.active { color: var(--text); border-bottom-color: var(--accent); }
 nav button:hover { color: var(--text); }
 .header-right { display: flex; align-items: center; gap: 10px; }
+.docs-link { color: var(--muted); text-decoration: none; font-size: 13px; }
+.docs-link:hover { color: var(--text); }
 
 main { padding: 20px; max-width: 1400px; margin: 0 auto; }
 .tab { display: none; }

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -592,6 +593,12 @@ func main() {
 			},
 		})
 		admin.Mount("/admin/api/", console.API(), true)
+		// Docs site (embedded, unauthenticated). Redirect bare /docs so the
+		// page's relative asset paths (css/, js/) resolve under the subtree.
+		admin.Mount("/docs", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/docs/", http.StatusMovedPermanently)
+		}), false)
+		admin.Mount("/docs/", console.Docs(), false)
 		admin.Mount("/", console.Static(), false)
 		log.Info("web console enabled", "url", "http://"+adminAddr+"/")
 	}

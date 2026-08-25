@@ -115,6 +115,32 @@ func TestStaticServesSPA(t *testing.T) {
 	}
 }
 
+func TestDocsServesSite(t *testing.T) {
+	f := newFixture(t)
+	h := f.ui.Docs()
+	for _, p := range []string{"/docs/", "/docs/index.html", "/docs/css/styles.css", "/docs/js/nav.js", "/docs/js/theme.js"} {
+		rec := do(t, h, http.MethodGet, p, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: got %d", p, rec.Code)
+		}
+		if rec.Body.Len() == 0 {
+			t.Fatalf("%s: empty body", p)
+		}
+	}
+	// Root of the subtree resolves to index.html.
+	rec := do(t, h, http.MethodGet, "/docs/", nil)
+	if ct := rec.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
+		t.Fatalf("index content-type: %q", ct)
+	}
+	// Traversal and unknown paths 404.
+	for _, p := range []string{"/docs/../../etc/passwd", "/docs/secret.txt"} {
+		rec := do(t, h, http.MethodGet, p, nil)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s: got %d", p, rec.Code)
+		}
+	}
+}
+
 func TestAPIRequiresTokenWhenMounted(t *testing.T) {
 	f := newFixture(t)
 	reg := metrics.NewRegistry()

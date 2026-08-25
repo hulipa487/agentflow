@@ -118,14 +118,14 @@ holds only the runtime and generic, runnable examples.
 
 ## Documentation
 
-Full docs (install guide, architecture, config reference, comprehensive Lua plugin development guide, hook specs, capability API) are a static site in [`docs/`](docs/). Serve locally:
+Full docs (install guide, architecture, config reference, comprehensive Lua plugin development guide, hook specs, capability API) are embedded in the binary and served by the web console at **`/docs/`**:
 
 ```bash
-cd docs && python -m http.server 8888
-# open http://localhost:8888
+./agentflow -config config.yaml
+# open http://127.0.0.1:9090/docs/
 ```
 
-On GitHub, this can be published via GitHub Pages → "Deploy from a branch" → `docs/` folder.
+No separate server or build step — the site is `go:embed`ded from `internal/webui/docs/` and readable without the admin token.
 
 ## Repository layout
 
@@ -138,9 +138,8 @@ agentflow/
 │   ├── drivers/        # llm, memory backends, telegram, webhook, ghhook, httpd, shell, mcp
 │   ├── builtins/       # embedded Lua builtins (per_chat route + support chunks)
 │   ├── tui/            # terminal dashboard (bubbletea): sessions, stats, logs
-│   ├── webui/          # embedded operator console (SPA + JSON API on the admin server)
+│   ├── webui/          # embedded operator console (SPA + JSON API) + docs site (at /docs/)
 │   └── vm/             # Luau cgo bridge + embedded prelude
-├── docs/               # documentation website (GitHub Pages-ready)
 └── third_party/luau/   # vendored Luau 0.731 (MIT, committed)
 ```
 

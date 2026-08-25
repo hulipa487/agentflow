@@ -96,7 +96,7 @@ func decode(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
 func TestStaticServesSPA(t *testing.T) {
 	f := newFixture(t)
 	h := f.ui.Static()
-	for _, p := range []string{"/", "/app.js", "/styles.css"} {
+	for _, p := range []string{"/", "/app.js", "/styles.css", "/shared/tokens.css", "/shared/theme.js"} {
 		rec := do(t, h, http.MethodGet, p, nil)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("%s: got %d", p, rec.Code)
@@ -118,7 +118,7 @@ func TestStaticServesSPA(t *testing.T) {
 func TestDocsServesSite(t *testing.T) {
 	f := newFixture(t)
 	h := f.ui.Docs()
-	for _, p := range []string{"/docs/", "/docs/index.html", "/docs/css/styles.css", "/docs/js/nav.js", "/docs/js/theme.js"} {
+	for _, p := range []string{"/docs/", "/docs/index.html", "/docs/css/styles.css", "/docs/js/nav.js"} {
 		rec := do(t, h, http.MethodGet, p, nil)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("%s: got %d", p, rec.Code)

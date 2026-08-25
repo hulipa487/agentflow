@@ -28,6 +28,9 @@ import (
 //go:embed static
 var staticFS embed.FS
 
+//go:embed docs
+var docsFS embed.FS
+
 // Deps are the runtime handles the console needs. All are wired in main; Creds
 // and Logs may be nil (credentials disabled / log tail off).
 type Deps struct {
@@ -82,6 +85,42 @@ func (u *UI) Static() http.Handler {
 			w.Header().Set("Content-Type", "text/css; charset=utf-8")
 		}
 		// The SPA is per-deployment and never cached across versions.
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write(b)
+	})
+}
+
+// Docs serves the embedded documentation site at /docs/. Like Static, it is
+// unauthenticated (documentation is not sensitive) and path-whitelisted.
+func (u *UI) Docs() http.Handler {
+	sub, err := fs.Sub(docsFS, "docs")
+	if err != nil {
+		panic(err)
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/docs/")
+		if path == "" || path == "docs" {
+			path = "index.html"
+		}
+		switch path {
+		case "index.html", "css/styles.css", "js/nav.js", "js/theme.js":
+		default:
+			http.NotFound(w, r)
+			return
+		}
+		b, err := fs.ReadFile(sub, path)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		switch {
+		case strings.HasSuffix(path, ".html"):
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		case strings.HasSuffix(path, ".js"):
+			w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+		case strings.HasSuffix(path, ".css"):
+			w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		}
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = w.Write(b)
 	})

@@ -168,13 +168,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// Palette mirrors the web UIs' shared tokens (internal/webui/static/shared/
+// tokens.css): accent blue for titles/borders, green for active/ok, grays for
+// muted/idle/log — so the terminal reads as the same product as the console.
 var (
-	borderStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("62"))
-	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
-	activeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	idleStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	borderStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("68"))  // muted accent blue
+	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("75"))                             // accent blue (#58a6ff-ish)
+	activeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))                                        // ok green
+	idleStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))                                       // muted gray
 	pmStyle     = lipgloss.NewStyle().Bold(true)
-	logStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	logStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))                                       // dim gray
 )
 
 func statusDot(busy bool) string {

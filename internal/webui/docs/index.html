@@ -532,6 +532,30 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
       args: ["-y", "@mcp/server-filesystem", "/data"]</code></pre>
   <p>Tools discovered at connect enter the registry as <code>mcp:&lt;server&gt;/&lt;tool&gt;</code>. If the server disconnects, invocations return structured <code>unavailable</code>.</p>
 
+  <h3><code>search</code></h3>
+  <pre><code>search:
+  default: ollama               # engine used when a call omits `engine`
+  engines:
+    doubao:
+      api_key: ${DOUBAO_API_KEY}   # Volcano Engine web-search Custom API
+    ollama:
+      api_key: ${OLLAMA_API_KEY}   # ollama.com hosted web search
+    stackoverflow:
+      site: stackoverflow          # optional; any StackExchange site (default stackoverflow)
+      # api_key optional — anonymous quota is 300 req/day; a free app key lifts it to 10k
+    github:
+      # repository search — api_key optional (a token lifts 10 req/min to 30/min)</code></pre>
+  <p>Configures the engines behind the <code>builtin:web_search</code> tool, selectable per call via the tool's <code>engine</code> parameter (<code>tools.run("builtin:web_search", {query=..., engine="doubao"})</code>); omitting <code>engine</code> uses <code>search.default</code>. With no engines configured the tool reports honest-unavailable (<code>{ok:false, unavailable:true}</code>). Per-engine <code>base_url</code> and <code>timeout</code> are optional overrides. Results normalize to <code>{title, url, site, summary, snippet, content, published, score}</code>; <code>score</code> is engine-native (doubao is a 0..1 relevance, stackoverflow is the raw upvote count, github is the stargazer count). doubao and ollama require <code>api_key</code>; stackoverflow and github need none (the <code>site</code> field picks any StackExchange network site, e.g. <code>superuser</code> or <code>serverfault</code>). github searches repositories and honors GitHub's full qualifier syntax in the query (<code>language:go stars:&gt;100 pushed:&gt;2024-01-01</code>).</p>
+
+  <h3><code>legal_search</code></h3>
+  <pre><code>legal_search:
+  default: hklii                # engine used when a call omits `engine`
+  engines:
+    hklii: {}                   # Hong Kong Legal Information Institute — free, no key
+    npc: {}                     # China National Database of Laws and Regulations — free, no key
+                                # (optional base_url / timeout overrides)</code></pre>
+  <p>Configures the engines behind two tools, selectable per call via the <code>engine</code> param (default <code>legal_search.default</code>); both report honest-unavailable when no engine is configured. <code>builtin:legal_search</code> returns hits as <code>{title, path, url, court, date, neutral, parallel, action, parties, coram}</code> (citations included; <code>total</code> is the full match count). Its <code>disable_fuzzy</code> param (default false) switches between fuzzy/concept and exact matching. <code>builtin:legal_fetch</code> retrieves one document's full plain text, keyed by the search hit's <code>path</code>, with <code>start</code>/<code>max_chars</code> paging for long bodies. The two engines differ in coverage and keys: <strong>hklii</strong> covers Hong Kong case law and legislation — its <code>path</code> is <code>/en/cases/hkcfi/2020/1808</code> (or explicit <code>abbr</code>/<code>year</code>/<code>num</code>), with an optional <code>lang</code> (<code>en</code>|<code>tc</code>|<code>sc</code>). <strong>npc</strong> covers PRC national laws, administrative regulations, and judicial interpretations — its <code>path</code> is the opaque <code>bbbs</code> document id from a hit, <code>disable_fuzzy</code> narrows full-text search to title-only, hits add <code>type</code> (法律/行政法规/…), <code>effective</code> (施行日期) and <code>status</code> (有效/已修改/已废止/尚未生效), and the fetched text is extracted from the returned Word document via the built-in doc/docx parser.</p>
+
   <h3><code>tools.policy</code></h3>
   <pre><code>tools:
   policy:

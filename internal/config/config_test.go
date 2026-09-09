@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestValidateShellProfile exercises the provider-specific validation rules.
 func TestValidateShellProfile(t *testing.T) {
@@ -58,5 +61,137 @@ func TestCredentialsMasterKeyEnvDefault(t *testing.T) {
 	c2.Runtime.Credentials.MasterKeyEnv = "MY_KEY_ENV"
 	if got := c2.CredentialsMasterKeyEnv(); got != "MY_KEY_ENV" {
 		t.Fatalf("override env = %q, want MY_KEY_ENV", got)
+	}
+}
+
+// TestValidateSearch exercises the search-engine validation rules: known
+// engines, per-engine key requirements, and default resolution.
+func TestValidateSearch(t *testing.T) {
+	tests := []struct {
+		name    string
+		search  Search
+		wantErr string
+		wantDef string
+	}{
+		{name: "none configured ok", search: Search{}},
+		{
+			name:    "doubao without key",
+			search:  Search{Engines: map[string]SearchEngine{"doubao": {}}},
+			wantErr: "requires api_key",
+		},
+		{
+			name:    "ollama without key",
+			search:  Search{Engines: map[string]SearchEngine{"ollama": {}}},
+			wantErr: "requires api_key",
+		},
+		{
+			name:    "unknown engine",
+			search:  Search{Engines: map[string]SearchEngine{"brave": {APIKey: "k"}}},
+			wantErr: "unsupported search engine",
+		},
+		{
+			name:    "multiple engines without default",
+			search:  Search{Engines: map[string]SearchEngine{"doubao": {APIKey: "k"}, "ollama": {APIKey: "k2"}}},
+			wantErr: "set search.default",
+		},
+		{
+			name:    "default names unconfigured engine",
+			search:  Search{Default: "ollama", Engines: map[string]SearchEngine{"doubao": {APIKey: "k"}}},
+			wantErr: "not a configured engine",
+		},
+		{
+			name:    "single engine defaults to itself",
+			search:  Search{Engines: map[string]SearchEngine{"ollama": {APIKey: "k"}}},
+			wantDef: "ollama",
+		},
+		{
+			name:    "explicit default ok",
+			search:  Search{Default: "ollama", Engines: map[string]SearchEngine{"doubao": {APIKey: "k"}, "ollama": {APIKey: "k2"}}},
+			wantDef: "ollama",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Config{Search: tt.search, Agents: map[string]Agent{"bot": {Loop: "./loop.lua"}}}
+			err := validate("cfg.yaml", c)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("expected error containing %q, got: %v", tt.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected no error, got: %v", err)
+			}
+			if tt.wantDef != "" && c.Search.Default != tt.wantDef {
+				t.Fatalf("default = %q, want %q", c.Search.Default, tt.wantDef)
+			}
+		})
+	}
+}
+
+// TestValidateLegalSearch exercises the legal-search engine rules: only hklii
+// is supported (no key), and default resolution.
+func TestValidateLegalSearch(t *testing.T) {
+	tests := []struct {
+		name    string
+		legal   LegalSearch
+		wantErr string
+		wantDef string
+	}{
+		{name: "none configured ok", legal: LegalSearch{}},
+		{
+			name:    "unknown engine",
+			legal:   LegalSearch{Engines: map[string]SearchEngine{"westlaw": {}}},
+			wantErr: "unsupported legal_search engine",
+		},
+		{
+			name:    "hklii needs no key, defaults to itself",
+			legal:   LegalSearch{Engines: map[string]SearchEngine{"hklii": {}}},
+			wantDef: "hklii",
+		},
+		{
+			name:    "default names unconfigured engine",
+			legal:   LegalSearch{Default: "lexis", Engines: map[string]SearchEngine{"hklii": {}}},
+			wantErr: "not a configured engine",
+		},
+		{
+			name:    "explicit default ok",
+			legal:   LegalSearch{Default: "hklii", Engines: map[string]SearchEngine{"hklii": {}}},
+			wantDef: "hklii",
+		},
+		{
+			name:    "npc supported, no key",
+			legal:   LegalSearch{Engines: map[string]SearchEngine{"npc": {}}},
+			wantDef: "npc",
+		},
+		{
+			name:    "two engines need an explicit default",
+			legal:   LegalSearch{Engines: map[string]SearchEngine{"hklii": {}, "npc": {}}},
+			wantErr: "set legal_search.default",
+		},
+		{
+			name:    "hklii + npc with default",
+			legal:   LegalSearch{Default: "npc", Engines: map[string]SearchEngine{"hklii": {}, "npc": {}}},
+			wantDef: "npc",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Config{Legal: tt.legal, Agents: map[string]Agent{"bot": {Loop: "./loop.lua"}}}
+			err := validate("cfg.yaml", c)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("expected error containing %q, got: %v", tt.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected no error, got: %v", err)
+			}
+			if tt.wantDef != "" && c.Legal.Default != tt.wantDef {
+				t.Fatalf("default = %q, want %q", c.Legal.Default, tt.wantDef)
+			}
+		})
 	}
 }

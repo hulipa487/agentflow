@@ -10,7 +10,7 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 - **Multi-agent** — `agent.send` / `agent.request` / `agent.reply` / `agent.spawn`, address authority with `can_contact` ACLs, ephemeral children with budget/lifetime limits.
 - **Memory** — provider → backend → store layering; `builtin:conversational` preset; retention/window GC.
 - **Embeddings & reranking** — `llm.embed` (OpenAI-compatible `/embeddings`) and `llm.rerank` (Jina/Cohere/TEI/vLLM `/rerank`); pgvector ingest on write and a `builtin:semantic` recall pipeline (embed → vector k-NN → rerank). Multimodal embeddings follow the Jina convention (`jina-embeddings-v5-omni-small`: text + image/video/audio/pdf in one vector space); `memory.write` embeds attachment-carrying records as one merged vector.
-- **Tools** — filesystem ops inside shell handles, honest-degradation `web_search`, and MCP stdio servers discovered at boot. Arbitrary commands (git, package managers, …) run through `shell.exec`.
+- **Tools** — filesystem ops inside shell handles, a multi-engine `web_search` tool (Doubao / Ollama / StackOverflow / GitHub, selected per call via `engine`; honest-degradation when unconfigured), a `legal_search` / `legal_fetch` pair over HKLII (Hong Kong case law + legislation) and the NPC China national laws database, and MCP stdio servers discovered at boot. Arbitrary commands (git, package managers, …) run through `shell.exec`.
 - **Shell** — Docker and SSH providers with resource limits and an exec-policy filter.
 - **HTTP** — `http.request` / `os.env` Lua ops with scheme validation, body cap, and secret-header redaction.
 - **Mail** — `mail.imap_fetch` / `mail.smtp_send` Lua ops (cap `net.mail`); passwords resolve from the credential store at call time and never cross the Lua bridge.
@@ -33,6 +33,8 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 | Mail | IMAP fetch + SMTP send (in-process, cap `net.mail`) |
 | Shell | Docker, SSH |
 | Tools | builtins + MCP stdio |
+| Web search | Doubao (Volcano Engine), Ollama (hosted web search), StackOverflow (StackExchange API), GitHub (repository search) — one `builtin:web_search` tool, per-call `engine` param; honest-unavailable when unconfigured |
+| Legal | HKLII (Hong Kong case law + legislation, with citations) and NPC (China National Database of Laws and Regulations) — `builtin:legal_search` + `builtin:legal_fetch` (full text, extracted from Word docs via the built-in parser); free, no key |
 
 ## Requirements
 

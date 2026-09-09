@@ -26,6 +26,8 @@ type Config struct {
 	Gateway  Gateway          `yaml:"gateway"`
 	MCP      MCP              `yaml:"mcp"`
 	Tools    Tools            `yaml:"tools"`
+	Search   Search           `yaml:"search"`
+	Legal    LegalSearch      `yaml:"legal_search"`
 	Agents   map[string]Agent `yaml:"agents"`
 	Plugins  Plugins          `yaml:"plugins"`
 }
@@ -246,6 +248,48 @@ type ToolSpecOverride struct {
 	CostLevel    *int    `yaml:"cost_level"`
 	UserVisible  *bool   `yaml:"user_visible"`
 	Autonomous   *bool   `yaml:"autonomous"`
+}
+
+// Search configures the builtin:web_search tool: a set of named engines and
+// the default used when a call omits `engine`. With no engines configured the
+// tool reports honest-unavailable rather than failing. Engine names double as
+// providers (doubao, ollama, stackoverflow, github); keys are env-interpolated
+// (${VAR}) like model keys so secrets never sit in the file as literals.
+type Search struct {
+	Default string                  `yaml:"default"` // engine used when a call omits `engine`
+	Engines map[string]SearchEngine `yaml:"engines"`
+}
+
+// SearchEngine is one backend's connection config. BaseURL overrides the
+// driver's default endpoint (testing / proxy); Timeout bounds each request.
+type SearchEngine struct {
+	APIKey  string `yaml:"api_key"`  // doubao, ollama: required; stackoverflow, github: optional (lifts the anonymous quota)
+	BaseURL string `yaml:"base_url"` // optional endpoint override
+	Timeout string `yaml:"timeout"`  // per-request bound; default 30s
+	Site    string `yaml:"site"`     // stackoverflow engine: any StackExchange site (default "stackoverflow")
+}
+
+// TimeoutD parses Timeout with a sane default.
+func (e SearchEngine) TimeoutD() time.Duration {
+	if e.Timeout == "" {
+		return 30 * time.Second
+	}
+	d, err := time.ParseDuration(e.Timeout)
+	if err != nil {
+		return 30 * time.Second
+	}
+	return d
+}
+
+// LegalSearch configures the builtin:legal_search / builtin:legal_fetch tools:
+// a set of named legal-database engines and the default used when a call omits
+// `engine`. Supported: hklii (Hong Kong Legal Information Institute) and npc
+// (China National Database of Laws and Regulations); neither needs a key. With
+// no engines configured the tools report honest-unavailable rather than
+// failing. Engine connection config reuses SearchEngine (base_url / timeout).
+type LegalSearch struct {
+	Default string                  `yaml:"default"` // engine used when a call omits `engine`
+	Engines map[string]SearchEngine `yaml:"engines"`
 }
 
 // Plugins controls the global capability ceiling.
@@ -585,6 +629,57 @@ func validate(path string, c *Config) error {
 		case "anthropic", "openai", "openai-responses", "gemini", "rerank":
 		default:
 			return fmt.Errorf("%s: model %q has unsupported provider %q", path, name, m.Provider)
+		}
+	}
+
+	// Search engines are optional; none configured leaves web_search in
+	// honest-unavailable mode. Engine names are the provider selectors.
+	for ename, e := range c.Search.Engines {
+		switch ename {
+		case "doubao", "ollama":
+			if e.APIKey == "" {
+				return fmt.Errorf("%s: search engine %q requires api_key", path, ename)
+			}
+		case "stackoverflow":
+			// key optional (anonymous 300 req/day quota; key lifts to 10,000)
+		case "github":
+			// key optional (anonymous 10 req/min search quota; key lifts to 30/min)
+		default:
+			return fmt.Errorf("%s: unsupported search engine %q (want doubao, ollama, stackoverflow, or github)", path, ename)
+		}
+	}
+	if n := len(c.Search.Engines); n > 0 {
+		if c.Search.Default == "" {
+			if n > 1 {
+				return fmt.Errorf("%s: search has %d engines; set search.default to the one used when a call omits `engine`", path, n)
+			}
+			for ename := range c.Search.Engines {
+				c.Search.Default = ename
+			}
+		} else if _, ok := c.Search.Engines[c.Search.Default]; !ok {
+			return fmt.Errorf("%s: search.default %q is not a configured engine", path, c.Search.Default)
+		}
+	}
+
+	// Legal-search engines are optional; none configured leaves legal_search /
+	// legal_fetch in honest-unavailable mode. hklii and npc need no key.
+	for ename := range c.Legal.Engines {
+		switch ename {
+		case "hklii", "npc":
+		default:
+			return fmt.Errorf("%s: unsupported legal_search engine %q (want hklii or npc)", path, ename)
+		}
+	}
+	if n := len(c.Legal.Engines); n > 0 {
+		if c.Legal.Default == "" {
+			if n > 1 {
+				return fmt.Errorf("%s: legal_search has %d engines; set legal_search.default to the one used when a call omits `engine`", path, n)
+			}
+			for ename := range c.Legal.Engines {
+				c.Legal.Default = ename
+			}
+		} else if _, ok := c.Legal.Engines[c.Legal.Default]; !ok {
+			return fmt.Errorf("%s: legal_search.default %q is not a configured engine", path, c.Legal.Default)
 		}
 	}
 

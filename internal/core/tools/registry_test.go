@@ -8,12 +8,13 @@ import (
 
 	"agentflow/internal/config"
 	"agentflow/internal/core/session"
+	"agentflow/internal/drivers/search"
 	"agentflow/internal/drivers/shell"
 )
 
 func TestRegistryExpose(t *testing.T) {
 	r := NewRegistry()
-	RegisterBuiltins(r)
+	RegisterBuiltins(r, nil)
 	as := r.Expose([]string{"builtin:web_search"}, config.ToolsPolicy{Default: "all"}, false)
 	if len(as.Tools) != 1 {
 		t.Fatalf("expected 1 tool, got %d", len(as.Tools))
@@ -25,7 +26,7 @@ func TestRegistryExpose(t *testing.T) {
 
 func TestWebSearchUnavailable(t *testing.T) {
 	r := NewRegistry()
-	RegisterBuiltins(r)
+	RegisterBuiltins(r, nil)
 	as := r.Expose([]string{"builtin:web_search"}, config.ToolsPolicy{}, false)
 	res, err := as.Invoke(context.Background(), "builtin:web_search", map[string]any{"query": "foo"})
 	if err != nil {
@@ -43,9 +44,47 @@ func TestWebSearchUnavailable(t *testing.T) {
 	}
 }
 
+// fakeEngine counts calls and records the request.
+type fakeEngine struct {
+	got search.Request
+	c   int
+}
+
+func (f *fakeEngine) Search(ctx context.Context, req search.Request) (*search.Result, error) {
+	f.c++
+	f.got = req
+	return &search.Result{Query: req.Query, Results: []search.WebResult{{Title: "t", URL: "u"}}}, nil
+}
+
+func TestWebSearchEngineDispatch(t *testing.T) {
+	fake := &fakeEngine{}
+	set := &search.Set{
+		Engines: map[string]search.Searcher{"fake": fake},
+		Default: "fake",
+	}
+	r := NewRegistry()
+	RegisterBuiltins(r, set)
+	as := r.Expose([]string{"builtin:web_search"}, config.ToolsPolicy{}, false)
+
+	// count arrives as float64 on the Lua->JSON path; argCount must accept int too.
+	for _, count := range []any{float64(3), 7} {
+		res, err := as.Invoke(context.Background(), "builtin:web_search", map[string]any{"query": "q", "count": count})
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := res.(map[string]any)
+		if m["ok"] != true || m["engine"] != "fake" || m["count"] != 1 {
+			t.Fatalf("invoke: %v", m)
+		}
+		if fake.got.Count == 0 {
+			t.Fatalf("count %v not forwarded", count)
+		}
+	}
+}
+
 func TestForbidden(t *testing.T) {
 	r := NewRegistry()
-	RegisterBuiltins(r)
+	RegisterBuiltins(r, nil)
 	as := r.Expose([]string{"builtin:web_search"}, config.ToolsPolicy{Forbidden: []string{"builtin:web_search"}}, false)
 	if len(as.Tools) != 0 {
 		t.Fatalf("expected no tools, got %d", len(as.Tools))
@@ -99,6 +138,8 @@ func (p *testShellProvider) Exec(ctx context.Context, handle *shell.Handle, cmd 
 func (p *testShellProvider) Read(ctx context.Context, handle *shell.Handle, path string) ([]byte, error) {
 	return []byte("content:" + path), nil
 }
-func (p *testShellProvider) Write(ctx context.Context, handle *shell.Handle, path string, content []byte) error { return nil }
+func (p *testShellProvider) Write(ctx context.Context, handle *shell.Handle, path string, content []byte) error {
+	return nil
+}
 func (p *testShellProvider) Destroy(ctx context.Context, handle *shell.Handle) error { return nil }
-func (p *testShellProvider) Alive(handle *shell.Handle) bool { return true }
+func (p *testShellProvider) Alive(handle *shell.Handle) bool                         { return true }

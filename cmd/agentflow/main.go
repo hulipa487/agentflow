@@ -39,12 +39,14 @@ import (
 	"agentflow/internal/core/tools"
 	"agentflow/internal/drivers/ghhook"
 	"agentflow/internal/drivers/httpd"
+	"agentflow/internal/drivers/legal"
 	"agentflow/internal/drivers/llm"
 	"agentflow/internal/drivers/mcp"
 	"agentflow/internal/drivers/mongodb"
 	"agentflow/internal/drivers/pgvector"
 	"agentflow/internal/drivers/postgres"
 	"agentflow/internal/drivers/redis"
+	"agentflow/internal/drivers/search"
 	"agentflow/internal/drivers/shell"
 	"agentflow/internal/drivers/sqlite"
 	"agentflow/internal/drivers/telegram"
@@ -155,9 +157,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Tool registry: builtins + shell builtins + MCP discovery.
+	// Tool registry: builtins + shell builtins + MCP discovery. The web_search
+	// tool is backed by the configured search engines (config.Search); with no
+	// engines it reports honest-unavailable.
+	searchSet, err := search.Build(cfg.Search)
+	if err != nil {
+		log.Error("search engines failed", "err", err)
+		os.Exit(1)
+	}
+	legalSet, err := legal.Build(cfg.Legal)
+	if err != nil {
+		log.Error("legal engines failed", "err", err)
+		os.Exit(1)
+	}
 	toolReg := tools.NewRegistry()
-	tools.RegisterBuiltins(toolReg)
+	tools.RegisterBuiltins(toolReg, searchSet)
+	tools.RegisterLegalBuiltins(toolReg, legalSet)
 	tools.RegisterShellBuiltins(toolReg, shellMgr)
 	mcpClients := map[string]*mcp.Client{}
 	for sname, s := range cfg.MCP.Servers {

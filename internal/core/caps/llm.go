@@ -22,7 +22,7 @@ const maxInlineMedia = 20 << 20 // 20 MiB
 // LLMHandlers exposes the llm driver as session op handlers. ms is the blob
 // store used to resolve part handles to inline base64 just before the
 // provider request; nil disables handle resolution (handle parts error).
-func LLMHandlers(m *llm.Manager, ms *media.Store) map[string]session.OpHandler {
+func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 	toLLM := func(ms0 []session.ChatMessage) ([]llm.Message, error) {
 		out := make([]llm.Message, len(ms0))
 		for i, mm := range ms0 {
@@ -158,7 +158,7 @@ func LLMHandlers(m *llm.Manager, ms *media.Store) map[string]session.OpHandler {
 // Already-inline (Data) and URL parts pass through untouched — providers
 // decide what they can consume. This is the single point where media bytes
 // enter a provider request; Lua never sees them.
-func resolvePart(p *media.Part, ms *media.Store) error {
+func resolvePart(p *media.Part, ms media.Store) error {
 	if p.Handle == "" || p.Data != "" {
 		return nil
 	}
@@ -207,7 +207,7 @@ func errString(err error) any {
 // commits the actual reported usage and releases unused reservation. On
 // exhaustion, the call returns a structured error instead of reaching the
 // provider.
-func MeteredLLMHandlers(m *llm.Manager, ms *media.Store, pool *budget.Pool) map[string]session.OpHandler {
+func MeteredLLMHandlers(m *llm.Manager, ms media.Store, pool *budget.Pool) map[string]session.OpHandler {
 	base := LLMHandlers(m, ms)
 	chat := base["llm.chat"]
 	metered := func(ctx context.Context, op session.Op) (string, bool) {

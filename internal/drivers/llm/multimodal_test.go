@@ -261,14 +261,50 @@ func TestResponsesVideoRequiresURL(t *testing.T) {
 	}}, "requires a url source")
 }
 
-func TestGeminiMediaParts(t *testing.T) {
-	var gotBody string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
-		gotBody = string(b)
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"steps":[{"type":"model_output","content":[{"type":"text","text":"a cat"}]}],"usage":{"input_tokens":10,"output_tokens":2}}`))
+// resetGeminiFileCache isolates cache-sensitive tests from each other (the
+// upload cache is process-level, keyed by content sha256).
+func resetGeminiFileCache() {
+	geminiFileCache.Lock()
+	geminiFileCache.m = map[string]geminiFileCacheEntry{}
+	geminiFileCache.Unlock()
+}
+
+// geminiFilesMock serves the Files API (start -> upload url header, finalize
+// -> file resource) plus the interactions endpoint, recording the upload
+// start count and the interactions request body.
+func geminiFilesMock(t *testing.T, gotBody *string, starts *int) *httptest.Server {
+	t.Helper()
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/upload/v1beta/files" && r.Header.Get("X-Goog-Upload-Command") == "start":
+			*starts++
+			w.Header().Set("X-Goog-Upload-Url", srv.URL+"/upload-session/1")
+			w.WriteHeader(http.StatusOK)
+		case strings.HasPrefix(r.URL.Path, "/upload-session/"):
+			b, _ := io.ReadAll(r.Body)
+			if string(b) != "hello" { // pngB64 decodes to "hello"
+				t.Errorf("uploaded bytes: %q", b)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"file":{"name":"files/abc123","uri":"` + srv.URL + `/v1beta/files/abc123","state":"ACTIVE","mimeType":"image/png"}}`))
+		case r.URL.Path == "/interactions":
+			b, _ := io.ReadAll(r.Body)
+			*gotBody = string(b)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"steps":[{"type":"model_output","content":[{"type":"text","text":"a cat"}]}],"usage":{"input_tokens":10,"output_tokens":2}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
 	}))
+	return srv
+}
+
+func TestGeminiMediaParts(t *testing.T) {
+	resetGeminiFileCache()
+	var gotBody string
+	var starts int
+	srv := geminiFilesMock(t, &gotBody, &starts)
 	defer srv.Close()
 	m := NewManager(map[string]config.Model{
 		"default": {Provider: "gemini", Model: "m", BaseURL: srv.URL},
@@ -280,16 +316,71 @@ func TestGeminiMediaParts(t *testing.T) {
 	if text != "a cat" {
 		t.Fatalf("text %q", text)
 	}
+	// The media part was uploaded to the Files API and referenced by URI —
+	// never inline base64.
+	if starts != 1 {
+		t.Errorf("expected 1 files upload, got %d", starts)
+	}
 	for _, want := range []string{
-		`"type":"inline_data"`,
+		`"type":"image"`,
 		`"mime_type":"image/png"`,
-		`"data":"aGVsbG8="`,
+		`"uri":"` + srv.URL + `/v1beta/files/abc123"`,
 		`"type":"text"`,
 	} {
 		if !strings.Contains(gotBody, want) {
 			t.Errorf("body missing %q\nbody: %s", want, gotBody)
 		}
 	}
+	if strings.Contains(gotBody, "inline_data") || strings.Contains(gotBody, "aGVsbG8=") {
+		t.Errorf("media must not be inline base64\nbody: %s", gotBody)
+	}
+}
+
+func TestGeminiUploadDeduped(t *testing.T) {
+	resetGeminiFileCache()
+	var gotBody string
+	var starts int
+	srv := geminiFilesMock(t, &gotBody, &starts)
+	defer srv.Close()
+	m := NewManager(map[string]config.Model{
+		"default": {Provider: "gemini", Model: "m", BaseURL: srv.URL},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// Two chats carrying the same bytes upload once (48h cache window).
+	for i := 0; i < 2; i++ {
+		if _, _, _, err := m.Chat(context.Background(), "default", []Message{imageTurn(pngB64)}, Opts{}); err != nil {
+			t.Fatalf("Chat %d: %v", i, err)
+		}
+	}
+	if starts != 1 {
+		t.Fatalf("same content should upload once, got %d uploads", starts)
+	}
+}
+
+func TestGeminiURLPartDownloaded(t *testing.T) {
+	var gotBody string
+	var starts int
+	srv := geminiFilesMock(t, &gotBody, &starts)
+	defer srv.Close()
+	m := NewManager(map[string]config.Model{
+		"default": {Provider: "gemini", Model: "m", BaseURL: srv.URL},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// A url part is downloaded then uploaded to the Files API.
+	_, _, _, err := m.Chat(context.Background(), "default", []Message{{
+		Role:  "user",
+		Parts: []media.Part{{Type: "image", MIME: "image/png", URL: srv.URL + "/img.png"}},
+	}}, Opts{})
+	// The mock 404s /img.png; the point is the URL path is attempted, not
+	// rejected outright.
+	if err == nil || !strings.Contains(err.Error(), "download failed") {
+		t.Fatalf("url part should be downloaded (here failing on the mock 404), got %v", err)
+	}
+}
+
+func TestGeminiPartNoSource(t *testing.T) {
+	multimodalChat(t, "gemini", []Message{{
+		Role:  "user",
+		Parts: []media.Part{{Type: "image", MIME: "image/png"}},
+	}}, "no resolvable source")
 }
 
 func TestGeminiTextOnlyStaysString(t *testing.T) {
@@ -310,13 +401,6 @@ func TestGeminiTextOnlyStaysString(t *testing.T) {
 	if !strings.Contains(gotBody, `"input":"user: hi"`) {
 		t.Errorf("text-only input should stay the legacy flattened string\nbody: %s", gotBody)
 	}
-}
-
-func TestGeminiURLPartRejected(t *testing.T) {
-	multimodalChat(t, "gemini", []Message{{
-		Role:  "user",
-		Parts: []media.Part{{Type: "image", MIME: "image/png", URL: "https://example.com/x.png"}},
-	}}, "requires inline base64 data")
 }
 
 // multimodalChatOn runs a Chat against a caller-provided server (for

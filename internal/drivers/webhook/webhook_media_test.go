@@ -27,7 +27,7 @@ func discardLog() *slog.Logger {
 
 // newWebhook builds a driver on a shared httpd server and returns the server,
 // sink, store, and driver for assertions.
-func newWebhook(t *testing.T, pol media.Policy) (*httptest.Server, *whSink, *media.Store, *Driver) {
+func newWebhook(t *testing.T, pol media.Policy) (*httptest.Server, *whSink, media.Store, *Driver) {
 	t.Helper()
 	store, err := media.Open(t.TempDir())
 	if err != nil {

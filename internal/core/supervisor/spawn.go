@@ -72,6 +72,7 @@ func (s *Supervisor) Spawn(ctx context.Context, parent session.Identity, profile
 	a.LoopSrc = tmpl.LoopSrc
 	a.SupportSrcs = builtins.SupportChunks()
 	a.OnExit = s.onActorExit
+	a.Journal = s.EgressJournal
 
 	actorCtx, cancel := context.WithCancel(s.ctx)
 

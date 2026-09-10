@@ -10,11 +10,12 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 - **Multi-agent** — `agent.send` / `agent.request` / `agent.reply` / `agent.spawn`, address authority with `can_contact` ACLs, ephemeral children with budget/lifetime limits.
 - **Memory** — provider → backend → store layering; `builtin:conversational` preset; retention/window GC.
 - **Embeddings & reranking** — `llm.embed` (OpenAI-compatible `/embeddings`) and `llm.rerank` (Jina/Cohere/TEI/vLLM `/rerank`); pgvector ingest on write and a `builtin:semantic` recall pipeline (embed → vector k-NN → rerank). Multimodal embeddings follow the Jina convention (`jina-embeddings-v5-omni-small`: text + image/video/audio/pdf in one vector space); `memory.write` embeds attachment-carrying records as one merged vector.
-- **Tools** — filesystem ops inside shell handles, a multi-engine `web_search` tool (Doubao / Ollama / StackOverflow / GitHub, selected per call via `engine`; honest-degradation when unconfigured), a `legal_search` / `legal_fetch` pair over HKLII (Hong Kong case law + legislation) and the NPC China national laws database, and MCP stdio servers discovered at boot. Arbitrary commands (git, package managers, …) run through `shell.exec`.
+- **Tools** — filesystem ops inside shell handles, a multi-engine `web_search` tool (Doubao / Ollama / StackOverflow / GitHub / YouTube, selected per call via `engine`; honest-degradation when unconfigured), a `legal_search` / `legal_fetch` pair over HKLII (Hong Kong case law + legislation) and the NPC China national laws database, and MCP stdio servers discovered at boot. Arbitrary commands (git, package managers, …) run through `shell.exec`.
 - **Shell** — Docker and SSH providers with resource limits and an exec-policy filter.
 - **HTTP** — `http.request` / `os.env` Lua ops with scheme validation, body cap, and secret-header redaction.
 - **Mail** — `mail.imap_fetch` / `mail.smtp_send` Lua ops (cap `net.mail`); passwords resolve from the credential store at call time and never cross the Lua bridge.
-- **Multimodal** — channels ingest media into a blob store (per-channel allow-list + size ceiling); loops forward part descriptors into `llm.chat` and the runtime resolves them at request time. Every provider covers images + PDFs; audio on the OpenAI shapes (input_audio) and Gemini; video via the MiniMax/Kimi/GLM `video_url` convention on the OpenAI shapes, a video block on Anthropic, and inline_data on Gemini. Opt-in via `media:` on a channel.
+- **Multimodal** — channels ingest media into a content-addressed blob store (per-channel allow-list + size ceiling; local filesystem or S3/MinIO backend via the top-level `media:` config); loops forward part descriptors into `llm.chat` and the runtime resolves them at request time. Every provider covers images + PDFs; audio on the OpenAI shapes (input_audio) and Gemini; video via the MiniMax/Kimi/GLM `video_url` convention on the OpenAI shapes, a video block on Anthropic, and the Gemini Files API (resumable upload, referenced by URI, auto-deleted after 48h) on Gemini. Opt-in via `media:` on a channel.
+- **Audit journal** — core-owned `message_journal` in the runtime store: every inbound (router) and outbound (session egress) message is recorded with channel, sender, agent, session, text, attachment handles, and delivery status — loops and channels can neither bypass nor forge it. Retention is configurable (`audit.retention_days`, default 90, 0 = forever).
 - **Credentials** — encrypted-at-rest, per-tenant credential store; loops reference a key by `{service=...}` and Go resolves and injects it at request time.
 - **Web console** — embedded single-page operator UI on the admin server (no build step): hot model management with test/persist, a validated config editor, an API-key manager over the credential store, live sessions, and in-process metrics sparklines. Token-authenticated; secrets are write-only.
 - **Scheduler** — `scheduler.every/after/cron`; timers arrive as mailbox messages, never a cross-goroutine Luau call.
@@ -28,12 +29,13 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 |---|---|
 | LLM | `anthropic` (Messages API), `openai` (Chat Completions + Embeddings), `openai-responses` (Responses API), `gemini` (Interactions API), `rerank` (cross-encoder rerank) — all pointed at compatible endpoints via `base_url` |
 | Storage | SQLite, Redis, MongoDB, PostgreSQL, in-memory volatile |
+| Media store | local filesystem (default), S3 / MinIO (hand-rolled SigV4, no AWS SDK) — content-addressed `media:<sha256>` handles |
 | Vector | pgvector (cosine similarity) |
 | Channels | webhook, GitHub webhook (`ghhook`), Telegram (polling + webhook + auto) |
 | Mail | IMAP fetch + SMTP send (in-process, cap `net.mail`) |
 | Shell | Docker, SSH |
 | Tools | builtins + MCP stdio |
-| Web search | Doubao (Volcano Engine), Ollama (hosted web search), StackOverflow (StackExchange API), GitHub (repository search) — one `builtin:web_search` tool, per-call `engine` param; honest-unavailable when unconfigured |
+| Web search | Doubao (Volcano Engine), Ollama (hosted web search), StackOverflow (StackExchange API), GitHub (repository search), YouTube (Data API v3) — one `builtin:web_search` tool, per-call `engine` param; honest-unavailable when unconfigured |
 | Legal | HKLII (Hong Kong case law + legislation, with citations) and NPC (China National Database of Laws and Regulations) — `builtin:legal_search` + `builtin:legal_fetch` (full text, extracted from Word docs via the built-in parser); free, no key |
 
 ## Requirements

@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
+
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/supervisor"
 	"agentflow/internal/vm"
@@ -33,6 +35,11 @@ type Router struct {
 	sup     *supervisor.Supervisor
 	mailbox chan Inbound
 	log     *slog.Logger
+
+	// Journal, when set, records every inbound event (routed or dropped) to
+	// the core-owned message journal. Set once at boot; channel drivers never
+	// see it, so a misbehaving channel cannot bypass the audit trail.
+	Journal func(in Inbound, status string)
 }
 
 func New(src string, sup *supervisor.Supervisor, log *slog.Logger) *Router {
@@ -44,13 +51,28 @@ func New(src string, sup *supervisor.Supervisor, log *slog.Logger) *Router {
 	}
 }
 
-// Submit queues an inbound event. A full queue drops the event — the
-// alternative is unbounded memory growth under flood; drops are logged.
+// Submit queues an inbound event. The message id is stamped here (the single
+// ingress choke point) so the journal, the session, and Lua all see the same
+// id — the item_id an audit lookup joins on. A full queue drops the event —
+// the alternative is unbounded memory growth under flood; drops are logged
+// and journaled.
 func (r *Router) Submit(in Inbound) {
+	if in.Message.ID == "" {
+		in.Message.ID = uuid.NewString()
+	}
+	if in.Message.Channel == "" {
+		in.Message.Channel = in.Channel
+	}
 	select {
 	case r.mailbox <- in:
+		if r.Journal != nil {
+			r.Journal(in, "routed")
+		}
 	default:
 		r.log.Warn("router queue full, dropping event", "channel", in.Channel)
+		if r.Journal != nil {
+			r.Journal(in, "dropped_queue")
+		}
 	}
 }
 

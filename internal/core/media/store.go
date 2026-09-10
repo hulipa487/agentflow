@@ -74,7 +74,10 @@ type Policy struct {
 
 const defaultMaxBytes = 8 << 20 // 8 MiB
 
-func (p Policy) maxBytes() int64 {
+func (p Policy) maxBytes() int64 { return p.MaxOrDefault() }
+
+// MaxOrDefault returns the per-file ceiling, applying the default when unset.
+func (p Policy) MaxOrDefault() int64 {
 	if p.MaxBytes > 0 {
 		return p.MaxBytes
 	}
@@ -102,19 +105,31 @@ func (p Policy) Allows(mime string) bool {
 	return false
 }
 
-// Store is a content-addressed blob store rooted at a directory (typically
+// Store is the blob-store contract: write under policy, read by handle.
+// Implementations: FS (content-addressed local directory, in this file) and
+// the S3 driver (internal/drivers/s3media). Handles are backend-agnostic
+// ("media:<sha256>"), so a Part never reveals where its bytes live.
+type Store interface {
+	// Put streams r into the store under the policy ceiling, returning the
+	// content-addressed ref. A repeat write of the same content dedupes.
+	Put(r io.Reader, mime string, pol Policy) (*Ref, error)
+	// ReadAll reads the whole blob, enforcing limit as a sanity ceiling.
+	ReadAll(handle string, limit int64) ([]byte, error)
+}
+
+// FS is a content-addressed blob store rooted at a directory (typically
 // data/media/). Writes dedupe by sha256; reads validate the handle format so
 // no path built from a handle can escape the root.
-type Store struct {
+type FS struct {
 	dir string
 }
 
-// Open creates (if needed) and returns a Store rooted at dir.
-func Open(dir string) (*Store, error) {
+// Open creates (if needed) and returns a filesystem Store rooted at dir.
+func Open(dir string) (*FS, error) {
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("media store: %w", err)
 	}
-	return &Store{dir: dir}, nil
+	return &FS{dir: dir}, nil
 }
 
 // Ref describes a stored blob.
@@ -127,7 +142,7 @@ type Ref struct {
 // Put streams r into the store, content-addressed by sha256, enforcing the
 // policy ceiling. Returns the ref; a repeat write of the same content is a
 // no-op that returns the existing ref.
-func (s *Store) Put(r io.Reader, mime string, pol Policy) (*Ref, error) {
+func (s *FS) Put(r io.Reader, mime string, pol Policy) (*Ref, error) {
 	limit := pol.maxBytes()
 	tmp, err := os.CreateTemp(s.dir, ".in-*")
 	if err != nil {
@@ -160,8 +175,8 @@ func (s *Store) Put(r io.Reader, mime string, pol Policy) (*Ref, error) {
 	return &Ref{Handle: "media:" + sum, MIME: mime, Size: size}, nil
 }
 
-// Open returns a reader over the blob named by handle.
-func (s *Store) Open(handle string) (*os.File, error) {
+// OpenFile returns a reader over the blob named by handle.
+func (s *FS) OpenFile(handle string) (*os.File, error) {
 	if !ValidHandle(handle) {
 		return nil, fmt.Errorf("media store: malformed handle %q", handle)
 	}
@@ -169,8 +184,8 @@ func (s *Store) Open(handle string) (*os.File, error) {
 }
 
 // ReadAll reads the whole blob, enforcing limit as a sanity ceiling.
-func (s *Store) ReadAll(handle string, limit int64) ([]byte, error) {
-	f, err := s.Open(handle)
+func (s *FS) ReadAll(handle string, limit int64) ([]byte, error) {
+	f, err := s.OpenFile(handle)
 	if err != nil {
 		return nil, err
 	}

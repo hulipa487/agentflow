@@ -19,7 +19,7 @@ type captureSink struct {
 func (c *captureSink) Submit(in router.Inbound) { c.inbs = append(c.inbs, in) }
 
 // newMediaMockTG serves getFile + the file download endpoint, like Telegram.
-func newMediaMockTG(t *testing.T, fileBody string) (*mockTG, *captureSink, *media.Store) {
+func newMediaMockTG(t *testing.T, fileBody string) (*mockTG, *captureSink, media.Store) {
 	t.Helper()
 	m := &mockTG{}
 	sink := &captureSink{}
@@ -45,7 +45,7 @@ func newMediaMockTG(t *testing.T, fileBody string) (*mockTG, *captureSink, *medi
 	return m, sink, store
 }
 
-func mediaDriver(m *mockTG, sink *captureSink, store *media.Store) *Driver {
+func mediaDriver(m *mockTG, sink *captureSink, store media.Store) *Driver {
 	return &Driver{
 		name:    "telegram",
 		token:   "TEST",

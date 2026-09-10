@@ -28,8 +28,50 @@ type Config struct {
 	Tools    Tools            `yaml:"tools"`
 	Search   Search           `yaml:"search"`
 	Legal    LegalSearch      `yaml:"legal_search"`
+	Media    MediaConfig      `yaml:"media"`
+	Audit    AuditConfig      `yaml:"audit"`
 	Agents   map[string]Agent `yaml:"agents"`
 	Plugins  Plugins          `yaml:"plugins"`
+}
+
+// MediaConfig selects the blob-store backend for inbound channel media.
+// Handles ("media:<sha256>") are backend-agnostic, so loops and the journal
+// never see where bytes live. Default: fs rooted beside the runtime db.
+type MediaConfig struct {
+	Backend string  `yaml:"backend"` // fs (default) | s3
+	Dir     string  `yaml:"dir"`     // fs root; default <runtime-persistence-dir>/media
+	S3      MediaS3 `yaml:"s3"`
+}
+
+// MediaS3 configures the S3 blob-store backend. Keys are env-interpolated
+// (${VAR}) like model keys so secrets never sit in the file as literals.
+type MediaS3 struct {
+	Bucket    string `yaml:"bucket"`
+	Region    string `yaml:"region"`
+	Endpoint  string `yaml:"endpoint"`   // optional custom S3-compatible host (MinIO, ...); empty = AWS
+	Prefix    string `yaml:"prefix"`     // optional object key prefix
+	AccessKey string `yaml:"access_key"` // env-interpolated
+	SecretKey string `yaml:"secret_key"` // env-interpolated
+}
+
+// AuditConfig controls the core-owned message journal (every inbound and
+// outbound message persisted to the runtime store). It is core-owned so loops
+// cannot bypass or forge it — that is what makes it an audit trail.
+type AuditConfig struct {
+	Enabled       *bool `yaml:"enabled"`        // default true
+	RetentionDays *int  `yaml:"retention_days"` // default 90; 0 = keep forever
+}
+
+// AuditEnabled reports whether the message journal is on (default true).
+func (a AuditConfig) AuditEnabled() bool { return a.Enabled == nil || *a.Enabled }
+
+// AuditRetention returns the journal retention in days (default 90; 0 = keep
+// forever).
+func (a AuditConfig) AuditRetention() int {
+	if a.RetentionDays == nil {
+		return 90
+	}
+	return *a.RetentionDays
 }
 
 // Runtime contains instance-wide tuning and persistence.
@@ -253,8 +295,9 @@ type ToolSpecOverride struct {
 // Search configures the builtin:web_search tool: a set of named engines and
 // the default used when a call omits `engine`. With no engines configured the
 // tool reports honest-unavailable rather than failing. Engine names double as
-// providers (doubao, ollama, stackoverflow, github); keys are env-interpolated
-// (${VAR}) like model keys so secrets never sit in the file as literals.
+// providers (doubao, ollama, stackoverflow, github, youtube); keys are
+// env-interpolated (${VAR}) like model keys so secrets never sit in the file
+// as literals.
 type Search struct {
 	Default string                  `yaml:"default"` // engine used when a call omits `engine`
 	Engines map[string]SearchEngine `yaml:"engines"`
@@ -636,7 +679,7 @@ func validate(path string, c *Config) error {
 	// honest-unavailable mode. Engine names are the provider selectors.
 	for ename, e := range c.Search.Engines {
 		switch ename {
-		case "doubao", "ollama":
+		case "doubao", "ollama", "youtube":
 			if e.APIKey == "" {
 				return fmt.Errorf("%s: search engine %q requires api_key", path, ename)
 			}
@@ -645,7 +688,7 @@ func validate(path string, c *Config) error {
 		case "github":
 			// key optional (anonymous 10 req/min search quota; key lifts to 30/min)
 		default:
-			return fmt.Errorf("%s: unsupported search engine %q (want doubao, ollama, stackoverflow, or github)", path, ename)
+			return fmt.Errorf("%s: unsupported search engine %q (want doubao, ollama, stackoverflow, github, or youtube)", path, ename)
 		}
 	}
 	if n := len(c.Search.Engines); n > 0 {
@@ -689,6 +732,25 @@ func validate(path string, c *Config) error {
 		default:
 			return fmt.Errorf("%s: memory backend %q has unsupported provider %q", path, bname, b.Provider)
 		}
+	}
+
+	// Media blob store: fs (default) or s3. S3 requires bucket, region, and
+	// credentials; endpoint/prefix are optional.
+	switch c.Media.Backend {
+	case "", "fs":
+	case "s3":
+		if c.Media.S3.Bucket == "" || c.Media.S3.Region == "" {
+			return fmt.Errorf("%s: media backend s3 requires s3.bucket and s3.region", path)
+		}
+		if c.Media.S3.AccessKey == "" || c.Media.S3.SecretKey == "" {
+			return fmt.Errorf("%s: media backend s3 requires s3.access_key and s3.secret_key (env-interpolated)", path)
+		}
+	default:
+		return fmt.Errorf("%s: unsupported media backend %q (want fs or s3)", path, c.Media.Backend)
+	}
+
+	if c.Audit.RetentionDays != nil && *c.Audit.RetentionDays < 0 {
+		return fmt.Errorf("%s: audit.retention_days must be >= 0 (0 = keep forever)", path)
 	}
 
 	for sname, s := range c.MCP.Servers {

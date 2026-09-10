@@ -100,7 +100,7 @@ end
 // LLMobileChatHandler is a minimal llm.chat handler for tests, resolving part
 // handles exactly like caps.LLMHandlers does (inlined to avoid an import
 // cycle with caps — the logic is the same).
-func LLMobileChatHandler(mgr *llm.Manager, store *media.Store) OpHandler {
+func LLMobileChatHandler(mgr *llm.Manager, store media.Store) OpHandler {
 	return func(ctx context.Context, op Op) (string, bool) {
 		msgs := make([]llm.Message, len(op.Messages))
 		for i, mm := range op.Messages {

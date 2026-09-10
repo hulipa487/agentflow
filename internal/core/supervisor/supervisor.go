@@ -63,6 +63,10 @@ type Supervisor struct {
 	users    session.UserResolver
 	log      *slog.Logger
 
+	// EgressJournal, when set, is attached to every spawned actor so all
+	// session egress lands in the core-owned message journal.
+	EgressJournal session.EgressJournalFunc
+
 	mu        sync.Mutex
 	sessions  map[string]*session.Actor
 	cancels   map[string]context.CancelFunc
@@ -137,6 +141,7 @@ func (s *Supervisor) Deliver(agent, key string, msg session.Message) error {
 		a.LoopSrc = def.LoopSrc
 		a.SupportSrcs = builtins.SupportChunks()
 		a.OnExit = s.onActorExit
+		a.Journal = s.EgressJournal
 		actorCtx, cancel := context.WithCancel(s.ctx)
 		s.sessions[skey] = a
 		s.cancels[skey] = cancel

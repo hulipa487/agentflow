@@ -78,6 +78,25 @@ func (s *Store) migrate() error {
 			kind TEXT NOT NULL,
 			next_fire INTEGER
 		);
+		CREATE TABLE IF NOT EXISTS message_journal (
+			id TEXT NOT NULL,
+			ts INTEGER NOT NULL,
+			direction TEXT NOT NULL,
+			status TEXT NOT NULL,
+			channel TEXT,
+			chat TEXT,
+			sender TEXT,
+			agent TEXT,
+			session_id TEXT,
+			type TEXT,
+			text TEXT,
+			attachments_json TEXT,
+			provenance_json TEXT,
+			err TEXT
+		);
+		CREATE INDEX IF NOT EXISTS message_journal_id ON message_journal (id);
+		CREATE INDEX IF NOT EXISTS message_journal_ts ON message_journal (ts);
+		CREATE INDEX IF NOT EXISTS message_journal_session ON message_journal (session_id);
 	`)
 	return err
 }

@@ -85,6 +85,16 @@ func TestValidateSearch(t *testing.T) {
 			wantErr: "requires api_key",
 		},
 		{
+			name:    "youtube without key",
+			search:  Search{Engines: map[string]SearchEngine{"youtube": {}}},
+			wantErr: "requires api_key",
+		},
+		{
+			name:    "youtube with key defaults to itself",
+			search:  Search{Engines: map[string]SearchEngine{"youtube": {APIKey: "k"}}},
+			wantDef: "youtube",
+		},
+		{
 			name:    "unknown engine",
 			search:  Search{Engines: map[string]SearchEngine{"brave": {APIKey: "k"}}},
 			wantErr: "unsupported search engine",
@@ -127,6 +137,66 @@ func TestValidateSearch(t *testing.T) {
 				t.Fatalf("default = %q, want %q", c.Search.Default, tt.wantDef)
 			}
 		})
+	}
+}
+
+// TestValidateMediaAudit exercises the media backend and audit journal rules.
+func TestValidateMediaAudit(t *testing.T) {
+	zero := 0
+	neg := -1
+	tests := []struct {
+		name    string
+		media   MediaConfig
+		audit   AuditConfig
+		wantErr string
+	}{
+		{name: "defaults ok", media: MediaConfig{}, audit: AuditConfig{}},
+		{name: "fs explicit ok", media: MediaConfig{Backend: "fs", Dir: "./data/media"}},
+		{
+			name:    "s3 missing fields",
+			media:   MediaConfig{Backend: "s3"},
+			wantErr: "requires s3.bucket and s3.region",
+		},
+		{
+			name:    "s3 missing keys",
+			media:   MediaConfig{Backend: "s3", S3: MediaS3{Bucket: "b", Region: "r"}},
+			wantErr: "requires s3.access_key and s3.secret_key",
+		},
+		{
+			name:  "s3 complete ok",
+			media: MediaConfig{Backend: "s3", S3: MediaS3{Bucket: "b", Region: "r", AccessKey: "k", SecretKey: "s"}},
+		},
+		{
+			name:    "unknown backend",
+			media:   MediaConfig{Backend: "gcs"},
+			wantErr: "unsupported media backend",
+		},
+		{
+			name:    "negative retention",
+			audit:   AuditConfig{RetentionDays: &neg},
+			wantErr: "retention_days must be >= 0",
+		},
+		{name: "zero retention = forever", audit: AuditConfig{RetentionDays: &zero}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Config{Media: tt.media, Audit: tt.audit, Agents: map[string]Agent{"bot": {Loop: "./loop.lua"}}}
+			err := validate("cfg.yaml", c)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("expected error containing %q, got: %v", tt.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected no error, got: %v", err)
+			}
+		})
+	}
+	// Defaults: enabled, 90-day retention.
+	d := AuditConfig{}
+	if !d.AuditEnabled() || d.AuditRetention() != 90 {
+		t.Fatalf("audit defaults: enabled=%v retention=%d", d.AuditEnabled(), d.AuditRetention())
 	}
 }
 

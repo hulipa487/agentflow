@@ -50,7 +50,7 @@ type Driver struct {
 	path      string         // webhook mode only
 	publicURL string         // webhook/auto: external base that routes to this process
 	apiBase   string         // override for the Telegram API host (tests); empty = api.telegram.org
-	store     *media.Store   // nil = media policy disabled
+	store     media.Store   // nil = media policy disabled
 	pol       media.Policy
 	sink      router.Sink
 	log       *slog.Logger
@@ -58,7 +58,7 @@ type Driver struct {
 	seq       int64
 }
 
-func New(name, token, agent, mode string, allowUsers []int64, path, publicURL string, sink router.Sink, srv *httpd.Server, store *media.Store, pol media.Policy, log *slog.Logger) *Driver {
+func New(name, token, agent, mode string, allowUsers []int64, path, publicURL string, sink router.Sink, srv *httpd.Server, store media.Store, pol media.Policy, log *slog.Logger) *Driver {
 	allow := map[int64]bool{}
 	for _, id := range allowUsers {
 		allow[id] = true

@@ -34,7 +34,7 @@ type Driver struct {
 	path  string
 	agent string
 	sink  router.Sink
-	store *media.Store // nil = media policy disabled
+	store media.Store // nil = media policy disabled
 	pol   media.Policy
 	log   *slog.Logger
 
@@ -43,7 +43,7 @@ type Driver struct {
 	pending map[string]chan string // request id → reply waiter
 }
 
-func New(name, path, agent string, sink router.Sink, srv *httpd.Server, store *media.Store, pol media.Policy, log *slog.Logger) *Driver {
+func New(name, path, agent string, sink router.Sink, srv *httpd.Server, store media.Store, pol media.Policy, log *slog.Logger) *Driver {
 	if path == "" {
 		path = "/webhook/"
 	}

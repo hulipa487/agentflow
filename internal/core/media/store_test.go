@@ -47,12 +47,12 @@ func TestStoreRejectsMalformedHandle(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, h := range []string{"../../etc/passwd", "media:abc", "media:ZZ" + strings.Repeat("0", 61), ""} {
-		if _, err := s.Open(h); err == nil {
+		if _, err := s.OpenFile(h); err == nil {
 			t.Fatalf("expected error for handle %q", h)
 		}
 	}
 	// The store dir must not be reachable through a "valid-looking" prefix.
-	if _, err := s.Open("media:" + strings.Repeat("0", 64)); err == nil {
+	if _, err := s.OpenFile("media:" + strings.Repeat("0", 64)); err == nil {
 		t.Fatal("expected error for missing blob")
 	}
 }

@@ -23,17 +23,20 @@ import (
 // This API is non-streaming (no SSE), so the reply is emitted as a single text
 // delta followed by usage. The conversation flattens into one "input" string
 // (system context first) — unless any turn carries media parts, in which case
-// "input" becomes an array of typed parts ({"type":"text"} and
-// {"type":"inline_data", mime_type, data}), the only form that can carry
-// images/audio/video/PDFs. Client-side function tools are not mapped (the
-// interactions tool schema differs); only cfg.ServerTools are sent, as
-// {"type":<name>} entries. The interactions API rejects max_output_tokens, so
-// no token cap is sent.
+// "input" becomes an array of typed parts ({"type":"text"} and media parts
+// referencing uploaded files). Media never goes inline: every media part is
+// uploaded to the Gemini Files API (POST /upload/v1beta/files, resumable
+// protocol) and referenced by URI — {"type":"image|audio|video|document",
+// "uri", "mime_type"}. Files are auto-deleted by Google after 48 hours; a
+// process-level cache dedupes uploads of the same content within that window.
+// Client-side function tools are not mapped (the interactions tool schema
+// differs); only cfg.ServerTools are sent, as {"type":<name>} entries. The
+// interactions API rejects max_output_tokens, so no token cap is sent.
 func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs []Message, opts Opts) (<-chan event, bool, error) {
 	base := resolveBase(cfg, "https://generativelanguage.googleapis.com/v1beta")
 	url := base + "/interactions"
 
-	input, err := geminiInput(msgs)
+	input, err := geminiInput(ctx, newGeminiFiles(base, cfg.APIKey, client), msgs)
 	if err != nil {
 		return nil, false, err
 	}
@@ -130,14 +133,21 @@ func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs
 	return events, false, nil
 }
 
+// geminiPartTypes maps our media part classes onto the interactions API's
+// typed part names (PDFs and other files are "document" parts).
+var geminiPartTypes = map[string]string{
+	"image": "image",
+	"audio": "audio",
+	"video": "video",
+	"file":  "document",
+}
+
 // geminiInput renders the conversation for the interactions API. With no
 // media it stays the historical single flattened string ("role: content"
 // lines, system first). With any media part it returns an array of typed
-// parts — text parts keep the role-prefixed rendering, media parts become
-// inline_data entries — because a plain string cannot carry bytes. URL-only
-// parts are rejected: inline_data needs base64 data, so resolve or download
-// the URL first.
-func geminiInput(msgs []Message) (any, error) {
+// parts — text parts keep the role-prefixed rendering, media parts are
+// uploaded to the Files API and referenced by URI.
+func geminiInput(ctx context.Context, files *geminiFiles, msgs []Message) (any, error) {
 	if !hasMedia(msgs) {
 		return flattenText(msgs), nil
 	}
@@ -168,17 +178,18 @@ func geminiInput(msgs []Message) (any, error) {
 					parts = append(parts, map[string]any{"type": "text", "text": p.Text})
 				}
 			case "image", "audio", "video", "file":
-				if p.Data == "" {
-					return nil, fmt.Errorf("gemini: %s part requires inline base64 data (url sources are not supported)", p.Type)
-				}
 				mime := p.MIME
 				if mime == "" {
 					mime = "application/octet-stream"
 				}
+				uri, err := files.reference(ctx, p, mime)
+				if err != nil {
+					return nil, err
+				}
 				parts = append(parts, map[string]any{
-					"type":      "inline_data",
+					"type":      geminiPartTypes[p.Type],
+					"uri":       uri,
 					"mime_type": mime,
-					"data":      p.Data,
 				})
 			default:
 				return nil, fmt.Errorf("gemini: unsupported part type %q", p.Type)

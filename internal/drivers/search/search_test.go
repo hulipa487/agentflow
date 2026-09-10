@@ -533,6 +533,152 @@ func TestGitHubTimeRange(t *testing.T) {
 // fmtQuery formats url.Values for failure messages.
 func fmtQuery(v url.Values) string { return v.Encode() }
 
+// youtubeOK is a trimmed real-shape /youtube/v3/search response: a video, a
+// live broadcast (HTML-escaped title), and a channel (exercises the id-kind
+// URL mapping).
+const youtubeOK = `{
+  "kind": "youtube#searchListResponse",
+  "nextPageToken": "CAUQAA",
+  "regionCode": "HK",
+  "pageInfo": {"totalResults": 1000000, "resultsPerPage": 3},
+  "items": [
+    {
+      "id": {"kind": "youtube#video", "videoId": "dQw4w9WgXcQ"},
+      "snippet": {
+        "publishedAt": "2009-10-25T06:57:33Z",
+        "channelId": "UCuAXFkgsw1L7xaCfnd5JJOw",
+        "title": "Rick Astley - Never Gonna Give You Up (Official Video)",
+        "description": "The official video for Never Gonna Give You Up.",
+        "channelTitle": "Rick Astley",
+        "liveBroadcastContent": "none"
+      }
+    },
+    {
+      "id": {"kind": "youtube#video", "videoId": "jfKfPfyJRdk"},
+      "snippet": {
+        "publishedAt": "2026-09-09T00:00:00Z",
+        "channelId": "UCxxxxxxxx",
+        "title": "lofi hip hop radio &#127925; beats to relax/study to &amp; chill",
+        "description": "24/7 stream",
+        "channelTitle": "Lofi Girl",
+        "liveBroadcastContent": "live"
+      }
+    },
+    {
+      "id": {"kind": "youtube#channel", "channelId": "UCuAXFkgsw1L7xaCfnd5JJOw"},
+      "snippet": {
+        "publishedAt": "2015-10-06T00:00:00Z",
+        "title": "Rick Astley",
+        "description": "Official channel.",
+        "channelTitle": "Rick Astley",
+        "liveBroadcastContent": "none"
+      }
+    }
+  ]
+}`
+
+func TestYouTubeSearch(t *testing.T) {
+	var gotQuery url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		io.WriteString(w, youtubeOK)
+	}))
+	defer srv.Close()
+
+	y, err := newYouTube(config.SearchEngine{BaseURL: srv.URL, APIKey: "yk"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := y.Search(context.Background(), Request{Query: "rick astley", Count: 3, TimeRange: "OneYear"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Wire params per the spec.
+	if gotQuery.Get("part") != "snippet" || gotQuery.Get("type") != "video" || gotQuery.Get("order") != "relevance" {
+		t.Fatalf("params: %s", gotQuery.Encode())
+	}
+	if gotQuery.Get("q") != "rick astley" || gotQuery.Get("maxResults") != "3" {
+		t.Fatalf("query/count: %s", gotQuery.Encode())
+	}
+	if gotQuery.Get("key") != "yk" {
+		t.Fatalf("key param: %q", gotQuery.Get("key"))
+	}
+	if gotQuery.Get("publishedAfter") == "" {
+		t.Fatal("TimeRange should map to publishedAfter")
+	}
+	// Mapping.
+	if len(res.Results) != 3 {
+		t.Fatalf("results: %+v", res)
+	}
+	w := res.Results[0]
+	if w.Title != "Rick Astley - Never Gonna Give You Up (Official Video)" {
+		t.Fatalf("title: %q", w.Title)
+	}
+	if w.URL != "https://www.youtube.com/watch?v=dQw4w9WgXcQ" {
+		t.Fatalf("video url: %q", w.URL)
+	}
+	if w.Site != "Rick Astley" || w.Content != "The official video for Never Gonna Give You Up." {
+		t.Fatalf("site/content: %+v", w)
+	}
+	if w.Published != "2009-10-25T06:57:33Z" {
+		t.Fatalf("published: %q", w.Published)
+	}
+	// Live broadcast: entities decoded, LIVE prefix on the snippet.
+	l := res.Results[1]
+	if l.Title != "lofi hip hop radio 🎵 beats to relax/study to & chill" {
+		t.Fatalf("title not entity-decoded: %q", l.Title)
+	}
+	if !strings.HasPrefix(l.Snippet, "LIVE: ") {
+		t.Fatalf("live snippet: %q", l.Snippet)
+	}
+	// Channel id-kind maps to the channel URL.
+	if res.Results[2].URL != "https://www.youtube.com/channel/UCuAXFkgsw1L7xaCfnd5JJOw" {
+		t.Fatalf("channel url: %q", res.Results[2].URL)
+	}
+}
+
+func TestYouTubeQuotaError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		io.WriteString(w, `{"error":{"code":403,"message":"The request cannot be completed because you have exceeded your quota.","errors":[{"reason":"quotaExceeded"}]}}`)
+	}))
+	defer srv.Close()
+	y, err := newYouTube(config.SearchEngine{BaseURL: srv.URL, APIKey: "sekret-yt-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = y.Search(context.Background(), Request{Query: "q"})
+	if err == nil || !strings.Contains(err.Error(), "quotaExceeded") || !strings.Contains(err.Error(), "quota") {
+		t.Fatalf("quota error should surface the reason: %v", err)
+	}
+	if strings.Contains(err.Error(), "sekret-yt-key") {
+		t.Fatalf("error must not leak the api key: %v", err)
+	}
+}
+
+func TestYouTubeTimeRange(t *testing.T) {
+	if _, _, ok := youtubeTimeRange(""); ok {
+		t.Fatal("empty should not map")
+	}
+	after, before, ok := youtubeTimeRange("OneWeek")
+	if !ok || after == "" || before != "" {
+		t.Fatalf("OneWeek should set only publishedAfter: %q %q", after, before)
+	}
+	after, before, ok = youtubeTimeRange("2024-01-01..2024-01-31")
+	if !ok || after != "2024-01-01T00:00:00Z" || before != "2024-02-01T00:00:00Z" {
+		t.Fatalf("range: %q..%q", after, before)
+	}
+	if _, _, ok := youtubeTimeRange("bogus"); ok {
+		t.Fatal("bogus should not map")
+	}
+}
+
+func TestYouTubeRequiresKey(t *testing.T) {
+	if _, err := newYouTube(config.SearchEngine{}); err == nil {
+		t.Fatal("youtube without api_key should fail")
+	}
+}
+
 // --- Set / Build --------------------------------------------------------------
 
 // bothEnginesServer answers doubao (PascalCase body) and ollama requests from
@@ -600,6 +746,9 @@ func TestBuildRequiresKeys(t *testing.T) {
 	}
 	if _, err := NewEngine("ollama", config.SearchEngine{}); err == nil {
 		t.Fatal("ollama without key should fail")
+	}
+	if _, err := NewEngine("youtube", config.SearchEngine{}); err == nil {
+		t.Fatal("youtube without key should fail")
 	}
 	if _, err := NewEngine("reddit", config.SearchEngine{}); err == nil {
 		t.Fatal("removed engine should fail (reddit was dropped: public .json deprecated, OAuth is commercial-only)")

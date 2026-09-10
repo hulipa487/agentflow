@@ -107,6 +107,8 @@ func NewEngine(name string, cfg config.SearchEngine) (Searcher, error) {
 		return newStackOverflow(cfg)
 	case "github":
 		return newGitHub(cfg)
+	case "youtube":
+		return newYouTube(cfg)
 	}
 	return nil, fmt.Errorf("search: unsupported engine %q", name)
 }

@@ -336,6 +336,12 @@ type Actor struct {
 
 	Mailbox chan Message
 
+	// Journal, when set, records every egress (delivered, failed, or
+	// safety-blocked) to the core-owned message journal. It is set by the
+	// supervisor at spawn; loops cannot touch it, which is what makes the
+	// journal an audit trail.
+	Journal EgressJournalFunc
+
 	gw       Gateway
 	agents   AgentService
 	sched    SchedulerService
@@ -594,7 +600,7 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 		if current.Channel == "" {
 			return `"no active message to reply to"`, false
 		}
-		return a.egress(ctx, current.Channel, current.ReplyTo, op.Text, op.Attachments)
+		return a.egress(ctx, current.Channel, current.ReplyTo, op.Text, op.Attachments, current.ID)
 	}
 	if op.Type == "session.push" {
 		// Proactive egress: send to an explicit channel/recipient without an
@@ -605,7 +611,7 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 		if op.Channel == "" {
 			return `"session.push requires a channel"`, false
 		}
-		return a.egress(ctx, op.Channel, op.ReplyTo, op.Text, op.Attachments)
+		return a.egress(ctx, op.Channel, op.ReplyTo, op.Text, op.Attachments, current.ID)
 	}
 	if op.Type == "session.push_user" {
 		// Proactive egress to a user by identity UUID. Channel-agnostic: the
@@ -626,7 +632,7 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 		if !ok {
 			return `"unknown user"`, false
 		}
-		return a.egress(ctx, channel, replyTo, op.Text, op.Attachments)
+		return a.egress(ctx, channel, replyTo, op.Text, op.Attachments, current.ID)
 	}
 	if a.agents != nil {
 		switch op.Type {
@@ -704,11 +710,47 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 	return r, false
 }
 
+// EgressRecord is one journaled outbound message: what the session tried to
+// send, to whom, and what happened. InReplyTo correlates the reply with the
+// journaled inbound message that prompted it (empty for proactive pushes).
+type EgressRecord struct {
+	SessionID   string
+	Agent       string
+	Channel     string
+	ReplyTo     string
+	Text        string
+	Attachments []media.Part
+	InReplyTo   string // inbound message id, when this is a reply
+	Status      string // delivered | failed | blocked_safety
+	Err         string
+}
+
+// EgressJournalFunc records one egress to the message journal. Implementations
+// must not block meaningfully (a fast DB write); errors are logged, never
+// fatal — an audit hiccup must not drop user replies.
+type EgressJournalFunc func(EgressRecord)
+
 // egress runs text through the safety dispatcher and delivers it to a
 // channel recipient via the gateway. A safety drop means nothing is sent.
 // Attachments are not safety-screened (the filters are text-only by design);
 // the text (caption) always is. Media allow-lists gate them at ingestion.
-func (a *Actor) egress(ctx context.Context, channel, replyTo, text string, attachments []media.Part) (string, bool) {
+// Every outcome is journaled when a Journal is set.
+func (a *Actor) egress(ctx context.Context, channel, replyTo, text string, attachments []media.Part, inReplyTo string) (string, bool) {
+	journal := func(status, errStr string) {
+		if a.Journal != nil {
+			a.Journal(EgressRecord{
+				SessionID:   a.Identity.SessionID,
+				Agent:       a.Identity.Agent,
+				Channel:     channel,
+				ReplyTo:     replyTo,
+				Text:        text,
+				Attachments: attachments,
+				InReplyTo:   inReplyTo,
+				Status:      status,
+				Err:         errStr,
+			})
+		}
+	}
 	if a.safety != nil {
 		res := a.safety.Egress(ctx, safety.EgressInput{
 			Text:   text,
@@ -716,6 +758,7 @@ func (a *Actor) egress(ctx context.Context, channel, replyTo, text string, attac
 		})
 		if res.Drop {
 			a.log.Info("safety egress dropped reply", "reason", res.Reason)
+			journal("blocked_safety", res.Reason)
 			return `"reply blocked by safety filter"`, false
 		}
 		text = res.Text
@@ -723,10 +766,12 @@ func (a *Actor) egress(ctx context.Context, channel, replyTo, text string, attac
 	if a.gw != nil {
 		if err := a.gw.Send(channel, replyTo, text, attachments); err != nil {
 			a.log.Warn("egress failed", "err", err)
+			journal("failed", err.Error())
 			r, _ := jsonString(err.Error())
 			return r, false
 		}
 	}
+	journal("delivered", "")
 	return "true", true
 }
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -16,9 +17,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/mattn/go-isatty"
 
 	"agentflow/internal/builtins"
+
 	"agentflow/internal/config"
 	"agentflow/internal/core/budget"
 	"agentflow/internal/core/caps"
@@ -46,6 +49,7 @@ import (
 	"agentflow/internal/drivers/pgvector"
 	"agentflow/internal/drivers/postgres"
 	"agentflow/internal/drivers/redis"
+	"agentflow/internal/drivers/s3media"
 	"agentflow/internal/drivers/search"
 	"agentflow/internal/drivers/shell"
 	"agentflow/internal/drivers/sqlite"
@@ -193,11 +197,19 @@ func main() {
 		}
 	}
 
-	// Media blob store: one per process, rooted beside the runtime
-	// persistence data. Channels with a media policy land inbound media here;
-	// llm caps resolve handles to inline base64 at request time.
-	mediaDir := filepath.Join(filepath.Dir(cfg.PersistencePath()), "media")
-	mediaStore, err := media.Open(mediaDir)
+	// Media blob store: one per process. Channels with a media policy land
+	// inbound media here; llm caps resolve handles at request time. Backend
+	// is fs (rooted beside the runtime persistence data) or s3.
+	var mediaStore media.Store
+	if cfg.Media.Backend == "s3" {
+		mediaStore, err = s3media.New(cfg.Media.S3)
+	} else {
+		mediaDir := cfg.Media.Dir
+		if mediaDir == "" {
+			mediaDir = filepath.Join(filepath.Dir(cfg.PersistencePath()), "media")
+		}
+		mediaStore, err = media.Open(mediaDir)
+	}
 	if err != nil {
 		log.Error("media store failed", "err", err)
 		os.Exit(1)
@@ -459,6 +471,57 @@ func main() {
 
 	sup = supervisor.New(defs, gw, opPool, shellMgr, log)
 
+	// Message journal (core-owned audit). Every inbound event is recorded at
+	// the router and every egress at the session actor; loops and channels
+	// can neither skip nor forge it. Journal errors are logged, never fatal.
+	if cfg.Audit.AuditEnabled() {
+		if days := cfg.Audit.AuditRetention(); days > 0 {
+			cutoff := time.Now().AddDate(0, 0, -days)
+			if n, err := rtStore.PruneMessages(ctx, cutoff); err != nil {
+				log.Warn("journal prune failed", "err", err)
+			} else if n > 0 {
+				log.Info("journal pruned", "rows", n, "retention_days", days)
+			}
+			go func() {
+				tick := time.NewTicker(24 * time.Hour)
+				defer tick.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-tick.C:
+						if _, err := rtStore.PruneMessages(ctx, time.Now().AddDate(0, 0, -days)); err != nil {
+							log.Warn("journal prune failed", "err", err)
+						}
+					}
+				}
+			}()
+		}
+		sup.EgressJournal = func(rec session.EgressRecord) {
+			errStr := rec.Err
+			entry := runtime.JournalEntry{
+				ID:          rec.InReplyTo,
+				Direction:   "out",
+				Status:      rec.Status,
+				Channel:     rec.Channel,
+				Chat:        rec.ReplyTo,
+				Sender:      rec.ReplyTo,
+				Agent:       rec.Agent,
+				SessionID:   rec.SessionID,
+				Type:        "agent",
+				Text:        rec.Text,
+				Attachments: rec.Attachments,
+				Err:         errStr,
+			}
+			if entry.ID == "" {
+				entry.ID = uuid.NewString()
+			}
+			if err := rtStore.RecordMessage(ctx, entry); err != nil {
+				log.Warn("journal egress write failed", "err", err)
+			}
+		}
+	}
+
 	// Web-console log tail: mirror every record into a ring buffer so the web
 	// UI's SSE endpoint can stream it. Wraps whichever handler is current
 	// (plain stderr, or the TUI tee) so both views see the same lines.
@@ -480,6 +543,43 @@ func main() {
 		os.Exit(1)
 	}
 	rtr := router.New(routeSrc, sup, log)
+	if cfg.Audit.AuditEnabled() {
+		rtr.Journal = func(in router.Inbound, status string) {
+			msg := in.Message
+			chat := ""
+			if msg.Payload != nil {
+				if c, ok := msg.Payload["chat_id"]; ok {
+					chat = fmt.Sprint(c)
+				}
+			}
+			var prov map[string]any
+			if msg.Provenance != nil {
+				if b, err := json.Marshal(msg.Provenance); err == nil {
+					_ = json.Unmarshal(b, &prov)
+				}
+			}
+			ts := msg.Ts
+			if ts == 0 {
+				ts = time.Now().Unix()
+			}
+			if err := rtStore.RecordMessage(ctx, runtime.JournalEntry{
+				ID:          msg.ID,
+				Ts:          ts,
+				Direction:   "in",
+				Status:      status,
+				Channel:     in.Channel,
+				Chat:        chat,
+				Sender:      msg.From,
+				Agent:       in.Agent,
+				Type:        msg.Type,
+				Text:        msg.Text,
+				Attachments: msg.Attachments,
+				Provenance:  prov,
+			}); err != nil {
+				log.Warn("journal ingress write failed", "err", err)
+			}
+		}
+	}
 	go rtr.Run(ctx)
 
 	// Identity layer (opt-in). When enabled, every inbound channel event is
@@ -526,7 +626,7 @@ func main() {
 			name = fmt.Sprintf("%s-%d", ch.Type, i)
 		}
 		mpol, mok := mediaPol(ch)
-		var mstore *media.Store
+		var mstore media.Store
 		if mok {
 			mstore = mediaStore
 		}

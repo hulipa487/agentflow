@@ -31,13 +31,75 @@ type ToolSpec struct {
 // JSON returns the provider-native tool definition.
 func (t ToolSpec) JSON() map[string]any {
 	return map[string]any{
-		"type":        "function",
+		"type": "function",
 		"function": map[string]any{
 			"name":        t.Name,
 			"description": t.Description,
-			"parameters":  t.Parameters,
+			"parameters":  NormalizeSchema(t.Parameters),
 		},
 	}
+}
+
+// NormalizeSchema returns a copy of a JSON-schema map with unusable `required`
+// keys dropped, recursively (properties/items). An empty `required` array is
+// semantically identical to an absent one, but an empty Go slice round-trips
+// through the Lua sandbox as an empty table, which serializes back to JSON as
+// `{}` (object) — invalid JSON Schema that strict providers (xAI) reject with
+// a 400. A `required` that arrives as an object has already been mangled that
+// way and is dropped here too, so no boundary can emit `"required": {}`.
+func NormalizeSchema(params map[string]any) map[string]any {
+	if params == nil {
+		return nil
+	}
+	out := make(map[string]any, len(params))
+	for k, v := range params {
+		switch k {
+		case "required":
+			if badRequired(v) {
+				continue
+			}
+			out[k] = v
+		case "properties":
+			m, ok := v.(map[string]any)
+			if !ok {
+				out[k] = v
+				continue
+			}
+			nm := make(map[string]any, len(m))
+			for pk, pv := range m {
+				if sm, ok := pv.(map[string]any); ok {
+					nm[pk] = NormalizeSchema(sm)
+				} else {
+					nm[pk] = pv
+				}
+			}
+			out[k] = nm
+		case "items":
+			if sm, ok := v.(map[string]any); ok {
+				out[k] = NormalizeSchema(sm)
+			} else {
+				out[k] = v
+			}
+		default:
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// badRequired reports whether a schema's `required` value cannot survive the
+// Lua bridge as valid JSON Schema: an empty array (becomes `{}`) or an object
+// (already mangled). Non-empty arrays pass through untouched.
+func badRequired(v any) bool {
+	switch r := v.(type) {
+	case []string:
+		return len(r) == 0
+	case []any:
+		return len(r) == 0
+	case map[string]any:
+		return true
+	}
+	return false
 }
 
 // Registry holds all tools keyed by their full name.
@@ -85,10 +147,11 @@ func (r *Registry) Expose(skills []string, policy config.ToolsPolicy, autonomous
 		for _, s := range skills {
 			allowed[s] = true
 		}
-	} else if defaultAllow {
-		// All tools are allowed.
-	} else {
-		// Default none and no skills -> nothing.
+	} else if !defaultAllow {
+		// Default none and no skills -> nothing, regardless of what is
+		// registered. (Overrides only adjust policy of exposed tools; they
+		// never allow-list on their own.)
+		return &AgentSet{Registry: r, Tools: []ToolSpec{}, ByName: map[string]ToolSpec{}}
 	}
 
 	r.mu.RLock()

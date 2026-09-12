@@ -11,6 +11,7 @@ import (
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/session"
+	"agentflow/internal/core/tools"
 	"agentflow/internal/drivers/llm"
 )
 
@@ -55,7 +56,11 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 	toToolDefs := func(specs []session.ToolSpec) []llm.ToolDef {
 		out := make([]llm.ToolDef, len(specs))
 		for i, s := range specs {
-			out[i] = llm.ToolDef{Name: s.Name, Description: s.Description, Parameters: s.Parameters}
+			// Schemas arrive from Lua: an empty Go `required: []` crossed the
+			// bridge as an empty table and decodes back as an object, which is
+			// invalid JSON Schema (strict providers 400 on it). Normalize so
+			// no schema can emit "required": {} regardless of origin.
+			out[i] = llm.ToolDef{Name: s.Name, Description: s.Description, Parameters: tools.NormalizeSchema(s.Parameters)}
 		}
 		return out
 	}

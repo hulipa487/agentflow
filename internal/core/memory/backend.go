@@ -199,6 +199,10 @@ type Store struct {
 	Window     int
 	Retention  time.Duration
 	Requires   []string // provider features the backend must offer
+	// Shared opts the store into cross-agent sharing: its physical table is
+	// used as-is. Private stores (the default) are isolated per agent at bind
+	// time — see ResolveStoresFor.
+	Shared bool
 }
 
 // StoreBinding is a resolved (backend, table) pair.
@@ -229,7 +233,18 @@ type AgentMemory struct {
 }
 
 // ResolveStore resolves a profile's store names into backend handles.
+// Equivalent to ResolveStoresFor with no agent (no table isolation).
 func (r *Registry) ResolveStores(profile map[string]Store) (AgentMemory, error) {
+	return r.ResolveStoresFor("", profile)
+}
+
+// ResolveStoresFor resolves a profile for one agent, isolating physical
+// tables: unless a store opts into sharing (Shared), its physical table is
+// prefixed with the agent name ("writer.dialogue"), so two agents on the same
+// memory profile never read or write each other's rows. The Tables map stays
+// keyed by the profile's table name — the name loops use — while the binding
+// carries the (possibly prefixed) physical table to the backend.
+func (r *Registry) ResolveStoresFor(agent string, profile map[string]Store) (AgentMemory, error) {
 	out := AgentMemory{
 		Stores: map[string]StoreBinding{},
 		Tables: map[string]StoreBinding{},
@@ -242,7 +257,11 @@ func (r *Registry) ResolveStores(profile map[string]Store) (AgentMemory, error) 
 		if err := r.checkRequires(sname, s); err != nil {
 			return AgentMemory{}, err
 		}
-		b := StoreBinding{Backend: s.Backend, Table: s.Table, Window: s.Window, Retention: s.Retention, Features: r.Features(s.Backend)}
+		table := s.Table
+		if !s.Shared && agent != "" {
+			table = agent + "." + s.Table
+		}
+		b := StoreBinding{Backend: s.Backend, Table: table, Window: s.Window, Retention: s.Retention, Features: r.Features(s.Backend)}
 		out.Stores[sname] = b
 		out.Tables[s.Table] = b
 	}

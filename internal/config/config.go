@@ -196,6 +196,11 @@ type Store struct {
 	Window     int      `yaml:"window"`
 	Requires   []string `yaml:"requires"`
 	Policy     string   `yaml:"policy"`
+	// Shared opts the store into cross-agent sharing (a deliberate knowledge
+	// base). Private stores (the default) are isolated per agent: the
+	// physical table is prefixed with the agent name at bind time. Existing
+	// deployments that rely on implicit cross-agent sharing must set this.
+	Shared bool `yaml:"shared"`
 }
 
 // ShellProfile defines defaults for shell.spawn.

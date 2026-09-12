@@ -32,6 +32,10 @@ type AgentDef struct {
 	CanContact       map[string]bool
 	Capabilities     map[string]bool
 	Safety           *safety.Dispatcher
+	// Persistent marks a daemon agent: the supervisor delivers a synthetic
+	// boot message at startup (BootPersistent) so its session spawns without
+	// waiting for external traffic.
+	Persistent bool
 	// SpawnTemplate marks this def as produced by a spawn profile.
 	SpawnTemplate *SpawnTemplate
 }
@@ -114,6 +118,34 @@ func (s *Supervisor) SetUserResolver(r session.UserResolver) { s.users = r }
 
 // Start fixes the context used for lazily spawned actors.
 func (s *Supervisor) Start(ctx context.Context) { s.ctx = ctx }
+
+// BootPersistent delivers a synthetic boot message to every agent definition
+// marked persistent, so daemon agents (cron schedulers, queue consumers)
+// spawn at boot without waiting for external traffic. Call after Start, once
+// channels are registered so a boot-turn reply has somewhere to go. Delivery
+// errors are logged, never fatal.
+func (s *Supervisor) BootPersistent() {
+	for name, def := range s.defs {
+		if !def.Persistent || def.SpawnTemplate != nil {
+			continue
+		}
+		msg := session.Message{
+			ID:   "boot:" + name,
+			Type: "boot",
+			From: "system:supervisor",
+			Ts:   time.Now().Unix(),
+			Provenance: &session.Provenance{
+				Kind:      "system",
+				Principal: "system:supervisor",
+			},
+		}
+		if err := s.Deliver(name, "boot", msg); err != nil {
+			s.log.Warn("persistent agent boot failed", "agent", name, "err", err)
+			continue
+		}
+		s.log.Info("persistent agent booted", "agent", name)
+	}
+}
 
 // Agents returns the agent definitions (the reload watcher reads these).
 func (s *Supervisor) Agents() map[string]*AgentDef { return s.defs }

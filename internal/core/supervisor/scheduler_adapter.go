@@ -21,12 +21,15 @@ func newSchedulerAdapter(svc *scheduler.Service, sup *Supervisor, log *slog.Logg
 	return &schedulerAdapter{svc: svc, sup: sup, log: log}
 }
 
-func (a *schedulerAdapter) deliver(owner string) {
+func (a *schedulerAdapter) deliver(owner string, timerID scheduler.TimerID) {
 	msg := session.Message{
-		ID:   "timer:" + owner,
+		ID:   "timer:" + owner + ":" + string(timerID),
 		Type: "timer",
 		From: "system:scheduler",
 		Ts:   time.Now().Unix(),
+		Payload: map[string]any{
+			"timer_id": string(timerID),
+		},
 		Provenance: &session.Provenance{
 			Kind:      "scheduler",
 			Principal: "system:scheduler",

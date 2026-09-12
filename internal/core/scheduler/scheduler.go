@@ -36,7 +36,9 @@ type timer struct {
 
 // Deliver is the callback the scheduler uses to enqueue a timer message.
 // The supervisor provides this; it stamps provenance and routes to the mailbox.
-type Deliver func(owner string)
+// The timer id travels with every fire so a session running multiple timers
+// can tell their messages apart.
+type Deliver func(owner string, id TimerID)
 
 func New(log *slog.Logger) *Service {
 	if log == nil {
@@ -55,18 +57,20 @@ func (s *Service) Every(owner string, interval time.Duration, deliver Deliver) (
 	if interval < 100*time.Millisecond {
 		return "", fmt.Errorf("scheduler.every: interval must be >= 100ms, got %v", interval)
 	}
-	return s.register(owner, "every", func(ctx context.Context) {
+	id := TimerID("timer-" + uuid.NewString()[:8])
+	_, err := s.registerWithID(id, owner, "every", func(ctx context.Context) {
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
 			select {
 			case <-t.C:
-				deliver(owner)
+				deliver(owner, id)
 			case <-ctx.Done():
 				return
 			}
 		}
 	})
+	return id, err
 }
 
 // After registers a one-shot timer.
@@ -80,7 +84,7 @@ func (s *Service) After(owner string, delay time.Duration, deliver Deliver) (Tim
 		defer t.Stop()
 		select {
 		case <-t.C:
-			deliver(owner)
+			deliver(owner, id)
 			s.removeSelf(id)
 		case <-ctx.Done():
 			return
@@ -97,7 +101,8 @@ func (s *Service) Cron(owner string, expr string, deliver Deliver) (TimerID, err
 	if err != nil {
 		return "", err
 	}
-	return s.register(owner, "cron", func(ctx context.Context) {
+	id := TimerID("timer-" + uuid.NewString()[:8])
+	_, err = s.registerWithID(id, owner, "cron", func(ctx context.Context) {
 		for {
 			next := schedule.next(time.Now())
 			if next.IsZero() {
@@ -107,13 +112,14 @@ func (s *Service) Cron(owner string, expr string, deliver Deliver) (TimerID, err
 			select {
 			case <-t.C:
 				t.Stop()
-				deliver(owner)
+				deliver(owner, id)
 			case <-ctx.Done():
 				t.Stop()
 				return
 			}
 		}
 	})
+	return id, err
 }
 
 // Cancel removes a single timer.
@@ -154,12 +160,6 @@ func (s *Service) Pending() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.timers)
-}
-
-func (s *Service) register(owner string, kind string, run func(context.Context)) (TimerID, error) {
-	id := TimerID("timer-" + uuid.NewString()[:8])
-	_, err := s.registerWithID(id, owner, kind, run)
-	return id, err
 }
 
 func (s *Service) registerWithID(id TimerID, owner string, kind string, run func(context.Context)) (TimerID, error) {

@@ -87,6 +87,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	// plugins.dir may shadow any builtin Lua (loops, routes, support chunks)
+	// by name — wire it before the first builtins.Resolve below.
+	builtins.SetPluginDir(cfg.Plugins.Dir)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -241,7 +245,9 @@ func main() {
 			for sname, s := range mp.Stores {
 				profile[sname] = memoryFromConfig(s)
 			}
-			am, err := memReg.ResolveStores(profile)
+			// Per-agent isolation: private stores are prefixed with the agent
+			// name at bind time; stores opt into sharing with shared: true.
+			am, err := memReg.ResolveStoresFor(name, profile)
 			if err != nil {
 				log.Error("memory resolve failed", "agent", name, "err", err)
 				os.Exit(1)
@@ -311,6 +317,7 @@ func main() {
 			CanContact:       canContact,
 			Capabilities:     effectiveCaps,
 			Safety:           safeDispatcher,
+			Persistent:       a.Persistent,
 		}
 	}
 
@@ -343,7 +350,7 @@ func main() {
 			for sname, s := range mp.Stores {
 				profile[sname] = memoryFromConfig(s)
 			}
-			am, err := memReg.ResolveStores(profile)
+			am, err := memReg.ResolveStoresFor("spawn:"+pname, profile)
 			if err != nil {
 				log.Error("spawn profile memory resolve failed", "profile", pname, "err", err)
 				os.Exit(1)
@@ -728,6 +735,11 @@ func main() {
 		}
 	}()
 
+	// Daemon agents (persistent: true) get a synthetic boot message so their
+	// sessions spawn now — after channels are registered, so a boot-turn reply
+	// has somewhere to go — instead of waiting for first external traffic.
+	sup.BootPersistent()
+
 	log.Info("agentflow up", "agents", len(defs), "channels", len(cfg.Gateway.Channels))
 	<-ctx.Done()
 
@@ -831,6 +843,7 @@ func memoryFromConfig(s config.Store) memory.Store {
 		Collection: s.Collection,
 		Window:     s.Window,
 		Requires:   s.Requires,
+		Shared:     s.Shared,
 	}
 	if s.Retention != "" {
 		d, err := time.ParseDuration(s.Retention)

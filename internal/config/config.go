@@ -311,10 +311,11 @@ type Search struct {
 // SearchEngine is one backend's connection config. BaseURL overrides the
 // driver's default endpoint (testing / proxy); Timeout bounds each request.
 type SearchEngine struct {
-	APIKey  string `yaml:"api_key"`  // doubao, ollama: required; stackoverflow, github: optional (lifts the anonymous quota)
+	APIKey  string `yaml:"api_key"`  // doubao, ollama, google_search, x_search: required; stackoverflow, github: optional (lifts the anonymous quota)
 	BaseURL string `yaml:"base_url"` // optional endpoint override
 	Timeout string `yaml:"timeout"`  // per-request bound; default 30s
 	Site    string `yaml:"site"`     // stackoverflow engine: any StackExchange site (default "stackoverflow")
+	Model   string `yaml:"model"`    // google_search (default gemini-3.8-flash), x_search (default grok-4.6): grounding model
 }
 
 // TimeoutD parses Timeout with a sane default.
@@ -697,7 +698,7 @@ func validate(path string, c *Config) error {
 	// honest-unavailable mode. Engine names are the provider selectors.
 	for ename, e := range c.Search.Engines {
 		switch ename {
-		case "doubao", "ollama", "youtube":
+		case "doubao", "ollama", "youtube", "google_search", "x_search":
 			if e.APIKey == "" {
 				return fmt.Errorf("%s: search engine %q requires api_key", path, ename)
 			}
@@ -706,7 +707,7 @@ func validate(path string, c *Config) error {
 		case "github":
 			// key optional (anonymous 10 req/min search quota; key lifts to 30/min)
 		default:
-			return fmt.Errorf("%s: unsupported search engine %q (want doubao, ollama, stackoverflow, github, or youtube)", path, ename)
+			return fmt.Errorf("%s: unsupported search engine %q (want doubao, ollama, google_search, x_search, stackoverflow, github, or youtube)", path, ename)
 		}
 	}
 	if n := len(c.Search.Engines); n > 0 {

@@ -379,6 +379,13 @@ type Channel struct {
 	Secret     string       `yaml:"secret"` // ghhook: webhook secret for HMAC verification (env-interpolated)
 	AllowUsers []int64      `yaml:"allow_users"`
 	Media      ChannelMedia `yaml:"media"` // inbound media policy; absent = media disabled
+	// Timeout is the webhook sync reply wait (default "55s"). Multi-agent
+	// pipelines that outrun it should raise this or use async mode.
+	Timeout string `yaml:"timeout"`
+	// Async switches a webhook channel to fire-and-poll: the POST returns
+	// 202 + a job id immediately; the reply is collected via
+	// GET <path>result/<id> or POSTed to a caller-supplied callback_url.
+	Async bool `yaml:"async"`
 }
 
 // ChannelMedia gates inbound media on a channel. Media is opt-in: with no
@@ -626,6 +633,12 @@ func validate(path string, c *Config) error {
 			// any explicit path ends in "/" so the subtree match covers the UUID.
 			if ch.Path != "" && !strings.HasSuffix(ch.Path, "/") {
 				return fmt.Errorf("%s: webhook channel %q path must end with / (got %q)", path, ch.Name, ch.Path)
+			}
+			if ch.Timeout != "" {
+				d, err := time.ParseDuration(ch.Timeout)
+				if err != nil || d <= 0 {
+					return fmt.Errorf("%s: webhook channel %q has invalid timeout %q (use e.g. \"120s\")", path, ch.Name, ch.Timeout)
+				}
 			}
 		case "ghhook":
 			if ch.Path != "" && !strings.HasSuffix(ch.Path, "/") {

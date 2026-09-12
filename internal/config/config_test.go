@@ -5,6 +5,39 @@ import (
 	"testing"
 )
 
+// TestValidateWebhookTimeout exercises the webhook channel timeout rule:
+// unset (driver default) and a valid duration pass; garbage and non-positive
+// durations are boot errors.
+func TestValidateWebhookTimeout(t *testing.T) {
+	base := func() *Config {
+		return &Config{
+			Agents: map[string]Agent{"bot": {Loop: "builtin:per_chat"}},
+			Gateway: Gateway{
+				Channels: []Channel{{Name: "wh", Type: "webhook", Agent: "bot"}},
+			},
+		}
+	}
+	c := base()
+	if err := validate("cfg.yaml", c); err != nil {
+		t.Fatalf("unset timeout should validate: %v", err)
+	}
+	c = base()
+	c.Gateway.Channels[0].Timeout = "120s"
+	if err := validate("cfg.yaml", c); err != nil {
+		t.Fatalf("120s should validate: %v", err)
+	}
+	c = base()
+	c.Gateway.Channels[0].Timeout = "soon"
+	if err := validate("cfg.yaml", c); err == nil || !strings.Contains(err.Error(), "invalid timeout") {
+		t.Fatalf("garbage timeout should fail, got %v", err)
+	}
+	c = base()
+	c.Gateway.Channels[0].Timeout = "-5s"
+	if err := validate("cfg.yaml", c); err == nil || !strings.Contains(err.Error(), "invalid timeout") {
+		t.Fatalf("negative timeout should fail, got %v", err)
+	}
+}
+
 // TestValidateShellProfile exercises the provider-specific validation rules.
 func TestValidateShellProfile(t *testing.T) {
 	tests := []struct {

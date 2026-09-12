@@ -1,8 +1,17 @@
 // Package webhook is the HTTP channel driver: POST {"from","text"} in,
-// synchronous reply out. Inbound events go to the router; the session's
-// reply resolves the pending request by correlation id. It attaches to the
-// shared httpd.Server (see internal/drivers/httpd) rather than listening on
-// its own port.
+// reply out. Inbound events go to the router; the session's reply resolves
+// the pending request by correlation id. It attaches to the shared
+// httpd.Server (see internal/drivers/httpd) rather than listening on its own
+// port.
+//
+// Reply modes (channel config):
+//   - sync (default): the POST parks until the agent replies or `timeout`
+//     (default 55s) elapses → 504. The reply body is plain text.
+//   - async (`async: true`): the POST returns 202 + {"id": ...} immediately;
+//     the reply is collected via GET <path>result/<id> (200 + text when done,
+//     202 while pending) or POSTed to a caller-supplied `callback_url` in the
+//     request body. Async jobs are never cut off by the sync timeout — that
+//     is the point of the mode — and expire after jobRetention.
 //
 // Inbound media: an optional "attachments" array of {mime, name, data
 // (base64)} objects is accepted when the channel media policy allows the
@@ -11,12 +20,14 @@ package webhook
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,24 +39,52 @@ import (
 	"agentflow/internal/drivers/httpd"
 )
 
+// defaultTimeout is the sync reply wait when the channel sets no timeout.
+const defaultTimeout = 55 * time.Second
+
+// jobRetention bounds how long a finished (or never-polled) async job is kept.
+const jobRetention = 15 * time.Minute
+
+// Options tunes a webhook driver (from the channel's YAML block).
+type Options struct {
+	Timeout time.Duration // sync reply wait; <= 0 selects defaultTimeout
+	Async   bool          // 202 + job id instead of parking the response
+}
+
 // Driver accepts webhooks and implements gateway.Driver for replies.
 type Driver struct {
-	name  string
-	path  string
-	agent string
-	sink  router.Sink
-	store media.Store // nil = media policy disabled
-	pol   media.Policy
-	log   *slog.Logger
+	name    string
+	path    string
+	agent   string
+	sink    router.Sink
+	store   media.Store // nil = media policy disabled
+	pol     media.Policy
+	opts    Options
+	log     *slog.Logger
+	http    *http.Client // callback delivery
 
 	seq     atomic.Uint64
 	mu      sync.Mutex
-	pending map[string]chan string // request id → reply waiter
+	pending map[string]chan string // request id → reply waiter (sync)
+	jobs    map[string]*job        // request id → async result slot
 }
 
-func New(name, path, agent string, sink router.Sink, srv *httpd.Server, store media.Store, pol media.Policy, log *slog.Logger) *Driver {
+// job is one async request's result slot. The reply lands here whenever the
+// agent produces it; a poll reads it (consuming the job) and a callback_url
+// fires once on completion.
+type job struct {
+	done     bool
+	text     string
+	callback string
+	expires  time.Time
+}
+
+func New(name, path, agent string, sink router.Sink, srv *httpd.Server, store media.Store, pol media.Policy, opts Options, log *slog.Logger) *Driver {
 	if path == "" {
 		path = "/webhook/"
+	}
+	if opts.Timeout <= 0 {
+		opts.Timeout = defaultTimeout
 	}
 	d := &Driver{
 		name:    name,
@@ -54,8 +93,11 @@ func New(name, path, agent string, sink router.Sink, srv *httpd.Server, store me
 		sink:    sink,
 		store:   store,
 		pol:     pol,
+		opts:    opts,
 		log:     log.With("driver", "webhook", "channel", name),
+		http:    &http.Client{Timeout: 10 * time.Second},
 		pending: map[string]chan string{},
+		jobs:    map[string]*job{},
 	}
 	srv.Handle(path, d.handle)
 	return d
@@ -68,6 +110,7 @@ type inbound struct {
 	From        string          `json:"from"`
 	Text        string          `json:"text"`
 	Attachments []inboundAttach `json:"attachments"`
+	CallbackURL string          `json:"callback_url"` // async mode: POST the reply here
 }
 
 type inboundAttach struct {
@@ -80,6 +123,15 @@ type inboundAttach struct {
 const maxRequestBytes = 24 << 20 // 24 MiB
 
 func (d *Driver) handle(w http.ResponseWriter, r *http.Request) {
+	// Async result polling lives under the same mounted path.
+	if r.Method == http.MethodGet {
+		if id, ok := strings.CutPrefix(strings.TrimPrefix(r.URL.Path, d.path), "result/"); ok && id != "" {
+			d.handleResult(w, id)
+			return
+		}
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
@@ -92,6 +144,23 @@ func (d *Driver) handle(w http.ResponseWriter, r *http.Request) {
 	d.log.Debug("webhook received", "from", in.From, "text_len", len(in.Text), "attachments", len(in.Attachments))
 
 	id := fmt.Sprintf("wh-%d", d.seq.Add(1))
+
+	if d.opts.Async {
+		if in.CallbackURL != "" && !validCallback(in.CallbackURL) {
+			http.Error(w, "callback_url must be http(s)", http.StatusBadRequest)
+			return
+		}
+		d.mu.Lock()
+		d.sweepLocked()
+		d.jobs[id] = &job{callback: in.CallbackURL, expires: time.Now().Add(jobRetention)}
+		d.mu.Unlock()
+		d.submit(id, in)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		fmt.Fprintf(w, `{"id":%q,"status":"pending"}`, id)
+		return
+	}
+
 	replyCh := make(chan string, 1)
 	d.mu.Lock()
 	d.pending[id] = replyCh
@@ -102,6 +171,20 @@ func (d *Driver) handle(w http.ResponseWriter, r *http.Request) {
 		d.mu.Unlock()
 	}()
 
+	d.submit(id, in)
+
+	select {
+	case reply := <-replyCh:
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		fmt.Fprint(w, reply)
+	case <-time.After(d.opts.Timeout):
+		http.Error(w, "agent timeout", http.StatusGatewayTimeout)
+	case <-r.Context().Done():
+	}
+}
+
+// submit forwards the inbound event to the router with the correlation id.
+func (d *Driver) submit(id string, in inbound) {
 	d.sink.Submit(router.Inbound{
 		Channel: d.name,
 		Agent:   d.agent,
@@ -116,14 +199,44 @@ func (d *Driver) handle(w http.ResponseWriter, r *http.Request) {
 			Ts:          time.Now().Unix(),
 		},
 	})
+}
 
-	select {
-	case reply := <-replyCh:
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprint(w, reply)
-	case <-time.After(55 * time.Second):
-		http.Error(w, "agent timeout", http.StatusGatewayTimeout)
-	case <-r.Context().Done():
+// handleResult serves GET <path>result/<id>: 200 + the reply when the job is
+// done (consuming it), 202 while pending, 404 for an unknown id.
+func (d *Driver) handleResult(w http.ResponseWriter, id string) {
+	d.mu.Lock()
+	j, ok := d.jobs[id]
+	if ok && j.done {
+		delete(d.jobs, id)
+	}
+	d.mu.Unlock()
+	if !ok {
+		http.Error(w, "unknown job", http.StatusNotFound)
+		return
+	}
+	if !j.done {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		fmt.Fprintf(w, `{"id":%q,"status":"pending"}`, id)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprint(w, j.text)
+}
+
+// validCallback restricts callback URLs to plain http(s) so a webhook caller
+// cannot turn the runtime into a file:/gopher: client.
+func validCallback(u string) bool {
+	return strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://")
+}
+
+// sweepLocked drops expired async jobs. Caller holds d.mu.
+func (d *Driver) sweepLocked() {
+	now := time.Now()
+	for id, j := range d.jobs {
+		if now.After(j.expires) {
+			delete(d.jobs, id)
+		}
 	}
 }
 
@@ -173,14 +286,47 @@ func (d *Driver) Deliver(replyToID string, text string, attachments []media.Part
 		return fmt.Errorf("webhook channel %q does not support media replies", d.name)
 	}
 	d.mu.Lock()
-	ch, ok := d.pending[replyToID]
+	if ch, ok := d.pending[replyToID]; ok {
+		delete(d.pending, replyToID)
+		d.mu.Unlock()
+		select {
+		case ch <- text:
+		default:
+		}
+		return nil
+	}
+	if j, ok := d.jobs[replyToID]; ok {
+		j.done = true
+		j.text = text
+		j.expires = time.Now().Add(jobRetention)
+		callback := j.callback
+		d.mu.Unlock()
+		if callback != "" {
+			go d.postCallback(callback, text)
+		}
+		return nil
+	}
 	d.mu.Unlock()
-	if !ok {
-		return fmt.Errorf("no pending request %q", replyToID)
+	return fmt.Errorf("no pending request %q", replyToID)
+}
+
+// postCallback delivers an async reply to the caller-supplied URL. Failures
+// are logged, never fatal — the result stays pollable until expiry.
+func (d *Driver) postCallback(url, text string) {
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, strings.NewReader(text))
+	if err != nil {
+		d.log.Warn("webhook callback build failed", "err", err)
+		return
 	}
-	select {
-	case ch <- text:
-	default:
+	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
+	resp, err := d.http.Do(req)
+	if err != nil {
+		d.log.Warn("webhook callback failed", "url", url, "err", err)
+		return
 	}
-	return nil
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode/100 != 2 {
+		d.log.Warn("webhook callback rejected", "url", url, "status", resp.StatusCode)
+	}
 }

@@ -8,7 +8,7 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 
 - **Actor-model sessions** — per-session Luau state, message-passing only, hot reload of loops and instructions.
 - **Multi-agent** — `agent.send` / `agent.request` / `agent.reply` / `agent.spawn`, address authority with `can_contact` ACLs, ephemeral children with budget/lifetime limits.
-- **Memory** — provider → backend → store layering; `builtin:conversational` preset; retention/window GC.
+- **Memory** — provider → backend → store layering; `builtin:conversational` preset; retention/window GC. Stores are isolated per agent by default (`<agent>.<table>`); `shared: true` opts a store into deliberate cross-agent sharing.
 - **Embeddings & reranking** — `llm.embed` (OpenAI-compatible `/embeddings`) and `llm.rerank` (Jina/Cohere/TEI/vLLM `/rerank`); pgvector ingest on write and a `builtin:semantic` recall pipeline (embed → vector k-NN → rerank). Multimodal embeddings follow the Jina convention (`jina-embeddings-v5-omni-small`: text + image/video/audio/pdf in one vector space); `memory.write` embeds attachment-carrying records as one merged vector.
 - **Tools** — filesystem ops inside shell handles, a multi-engine `web_search` tool (Doubao / Ollama / StackOverflow / GitHub / YouTube, selected per call via `engine`; honest-degradation when unconfigured), a `legal_search` / `legal_fetch` pair over HKLII (Hong Kong case law + legislation) and the NPC China national laws database, and MCP stdio servers discovered at boot. Arbitrary commands (git, package managers, …) run through `shell.exec`.
 - **Shell** — Docker and SSH providers with resource limits and an exec-policy filter.
@@ -18,7 +18,7 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 - **Audit journal** — core-owned `message_journal` in the runtime store: every inbound (router) and outbound (session egress) message is recorded with channel, sender, agent, session, text, attachment handles, and delivery status — loops and channels can neither bypass nor forge it. Retention is configurable (`audit.retention_days`, default 90, 0 = forever).
 - **Credentials** — encrypted-at-rest, per-tenant credential store; loops reference a key by `{service=...}` and Go resolves and injects it at request time.
 - **Web console** — embedded single-page operator UI on the admin server (no build step): hot model management with test/persist, a validated config editor, an API-key manager over the credential store, live sessions, and in-process metrics sparklines. Token-authenticated; secrets are write-only.
-- **Scheduler** — `scheduler.every/after/cron`; timers arrive as mailbox messages, never a cross-goroutine Luau call.
+- **Scheduler** — `scheduler.every/after/cron`; timers arrive as mailbox messages carrying `payload.timer_id` (multiple independent timers per session), never a cross-goroutine Luau call. Daemon agents (`persistent: true`) boot on a synthetic message instead of waiting for traffic.
 - **Budget** — per-agent token pools with reserve/commit/release around LLM calls; daily reset or rolling-window accounting; spawn profiles get their own shared pool.
 - **Safety** — core-owned ingress/egress chain (source-attribution, signal-gate, steady-directive, support-offer, affect-guard) that cannot be uninstalled from Lua.
 - **Observability** — `/healthz`, `/readyz`, `/metrics`, `/v1/sessions` on loopback; an embedded web console on the admin server (token-authenticated, `-no-webui` to disable); shared channel listener serves `GET /health`.
@@ -31,7 +31,7 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 | Storage | SQLite, Redis, MongoDB, PostgreSQL, in-memory volatile |
 | Media store | local filesystem (default), S3 / MinIO (hand-rolled SigV4, no AWS SDK) — content-addressed `media:<sha256>` handles |
 | Vector | pgvector (cosine similarity) |
-| Channels | webhook, GitHub webhook (`ghhook`), Telegram (polling + webhook + auto) |
+| Channels | webhook (sync reply with configurable `timeout`, or `async: true` fire-and-poll via `GET <path>result/<id>` / `callback_url`), GitHub webhook (`ghhook`), Telegram (polling + webhook + auto) |
 | Mail | IMAP fetch + SMTP send (in-process, cap `net.mail`) |
 | Shell | Docker, SSH |
 | Tools | builtins + MCP stdio |
@@ -148,6 +148,27 @@ agentflow/
 ```
 
 ## Breaking changes
+
+### Memory stores are private per agent by default
+
+Two agents on the same memory profile (including `builtin:conversational`) no
+longer share physical tables — each binds `<agent>.<table>` (e.g.
+`writer.dialogue`), so conversation history cannot leak across agents. Loops
+are unaffected (they use the profile's table names; the prefix is applied at
+bind time).
+
+**Migration:** a store that is deliberately shared across agents (a common
+knowledge base) must opt in:
+
+```yaml
+profiles:
+  memory/team:
+    stores:
+      kb: { backend: main_db, table: kb, shared: true }
+```
+
+Rows written before this change live under the old unprefixed table; set
+`shared: true` to keep reading them, or migrate the rows.
 
 ### Unified webhook listener (per-channel `listen` removed)
 

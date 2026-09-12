@@ -438,8 +438,12 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
       <tr><td><code>retention</code></td><td>Duration or <code>forever</code>. Core GC.</td></tr>
       <tr><td><code>window</code></td><td>Max records kept. Core GC.</td></tr>
       <tr><td><code>requires</code></td><td>Feature list validated against provider at boot.</td></tr>
+      <tr><td><code>shared</code></td><td><code>true</code> opts the store into cross-agent sharing (a deliberate knowledge base). Default <code>false</code>: the physical table is isolated per agent (<code>&lt;agent&gt;.&lt;table&gt;</code>).</td></tr>
     </tbody>
   </table>
+  <div class="callout warn">
+    <strong>Isolation change</strong>: <span>memory stores are <b>private per agent by default</b> — two agents on the same profile (or <code>builtin:conversational</code>) no longer share physical tables; each binds <code>&lt;agent&gt;.&lt;table&gt;</code> (e.g. <code>writer.dialogue</code>). Loops keep using the profile's table names; the prefix is applied at bind time. <b>Migration:</b> deployments that deliberately share a table across agents must mark that store <code>shared: true</code>; existing per-agent rows written before the change stay under the old unprefixed table (re-point with <code>shared: true</code> or migrate the rows).</span>
+  </div>
 
   <h4>Safety profile</h4>
   <pre><code>profiles:
@@ -491,7 +495,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
   <table class="table config-table">
     <thead><tr><th>Type</th><th>Description</th></tr></thead>
     <tbody>
-      <tr><td><code>webhook</code></td><td>POST → router → session → synchronous reply (55s timeout). Default path <code>/webhook/</code></td></tr>
+      <tr><td><code>webhook</code></td><td>POST → router → session → reply. <strong>Sync</strong> (default): the response parks until the agent replies or <code>timeout</code> (default <code>55s</code>) → 504. <strong>Async</strong> (<code>async: true</code>): 202 + a job id immediately; the reply is collected via <code>GET &lt;path&gt;result/&lt;id&gt;</code> (202 while pending) or POSTed to a caller-supplied <code>callback_url</code> — async jobs are never cut off by the sync timeout and expire after 15 minutes. Default path <code>/webhook/</code></td></tr>
       <tr><td><code>ghhook</code></td><td>GitHub webhook intake: verifies the <code>X-Hub-Signature-256</code> HMAC with <code>secret</code>, acks 200 immediately, and forwards the event as an agent-typed message (payload <code>{type: project_event, source: github, event, data}</code>). No reply path. Default path <code>/hooks/github/</code></td></tr>
       <tr><td><code>telegram</code> (<code>mode: polling</code>)</td><td>Default. Long-poll <code>getUpdates</code>, <code>allow_users</code> enforced</td></tr>
       <tr><td><code>telegram</code> (<code>mode: webhook</code>)</td><td>Receives POST updates at <code>path</code> (default <code>/webhook/telegram/</code>); requires <code>gateway.public_url</code></td></tr>
@@ -507,6 +511,9 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
     - type: webhook
       path: /webhook/dev/9f2c.../   # subtree; UUID segment = secret prefix
       agent: bot
+#     timeout: 120s                 # sync reply wait (default 55s)
+#     async: true                   # or fire-and-poll: 202 + job id, then
+                                    # GET <path>result/<id> or callback_url
 #     media:                        # optional — media ingestion off by default
 #       max_bytes: 8388608
 #       allow: [image/*, application/pdf]
@@ -603,8 +610,10 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
     budget:
       tokens_per_day: 500000
       window: 24h                       # optional rolling window; omit for daily reset
-    channels: [webhook]</code></pre>
+    channels: [webhook]
+    persistent: true                    # optional — daemon agent (see below)</code></pre>
   <p><strong>Capability ceiling</strong>: <code>plugins.allow_capabilities</code> (global) ⊇ <code>agents.&lt;name&gt;.capabilities</code> (per-agent) ⊇ spawn-spec grants (child). You cannot delegate what you lack. If an agent omits <code>capabilities</code> it gets the defaults <code>[llm.chat, memory, tools, agent.send, net.http]</code> — note <code>net.mail</code> is <em>not</em> a default and must be declared explicitly.</p>
+  <p><strong>Daemon agents</strong>: sessions normally spawn lazily on first message. An agent with <code>persistent: true</code> receives a synthetic <code>{ type = "boot", from = "system:supervisor" }</code> message once the runtime is up (after channels register), so cron schedulers and queue consumers start without external traffic.</p>
   <p><strong>Budget</strong>: <code>tokens_per_day</code> wraps LLM calls in reserve/commit/release against a token pool. By default the pool resets daily; set <code>window</code> (e.g. <code>24h</code>, <code>168h</code>) for rolling-window accounting where usage drains continuously as commits age out — no midnight cliff. A call that would exceed the budget is denied (counted in <code>agentflow_budget_denied</code>).</p>
 
   <h3><code>plugins</code></h3>
@@ -622,6 +631,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
     - agent.spawn
     - agent.send
     - agent.request</code></pre>
+  <p><code>plugins.dir</code> also <strong>shadows builtins by name</strong>: a file <code>&lt;dir&gt;/&lt;name&gt;.lua</code> (e.g. <code>./plugins/recency.lua</code>) replaces the embedded builtin of that name everywhere — loop/route refs (<code>loop: builtin:recency</code>, including the hot-reload watch path) and the support chunks loaded into every session. Shadowed support chunks are re-read from disk at each session spawn, so edits take effect on new sessions without a restart.</p>
 </section>
 
 <section id="lua" class="section">
@@ -736,9 +746,9 @@ agent.spawn(profile, spec?) -> { address, session_id, agent }</code></pre>
   <h4><code>scheduler</code> — cap: <code>scheduler</code></h4>
   <pre><code>scheduler.every(interval) -> timer_id    -- seconds; dies with session
 scheduler.after(delay) -> timer_id
-scheduler.cron(expr) -> timer_id          -- standard 5-field cron
+scheduler.cron(expr) -> timer_id          -- cron subset (see below)
 scheduler.cancel(timer_id)</code></pre>
-  <p>Timers enqueue a <code>Message{ type = "timer" }</code> into the owning session's mailbox. They never call Lua from a timer goroutine, so the VM stays single-threaded.</p>
+  <p>Timers enqueue a <code>Message{ type = "timer" }</code> into the owning session's mailbox — carrying <code>msg.payload.timer_id</code> so one session can tell its timers apart. They never call Lua from a timer goroutine, so the VM stays single-threaded. <code>scheduler.cron</code> supports a <strong>subset</strong> of 5-field cron: <code>*/N * * * *</code> (every N minutes) and fixed minute/hour forms like <code>30 9 * * *</code>; the day-of-month, month, and weekday fields must be <code>*</code>. Anything else is a config-time error — use <code>every</code>/<code>after</code> (or self-rescheduling) for richer schedules.</p>
 
   <h4><code>memory</code> and <code>store</code> — cap: <code>memory</code> / <code>store.raw</code></h4>
   <pre><code>memory.write(record) -> boolean          -- routed by builtin:routing_table

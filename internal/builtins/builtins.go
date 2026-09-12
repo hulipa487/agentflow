@@ -1,12 +1,13 @@
 // Package builtins ships the default plugins, embedded in the binary.
-// Builtins are plugins with the same contract as user plugins; a user file
-// may shadow a builtin by name (docs/builtins.md).
+// Builtins are plugins with the same contract as user plugins; a file
+// <plugins.dir>/<name>.lua shadows a builtin by name (see SetPluginDir).
 package builtins
 
 import (
 	_ "embed"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -45,24 +46,63 @@ var sources = map[string]string{
 	"ttl":            ttl,
 }
 
+// supportOrder fixes the evaluation order of support chunks in every session.
+var supportOrder = []string{"token_budget", "routing_table", "recency", "semantic", "fact_extractor", "exec_policy", "ttl"}
+
+// pluginDir is the deployment's plugins.dir, set once at boot via
+// SetPluginDir. A file <pluginDir>/<name>.lua shadows the embedded builtin
+// of the same name — for loop/route refs (Resolve) and support chunks
+// (SupportChunks) alike. Boot-time only; not synchronized.
+var pluginDir string
+
+// SetPluginDir points the builtin loader at the deployment's plugins dir.
+// Call once at boot, before any Resolve or SupportChunks.
+func SetPluginDir(dir string) { pluginDir = dir }
+
+// shadow returns the deployment's override for a builtin name, if one exists.
+func shadow(name string) (src, path string, ok bool) {
+	if pluginDir == "" {
+		return "", "", false
+	}
+	p := filepath.Join(pluginDir, name+".lua")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return "", "", false
+	}
+	return string(b), p, true
+}
+
 // SupportChunks returns the support chunks loaded into every session state
-// before the loop plugin.
+// before the loop plugin. A chunk shadowed in plugins.dir loads from disk
+// (and is re-read per spawn, so shadow edits take effect on new sessions).
 func SupportChunks() []string {
-	return []string{tokenBudget, routingTable, recency, semantic, factExtractor, execPolicy, ttl}
+	out := make([]string, 0, len(supportOrder))
+	for _, name := range supportOrder {
+		if src, _, ok := shadow(name); ok {
+			out = append(out, src)
+			continue
+		}
+		out = append(out, sources[name])
+	}
+	return out
 }
 
 // Resolve turns a loop/route reference into Lua source. "builtin:<name>"
-// resolves to an embedded builtin; anything else is a file or directory path.
-// The second return value is the watch path for hot-reload ("" for builtins):
-// a file watches itself; a directory is concatenated as its *.lua files in
-// sorted name order and the directory is watched as a whole.
+// resolves to an embedded builtin unless plugins.dir shadows it (the shadow
+// file then also becomes the hot-reload watch path); anything else is a file
+// or directory path. The second return value is the watch path for
+// hot-reload ("" for unshadowed builtins): a file watches itself; a
+// directory is concatenated as its *.lua files in sorted name order and the
+// directory is watched as a whole.
 func Resolve(ref string) (src string, watchPath string, err error) {
 	if name, ok := strings.CutPrefix(ref, "builtin:"); ok {
-		s, found := sources[name]
-		if !found {
+		if _, found := sources[name]; !found {
 			return "", "", fmt.Errorf("unknown builtin %q", ref)
 		}
-		return s, "", nil
+		if src, path, ok := shadow(name); ok {
+			return src, path, nil
+		}
+		return sources[name], "", nil
 	}
 	fi, err := os.Stat(ref)
 	if err != nil {

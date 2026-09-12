@@ -103,6 +103,10 @@ func NewEngine(name string, cfg config.SearchEngine) (Searcher, error) {
 		return newDoubao(cfg)
 	case "ollama":
 		return newOllama(cfg)
+	case "google_search":
+		return newGoogleSearch(cfg)
+	case "x_search":
+		return newXSearch(cfg)
 	case "stackoverflow":
 		return newStackOverflow(cfg)
 	case "github":

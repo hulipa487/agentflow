@@ -632,7 +632,12 @@ func main() {
 		}
 		switch ch.Type {
 		case "webhook":
-			d := webhook.New(name, ch.Path, ch.Agent, sink, httpSrv, mstore, mpol, log)
+			var wopts webhook.Options
+			if ch.Timeout != "" {
+				wopts.Timeout, _ = time.ParseDuration(ch.Timeout) // validated at config load
+			}
+			wopts.Async = ch.Async
+			d := webhook.New(name, ch.Path, ch.Agent, sink, httpSrv, mstore, mpol, wopts, log)
 			gw.Register(d)
 		case "telegram":
 			d := telegram.New(name, ch.Token, ch.Agent, ch.Mode, ch.AllowUsers, ch.Path, cfg.Gateway.PublicURL, sink, httpSrv, mstore, mpol, log)

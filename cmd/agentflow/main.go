@@ -41,6 +41,7 @@ import (
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/supervisor"
 	"agentflow/internal/core/tools"
+	"agentflow/internal/core/triggers"
 	"agentflow/internal/drivers/ghhook"
 	"agentflow/internal/drivers/httpd"
 	"agentflow/internal/drivers/legal"
@@ -849,6 +850,26 @@ func main() {
 		}
 	}()
 
+	// Engine trigger scheduler: every:/cron: triggers fire from the engine
+	// itself — no agent holds the scheduler capability and no loop runs its own
+	// calendar. A fire enqueues an ordinary Message{type:"cron"} (payload copied
+	// from the trigger) into the target profile's session; run_on_boot fires once
+	// at startup. Started here, after channels are registered, so a boot fire's
+	// reply has somewhere to go.
+	triggerSvc := triggers.New(
+		func(profile string) (string, bool) { return triggerTarget(cfg, profile) },
+		func(agent, key string, msg session.Message) error { return sup.Deliver(agent, key, msg) },
+		cfg.Runtime.TimezoneOffset(),
+		log,
+	)
+	triggerSvc.Start(ctx)
+	triggerSvc.Reload(cfg.Triggers)
+	// A configdir's triggers/*.yaml is re-read on a poll, so editing a schedule
+	// needs no restart (the rest of the directory still does).
+	if *configDir != "" {
+		go triggerSvc.WatchConfigDir(ctx, *configDir)
+	}
+
 	// Daemon agents (persistent: true) get a synthetic boot message so their
 	// sessions spawn now — after channels are registered, so a boot-turn reply
 	// has somewhere to go — instead of waiting for first external traffic.
@@ -901,6 +922,24 @@ func capabilitySet(caps []string) map[string]bool {
 		caps = config.DefaultCapabilities
 	}
 	return stringSet(caps)
+}
+
+// triggerTarget resolves a trigger's target.profile to the supervisor address
+// that owns it: a configured agent keeps its name, a spawn profile becomes
+// "spawn:<name>" (a top-level session running that profile's loop and grants).
+// An unknown profile is not fatal — the trigger scheduler logs it and skips
+// that trigger.
+func triggerTarget(cfg *config.Config, profile string) (string, bool) {
+	if profile == "" {
+		return "", false
+	}
+	if _, ok := cfg.Agents[profile]; ok {
+		return profile, true
+	}
+	if _, ok := cfg.Profiles.Agent[profile]; ok {
+		return "spawn:" + profile, true
+	}
+	return "", false
 }
 
 // toolPolicyFor returns the tools policy for one agent or spawn profile. An

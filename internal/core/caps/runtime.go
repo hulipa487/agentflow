@@ -17,7 +17,8 @@ import (
 // TriggersPayload renders the merged trigger list as the JSON array string
 // shared by the agent-facing runtime.triggers op and the gateway router, so
 // both surfaces answer with byte-identical data. Cron/every expressions pass
-// through verbatim; the engine never reduces them to timers.
+// through verbatim: the engine schedules those itself (internal/core/triggers)
+// and loops read them as data — the shape never changes.
 func TriggersPayload(triggers []config.Trigger) string {
 	out := make([]map[string]any, 0, len(triggers))
 	for _, tr := range triggers {
@@ -60,6 +61,8 @@ func TriggersResponse(triggers []config.Trigger) string {
 // or the top-level triggers: key) as read-only Lua data. The list is
 // snapshotted at boot — a loop calling runtime.triggers() replaces the
 // downstream pattern of baking CRON_TASKS / ROUTES tables into Lua source.
+// every:/cron: entries are ALSO executed by the engine (internal/core/triggers);
+// this surface is unchanged, so loops that read schedules keep working.
 func RuntimeHandlers(triggers []config.Trigger) map[string]session.OpHandler {
 	response := TriggersResponse(triggers)
 	return map[string]session.OpHandler{

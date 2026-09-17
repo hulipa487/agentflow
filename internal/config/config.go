@@ -91,6 +91,17 @@ type Runtime struct {
 	Admin       AdminConfig       `yaml:"admin"`
 	Identity    IdentityConfig    `yaml:"identity"`
 	Credentials CredentialsConfig `yaml:"credentials"`
+	// TimezoneOffsetHours is the instance-wide UTC offset applied to cron
+	// trigger matching (e.g. 8 for UTC+8, -5.5 for UTC-5:30). 0 = UTC, the
+	// default. every: triggers are unaffected: an interval has no wall clock.
+	TimezoneOffsetHours float64 `yaml:"timezone_offset_hours"`
+}
+
+// TimezoneOffset is the cron matching offset as a duration. It is a fixed
+// offset (not a named zone): cron schedules then never shift under daylight
+// saving, matching how deployments describe "09:00 local" for a single region.
+func (r Runtime) TimezoneOffset() time.Duration {
+	return time.Duration(r.TimezoneOffsetHours * float64(time.Hour))
 }
 
 // CredentialsConfig controls the encrypted per-tenant credential store. When
@@ -519,6 +530,9 @@ func validate(path string, c *Config) error {
 	}
 	if c.Runtime.Persistence == "" {
 		c.Runtime.Persistence = "sqlite://./data/agentflow.db"
+	}
+	if off := c.Runtime.TimezoneOffsetHours; off < -12 || off > 14 {
+		return fmt.Errorf("%s: runtime.timezone_offset_hours %g is outside the real-world range -12..14", path, off)
 	}
 	if c.Runtime.Credentials.Enabled && c.CredentialsMasterKeyEnv() == "" {
 		return fmt.Errorf("%s: runtime.credentials.enabled requires master_key_env to name the env var holding the master key", path)

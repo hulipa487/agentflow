@@ -229,7 +229,8 @@ make clean && make</code></pre>
        supervisor.deliver ◄─────────────────────┘
           │ enforce can_contact, stamp provenance, enqueue mailbox
           ▼
-       actor mailbox ◄──── scheduler.every / after / cron ── (timer messages)
+       actor mailbox ◄──── scheduler.every / after / cron ── (session timers)
+                     ◄──── every: / cron: triggers ──────── (engine cron messages)
           ▼
        loop() resumes
           │  ├─ memory.recall(history)        ── async bridge ──► store backend
@@ -344,7 +345,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
   channels.yaml     # optional: channels: [...]
   profiles/*.yaml   # optional: one agent per file (sorted glob)
   triggers/*.yaml   # optional: triggers: [...] (merged sorted, later file wins)</code></pre>
-  <p>A <code>profiles/*.yaml</code> file is an agent config plus a <code>name</code> and a <code>spawn</code> flag: <code>spawn: false</code> (or absent) routes it to <code>agents</code>, <code>spawn: true</code> routes it to <code>profiles.agent</code> (a spawn template, including its <code>extras</code> and <code>credentials</code> allow-list — spawned children see both). Agent-only fields (<code>persistent</code>, <code>singleton</code>, <code>taps</code>, <code>channels</code>, <code>lifecycle</code>) on a spawn profile are boot errors. A trigger is declarative data — <code>{name, event{channel, match}|cron|every, run_on_boot, target{profile}, payload}</code> — consumed by loops via <code>runtime.triggers()</code>; cron expressions pass through verbatim.</p>
+  <p>A <code>profiles/*.yaml</code> file is an agent config plus a <code>name</code> and a <code>spawn</code> flag: <code>spawn: false</code> (or absent) routes it to <code>agents</code>, <code>spawn: true</code> routes it to <code>profiles.agent</code> (a spawn template, including its <code>extras</code> and <code>credentials</code> allow-list — spawned children see both). Agent-only fields (<code>persistent</code>, <code>singleton</code>, <code>taps</code>, <code>channels</code>, <code>lifecycle</code>) on a spawn profile are boot errors. A trigger is <code>{name, event{channel, match} | cron | every, run_on_boot, target{profile}, payload}</code> — <code>every:</code> and <code>cron:</code> triggers are executed <em>by the engine</em> (see <code>triggers</code> below), and the merged list is served to loops as data via <code>runtime.triggers()</code>. A <code>-configdir</code> deployment re-reads <code>triggers/*.yaml</code> on a poll, so editing a schedule takes effect without a restart.</p>
 </section>
 
 <section id="config-ref" class="section">
@@ -365,9 +366,10 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
       <tr><td><code>credentials.enabled</code></td><td>bool</td><td>false</td><td>Encrypted per-tenant credential store backing <code>auth={service=...}</code></td></tr>
       <tr><td><code>credentials.path</code></td><td>string</td><td>&lt;persistence dir&gt;/credentials.db</td><td>sqlite path for the credential store</td></tr>
       <tr><td><code>credentials.master_key_env</code></td><td>string</td><td>CREDENTIALS_MASTER_KEY</td><td>Env var holding the master key (read at boot, never from the file)</td></tr>
+      <tr><td><code>timezone_offset_hours</code></td><td>float</td><td>0</td><td>UTC offset cron triggers are matched in (e.g. <code>8</code>, <code>-5.5</code>); <code>every:</code> is unaffected</td></tr>
     </tbody>
   </table>
-  <p>The admin server exposes <code>GET /healthz</code>, <code>GET /readyz</code>, <code>GET /metrics</code> (Prometheus text format), <code>GET /v1/sessions</code>, and <code>/admin/credentials</code>. Live counters include <code>agentflow_sessions_active</code>, <code>agentflow_children_spawned</code>/<code>died</code>, <code>agentflow_llm_calls</code>, <code>agentflow_llm_tokens</code>, and <code>agentflow_budget_denied</code>.</p>
+  <p>The admin server exposes <code>GET /healthz</code>, <code>GET /readyz</code>, <code>GET /metrics</code> (Prometheus text format), <code>GET /v1/sessions</code>, and <code>/admin/credentials</code>. Live counters include <code>agentflow_sessions_active</code>, <code>agentflow_children_spawned</code>/<code>died</code>, <code>agentflow_llm_calls</code>, <code>agentflow_llm_tokens</code>, <code>agentflow_budget_denied</code>, and <code>agentflow_trigger_fires</code>.</p>
 
   <h3>Credential CLI</h3>
   <p><code>agentflow cred set|get|list|delete &lt;name&gt;</code> manages engine-wide credentials in the store named by the loaded config (configdir or <code>-config</code>). <code>set</code> reads the value from an interactive prompt or stdin — never argv (pipe it: <code>printf %s "$TOKEN" | agentflow cred set github_token</code>). The master key comes from the env var named by <code>credentials.master_key_env</code> (default <code>CREDENTIALS_MASTER_KEY</code>); an unset key is a clear error. <code>list</code> prints names only, never values. These are the same records <code>credential.get()</code> and <code>cred:&lt;service&gt;</code> config references resolve against.</p>
@@ -671,6 +673,28 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
     - agent.send
     - agent.request</code></pre>
   <p><code>plugins.dir</code> also <strong>shadows builtins by name</strong>: a file <code>&lt;dir&gt;/&lt;name&gt;.lua</code> (e.g. <code>./plugins/recency.lua</code>) replaces the embedded builtin of that name everywhere — loop/route refs (<code>loop: builtin:recency</code>, including the hot-reload watch path) and the support chunks loaded into every session. Shadowed support chunks are re-read from disk at each session spawn, so edits take effect on new sessions without a restart.</p>
+
+  <h3><code>triggers</code> — scheduled and event tasks</h3>
+  <pre><code>triggers:                       # top-level, or triggers/*.yaml in a -configdir
+  - name: morning-digest
+    cron: "30 9 * * 1-5"        # kind = cron  (5 fields)
+    every: 15m                  # kind = every (ms, s, m, h, d)
+    event: { channel: webhook, match: urgent }   # kind = event
+    run_on_boot: false          # fire once at startup, then follow the schedule
+    target: { profile: pm }     # a configured agent, or a spawn profile
+    payload: { topic: news }    # copied verbatim into the fired message</code></pre>
+  <p><strong><code>every:</code> and <code>cron:</code> triggers are executed by the engine</strong>, not by an agent: when one is due the runtime enqueues an ordinary message into the target's mailbox —</p>
+  <pre><code>{ id = "cron:&lt;trigger-name&gt;:&lt;unix&gt;", type = "cron", from = "system:scheduler",
+  payload = { ... }, ts = ..., provenance = { kind = "scheduler", principal = "trigger:&lt;name&gt;" } }</code></pre>
+  <p>— into session <code>&lt;target&gt;|&lt;trigger-name&gt;</code>. No agent holds a capability for this and no loop needs a timer: scheduling is engine infrastructure, so a deployment can drop the user-space scheduler agent it used to run. Deliveries always journal and count (<code>agentflow_trigger_fires</code>), and fire at <code>info</code> (<code>debug</code> carries the next computed occurrence).</p>
+  <ul>
+    <li><code>every:</code> takes a duration in <code>ms</code>, <code>s</code>, <code>m</code>, <code>h</code>, or <code>d</code>, compound and fractional allowed (<code>30s</code>, <code>15m</code>, <code>6h</code>, <code>1d</code>, <code>1.5h</code>, <code>2d12h</code>). The first fire is one interval after startup (or immediately with <code>run_on_boot</code>); subsequent fires are anchored to that first tick, so they do not drift. The shortest interval is 100ms.</li>
+    <li><code>cron:</code> takes the classic 5 fields (<code>minute hour day-of-month month day-of-week</code>) with <code>*</code>, <code>N</code>, <code>N-M</code>, <code>*/N</code>, <code>N-M/N</code>, and comma-separated lists. Day-of-week accepts <code>0</code>–<code>7</code> (both <code>0</code> and <code>7</code> are Sunday). When day-of-month <em>and</em> day-of-week are both restricted, a day matching <em>either</em> fires (the classic rule). Names (<code>mon</code>, <code>jan</code>) are not supported, and there is no seconds field.</li>
+    <li><code>cron:</code> fields are matched in <code>runtime.timezone_offset_hours</code> (a fixed UTC offset, default 0 = UTC). It is an offset, not a named zone, so a schedule never shifts under another region's daylight saving — <code>30 9 * * 1-5</code> with <code>8</code> means 09:30 UTC+8, every day of the year.</li>
+    <li><code>target.profile</code> names a configured agent or a spawn profile. A spawn profile resolves to the <code>spawn:&lt;profile&gt;</code> address — a top-level session running that profile's loop, model, and grants (no parent, no capability attenuation to a parent).</li>
+    <li><code>event:</code> triggers are <strong>not</strong> scheduled: the router and loops match those themselves. <code>runtime.triggers()</code> still returns the whole merged list, unchanged in shape, so loops that read it keep working.</li>
+    <li>A trigger that cannot be scheduled — a malformed expression, an interval under the floor, or a <code>target.profile</code> that is neither an agent nor a spawn profile — is <strong>logged and skipped</strong>; the rest still run. A config typo costs you one trigger and one warning line, never a boot.</li>
+  </ul>
 </section>
 
 <section id="lua" class="section">
@@ -697,7 +721,7 @@ end</code></pre>
   <p><code>session.inbox()</code> parks the coroutine until the session mailbox receives a message. A message is a table with at least:</p>
   <pre><code>{
   id = "msg-...",
-  type = "user",           -- "user" | "system" | "timer" | "agent" | ...
+  type = "user",           -- "user" | "system" | "timer" | "cron" | "agent" | ...
   from = "webhook:alice",  -- core-stamped sender
   text = "hello",
   channel = "webhook",
@@ -794,7 +818,7 @@ agent.spawn(profile, spec?) -> { address, session_id, agent }</code></pre>
                           | every } ] }                 -- kind = "every"
 
 credential.get(name) -> { ok, name, value }              -- allow-listed only</code></pre>
-  <p><code>runtime.triggers()</code> returns the merged <code>triggers/*.yaml</code> (or top-level <code>triggers:</code>) list snapshotted at boot — read your CRON_TASKS/ROUTES from the engine instead of baking tables into Lua source. It is answered the same way in <strong>both</strong> Lua surfaces: an agent loop and the gateway route handler (the router op switch serves the identical payload), so an event route can read the trigger list that drives it. Cron and every expressions pass through verbatim; the engine does not schedule them for you. <code>credential.get(name)</code> fetches an engine-wide stored secret <strong>only</strong> when the agent's profile lists the name under <code>credentials: [...]</code> (empty or missing list = denied with an error saying so). Every access is logged (agent, name, granted/denied) and counted (<code>agentflow_credential_gets</code> / <code>agentflow_credential_gets_denied</code>); the value is never journaled and should never be echoed into a reply.</p>
+  <p><code>runtime.triggers()</code> returns the merged <code>triggers/*.yaml</code> (or top-level <code>triggers:</code>) list snapshotted at boot — read your CRON_TASKS/ROUTES from the engine instead of baking tables into Lua source. It is answered the same way in <strong>both</strong> Lua surfaces: an agent loop and the gateway route handler (the router op switch serves the identical payload), so an event route can read the trigger list that drives it. Expressions pass through verbatim, and the shape is unchanged by engine scheduling: <code>every:</code>/<code>cron:</code> entries are also fired by the engine itself (see <code>triggers</code> in the config reference), so a loop only needs this call to <em>observe</em> the deployment's schedule. <code>credential.get(name)</code> fetches an engine-wide stored secret <strong>only</strong> when the agent's profile lists the name under <code>credentials: [...]</code> (empty or missing list = denied with an error saying so). Every access is logged (agent, name, granted/denied) and counted (<code>agentflow_credential_gets</code> / <code>agentflow_credential_gets_denied</code>); the value is never journaled and should never be echoed into a reply.</p>
 
   <h4><code>scheduler</code> — cap: <code>scheduler</code></h4>
   <pre><code>scheduler.every(interval) -> timer_id    -- seconds; dies with session
@@ -802,6 +826,7 @@ scheduler.after(delay) -> timer_id
 scheduler.cron(expr) -> timer_id          -- cron subset (see below)
 scheduler.cancel(timer_id)</code></pre>
   <p>Timers enqueue a <code>Message{ type = "timer" }</code> into the owning session's mailbox — carrying <code>msg.payload.timer_id</code> so one session can tell its timers apart. They never call Lua from a timer goroutine, so the VM stays single-threaded. <code>scheduler.cron</code> supports a <strong>subset</strong> of 5-field cron: <code>*/N * * * *</code> (every N minutes) and fixed minute/hour forms like <code>30 9 * * *</code>; the day-of-month, month, and weekday fields must be <code>*</code>. Anything else is a config-time error — use <code>every</code>/<code>after</code> (or self-rescheduling) for richer schedules.</p>
+  <p>These are <em>session-scoped</em> timers: they need the <code>scheduler</code> capability and die with the session. A deployment-wide schedule declared in YAML (<code>every:</code>/<code>cron:</code> triggers) is engine infrastructure instead — fired by the engine with no capability involved and delivered as <code>Message{ type = "cron" }</code>, so a loop does not have to run a timer loop to be scheduled. Use <code>os.time()</code>/<code>os.date()</code> (UTC) when a loop needs to reason about the clock itself.</p>
 
   <h4><code>memory</code> and <code>store</code> — cap: <code>memory</code> / <code>store.raw</code></h4>
   <pre><code>memory.write(record) -> boolean          -- routed by builtin:routing_table
@@ -852,7 +877,10 @@ http.post(url, body, opts?)
 -- opts: { method, url, headers, body, json, query, timeout, auth }
 -- auth = { service = "..." } resolves a stored credential at request time.
 
-os.env(name) -> string | nil</code></pre>
+os.env(name) -> string | nil
+os.time() -> number                        -- Unix seconds (UTC)
+os.date([format,] time?) -> table | string -- UTC; table unless a format is given</code></pre>
+  <p><strong>Wall clock.</strong> <code>os.time()</code> returns whole Unix seconds and takes no arguments (this is not Lua's <code>os.time(table)</code>). <code>os.date()</code> returns the date <em>table</em> — <code>{ year, month, day, hour, min, sec, wday, yday, isdst }</code> with <code>wday</code> 1 = Sunday … 7 = Saturday, <code>yday</code> 1–366, and <code>isdst</code> always <code>false</code> — and takes an optional Unix-seconds time (default: now). The table is JSON-encodable, so it can ride in a payload. Pass a strftime string to get text instead: <code>os.date("%Y-%m-%d %H:%M:%S", t)</code>. Supported directives are <code>%Y %y %m %d %e %H %I %M %S %p %A %a %B %b %j %w %u %Z %%</code>; an unknown one is left verbatim. <strong>Everything is UTC</strong> — the sandbox has no local timezone, so the fields are identical on every host, and a leading <code>!</code> (<code>os.date("!*t")</code>) is accepted as a no-op. Cron triggers, by contrast, are matched in <code>runtime.timezone_offset_hours</code>; converting between the two is your loop's business.</p>
 
   <h4><code>mail</code> — cap: <code>net.mail</code></h4>
   <pre><code>mail.imap_fetch(opts) -> { ok, mailbox, count, messages }
@@ -897,7 +925,7 @@ end</code></pre>
   <h3>Restrictions and caveats</h3>
   <ul>
     <li><code>llm.stream</code> returns a closure — call it directly, never in a generic <code>for ... in</code>.</li>
-    <li>The standard library includes base, coroutine, table, string, math, bit32, utf8, and buffer. <code>io</code>, <code>os</code> (except the prelude's <code>os.env</code>), and <code>debug</code> are not available.</li>
+    <li>The standard library includes base, coroutine, table, string, math, bit32, utf8, and buffer. <code>io</code> and <code>debug</code> are not available, and neither is the real <code>os</code> library: the prelude provides exactly <code>os.env</code>, <code>os.time</code>, and <code>os.date</code> (all UTC — there is no local timezone in the sandbox).</li>
     <li>Raw network access from Lua is only through <code>http.request</code> and the <code>mail.*</code> ops. There is no socket library.</li>
     <li>All values crossing the bridge are JSON-encoded. Tables must be serializable; functions and userdata cannot cross.</li>
     <li>Plugins are hot-reloadable when <code>runtime.reload.watch</code> is true. Edits to a loop file or instructions file restart the session coroutine from scratch on the next turn.</li>

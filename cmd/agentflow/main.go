@@ -201,6 +201,15 @@ func main() {
 		}
 	}
 
+	// Bake config-level tool spec overrides (tools.policy.overrides) into the
+	// registry — after every Register* call (builtins, legal, shell, MCP) and
+	// before any Expose. An override naming an unregistered tool is a typo and
+	// fails the boot.
+	if err := toolReg.ApplyOverrides(cfg.Tools.Policy.Overrides, log); err != nil {
+		log.Error("tool overrides failed", "err", err)
+		os.Exit(1)
+	}
+
 	// Media blob store: one per process. Channels with a media policy land
 	// inbound media here; llm caps resolve handles at request time. Backend
 	// is fs (rooted beside the runtime persistence data) or s3.

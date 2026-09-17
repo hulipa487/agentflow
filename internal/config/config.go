@@ -290,11 +290,25 @@ type ToolsPolicy struct {
 
 // ToolSpecOverride uses pointers so "not set" is distinct from explicit false/0.
 type ToolSpecOverride struct {
+	// Description replaces the tool's registered description verbatim.
+	Description *string `yaml:"description"`
+	// Params shallow-merges into the schema's parameters.properties: refine one
+	// param's description without re-declaring the whole schema. A param the
+	// schema does not declare is skipped with a boot warning, never an error.
+	Params map[string]ToolParamOverride `yaml:"params"`
+
 	NeedsConfirm *bool   `yaml:"needs_confirm"`
 	Permission   *string `yaml:"permission"`
 	CostLevel    *int    `yaml:"cost_level"`
 	UserVisible  *bool   `yaml:"user_visible"`
 	Autonomous   *bool   `yaml:"autonomous"`
+}
+
+// ToolParamOverride overrides the presentation of one parameter. Only the
+// description is overridable — types and constraints stay owned by the tool's
+// registered Go schema.
+type ToolParamOverride struct {
+	Description string `yaml:"description"`
 }
 
 // Search configures the builtin:web_search tool: a set of named engines and

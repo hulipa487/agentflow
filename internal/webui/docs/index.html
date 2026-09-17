@@ -593,7 +593,14 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
     forbidden: [social_post, auto_purchase]
     overrides:
       "builtin:fs.write": { needs_confirm: true }
-      "mcp:github/create_issue": { needs_confirm: true }</code></pre>
+      "mcp:github/create_issue": { needs_confirm: true }
+      "builtin:web_search":
+        description: "Search the deployment's runbooks."   # verbatim replacement
+        params:                            # shallow-merged into parameters.properties
+          query: { description: "What to look up, in the user's words" }
+        needs_confirm: false               # policy fields: needs_confirm, permission,
+        autonomous: true                   # cost_level, user_visible, autonomous</code></pre>
+  <p>Overrides are baked into the registry once at boot, after every tool is registered (builtins, legal, shell, MCP) and before any agent set is exposed. An override naming an unregistered tool fails the boot — typos are loud. A <code>params</code> entry naming a param the schema does not declare is skipped with a warning, never an error. Policy fields apply per tool; <code>permission: forbidden</code> removes the tool from every exposed set.</p>
 
   <h3><code>agents</code></h3>
   <pre><code>agents:

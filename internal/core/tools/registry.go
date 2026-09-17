@@ -4,6 +4,9 @@ package tools
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"sort"
+	"strings"
 	"sync"
 
 	"agentflow/internal/config"
@@ -118,6 +121,88 @@ func (r *Registry) Register(t ToolSpec) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.tools[t.Name] = t
+}
+
+// ApplyOverrides bakes the config's tool overrides (tools.policy.overrides)
+// into the registry's canonical specs. Call once at boot, after every
+// Register* call and before any Expose: an override naming an unregistered
+// tool is a typo and fails the boot. A description override replaces the
+// registered description verbatim; param overrides shallow-merge into
+// parameters.properties[name]; the policy fields are applied here and again
+// per-agent in Expose (same values, idempotent). Schemas still pass through
+// NormalizeSchema at emit time (JSON, llm.chat), so an override can never
+// produce a mangled "required": {}.
+func (r *Registry) ApplyOverrides(overrides map[string]config.ToolSpecOverride, log *slog.Logger) error {
+	if len(overrides) == 0 {
+		return nil
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	unknown := []string{}
+	for name, o := range overrides {
+		t, ok := r.tools[name]
+		if !ok {
+			unknown = append(unknown, name)
+			continue
+		}
+		if o.Description != nil {
+			t.Description = *o.Description
+		}
+		applyParamOverrides(&t, o.Params, log)
+		if o.NeedsConfirm != nil {
+			t.NeedsConfirm = *o.NeedsConfirm
+		}
+		if o.Permission != nil {
+			t.Permission = *o.Permission
+		}
+		if o.CostLevel != nil {
+			t.CostLevel = *o.CostLevel
+		}
+		if o.UserVisible != nil {
+			t.UserVisible = *o.UserVisible
+		}
+		if o.Autonomous != nil {
+			t.Autonomous = *o.Autonomous
+		}
+		r.tools[name] = t
+	}
+	if len(unknown) > 0 {
+		sort.Strings(unknown)
+		return fmt.Errorf("tools.policy.overrides names unregistered tool(s): %s", strings.Join(unknown, ", "))
+	}
+	return nil
+}
+
+// applyParamOverrides shallow-merges param overrides into the tool schema's
+// properties. Only declared params can be overridden — anything else warns
+// and is skipped (a config naming a dropped param must not break the boot).
+func applyParamOverrides(t *ToolSpec, params map[string]config.ToolParamOverride, log *slog.Logger) {
+	if len(params) == 0 {
+		return
+	}
+	props, ok := t.Parameters["properties"].(map[string]any)
+	if !ok {
+		log.Warn("tool override: schema declares no properties", "tool", t.Name)
+		return
+	}
+	for pname, po := range params {
+		raw, declared := props[pname]
+		if !declared {
+			log.Warn("tool override: param not in schema, ignoring", "tool", t.Name, "param", pname)
+			continue
+		}
+		m, ok := raw.(map[string]any)
+		if !ok {
+			log.Warn("tool override: param schema is not an object, ignoring", "tool", t.Name, "param", pname)
+			continue
+		}
+		if po.Description != "" {
+			m["description"] = po.Description
+		}
+	}
 }
 
 // AgentSet is the resolved tool list for one agent.

@@ -1,6 +1,37 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"agentflow/internal/config"
+)
+
+// TestTriggerTarget: a scheduled trigger's target.profile resolves to a
+// configured agent by name, or to the "spawn:<profile>" address the supervisor
+// registers for a spawn profile. Anything else is unresolvable (the trigger
+// scheduler logs it and skips the trigger — never a boot failure).
+func TestTriggerTarget(t *testing.T) {
+	cfg := &config.Config{
+		Agents:   map[string]config.Agent{"digest": {Loop: "x.lua"}},
+		Profiles: config.Profiles{Agent: map[string]config.SpawnProfile{"pm": {Loop: "y.lua"}}},
+	}
+	cases := []struct {
+		profile string
+		want    string
+		ok      bool
+	}{
+		{"digest", "digest", true},
+		{"pm", "spawn:pm", true},
+		{"nope", "", false},
+		{"", "", false},
+	}
+	for _, c := range cases {
+		got, ok := triggerTarget(cfg, c.profile)
+		if ok != c.ok || got != c.want {
+			t.Fatalf("triggerTarget(%q) = %q, %v; want %q, %v", c.profile, got, ok, c.want, c.ok)
+		}
+	}
+}
 
 // TestCheckConfigSource: -config and -configdir are mutually exclusive, but
 // the default -config value alone (never explicitly passed) does not collide

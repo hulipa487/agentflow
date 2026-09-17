@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -357,5 +358,48 @@ func TestValidateLegalSearch(t *testing.T) {
 				t.Fatalf("default = %q, want %q", c.Legal.Default, tt.wantDef)
 			}
 		})
+	}
+}
+
+// TestValidateTimezoneOffset: the cron matching offset is a fixed UTC offset
+// in the real-world range, and TimezoneOffset converts it to a duration.
+func TestValidateTimezoneOffset(t *testing.T) {
+	tests := []struct {
+		name    string
+		hours   float64
+		wantErr string
+	}{
+		{name: "unset is UTC", hours: 0},
+		{name: "UTC+8", hours: 8},
+		{name: "half-hour offset", hours: -5.5},
+		{name: "far east", hours: 14},
+		{name: "far west", hours: -12},
+		{name: "past the date line", hours: 14.5, wantErr: "outside the real-world range"},
+		{name: "nonsense", hours: -30, wantErr: "outside the real-world range"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Config{
+				Runtime: Runtime{TimezoneOffsetHours: tt.hours},
+				Agents:  map[string]Agent{"bot": {Loop: "./loop.lua"}},
+			}
+			err := validate("cfg.yaml", c)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("expected error containing %q, got: %v", tt.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected no error, got: %v", err)
+			}
+		})
+	}
+
+	if got := (&Config{Runtime: Runtime{TimezoneOffsetHours: 5.5}}).Runtime.TimezoneOffset(); got != 5*time.Hour+30*time.Minute {
+		t.Fatalf("TimezoneOffset = %v", got)
+	}
+	if got := (&Config{}).Runtime.TimezoneOffset(); got != 0 {
+		t.Fatalf("unset offset = %v; want 0", got)
 	}
 }

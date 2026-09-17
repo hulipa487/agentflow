@@ -352,3 +352,86 @@ loop: ./loops/plain.lua
 		t.Fatalf("plain profile must have no extras: %#v", cfg.Profiles.Agent["plain"].Extras)
 	}
 }
+
+// TestLoadTriggersMatchesBoot: the engine's trigger scheduler re-reads the
+// merged list through LoadTriggers, so that call must return exactly what the
+// boot load produced — same merge order, same env expansion — and must follow
+// an edit without a restart.
+func TestLoadTriggersMatchesBoot(t *testing.T) {
+	t.Setenv("TRIGGER_REGION", "us-east-1")
+	dir := writeDir(t, map[string]string{
+		"system.yaml":             dirSystem,
+		"profiles/greeter.yaml":   dirProfileGreeter,
+		"profiles/worker.yaml":    dirProfileWorker,
+		"triggers/10-digest.yaml": dirTriggersA,
+		"triggers/20-extra.yaml":  dirTriggersB,
+	})
+
+	cfg, err := LoadDir(dir, discardLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadTriggers(dir, discardLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(cfg.Triggers) {
+		t.Fatalf("reload saw %d triggers; boot saw %d", len(got), len(cfg.Triggers))
+	}
+	for i := range got {
+		if got[i].Name != cfg.Triggers[i].Name || got[i].Cron != cfg.Triggers[i].Cron ||
+			got[i].Every != cfg.Triggers[i].Every || got[i].RunOnBoot != cfg.Triggers[i].RunOnBoot ||
+			got[i].Target.Profile != cfg.Triggers[i].Target.Profile {
+			t.Fatalf("trigger %d differs:\n reload %+v\n boot   %+v", i, got[i], cfg.Triggers[i])
+		}
+	}
+	// Boot order is sorted-glob with the later file winning on a duplicate name.
+	if got[0].Name != "digest" || got[0].Cron != "30 9 * * *" || got[1].Name != "heartbeat" {
+		t.Fatalf("merge/override order wrong: %+v", got)
+	}
+
+	// A non-secret payload reference expands on the reload path too.
+	if err := os.WriteFile(filepath.Join(dir, "triggers", "30-region.yaml"), []byte(`
+triggers:
+  - { name: regional, every: 1h, target: { profile: worker }, payload: { region: "${TRIGGER_REGION}" } }
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err = LoadTriggers(dir, discardLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 || got[2].Name != "regional" {
+		t.Fatalf("new trigger file not picked up: %+v", got)
+	}
+	if got[2].Payload["region"] != "us-east-1" {
+		t.Fatalf("payload not expanded on reload: %v", got[2].Payload)
+	}
+
+	// Removing every trigger file leaves an empty list (the running set is then
+	// replaced with nothing) — not an error.
+	if err := os.Remove(filepath.Join(dir, "triggers", "10-digest.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "triggers", "20-extra.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "triggers", "30-region.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	got, err = LoadTriggers(dir, discardLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("empty triggers dir must yield an empty list: %+v", got)
+	}
+
+	// A malformed fragment is an error, so the scheduler keeps the running set.
+	if err := os.WriteFile(filepath.Join(dir, "triggers", "40-bad.yaml"), []byte("triggers:\n  - { name: bad, every: 5m, nope: 1 }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadTriggers(dir, discardLog()); err == nil {
+		t.Fatal("a malformed trigger fragment must be an error")
+	}
+}

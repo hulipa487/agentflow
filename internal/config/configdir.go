@@ -26,13 +26,16 @@ import (
 	"strings"
 )
 
-// Trigger is one scheduled or event-driven task definition. Triggers are
-// declarative data: cron expressions pass through as-is — the engine does not
-// reduce them to timers; loops consume them via runtime.triggers().
+// Trigger is one scheduled or event-driven task definition. A trigger with
+// every: or cron: is executed by the engine itself (internal/core/triggers):
+// when due, the engine enqueues a Message{type:"cron"} into the target
+// profile's session, so a deployment needs no scheduler agent of its own. A
+// trigger with event: is matched by the router/loops instead. The merged list
+// is also served to Lua as read-only data via runtime.triggers().
 type Trigger struct {
 	Name      string         `yaml:"name"`
 	Event     *TriggerEvent  `yaml:"event"` // kind = event
-	Cron      string         `yaml:"cron"`  // kind = cron (expression passes through verbatim)
+	Cron      string         `yaml:"cron"`  // kind = cron (5-field expression)
 	Every     string         `yaml:"every"` // kind = every (duration, e.g. "15m")
 	RunOnBoot bool           `yaml:"run_on_boot"`
 	Target    TriggerTarget  `yaml:"target"`
@@ -45,7 +48,7 @@ type TriggerEvent struct {
 	Match   string `yaml:"match"`
 }
 
-// TriggerTarget names the spawn profile a trigger runs as.
+// TriggerTarget names the agent or spawn profile a trigger runs as.
 type TriggerTarget struct {
 	Profile string `yaml:"profile"`
 }
@@ -139,11 +142,53 @@ func LoadDir(dir string, log *slog.Logger) (*Config, error) {
 
 	// triggers/*.yaml -> merged trigger list, sorted-glob; a trigger name
 	// redefined by a later file wins (logged).
+	c.Triggers, err = loadDirTriggers(dir, log)
+	if err != nil {
+		return nil, err
+	}
+
+	// Structured env expansion: every non-secret field expands ${VAR} now, as
+	// the single-file path does; registry secret fields keep their raw
+	// reference (${VAR} / cred:<service>) for lazy resolution at consumers.
+	expandDeferredSecrets(c)
+
+	if err := validate(dir, c); err != nil {
+		return nil, err
+	}
+	// Rebase last so defaults applied by validate (runtime.persistence) pick
+	// up the directory base too. Validation only checks references, not paths.
+	rebaseConfigPaths(dir, c)
+	return c, nil
+}
+
+// LoadTriggers re-reads just the merged trigger list of a config directory —
+// the same fragments, merge order, and env expansion the boot load applies.
+// The engine's trigger scheduler calls it on a poll so an edit to
+// triggers/*.yaml takes effect without a restart; everything else in a
+// configdir still needs one.
+func LoadTriggers(dir string, log *slog.Logger) ([]Trigger, error) {
+	if log == nil {
+		log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	list, err := loadDirTriggers(dir, log)
+	if err != nil {
+		return nil, err
+	}
+	// Payload strings expand exactly as they did at boot (the rest of the
+	// config is not re-read, so only the trigger subtree is walked).
+	c := &Config{Triggers: list}
+	expandDeferredSecrets(c)
+	return c.Triggers, nil
+}
+
+// loadDirTriggers merges <dir>/triggers/*.yaml (sorted glob) into one list.
+func loadDirTriggers(dir string, log *slog.Logger) ([]Trigger, error) {
 	triggerFiles, err := filepath.Glob(filepath.Join(dir, "triggers", "*.yaml"))
 	if err != nil {
 		return nil, fmt.Errorf("configdir %s: triggers: %w", dir, err)
 	}
 	sort.Strings(triggerFiles)
+	var out []Trigger
 	triggerIdx := map[string]int{}
 	for _, tf := range triggerFiles {
 		b, err := os.ReadFile(tf)
@@ -163,26 +208,14 @@ func LoadDir(dir string, log *slog.Logger) (*Config, error) {
 			if i, dup := triggerIdx[tr.Name]; dup {
 				log.Warn("configdir: trigger overridden by later file",
 					"trigger", tr.Name, "file", tf)
-				c.Triggers[i] = tr
+				out[i] = tr
 				continue
 			}
-			triggerIdx[tr.Name] = len(c.Triggers)
-			c.Triggers = append(c.Triggers, tr)
+			triggerIdx[tr.Name] = len(out)
+			out = append(out, tr)
 		}
 	}
-
-	// Structured env expansion: every non-secret field expands ${VAR} now, as
-	// the single-file path does; registry secret fields keep their raw
-	// reference (${VAR} / cred:<service>) for lazy resolution at consumers.
-	expandDeferredSecrets(c)
-
-	if err := validate(dir, c); err != nil {
-		return nil, err
-	}
-	// Rebase last so defaults applied by validate (runtime.persistence) pick
-	// up the directory base too. Validation only checks references, not paths.
-	rebaseConfigPaths(dir, c)
-	return c, nil
+	return out, nil
 }
 
 // spawnProfile converts an agent file marked spawn: true into a SpawnProfile.

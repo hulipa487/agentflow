@@ -514,6 +514,10 @@ func main() {
 				Memory:        amPtr,
 				Skills:        p.Skills,
 				Capabilities:  p.Capabilities,
+
+				InstructionsPath: p.Instructions,
+				Extras:           p.Extras,
+				Credentials:      p.Credentials,
 			},
 		}
 		defs["__spawn__"+pname] = &supervisor.AgentDef{

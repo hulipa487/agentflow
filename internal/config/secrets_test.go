@@ -239,3 +239,63 @@ agents:
 		t.Fatal("sanity: expandEnv default semantics")
 	}
 }
+
+// TestExtrasReferencesStayOpaque: a whole ${VAR} / ${VAR:-default} / cred:
+// reference inside profile extras is NOT expanded at load (agent and spawn
+// alike), so agent.config() renders it as an opaque marker instead of handing
+// a resolved secret to Lua — including to a spawned child. Strings that only
+// embed a reference stay ordinary literals and expand as before.
+func TestExtrasReferencesStayOpaque(t *testing.T) {
+	const secret = "sk-MUST-NOT-APPEAR"
+	t.Setenv("PM_API_KEY", secret)
+	dir := writeDir(t, map[string]string{
+		"system.yaml": dirSystem,
+		"profiles/bot.yaml": `
+name: bot
+loop: builtin:per_chat
+extras:
+  api_key: "${PM_API_KEY}"
+  fallback: "${PM_REGION:-us-east-1}"
+  svc: "cred:deploy"
+  embedded: "prefix-${PM_API_KEY}"
+  nested: { key: "${PM_API_KEY}", plain: "release-train" }
+`,
+		"profiles/w.yaml": `
+name: w
+spawn: true
+loop: builtin:per_chat
+extras:
+  api_key: "${PM_API_KEY}"
+`,
+	})
+	cfg, err := LoadDir(dir, discardLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	agentExtras := cfg.Agents["bot"].Extras
+	if agentExtras["api_key"] != "${PM_API_KEY}" {
+		t.Fatalf("agent extras reference expanded: %v", agentExtras["api_key"])
+	}
+	if agentExtras["fallback"] != "${PM_REGION:-us-east-1}" {
+		t.Fatalf("defaulted reference expanded: %v", agentExtras["fallback"])
+	}
+	if agentExtras["svc"] != "cred:deploy" {
+		t.Fatalf("cred reference mangled: %v", agentExtras["svc"])
+	}
+	if nested := agentExtras["nested"].(map[string]any); nested["key"] != "${PM_API_KEY}" {
+		t.Fatalf("nested reference expanded: %v", nested["key"])
+	}
+	if nested := agentExtras["nested"].(map[string]any); nested["plain"] != "release-train" {
+		t.Fatalf("plain extras value changed: %v", nested["plain"])
+	}
+	// A composite string is a literal, not a reference: it still expands.
+	if got := agentExtras["embedded"]; got != "prefix-"+secret {
+		t.Fatalf("embedded expansion changed: %v", got)
+	}
+	// The spawn-profile path is opaque too — a child must not receive a
+	// resolved secret through its own extras.
+	if got := cfg.Profiles.Agent["w"].Extras["api_key"]; got != "${PM_API_KEY}" {
+		t.Fatalf("spawn extras reference expanded: %v", got)
+	}
+}

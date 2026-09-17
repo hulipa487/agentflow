@@ -297,3 +297,58 @@ can_contact: [ghost]
 		t.Fatalf("cross-file reference validation must run: %v", err)
 	}
 }
+
+// TestLoadDirSpawnProfileExtras: a spawn profile's extras survive the
+// agent-file -> SpawnProfile conversion (they used to be accepted by strict
+// decode and then silently discarded).
+func TestLoadDirSpawnProfileExtras(t *testing.T) {
+	dir := writeDir(t, map[string]string{
+		"system.yaml": dirSystem,
+		"profiles/boss.yaml": `
+name: boss
+loop: ./loops/boss.lua
+extras:
+  workflow: boss-flow
+`,
+		"profiles/pm.yaml": `
+name: pm
+spawn: true
+loop: ./loops/pm.lua
+extras:
+  workflow: release-train
+  goal: { type: autonomous, success_signal: "PR merged", max_turns: 12 }
+  api_key: ${PM_API_KEY}
+`,
+		"profiles/plain.yaml": `
+name: plain
+spawn: true
+loop: ./loops/plain.lua
+`,
+	})
+	cfg, err := LoadDir(dir, discardLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Static-agent extras are untouched by the spawn conversion.
+	if boss := cfg.Agents["boss"]; boss.Extras["workflow"] != "boss-flow" {
+		t.Fatalf("static agent extras changed: %#v", boss.Extras)
+	}
+	pm, ok := cfg.Profiles.Agent["pm"]
+	if !ok {
+		t.Fatalf("pm profile missing: %v", cfg.Profiles.Agent)
+	}
+	if pm.Extras["workflow"] != "release-train" {
+		t.Fatalf("spawn extras dropped: %#v", pm.Extras)
+	}
+	if pm.Extras["api_key"] != "${PM_API_KEY}" {
+		t.Fatalf("spawn extras must stay raw: %#v", pm.Extras)
+	}
+	goal, ok := pm.Extras["goal"].(map[string]any)
+	if !ok || goal["success_signal"] != "PR merged" {
+		t.Fatalf("goal block wrong: %#v", pm.Extras["goal"])
+	}
+	// A spawn profile without extras stays nil — no behavior change.
+	if cfg.Profiles.Agent["plain"].Extras != nil {
+		t.Fatalf("plain profile must have no extras: %#v", cfg.Profiles.Agent["plain"].Extras)
+	}
+}

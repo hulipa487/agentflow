@@ -37,6 +37,40 @@ var secretPathPatterns = []string{
 	"profiles.shell.*.password",
 }
 
+// secretSubtreePatterns names free-form subtrees whose whole-reference
+// strings are treated like registry fields. Profile extras are open-ended
+// maps, so a leaf cannot be enumerated by path the way the registry does:
+// instead, any string below these paths that IS exactly a reference
+// (${VAR} / ${VAR:-default} / cred:<service>) is left raw, so agent.config()
+// renders it as an opaque marker and the resolved value never reaches Lua —
+// not even in a spawned child. Strings that merely embed a reference are
+// still literals and expand normally.
+var secretSubtreePatterns = []string{
+	"agents.*.extras",
+	"profiles.agent.*.extras",
+}
+
+// inSecretSubtree reports whether path lies at or below a secret subtree.
+func inSecretSubtree(path []string) bool {
+	for _, pat := range secretSubtreePatterns {
+		segs := strings.Split(pat, ".")
+		if len(path) <= len(segs) {
+			continue // the subtree root itself is not a field
+		}
+		match := true
+		for i, seg := range segs {
+			if seg != "*" && seg != path[i] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
 // expandDeferredSecrets environment-expands every non-secret string in the
 // merged config, leaving registry fields raw for lazy resolution. Used by the
 // configdir path; the single-file path keeps whole-document byte expansion.
@@ -96,10 +130,17 @@ func walkExpand(v reflect.Value, path []string) {
 			walkExpand(v.Index(i), append(path, "[]"))
 		}
 	case reflect.String:
+		s := v.String()
 		if isSecretPath(path) {
 			return // raw reference, resolved lazily at the consumer
 		}
-		s := v.String()
+		if inSecretSubtree(path) {
+			// A whole reference stays raw so it renders as an opaque marker;
+			// anything else is a literal and expands like any other field.
+			if ref := ParseSecretRef(s); ref.Cred != "" || ref.Env != "" {
+				return
+			}
+		}
 		if !strings.Contains(s, "${") {
 			return
 		}

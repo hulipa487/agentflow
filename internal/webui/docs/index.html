@@ -344,7 +344,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
   channels.yaml     # optional: channels: [...]
   profiles/*.yaml   # optional: one agent per file (sorted glob)
   triggers/*.yaml   # optional: triggers: [...] (merged sorted, later file wins)</code></pre>
-  <p>A <code>profiles/*.yaml</code> file is an agent config plus a <code>name</code> and a <code>spawn</code> flag: <code>spawn: false</code> (or absent) routes it to <code>agents</code>, <code>spawn: true</code> routes it to <code>profiles.agent</code> (a spawn template). Agent-only fields (<code>persistent</code>, <code>singleton</code>, <code>taps</code>, <code>channels</code>, <code>lifecycle</code>) on a spawn profile are boot errors. A trigger is declarative data — <code>{name, event{channel, match}|cron|every, run_on_boot, target{profile}, payload}</code> — consumed by loops via <code>runtime.triggers()</code>; cron expressions pass through verbatim.</p>
+  <p>A <code>profiles/*.yaml</code> file is an agent config plus a <code>name</code> and a <code>spawn</code> flag: <code>spawn: false</code> (or absent) routes it to <code>agents</code>, <code>spawn: true</code> routes it to <code>profiles.agent</code> (a spawn template, including its <code>extras</code> and <code>credentials</code> allow-list — spawned children see both). Agent-only fields (<code>persistent</code>, <code>singleton</code>, <code>taps</code>, <code>channels</code>, <code>lifecycle</code>) on a spawn profile are boot errors. A trigger is declarative data — <code>{name, event{channel, match}|cron|every, run_on_boot, target{profile}, payload}</code> — consumed by loops via <code>runtime.triggers()</code>; cron expressions pass through verbatim.</p>
 </section>
 
 <section id="config-ref" class="section">
@@ -429,6 +429,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
       provider: builtin:sqlite
       config:
         path: ./data/agentflow.db</code></pre>
+  <p>A backend whose <code>config.url</code>/<code>config.password</code> secret reference cannot be resolved is <strong>skipped with a warning</strong> rather than failing the boot: stores bound to it rebind to a surviving backend (preferring one whose provider offers <code>text_search</code>, so a vector store degrades to full-text search; loops feature-detect from the binding's features) with <code>requires</code> lowered to what the fallback offers, or are dropped when no backend survives. A genuinely unknown backend name is still a boot error.</p>
 
   <h3><code>profiles</code> — reusable configs</h3>
   <p>Profile kinds are namespaced: <code>memory/&lt;name&gt;</code>, <code>safety/&lt;name&gt;</code>, <code>shell/&lt;name&gt;</code>, <code>agent/&lt;name&gt;</code>. Agents reference them by short name.</p>
@@ -492,6 +493,10 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
     skills: [builtin:fs.read, builtin:fs.write]
     capabilities: [llm.chat, tools]
     can_contact: []
+    credentials: [deploy_token]   # credential.get allow-list for children
+    extras:                       # read-only via agent.config() in the child
+      workflow: release-train
+      goal: { type: autonomous, max_turns: 12 }
     ephemeral:
       max_lifetime: 2h
       idle_ttl: 15m
@@ -500,6 +505,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
       tokens_per_day: 100000
       window: 168h            # optional rolling window; omit for daily reset</code></pre>
   <p>A spawn profile that declares <code>budget.tokens_per_day</code> gets a metered LLM pool <strong>shared by every child spawned from it</strong>, so a project type (manager + workers) draws from one budget. With <code>window</code> set, usage drains continuously as commits age past the window instead of resetting at the day boundary.</p>
+  <p><code>extras</code> and <code>credentials</code> carry over to every child, so a spawned loop calling <code>agent.config()</code> sees its own profile options and its credential allow-list — the same shape a static agent sees.</p>
 
   <h3><code>gateway</code> — one shared HTTP listener</h3>
   <p>All HTTP channels (webhook, ghhook, telegram webhook/auto) mount paths on <strong>one shared HTTP server</strong> — there is no per-channel <code>listen</code>. The listener is set once at <code>gateway.listen</code> (default <code>:8080</code>), and the server also serves <code>GET /health</code> → <code>200 {"ok":true}</code> for probes and reverse-proxy health checks. <code>gateway.public_url</code> is the externally-reachable base (e.g. <code>https://bot.example.com</code>) used when the runtime should register webhooks for you.</p>
@@ -645,7 +651,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
       goal: { type: autonomous, success_signal: "PR merged", max_turns: 40 }
       workflow: release-train</code></pre>
   <p><strong>Capability ceiling</strong>: <code>plugins.allow_capabilities</code> (global) ⊇ <code>agents.&lt;name&gt;.capabilities</code> (per-agent) ⊇ spawn-spec grants (child). You cannot delegate what you lack. If an agent omits <code>capabilities</code> it gets the defaults <code>[llm.chat, memory, tools, agent.send, net.http]</code> — note <code>net.mail</code> is <em>not</em> a default and must be declared explicitly.</p>
-  <p><strong>Profile extras &amp; credentials</strong>: <code>extras</code> is deployment-specific, read-only profile data surfaced to the loop by <code>agent.config()</code> (a <code>goal</code> block is hoisted to a top-level <code>goal</code> key; everything else lands under <code>extras</code>). Secret references inside extras render as opaque markers (<code>{env="VAR"}</code> / <code>{cred="service"}</code>) — resolved values never appear. <code>credentials</code> is the allow-list for <code>credential.get()</code>: an agent can only fetch a stored secret it names here; empty or missing = no access.</p>
+  <p><strong>Profile extras &amp; credentials</strong>: <code>extras</code> is deployment-specific, read-only profile data surfaced to the loop by <code>agent.config()</code> (a <code>goal</code> block is hoisted to a top-level <code>goal</code> key; everything else lands under <code>extras</code>). Values that are <em>exactly</em> a secret reference — <code>${VAR}</code>, <code>${VAR:-default}</code>, or <code>cred:&lt;service&gt;</code> — are never resolved for this surface: on the configdir path they stay raw and render as opaque markers (<code>{env="VAR"}</code> / <code>{cred="service"}</code>), so no resolved secret reaches a loop (or a spawned child); a string that merely embeds a reference (<code>prefix-${VAR}</code>) is an ordinary literal and expands as usual. <code>credentials</code> is the allow-list for <code>credential.get()</code>: an agent can only fetch a stored secret it names here; empty or missing = no access. Both fields apply to spawn profiles too and reach every child.</p>
   <p><strong>Daemon agents</strong>: sessions normally spawn lazily on first message. An agent with <code>persistent: true</code> receives a synthetic <code>{ type = "boot", from = "system:supervisor" }</code> message once the runtime is up (after channels register), so cron schedulers and queue consumers start without external traffic.</p>
   <p><strong>Budget</strong>: <code>tokens_per_day</code> wraps LLM calls in reserve/commit/release against a token pool. By default the pool resets daily; set <code>window</code> (e.g. <code>24h</code>, <code>168h</code>) for rolling-window accounting where usage drains continuously as commits age out — no midnight cliff. A call that would exceed the budget is denied (counted in <code>agentflow_budget_denied</code>).</p>
 

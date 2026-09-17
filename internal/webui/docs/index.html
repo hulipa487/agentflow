@@ -770,8 +770,18 @@ store.delete(table, key)</code></pre>
   <h4><code>tools</code> — cap: <code>tools</code></h4>
   <pre><code>tools.list() -> [ToolSpec]
 tools.run(name, args, opts?) -> ToolResult
--- opts: { confirmed = true, confirm_id = "..." }</code></pre>
+-- opts: { confirmed = true, confirm_id = "..." }
+
+tool.def({ name = "lua:shout",
+           description = "Shout the text back",
+           params = { type = "object",
+                      properties = { text = { type = "string" } },
+                      required = { "text" } },
+           handler = function(args)
+             return { ok = true, shouted = string.upper(args.text) }
+           end })</code></pre>
   <p>If a tool declares <code>needs_confirm: true</code>, the first call returns a <code>needs_confirm</code> response. The runtime asks the user, then re-invokes the tool with <code>opts.confirmed = true</code>. Your loop sees only the final result.</p>
+  <p><code>tool.def</code> declares a model-visible tool in Lua — the engine-standard replacement for hand-assembled extra tool defs. Declared tools merge into <code>tools.list</code> (same <code>{ type = "function", function = {...} }</code> shape as Go tools, so they flow into <code>llm.chat</code> unchanged) and <code>tools.run</code> dispatches to the Lua handler. The handler runs synchronously on the loop coroutine and may itself call any op (<code>llm.chat</code>, <code>memory.*</code>, …). A declared name shadows a Go-registered tool of the same name in both list and run; a handler error comes back as <code>{ ok = false, error = ... }</code> instead of killing the loop. Declared tools are the loop's own code: the Go tools policy (<code>forbidden</code>, <code>needs_confirm</code>) does not gate them. Declare at chunk top level, before <code>loop()</code>.</p>
 
   <h4><code>shell</code> — cap: <code>shell.exec</code></h4>
   <pre><code>shell.spawn(opts) -> { id, provider, state }

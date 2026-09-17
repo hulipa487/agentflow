@@ -355,6 +355,64 @@ function tools.run(name, args, opts)
   return op(req)
 end
 
+-- Lua-declared tools: a loop (or a support chunk) registers its own
+-- model-visible tools with tool.def. Declared tools merge into tools.list and
+-- intercept tools.run; the handler runs synchronously on the loop coroutine,
+-- so it may itself call any op (llm.chat, memory.*, ...). A declared name
+-- shadows a Go-registered tool of the same name in both list and run.
+-- Declared tools are the loop's own code: the Go tools policy (forbidden,
+-- needs_confirm) does not gate them.
+tool = {}
+local lua_tools = {}
+local go_tools_list = tools.list
+local go_tools_run = tools.run
+
+function tool.def(spec)
+  assert(type(spec) == "table", "tool.def: spec must be a table")
+  assert(type(spec.name) == "string" and #spec.name > 0, "tool.def: spec.name must be a non-empty string")
+  assert(type(spec.handler) == "function", "tool.def: spec.handler must be a function")
+  if spec.params ~= nil then
+    assert(type(spec.params) == "table", "tool.def: spec.params must be a JSON-schema table")
+  end
+  lua_tools[spec.name] = spec
+end
+
+function tools.list()
+  local out = {}
+  for _, def in ipairs(go_tools_list()) do
+    local f = def["function"]
+    if not (f and lua_tools[f.name]) then
+      out[#out + 1] = def
+    end
+  end
+  for name, spec in pairs(lua_tools) do
+    out[#out + 1] = {
+      type = "function",
+      ["function"] = {
+        name = name,
+        description = spec.description or "",
+        parameters = spec.params or { type = "object", properties = {} },
+      },
+    }
+  end
+  return out
+end
+
+function tools.run(name, args, opts)
+  local spec = lua_tools[name]
+  if spec == nil then
+    return go_tools_run(name, args, opts)
+  end
+  local ok, res = pcall(spec.handler, args or {})
+  if not ok then
+    return { ok = false, tool = name, error = tostring(res) }
+  end
+  if res == nil then
+    res = { ok = true, tool = name }
+  end
+  return res
+end
+
 shell = {}
 function shell.spawn(opts)
   opts = opts or {}

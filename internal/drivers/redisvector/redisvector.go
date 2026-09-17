@@ -51,9 +51,9 @@ func (Provider) Open(config map[string]any) (memory.BackendHandle, error) {
 	if url == "" {
 		return nil, fmt.Errorf("builtin:redisvector: url is required")
 	}
-	opts, err := redis.ParseURL(url)
+	opts, err := parseOptions(url)
 	if err != nil {
-		return nil, fmt.Errorf("builtin:redisvector: parse url: %w", err)
+		return nil, err
 	}
 	dim := defaultDim
 	switch v := config["dim"].(type) {
@@ -75,6 +75,27 @@ func (Provider) Open(config map[string]any) (memory.BackendHandle, error) {
 		return nil, fmt.Errorf("builtin:redisvector: ping: %w", err)
 	}
 	return &Handle{client: client, dim: dim, indexed: map[string]bool{}}, nil
+}
+
+// parseOptions builds the client options, pinning RESP2.
+//
+// go-redis v9 negotiates RESP3 by default (options.go: "if opt.Protocol < 2 {
+// opt.Protocol = 3 }"), and under RESP3 RediSearch returns FT.SEARCH as a map
+// of named fields — total_results, results[], attributes — rather than the
+// flat [total, key, key, ...] array RESP2 produces. searchKeys reads the flat
+// form, so without this pin every vector query fails to parse. Everything else
+// this driver issues (HSET, HGET, DEL, SCAN) replies identically under both.
+//
+// Pinning is the fix rather than teaching searchKeys the map shape because one
+// reply format is easier to keep correct; if this pin is ever removed, the
+// parse error names the shape it got, so the regression is self-diagnosing.
+func parseOptions(url string) (*redis.Options, error) {
+	opts, err := redis.ParseURL(url)
+	if err != nil {
+		return nil, fmt.Errorf("builtin:redisvector: parse url: %w", err)
+	}
+	opts.Protocol = 2
+	return opts, nil
 }
 
 // Handle is an opened Redis (RediSearch) backend.
@@ -295,11 +316,12 @@ func searchArgs(index string, k int, vec []float32) []any {
 }
 
 // searchKeys reads the document keys out of an FT.SEARCH ... NOCONTENT reply,
-// which is [total, key, key, ...].
+// which is [total, key, key, ...] under RESP2. The error names the type it got
+// so a protocol change (see parseOptions) is obvious rather than mysterious.
 func searchKeys(reply any) ([]string, error) {
 	arr, ok := reply.([]any)
 	if !ok {
-		return nil, fmt.Errorf("builtin:redisvector: unexpected search reply %T", reply)
+		return nil, fmt.Errorf("builtin:redisvector: unexpected search reply %T (expected the flat RESP2 form; is the client negotiating RESP3?)", reply)
 	}
 	if len(arr) == 0 {
 		return nil, nil

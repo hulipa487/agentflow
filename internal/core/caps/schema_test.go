@@ -103,7 +103,7 @@ func TestToolSchemaVMRoundTrip(t *testing.T) {
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	handlers := map[string]session.OpHandler{}
-	for k, h := range ToolHandlers(agentSet) {
+	for k, h := range ToolHandlers(agentSet, ToolWiring{}) {
 		handlers[k] = h
 	}
 	for k, h := range LLMHandlers(mgr, nil) {

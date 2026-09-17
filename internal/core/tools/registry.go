@@ -125,8 +125,7 @@ func (r *Registry) Register(t ToolSpec) {
 
 // ApplyOverrides bakes the config's tool overrides (tools.policy.overrides)
 // into the registry's canonical specs. Call once at boot, after every
-// Register* call and before any Expose: an override naming an unregistered
-// tool is a typo and fails the boot. A description override replaces the
+// Register* call and before any Expose. A description override replaces the
 // registered description verbatim — either a literal or the text of a
 // prompts: registry key (prompts maps prompt names to resolved text); a
 // reference to a key that is not in prompts fails the boot. Param overrides
@@ -134,6 +133,13 @@ func (r *Registry) Register(t ToolSpec) {
 // applied here and again per-agent in Expose (same values, idempotent).
 // Schemas still pass through NormalizeSchema at emit time (JSON, llm.chat),
 // so an override can never produce a mangled "required": {}.
+//
+// An override naming no registered tool is not an error and is not applied
+// here: it may target a Lua-declared tool, which exists only once a loop chunk
+// loads, so LuaOverrides resolves it at tools.list() time. Its prompt
+// references are still checked, so a misspelled prompt key fails the boot for
+// either kind of tool. A declared tool that shadows a registered one takes its
+// override from the same LuaOverrides entry (the two resolve to the same text).
 func (r *Registry) ApplyOverrides(overrides map[string]config.ToolSpecOverride, prompts map[string]string, log *slog.Logger) error {
 	if len(overrides) == 0 {
 		return nil
@@ -143,12 +149,11 @@ func (r *Registry) ApplyOverrides(overrides map[string]config.ToolSpecOverride, 
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	unknown := []string{}
 	unresolved := []string{}
 	for name, o := range overrides {
-		t, ok := r.tools[name]
-		if !ok {
-			unknown = append(unknown, name)
+		t, registered := r.tools[name]
+		if !registered {
+			unresolved = append(unresolved, checkPromptRefs(name, o, prompts)...)
 			continue
 		}
 		if o.Description != nil {
@@ -177,15 +182,45 @@ func (r *Registry) ApplyOverrides(overrides map[string]config.ToolSpecOverride, 
 		}
 		r.tools[name] = t
 	}
-	if len(unknown) > 0 {
-		sort.Strings(unknown)
-		return fmt.Errorf("tools.policy.overrides names unregistered tool(s): %s", strings.Join(unknown, ", "))
-	}
 	if len(unresolved) > 0 {
 		sort.Strings(unresolved)
 		return fmt.Errorf("tools.policy.overrides references unknown prompt(s): %s", strings.Join(unresolved, ", "))
 	}
 	return nil
+}
+
+// Names returns the registered tool names — what a caller needs to tell an
+// override aimed at a Go tool from one aimed at a Lua-declared tool.
+func (r *Registry) Names() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]string, 0, len(r.tools))
+	for name := range r.tools {
+		out = append(out, name)
+	}
+	return out
+}
+
+// checkPromptRefs reports an override's prompt references that do not resolve,
+// without applying anything. Used for entries naming no registered tool: they
+// are applied later against a Lua-declared tool, but a misspelled prompt key
+// is still a boot error.
+func checkPromptRefs(name string, o config.ToolSpecOverride, prompts map[string]string) []string {
+	var bad []string
+	if o.Description != nil && o.Description.IsRef {
+		if _, ok := o.Description.Resolve(prompts); !ok {
+			bad = append(bad, fmt.Sprintf("%s description -> %q", name, o.Description.Value))
+		}
+	}
+	for pname, po := range o.Params {
+		if !po.Description.IsRef {
+			continue
+		}
+		if _, ok := po.Description.Resolve(prompts); !ok {
+			bad = append(bad, fmt.Sprintf("%s param %s -> %q", name, pname, po.Description.Value))
+		}
+	}
+	return bad
 }
 
 // applyParamOverrides shallow-merges param overrides into the tool schema's

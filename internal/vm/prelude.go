@@ -369,7 +369,16 @@ end
 -- so it may itself call any op (llm.chat, memory.*, ...). A declared name
 -- shadows a Go-registered tool of the same name in both list and run.
 -- Declared tools are the loop's own code: the Go tools policy (forbidden,
--- needs_confirm) does not gate them.
+-- needs_confirm) does not gate them, and they are listed whether or not the
+-- agent's skills name them.
+--
+-- tools.policy.overrides may target a declared tool by name: its description
+-- (literal or {prompt: key} from the prompts registry) replaces the spec's,
+-- and params.<param>.description refines one declared parameter. The spec's
+-- own description and params are the fallback when no override names it, and
+-- an override can never add or remove a list entry. Overrides are resolved
+-- when the list is built, not at boot, so editing a file:-backed prompt is
+-- reflected on the next tools.list().
 tool = {}
 local lua_tools = {}
 local go_tools_list = tools.list
@@ -385,6 +394,32 @@ function tool.def(spec)
   lua_tools[spec.name] = spec
 end
 
+-- tool_override_params returns the declared schema with any overridden param
+-- description merged in. The spec's own table is never mutated: it belongs to
+-- the loop and is reused on every turn. A param the schema does not declare is
+-- skipped, matching the Go registry's rule.
+local function tool_override_params(params, ovparams)
+  local base = params or { type = "object", properties = {} }
+  if ovparams == nil then
+    return base
+  end
+  local out = {}
+  for k, v in pairs(base) do out[k] = v end
+  local props = {}
+  for k, v in pairs(base.properties or {}) do props[k] = v end
+  for pname, po in pairs(ovparams) do
+    local declared = props[pname]
+    if po.description and type(declared) == "table" then
+      local merged = {}
+      for k, v in pairs(declared) do merged[k] = v end
+      merged.description = po.description
+      props[pname] = merged
+    end
+  end
+  out.properties = props
+  return out
+end
+
 function tools.list()
   local out = {}
   for _, def in ipairs(go_tools_list()) do
@@ -393,13 +428,23 @@ function tools.list()
       out[#out + 1] = def
     end
   end
+  if next(lua_tools) == nil then
+    return out
+  end
+  -- Ask for the config overrides targeting the tools this chunk declared.
+  -- Resolved per call against the live prompt registry, so a reloaded
+  -- file:-backed prompt shows up here without a session restart.
+  local names = {}
+  for name in pairs(lua_tools) do names[#names + 1] = name end
+  local overrides = op({ type = "tools.overrides", tool_names = names }) or {}
   for name, spec in pairs(lua_tools) do
+    local ov = overrides[name]
     out[#out + 1] = {
       type = "function",
       ["function"] = {
         name = name,
-        description = spec.description or "",
-        parameters = spec.params or { type = "object", properties = {} },
+        description = (ov and ov.description) or spec.description or "",
+        parameters = tool_override_params(spec.params, ov and ov.params),
       },
     }
   end

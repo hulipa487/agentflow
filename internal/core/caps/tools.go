@@ -5,14 +5,26 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/tools"
 )
 
+// ToolWiring carries what the tool ops need beyond one agent's exposed set:
+// the overrides that target Lua-declared tools and the live prompt registry
+// they resolve against. A zero value is valid — an agent with no overrides
+// and no prompts behaves exactly as before.
+type ToolWiring struct {
+	LuaOverrides *tools.LuaOverrides
+	Prompts      *session.PromptRegistry
+	Log          *slog.Logger
+}
+
 // ToolHandlers returns handlers for tools.list and tools.run bound to one
-// agent's exposed tool set.
-func ToolHandlers(agentSet *tools.AgentSet) map[string]session.OpHandler {
+// agent's exposed tool set, plus tools.overrides, which the prelude's
+// tools.list consults with the names its chunk declared.
+func ToolHandlers(agentSet *tools.AgentSet, w ToolWiring) map[string]session.OpHandler {
 	return map[string]session.OpHandler{
 		"tools.list": func(ctx context.Context, op session.Op) (string, bool) {
 			if agentSet == nil {
@@ -24,6 +36,22 @@ func ToolHandlers(agentSet *tools.AgentSet) map[string]session.OpHandler {
 				defs = append(defs, t.JSON())
 			}
 			b, _ := json.Marshal(defs)
+			return string(b), true
+		},
+
+		// tools.overrides answers a loop's declared tool names with the
+		// config overrides targeting them. It resolves here rather than at
+		// boot so the text is current: the prompt registry is snapshotted per
+		// call, and the reload watcher rewrites it from its own goroutine.
+		"tools.overrides": func(ctx context.Context, op session.Op) (string, bool) {
+			res := w.LuaOverrides.For(op.ToolNames, w.Prompts.Snapshot(), w.Log)
+			if res == nil {
+				res = map[string]tools.ResolvedOverride{}
+			}
+			b, err := json.Marshal(res)
+			if err != nil {
+				return fmt.Sprintf("%q", err.Error()), false
+			}
 			return string(b), true
 		},
 

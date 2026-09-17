@@ -137,6 +137,10 @@ type Op struct {
 	Query  memory.Query   `json:"query,omitempty"`
 	Tool   string         `json:"tool,omitempty"`
 	Args   map[string]any `json:"args,omitempty"`
+	// ToolNames is the tools.overrides op's declared-tool list: the Lua chunk
+	// reports which tools it defined so the handler can return the config
+	// overrides targeting them and report ones no loop declares.
+	ToolNames []string `json:"tool_names,omitempty"`
 
 	// HTTP op (http.request).
 	Method  string            `json:"method,omitempty"`

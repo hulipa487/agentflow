@@ -80,7 +80,7 @@ func TestToolHandlers(t *testing.T) {
 	reg := tools.NewRegistry()
 	tools.RegisterBuiltins(reg, nil)
 	as := reg.Expose([]string{"builtin:web_search"}, config.ToolsPolicy{}, false)
-	h := ToolHandlers(as)
+	h := ToolHandlers(as, ToolWiring{})
 
 	resp, ok := h["tools.list"](context.Background(), session.Op{})
 	if !ok {
@@ -111,7 +111,7 @@ func TestForbiddenTool(t *testing.T) {
 	reg := tools.NewRegistry()
 	tools.RegisterBuiltins(reg, nil)
 	as := reg.Expose([]string{"builtin:web_search"}, config.ToolsPolicy{}, false)
-	h := ToolHandlers(as)
+	h := ToolHandlers(as, ToolWiring{})
 	resp, ok := h["tools.run"](context.Background(), session.Op{Tool: "builtin:unknown", Args: map[string]any{}})
 	if ok {
 		t.Fatalf("expected run to fail")

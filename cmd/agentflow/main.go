@@ -265,12 +265,15 @@ func main() {
 
 	// Bake config-level tool spec overrides (tools.policy.overrides) into the
 	// registry — after every Register* call (builtins, legal, shell, MCP) and
-	// before any Expose. An override naming an unregistered tool is a typo and
-	// fails the boot, as does a description referencing an unknown prompt key.
+	// before any Expose. An override naming no registered tool is left for the
+	// Lua path (it may target a tool.def-declared tool, which does not exist
+	// until a chunk loads); a description referencing an unknown prompt key
+	// still fails the boot, for either kind of tool.
 	if err := toolReg.ApplyOverrides(cfg.Tools.Policy.Overrides, cfg.PromptTexts(), log); err != nil {
 		log.Error("tool overrides failed", "err", err)
 		os.Exit(1)
 	}
+	luaOverrides := tools.NewLuaOverrides(cfg.Tools.Policy.Overrides, toolReg.Names())
 
 	// Media blob store: one per process. Channels with a media policy land
 	// inbound media here; llm caps resolve handles at request time. Backend
@@ -305,6 +308,9 @@ func main() {
 	// serializes those writes against the reads agent.config() performs.
 	promptReg := session.NewPromptRegistry(cfg.PromptTexts())
 	promptFiles := cfg.PromptFiles()
+	// Every agent's tool handlers share one LuaOverrides instance, so an
+	// override is reported as unclaimed only when no loaded loop declares it.
+	toolWiring := caps.ToolWiring{LuaOverrides: luaOverrides, Prompts: promptReg, Log: log}
 	agentMemories := []memory.AgentMemory{}
 	defs := map[string]*supervisor.AgentDef{}
 	for name, a := range cfg.Agents {
@@ -370,7 +376,7 @@ func main() {
 		for k, h := range caps.StoreHandlers(amPtr, memMgr) {
 			handlers[k] = h
 		}
-		for k, h := range caps.ToolHandlers(agentSet) {
+		for k, h := range caps.ToolHandlers(agentSet, toolWiring) {
 			handlers[k] = h
 		}
 		for k, h := range caps.ShellHandlers(shellMgr) {
@@ -484,7 +490,7 @@ func main() {
 		for k, h := range caps.StoreHandlers(amPtr, memMgr) {
 			handlers[k] = h
 		}
-		for k, h := range caps.ToolHandlers(agentSet) {
+		for k, h := range caps.ToolHandlers(agentSet, toolWiring) {
 			handlers[k] = h
 		}
 		for k, h := range caps.ShellHandlers(shellMgr) {

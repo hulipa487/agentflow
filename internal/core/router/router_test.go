@@ -17,7 +17,7 @@ func testLogger(t *testing.T) *slog.Logger {
 // item_id) and record the event to the journal with its status.
 func TestSubmitStampsIDAndJournals(t *testing.T) {
 	var got []string
-	r := New("loop-src", nil, testLogger(t))
+	r := New("loop-src", "", nil, testLogger(t))
 	r.Journal = func(in Inbound, status string) {
 		got = append(got, in.Message.ID+"|"+status)
 	}
@@ -52,7 +52,7 @@ func TestSubmitStampsIDAndJournals(t *testing.T) {
 // the drop.
 func TestSubmitKeepsIDAndJournalsDrop(t *testing.T) {
 	var statuses []string
-	r := New("loop-src", nil, testLogger(t))
+	r := New("loop-src", "", nil, testLogger(t))
 	r.Journal = func(in Inbound, status string) { statuses = append(statuses, status) }
 	// Fill the queue.
 	for i := 0; i < cap(r.mailbox); i++ {

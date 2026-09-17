@@ -23,18 +23,18 @@ func newTestSupervisor(t *testing.T) *Supervisor {
 	p := pool.New(2)
 	defs := map[string]*AgentDef{
 		"planner": {
-			Info:     &session.Info{Name: "planner", HistoryBudget: 100},
-			CanContact: map[string]bool{"worker": true},
+			Info:         &session.Info{Name: "planner", HistoryBudget: 100},
+			CanContact:   map[string]bool{"worker": true},
 			Capabilities: map[string]bool{"llm.chat": true, "agent.send": true, "agent.request": true, "agent.spawn": true},
-			Handlers: map[string]session.OpHandler{},
-			LoopSrc:  "function loop() while true do session.inbox() end end",
+			Handlers:     map[string]session.OpHandler{},
+			LoopSrc:      "function loop() while true do session.inbox() end end",
 		},
 		"worker": {
-			Info:     &session.Info{Name: "worker", HistoryBudget: 100},
-			CanContact: map[string]bool{"planner": true},
+			Info:         &session.Info{Name: "worker", HistoryBudget: 100},
+			CanContact:   map[string]bool{"planner": true},
 			Capabilities: map[string]bool{"llm.chat": true, "agent.reply": true},
-			Handlers: map[string]session.OpHandler{},
-			LoopSrc:  "function loop() while true do session.inbox() end end",
+			Handlers:     map[string]session.OpHandler{},
+			LoopSrc:      "function loop() while true do session.inbox() end end",
 		},
 	}
 	sup := New(defs, gw, p, nil, log)
@@ -329,3 +329,66 @@ func TestSendToExitedSessionFails(t *testing.T) {
 	}
 }
 
+// TestSpawnPreservesProfileExtras: a spawn profile's Extras ride the template
+// Info through cloneInfo, so a spawned child's agent.config() can surface its
+// own options (and the credentials allow-list) instead of losing them.
+func TestSpawnPreservesProfileExtras(t *testing.T) {
+	sup := newTestSupervisor(t)
+	extras := map[string]any{
+		"workflow": "release-train",
+		"goal":     map[string]any{"type": "autonomous", "max_turns": 12},
+		"api_key":  "${PM_API_KEY}",
+	}
+	sup.templates["pm"] = &SpawnTemplate{
+		Name:         "pm",
+		LoopSrc:      "function loop() while true do session.inbox() end end",
+		Capabilities: map[string]bool{"llm.chat": true},
+		Handlers:     map[string]session.OpHandler{},
+		Memory: &session.Info{
+			Name:             "spawn:pm",
+			InstructionsPath: "/deploy/prompts/pm.md",
+			Extras:           extras,
+			Credentials:      []string{"deploy_token"},
+		},
+	}
+	parent := session.Identity{
+		SessionID:    "planner|x",
+		Agent:        "planner",
+		Capabilities: map[string]bool{"agent.spawn": true, "llm.chat": true},
+	}
+	res, err := sup.Spawn(context.Background(), parent, "pm", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sup.mu.Lock()
+	child := sup.sessions[res.SessionID]
+	sup.mu.Unlock()
+	if child == nil {
+		t.Fatal("child not registered")
+	}
+	if child.Info == nil {
+		t.Fatal("child has no Info")
+	}
+	if child.Info.Extras["workflow"] != "release-train" {
+		t.Fatalf("extras dropped by the spawn path: %#v", child.Info.Extras)
+	}
+	if child.Info.Extras["api_key"] != "${PM_API_KEY}" {
+		t.Fatalf("extras must stay raw for agent.config() to render opaque: %#v", child.Info.Extras)
+	}
+	if child.Info.InstructionsPath != "/deploy/prompts/pm.md" {
+		t.Fatalf("instructions path dropped: %q", child.Info.InstructionsPath)
+	}
+	if len(child.Info.Credentials) != 1 || child.Info.Credentials[0] != "deploy_token" {
+		t.Fatalf("credentials allow-list dropped: %v", child.Info.Credentials)
+	}
+
+	// The template's Info must not be mutated by the spawn (the child gets a
+	// copy), so a second spawn sees the same profile data.
+	if child.Info == sup.templates["pm"].Memory {
+		t.Fatal("child must get a cloned Info, not the template pointer")
+	}
+	if sup.templates["pm"].Memory.Name != "spawn:pm" {
+		t.Fatalf("template Info mutated: %q", sup.templates["pm"].Memory.Name)
+	}
+}

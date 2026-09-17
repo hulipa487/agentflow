@@ -118,6 +118,12 @@ func keysOf(m map[string]bool) []string {
 	return out
 }
 
+// cloneInfo copies a spawn template's Info so per-session state does not leak
+// across spawns. The copy is field-wise: map-typed config carried on the
+// template (Extras, Shell, and the Credentials allow-list) is shared by
+// reference, which is deliberate — it is read-only deployment data that
+// agent.config() only reads (and renders secrets from as opaque markers), so
+// every child of a profile sees its own extras without a per-spawn copy.
 func cloneInfo(src *session.Info) *session.Info {
 	if src == nil {
 		return nil

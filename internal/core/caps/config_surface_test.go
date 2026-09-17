@@ -299,3 +299,53 @@ end
 		t.Fatalf("nil-store loop failed: %s", got)
 	}
 }
+
+// TestSpawnedChildConfigExtras: the Info shape main.go now puts on a spawn
+// template (spawn:<profile> name, instructions path, extras, credential
+// allow-list) is what a spawned child's agent.config() renders — extras
+// visible, secret references opaque, and the resolved value absent.
+func TestSpawnedChildConfigExtras(t *testing.T) {
+	const secretValue = "sk-CHILD-MUST-NOT-SEE"
+	t.Setenv("PM_API_KEY", secretValue) // set: proves opacity is not "unresolved"
+
+	info := &session.Info{
+		Name:             "spawn:pm",
+		Model:            "default",
+		InstructionsPath: "/deploy/prompts/pm.md",
+		Credentials:      []string{"deploy_token"},
+		Extras: map[string]any{
+			"workflow": "release-train",
+			"goal":     map[string]any{"type": "autonomous", "max_turns": 12},
+			"api_key":  "${PM_API_KEY}",
+		},
+	}
+	got, _ := runConfigLoop(t, `
+function loop()
+  local msg = session.inbox()
+  local cfg = agent.config()
+  if cfg.name ~= "spawn:pm" then
+    session.send("err: name " .. tostring(cfg.name))
+    return
+  end
+  if cfg.extras.workflow ~= "release-train" then
+    session.send("err: child extras missing: " .. json.encode(cfg.extras))
+    return
+  end
+  if not (cfg.goal and cfg.goal.type == "autonomous" and cfg.goal.max_turns == 12) then
+    session.send("err: child goal missing")
+    return
+  end
+  if not (type(cfg.extras.api_key) == "table" and cfg.extras.api_key.env == "PM_API_KEY") then
+    session.send("err: child secret not opaque: " .. json.encode(cfg.extras.api_key))
+    return
+  end
+  session.send("CHILD:" .. json.encode(cfg))
+end
+`, info, nil, nil, nil)
+	if !strings.HasPrefix(got, "CHILD:") {
+		t.Fatalf("loop failed: %s", got)
+	}
+	if strings.Contains(got, secretValue) {
+		t.Fatal("resolved secret reached a spawned child's agent.config()")
+	}
+}

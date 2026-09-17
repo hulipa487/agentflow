@@ -223,17 +223,21 @@ type ShellProfile struct {
 // references rather than raw memory/shell credentials, and its grants are
 // always intersected with the spawning actor's effective grants.
 type SpawnProfile struct {
-	Model        string             `yaml:"model"`
-	Loop         string             `yaml:"loop"`
-	Instructions string             `yaml:"instructions"`
-	Memory       string             `yaml:"memory"`
-	Shell        string             `yaml:"shell"`
-	Skills       []string           `yaml:"skills"`
-	Capabilities []string           `yaml:"capabilities"`
-	CanContact   []string           `yaml:"can_contact"`
-	Credentials  []string           `yaml:"credentials"` // credential.get allow-list for spawned children
-	Ephemeral    EphemeralLifecycle `yaml:"ephemeral"`
-	Budget       BudgetConfig       `yaml:"budget"`
+	Model        string   `yaml:"model"`
+	Loop         string   `yaml:"loop"`
+	Instructions string   `yaml:"instructions"`
+	Memory       string   `yaml:"memory"`
+	Shell        string   `yaml:"shell"`
+	Skills       []string `yaml:"skills"`
+	Capabilities []string `yaml:"capabilities"`
+	CanContact   []string `yaml:"can_contact"`
+	Credentials  []string `yaml:"credentials"` // credential.get allow-list for spawned children
+	// Extras is the spawn profile's deployment-specific data (a pm options
+	// block, a workflow name, a goal{...}), surfaced read-only to a spawned
+	// child's loop by agent.config() with secret references rendered opaque.
+	Extras    map[string]any     `yaml:"extras"`
+	Ephemeral EphemeralLifecycle `yaml:"ephemeral"`
+	Budget    BudgetConfig       `yaml:"budget"`
 }
 
 type EphemeralLifecycle struct {

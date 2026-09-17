@@ -327,6 +327,15 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
   <div class="callout">
     <strong>Strict parsing</strong>: <span><code>KnownFields(true)</code> means every unknown key is a boot error. There are no "ignored" typos.</span>
   </div>
+
+  <h3>Config directories (<code>-configdir</code>)</h3>
+  <p>As an alternative to the single file, <code>agentflow -configdir &lt;dir&gt;</code> loads a directory layout (mutually exclusive with <code>-config</code>). Every fragment decodes under the same strict validation, and validation runs <em>after</em> the merge, so cross-file references check exactly as they do in the single file. <code>&lt;dir&gt;</code> becomes the resolution base for every relative path (loops, instructions, the router route, persistence, sqlite backend paths, shell <code>key_file</code>, <code>plugins.dir</code>, <code>media.dir</code>).</p>
+  <pre><code>&lt;dir&gt;/
+  system.yaml       # required: top-level config minus agents/channels
+  channels.yaml     # optional: channels: [...]
+  profiles/*.yaml   # optional: one agent per file (sorted glob)
+  triggers/*.yaml   # optional: triggers: [...] (merged sorted, later file wins)</code></pre>
+  <p>A <code>profiles/*.yaml</code> file is an agent config plus a <code>name</code> and a <code>spawn</code> flag: <code>spawn: false</code> (or absent) routes it to <code>agents</code>, <code>spawn: true</code> routes it to <code>profiles.agent</code> (a spawn template). Agent-only fields (<code>persistent</code>, <code>singleton</code>, <code>taps</code>, <code>channels</code>, <code>lifecycle</code>) on a spawn profile are boot errors. A trigger is declarative data — <code>{name, event{channel, match}|cron|every, run_on_boot, target{profile}, payload}</code> — consumed by loops via <code>runtime.triggers()</code>; cron expressions pass through verbatim.</p>
 </section>
 
 <section id="config-ref" class="section">

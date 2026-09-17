@@ -31,6 +31,7 @@ type Config struct {
 	Media    MediaConfig      `yaml:"media"`
 	Audit    AuditConfig      `yaml:"audit"`
 	Agents   map[string]Agent `yaml:"agents"`
+	Triggers []Trigger        `yaml:"triggers"` // configdir layout; declarative task data for loops
 	Plugins  Plugins          `yaml:"plugins"`
 }
 
@@ -463,15 +464,25 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	var c Config
-	dec := yaml.NewDecoder(bytes.NewReader(expandEnv(b)))
-	dec.KnownFields(true)
-	if err := dec.Decode(&c); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
+	if err := decodeStrict(b, &c, path); err != nil {
+		return nil, err
 	}
 	if err := validate(path, &c); err != nil {
 		return nil, err
 	}
 	return &c, nil
+}
+
+// decodeStrict decodes one YAML document with KnownFields validation after
+// environment expansion. Shared by the single-file path and every configdir
+// fragment.
+func decodeStrict(data []byte, v any, label string) error {
+	dec := yaml.NewDecoder(bytes.NewReader(expandEnv(data)))
+	dec.KnownFields(true)
+	if err := dec.Decode(v); err != nil {
+		return fmt.Errorf("parse %s: %w", label, err)
+	}
+	return nil
 }
 
 func validate(path string, c *Config) error {

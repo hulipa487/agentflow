@@ -66,11 +66,19 @@ var version = "dev"
 
 func main() {
 	cfgPath := flag.String("config", "agentflow.yaml", "path to agentflow.yaml")
+	configDir := flag.String("configdir", "", "path to a config directory (alternative to -config; mutually exclusive)")
 	workers := flag.Int("workers", 8, "op worker pool size")
 	logLevel := flag.String("log-level", "info", "minimum log level: dev|debug|info|warn|error (additive)")
 	noTUI := flag.Bool("no-tui", false, "disable the terminal dashboard (plain stderr logs)")
 	noWebUI := flag.Bool("no-webui", false, "disable the web console (admin server keeps token-optional loopback behavior)")
 	flag.Parse()
+
+	explicit := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+	if err := checkConfigSource(explicit); err != nil {
+		fmt.Fprintln(os.Stderr, "agentflow:", err)
+		os.Exit(2)
+	}
 
 	startedAt := time.Now()
 
@@ -81,7 +89,7 @@ func main() {
 	}
 	log := slog.New(llog.NewTextHandler(os.Stderr, lvl))
 
-	cfg, err := config.Load(*cfgPath)
+	cfg, err := loadConfigSource(*cfgPath, *configDir, log)
 	if err != nil {
 		log.Error("config load failed", "err", err)
 		os.Exit(1)
@@ -771,6 +779,25 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	httpSrv.Stop(shutdownCtx)
+}
+
+// checkConfigSource enforces -config / -configdir mutual exclusion. The
+// default -config value is not "set" unless the operator passed it explicitly
+// (tracked via flag.Visit), so `-configdir dir` alone is legal.
+func checkConfigSource(explicit map[string]bool) error {
+	if explicit["config"] && explicit["configdir"] {
+		return fmt.Errorf("-config and -configdir are mutually exclusive")
+	}
+	return nil
+}
+
+// loadConfigSource loads the config from whichever source the flags select:
+// a config directory (-configdir) or the single file (-config).
+func loadConfigSource(cfgPath, configDir string, log *slog.Logger) (*config.Config, error) {
+	if configDir != "" {
+		return config.LoadDir(configDir, log)
+	}
+	return config.Load(cfgPath)
 }
 
 func capabilitySet(caps []string) map[string]bool {

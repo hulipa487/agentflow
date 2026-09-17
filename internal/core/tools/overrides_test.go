@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -95,15 +96,57 @@ func TestApplyOverridesMergesParamDescription(t *testing.T) {
 	}
 }
 
-// TestApplyOverridesUnknownToolFails: an override naming an unregistered tool
-// is a typo and must fail loudly at boot.
-func TestApplyOverridesUnknownToolFails(t *testing.T) {
+// TestApplyOverridesIgnoresUnregistered: an override naming no registered Go
+// tool is not a boot error — it may target a Lua-declared tool, which exists
+// only once a loop chunk loads. It is left for LuaOverrides to resolve, while
+// the registered tools still get theirs in the same pass.
+func TestApplyOverridesIgnoresUnregistered(t *testing.T) {
 	r := overrideRegistry()
 	err := r.ApplyOverrides(map[string]config.ToolSpecOverride{
-		"builtin:web_serach": {Description: strPtr("typo")},
+		"builtin:web_search": {Description: strPtr("Search the deployment's runbooks.")},
+		"lua:shout":          {Description: strPtr("Shout it")},
 	}, nil, nil)
-	if err == nil || !strings.Contains(err.Error(), "builtin:web_serach") {
-		t.Fatalf("unknown tool must fail, got %v", err)
+	if err != nil {
+		t.Fatalf("an unregistered name must not fail the boot: %v", err)
+	}
+	// The registered tool was still baked in the same call.
+	as := r.Expose(nil, config.ToolsPolicy{}, false)
+	if got := as.ByName["builtin:web_search"].Description; got != "Search the deployment's runbooks." {
+		t.Fatalf("registered override not applied: %q", got)
+	}
+	// The unregistered one resolves through the Lua path instead.
+	lua := NewLuaOverrides(map[string]config.ToolSpecOverride{
+		"lua:shout": {Description: strPtr("Shout it")},
+	}, r.Names())
+	res := lua.For([]string{"lua:shout"}, nil, nil)
+	if got := res["lua:shout"].Description; got == nil || *got != "Shout it" {
+		t.Fatalf("lua override not resolved: %+v", res["lua:shout"])
+	}
+	// A registered name is never reported as unclaimed, even when no loop
+	// declares it.
+	logs := &strings.Builder{}
+	lua2 := NewLuaOverrides(map[string]config.ToolSpecOverride{
+		"builtin:web_search": {Description: strPtr("x")},
+	}, r.Names())
+	lua2.For(nil, nil, slog.New(slog.NewTextHandler(logs, nil)))
+	if logs.Len() != 0 {
+		t.Fatalf("a registered tool must not be reported unclaimed: %s", logs)
+	}
+}
+
+// TestApplyOverridesUnknownPromptOnUnregisteredFails: a Lua-targeted override
+// referencing a prompt key that does not exist is still a boot error, so a
+// misspelled key cannot silently do nothing until a loop runs.
+func TestApplyOverridesUnknownPromptOnUnregisteredFails(t *testing.T) {
+	r := overrideRegistry()
+	err := r.ApplyOverrides(map[string]config.ToolSpecOverride{
+		"lua:shout": {
+			Description: promptRef("missing"),
+			Params:      map[string]config.ToolParamOverride{"text": {Description: config.PromptString{Value: "also_missing", IsRef: true}}},
+		},
+	}, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("unknown prompt key must fail the boot, got %v", err)
 	}
 }
 

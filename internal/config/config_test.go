@@ -35,10 +35,10 @@ tools:
 	if !ok {
 		t.Fatal("override not decoded")
 	}
-	if o.Description == nil || *o.Description != "Search the deployment's runbooks." {
+	if o.Description == nil || o.Description.Value != "Search the deployment's runbooks." {
 		t.Fatalf("description override not decoded: %+v", o.Description)
 	}
-	if o.Params["query"].Description != "What to look up" {
+	if o.Params["query"].Description.Value != "What to look up" {
 		t.Fatalf("param override not decoded: %+v", o.Params)
 	}
 	if o.NeedsConfirm == nil || !*o.NeedsConfirm {
@@ -358,6 +358,158 @@ func TestValidateLegalSearch(t *testing.T) {
 				t.Fatalf("default = %q, want %q", c.Legal.Default, tt.wantDef)
 			}
 		})
+	}
+}
+
+// TestValidatePrompts: each prompt entry names exactly one source, and every
+// reference into the registry (agent/spawn instructions, tool description
+// overrides) must resolve — a missing key is a boot error, never a silently
+// empty prompt.
+func TestValidatePrompts(t *testing.T) {
+	base := func() *Config {
+		return &Config{
+			Agents:  map[string]Agent{"bot": {Loop: "./loop.lua"}},
+			Prompts: map[string]Prompt{"sys": {Inline: "you are helpful"}},
+		}
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{name: "inline ok", mutate: func(c *Config) {}},
+		{name: "text alias ok", mutate: func(c *Config) { c.Prompts["t"] = Prompt{Text: "alias"} }},
+		{name: "file ok", mutate: func(c *Config) { c.Prompts["f"] = Prompt{File: "./x.md"} }},
+		{
+			name:    "no source",
+			mutate:  func(c *Config) { c.Prompts["empty"] = Prompt{} },
+			wantErr: "has no file, inline, or text",
+		},
+		{
+			name:    "two sources",
+			mutate:  func(c *Config) { c.Prompts["both"] = Prompt{Inline: "a", File: "./x.md"} },
+			wantErr: "more than one",
+		},
+		{
+			name: "instructions prompt ok",
+			mutate: func(c *Config) {
+				c.Agents["bot"] = Agent{Loop: "./loop.lua", Instructions: InstructionsRef{Prompt: "sys"}}
+			},
+		},
+		{
+			name: "instructions unknown prompt",
+			mutate: func(c *Config) {
+				c.Agents["bot"] = Agent{Loop: "./loop.lua", Instructions: InstructionsRef{Prompt: "nope"}}
+			},
+			wantErr: "unknown prompt",
+		},
+		{
+			name: "spawn instructions unknown prompt",
+			mutate: func(c *Config) {
+				c.Profiles.Agent = map[string]SpawnProfile{
+					"w": {Loop: "./w.lua", Instructions: InstructionsRef{Prompt: "nope"}},
+				}
+			},
+			wantErr: "unknown prompt",
+		},
+		{
+			name: "tool description prompt ok",
+			mutate: func(c *Config) {
+				c.Tools.Policy.Overrides = map[string]ToolSpecOverride{
+					"builtin:web_search": {Description: &PromptString{Value: "sys", IsRef: true}},
+				}
+			},
+		},
+		{
+			name: "tool description unknown prompt",
+			mutate: func(c *Config) {
+				c.Tools.Policy.Overrides = map[string]ToolSpecOverride{
+					"builtin:web_search": {Description: &PromptString{Value: "nope", IsRef: true}},
+				}
+			},
+			wantErr: "unknown prompt",
+		},
+		{
+			name: "tool param description unknown prompt",
+			mutate: func(c *Config) {
+				c.Tools.Policy.Overrides = map[string]ToolSpecOverride{
+					"builtin:web_search": {Params: map[string]ToolParamOverride{
+						"query": {Description: PromptString{Value: "nope", IsRef: true}},
+					}},
+				}
+			},
+			wantErr: "unknown prompt",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := base()
+			tt.mutate(c)
+			err := validate("cfg.yaml", c)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("expected error containing %q, got: %v", tt.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected no error, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestInstructionsRefDecode: instructions accepts a scalar file path (the
+// existing shape) or {prompt: <key>}; tool descriptions accept a literal or a
+// prompt reference. Anything else is a decode error under KnownFields.
+func TestInstructionsRefDecode(t *testing.T) {
+	var c Config
+	dec := yaml.NewDecoder(strings.NewReader(`
+version: "1"
+agents:
+  promptbot:
+    loop: builtin:per_chat
+    instructions: {prompt: assistant_system}
+  filebot:
+    loop: builtin:per_chat
+    instructions: ./prompts/filebot.md
+prompts:
+  assistant_system: { inline: "You are the assistant." }
+  from_file: { file: ./prompts/sys.md }
+tools:
+  policy:
+    overrides:
+      "builtin:web_search":
+        description: {prompt: assistant_system}
+        params:
+          query: { description: "literal query help" }
+`))
+	dec.KnownFields(true)
+	if err := dec.Decode(&c); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Agents["promptbot"].Instructions; got.Prompt != "assistant_system" || got.File != "" {
+		t.Fatalf("prompt ref not decoded: %+v", got)
+	}
+	if got := c.Agents["filebot"].Instructions; got.File != "./prompts/filebot.md" || got.Prompt != "" {
+		t.Fatalf("file path not decoded: %+v", got)
+	}
+	o := c.Tools.Policy.Overrides["builtin:web_search"]
+	if o.Description == nil || !o.Description.IsRef || o.Description.Value != "assistant_system" {
+		t.Fatalf("description prompt ref not decoded: %+v", o.Description)
+	}
+	if q := o.Params["query"].Description; q.IsRef || q.Value != "literal query help" {
+		t.Fatalf("literal param description not decoded: %+v", q)
+	}
+
+	// A malformed instructions reference is a decode error, not a silent path.
+	bad := yaml.NewDecoder(strings.NewReader(`
+agents:
+  bot: { loop: builtin:per_chat, instructions: {nope: 1} }
+`))
+	bad.KnownFields(true)
+	if err := bad.Decode(&Config{}); err == nil {
+		t.Fatal("instructions with an unknown key must fail to decode")
 	}
 }
 

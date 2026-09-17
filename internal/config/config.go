@@ -18,21 +18,64 @@ import (
 )
 
 type Config struct {
-	Version  string           `yaml:"version"`
-	Runtime  Runtime          `yaml:"runtime"`
-	Models   map[string]Model `yaml:"models"`
-	Memory   Memory           `yaml:"memory"`
-	Profiles Profiles         `yaml:"profiles"`
-	Gateway  Gateway          `yaml:"gateway"`
-	MCP      MCP              `yaml:"mcp"`
-	Tools    Tools            `yaml:"tools"`
-	Search   Search           `yaml:"search"`
-	Legal    LegalSearch      `yaml:"legal_search"`
-	Media    MediaConfig      `yaml:"media"`
-	Audit    AuditConfig      `yaml:"audit"`
-	Agents   map[string]Agent `yaml:"agents"`
-	Triggers []Trigger        `yaml:"triggers"` // configdir layout; declarative task data for loops
-	Plugins  Plugins          `yaml:"plugins"`
+	Version  string            `yaml:"version"`
+	Runtime  Runtime           `yaml:"runtime"`
+	Models   map[string]Model  `yaml:"models"`
+	Memory   Memory            `yaml:"memory"`
+	Profiles Profiles          `yaml:"profiles"`
+	Gateway  Gateway           `yaml:"gateway"`
+	MCP      MCP               `yaml:"mcp"`
+	Tools    Tools             `yaml:"tools"`
+	Search   Search            `yaml:"search"`
+	Legal    LegalSearch       `yaml:"legal_search"`
+	Media    MediaConfig       `yaml:"media"`
+	Audit    AuditConfig       `yaml:"audit"`
+	Agents   map[string]Agent  `yaml:"agents"`
+	Triggers []Trigger         `yaml:"triggers"` // configdir layout; declarative task data for loops
+	Prompts  map[string]Prompt `yaml:"prompts"`
+	Plugins  Plugins           `yaml:"plugins"`
+}
+
+// Prompt is one registry entry. Exactly one of File, Inline, or Text must be
+// set; Content is filled at load time with the resolved text.
+type Prompt struct {
+	File    string `yaml:"file"`
+	Inline  string `yaml:"inline"`
+	Text    string `yaml:"text"` // alias for inline
+	Content string `yaml:"-"`
+}
+
+// InstructionsRef is either a file path or a reference to a prompt-registry
+// key. YAML: "./prompts/x.md" or {prompt: shared}.
+type InstructionsRef struct {
+	File   string
+	Prompt string
+}
+
+// UnmarshalYAML accepts a scalar file path or a mapping with exactly the key
+// "prompt".
+func (i *InstructionsRef) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		i.File = node.Value
+		return nil
+	case yaml.MappingNode:
+		var m map[string]string
+		if err := node.Decode(&m); err != nil {
+			return err
+		}
+		p, ok := m["prompt"]
+		if !ok {
+			return fmt.Errorf("instructions: expected a file path or {prompt: <key>}")
+		}
+		if len(m) != 1 {
+			return fmt.Errorf("instructions: {prompt: <key>} must contain only the prompt key")
+		}
+		i.Prompt = p
+		return nil
+	default:
+		return fmt.Errorf("instructions: must be a string or {prompt: <key>}")
+	}
 }
 
 // MediaConfig selects the blob-store backend for inbound channel media.
@@ -234,15 +277,15 @@ type ShellProfile struct {
 // references rather than raw memory/shell credentials, and its grants are
 // always intersected with the spawning actor's effective grants.
 type SpawnProfile struct {
-	Model        string   `yaml:"model"`
-	Loop         string   `yaml:"loop"`
-	Instructions string   `yaml:"instructions"`
-	Memory       string   `yaml:"memory"`
-	Shell        string   `yaml:"shell"`
-	Skills       []string `yaml:"skills"`
-	Capabilities []string `yaml:"capabilities"`
-	CanContact   []string `yaml:"can_contact"`
-	Credentials  []string `yaml:"credentials"` // credential.get allow-list for spawned children
+	Model        string          `yaml:"model"`
+	Loop         string          `yaml:"loop"`
+	Instructions InstructionsRef `yaml:"instructions"`
+	Memory       string          `yaml:"memory"`
+	Shell        string          `yaml:"shell"`
+	Skills       []string        `yaml:"skills"`
+	Capabilities []string        `yaml:"capabilities"`
+	CanContact   []string        `yaml:"can_contact"`
+	Credentials  []string        `yaml:"credentials"` // credential.get allow-list for spawned children
 	// Extras is the spawn profile's deployment-specific data (a pm options
 	// block, a workflow name, a goal{...}), surfaced read-only to a spawned
 	// child's loop by agent.config() with secret references rendered opaque.
@@ -307,8 +350,9 @@ type ToolsPolicy struct {
 
 // ToolSpecOverride uses pointers so "not set" is distinct from explicit false/0.
 type ToolSpecOverride struct {
-	// Description replaces the tool's registered description verbatim.
-	Description *string `yaml:"description"`
+	// Description replaces the tool's registered description verbatim, either
+	// as a literal string or as a reference to a prompts: registry key.
+	Description *PromptString `yaml:"description"`
 	// Params shallow-merges into the schema's parameters.properties: refine one
 	// param's description without re-declaring the whole schema. A param the
 	// schema does not declare is skipped with a boot warning, never an error.
@@ -325,7 +369,64 @@ type ToolSpecOverride struct {
 // description is overridable — types and constraints stay owned by the tool's
 // registered Go schema.
 type ToolParamOverride struct {
-	Description string `yaml:"description"`
+	Description PromptString `yaml:"description"`
+}
+
+// PromptString is a string that may instead name a prompts: registry key.
+// YAML: "literal text" or {prompt: <key>}. The zero value is "unset" for
+// value-typed fields (an empty literal and an absent field are the same, as
+// they were for a plain string).
+type PromptString struct {
+	Value string
+	IsRef bool // decoded from the {prompt: <key>} form
+}
+
+// UnmarshalYAML accepts a scalar string or a mapping with exactly the key
+// "prompt".
+func (p *PromptString) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		p.Value = node.Value
+		return nil
+	case yaml.MappingNode:
+		var m map[string]string
+		if err := node.Decode(&m); err != nil {
+			return err
+		}
+		key, ok := m["prompt"]
+		if !ok || len(m) != 1 {
+			return fmt.Errorf("description: expected a string or {prompt: <key>}")
+		}
+		p.Value = key
+		p.IsRef = true
+		return nil
+	default:
+		return fmt.Errorf("description: must be a string or {prompt: <key>}")
+	}
+}
+
+// Resolve returns the text this value stands for given the resolved prompt
+// registry: the literal value, or the registry text when it is a reference.
+// ok is false when a reference names a key the registry does not define.
+func (p PromptString) Resolve(prompts map[string]string) (string, bool) {
+	if !p.IsRef {
+		return p.Value, true
+	}
+	v, ok := prompts[p.Value]
+	return v, ok
+}
+
+// PromptTexts returns the resolved prompt content keyed by prompt name — the
+// map agent.config() surfaces and tool overrides resolve against.
+func (c *Config) PromptTexts() map[string]string {
+	if len(c.Prompts) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(c.Prompts))
+	for name, p := range c.Prompts {
+		out[name] = p.Content
+	}
+	return out
 }
 
 // Search configures the builtin:web_search tool: a set of named engines and
@@ -382,7 +483,7 @@ type Plugins struct {
 type Agent struct {
 	Loop          string            `yaml:"loop"`
 	Model         string            `yaml:"model"`
-	Instructions  string            `yaml:"instructions"`
+	Instructions  InstructionsRef   `yaml:"instructions"`
 	HistoryBudget int               `yaml:"history_budget"`
 	Memory        MemoryAgentConfig `yaml:"memory"`
 	Safety        string            `yaml:"safety"`
@@ -494,7 +595,48 @@ func Load(path string) (*Config, error) {
 	if err := validate(path, &c); err != nil {
 		return nil, err
 	}
+	// Prompt file: paths resolve relative to the config file (a bare relative
+	// path is joined with the file's directory), then the text is read. Direct
+	// instructions: paths keep their existing CWD-relative behavior.
+	rebasePromptFiles(filepath.Dir(path), &c)
+	if err := resolvePrompts(&c); err != nil {
+		return nil, err
+	}
 	return &c, nil
+}
+
+// rebasePromptFiles makes base the resolution base for relative prompt file:
+// paths, leaving absolute paths untouched.
+func rebasePromptFiles(base string, c *Config) {
+	for name, p := range c.Prompts {
+		if p.File != "" && !filepath.IsAbs(p.File) {
+			p.File = filepath.Join(base, p.File)
+		}
+		c.Prompts[name] = p
+	}
+}
+
+// resolvePrompts fills each registry entry's Content with its resolved text:
+// the literal inline/text value, or the contents of the file: path (already
+// rebased against the config base). An unreadable file is a boot error, so a
+// missing prompt never degrades into a silently empty system prompt.
+func resolvePrompts(c *Config) error {
+	for name, p := range c.Prompts {
+		switch {
+		case p.File != "":
+			b, err := os.ReadFile(p.File)
+			if err != nil {
+				return fmt.Errorf("prompt %q: read %s: %w", name, p.File, err)
+			}
+			p.Content = string(b)
+		case p.Inline != "":
+			p.Content = p.Inline
+		case p.Text != "":
+			p.Content = p.Text
+		}
+		c.Prompts[name] = p
+	}
+	return nil
 }
 
 // decodeStrict decodes one YAML document with KnownFields validation after
@@ -536,6 +678,30 @@ func validate(path string, c *Config) error {
 	}
 	if c.Runtime.Credentials.Enabled && c.CredentialsMasterKeyEnv() == "" {
 		return fmt.Errorf("%s: runtime.credentials.enabled requires master_key_env to name the env var holding the master key", path)
+	}
+
+	// Prompt registry: each entry names exactly one source, and every reference
+	// to a prompt key (instructions, tool description overrides) must resolve.
+	for name, p := range c.Prompts {
+		n := 0
+		if p.File != "" {
+			n++
+		}
+		if p.Inline != "" {
+			n++
+		}
+		if p.Text != "" {
+			n++
+		}
+		if n == 0 {
+			return fmt.Errorf("%s: prompt %q has no file, inline, or text", path, name)
+		}
+		if n > 1 {
+			return fmt.Errorf("%s: prompt %q sets more than one of file/inline/text; pick one", path, name)
+		}
+	}
+	if err := validatePromptRefs(path, c); err != nil {
+		return err
 	}
 
 	allowedCaps := map[string]bool{}
@@ -837,6 +1003,37 @@ func validate(path string, c *Config) error {
 		}
 	}
 
+	return nil
+}
+
+// validatePromptRefs checks every reference into the prompts registry: agent
+// and spawn-profile instructions, and tool description overrides. A reference
+// to a key that is not defined is a boot error, never a silent empty prompt.
+func validatePromptRefs(path string, c *Config) error {
+	has := func(key string) bool {
+		_, ok := c.Prompts[key]
+		return ok
+	}
+	for name, a := range c.Agents {
+		if a.Instructions.Prompt != "" && !has(a.Instructions.Prompt) {
+			return fmt.Errorf("%s: agent %q instructions references unknown prompt %q", path, name, a.Instructions.Prompt)
+		}
+	}
+	for pname, p := range c.Profiles.Agent {
+		if p.Instructions.Prompt != "" && !has(p.Instructions.Prompt) {
+			return fmt.Errorf("%s: spawn profile %q instructions references unknown prompt %q", path, pname, p.Instructions.Prompt)
+		}
+	}
+	for tname, o := range c.Tools.Policy.Overrides {
+		if o.Description != nil && o.Description.IsRef && !has(o.Description.Value) {
+			return fmt.Errorf("%s: tool override %q description references unknown prompt %q", path, tname, o.Description.Value)
+		}
+		for pname, po := range o.Params {
+			if po.Description.IsRef && !has(po.Description.Value) {
+				return fmt.Errorf("%s: tool override %q param %q description references unknown prompt %q", path, tname, pname, po.Description.Value)
+			}
+		}
+	}
 	return nil
 }
 

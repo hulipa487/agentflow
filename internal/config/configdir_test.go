@@ -179,8 +179,8 @@ loop: builtin:per_chat
 	if g.Loop != "builtin:per_chat" {
 		t.Fatalf("builtin: ref must not be rebased: %q", g.Loop)
 	}
-	if g.Instructions != absInstr {
-		t.Fatalf("absolute path must not be rebased: %q", g.Instructions)
+	if g.Instructions.File != absInstr {
+		t.Fatalf("absolute path must not be rebased: %q", g.Instructions.File)
 	}
 	if cfg.Gateway.Route != filepath.Join(dir, "routes", "route.lua") {
 		t.Fatalf("route not rebased: %q", cfg.Gateway.Route)
@@ -350,6 +350,123 @@ loop: ./loops/plain.lua
 	// A spawn profile without extras stays nil — no behavior change.
 	if cfg.Profiles.Agent["plain"].Extras != nil {
 		t.Fatalf("plain profile must have no extras: %#v", cfg.Profiles.Agent["plain"].Extras)
+	}
+}
+
+// TestLoadDirPrompts: a prompts: registry in system.yaml resolves both file:
+// (relative to the configdir) and inline:/text: entries, and an instructions:
+// {prompt: <key>} reference in a profile resolves against it.
+func TestLoadDirPrompts(t *testing.T) {
+	dir := writeDir(t, map[string]string{
+		"system.yaml": dirSystem + `
+prompts:
+  assistant_system: { file: ./prompts/assistant.md }
+  kb_header: { inline: "[Knowledge base]" }
+  distiller: { text: "You are a distiller." }
+`,
+		"prompts/assistant.md": "You are the assistant.\n",
+		"profiles/greeter.yaml": `
+name: greeter
+loop: ./loops/greeter.lua
+instructions: {prompt: assistant_system}
+model: default
+`,
+		"profiles/plain.yaml": `
+name: plain
+loop: ./loops/plain.lua
+model: default
+`,
+	})
+	cfg, err := LoadDir(dir, discardLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p := cfg.Prompts["assistant_system"]
+	if want := filepath.Join(dir, "prompts", "assistant.md"); p.File != want {
+		t.Fatalf("prompt file path not rebased: %q want %q", p.File, want)
+	}
+	if p.Content != "You are the assistant.\n" {
+		t.Fatalf("prompt file text not resolved: %q", p.Content)
+	}
+	if got := cfg.Prompts["kb_header"].Content; got != "[Knowledge base]" {
+		t.Fatalf("inline prompt not resolved: %q", got)
+	}
+	if got := cfg.Prompts["distiller"].Content; got != "You are a distiller." {
+		t.Fatalf("text alias prompt not resolved: %q", got)
+	}
+	if got := cfg.Agents["greeter"].Instructions; got.Prompt != "assistant_system" || got.File != "" {
+		t.Fatalf("profile instructions prompt ref not kept: %+v", got)
+	}
+	// A profile with no instructions is unaffected.
+	if got := cfg.Agents["plain"].Instructions; got.File != "" || got.Prompt != "" {
+		t.Fatalf("plain profile instructions must stay empty: %+v", got)
+	}
+
+	texts := cfg.PromptTexts()
+	if len(texts) != 3 || texts["assistant_system"] != "You are the assistant.\n" {
+		t.Fatalf("PromptTexts wrong: %#v", texts)
+	}
+}
+
+// TestLoadDirPromptMissingFile: a file: prompt that cannot be read fails the
+// load — a missing prompt never degrades into a silently empty system prompt.
+func TestLoadDirPromptMissingFile(t *testing.T) {
+	dir := writeDir(t, map[string]string{
+		"system.yaml":         dirSystem + "prompts:\n  sys: { file: ./prompts/nope.md }\n",
+		"profiles/plain.yaml": "name: plain\nloop: builtin:per_chat\n",
+	})
+	if _, err := LoadDir(dir, discardLog()); err == nil || !strings.Contains(err.Error(), "nope.md") {
+		t.Fatalf("unreadable prompt file must fail the load: %v", err)
+	}
+}
+
+// TestLoadDirPromptUnknownKey: a profile referencing a prompt key that the
+// registry does not define is a boot error, not a silently empty prompt.
+func TestLoadDirPromptUnknownKey(t *testing.T) {
+	dir := writeDir(t, map[string]string{
+		"system.yaml": dirSystem + "prompts:\n  sys: { inline: \"hi\" }\n",
+		"profiles/bot.yaml": `
+name: bot
+loop: builtin:per_chat
+instructions: {prompt: ghost}
+`,
+	})
+	if _, err := LoadDir(dir, discardLog()); err == nil || !strings.Contains(err.Error(), "ghost") {
+		t.Fatalf("unknown prompt key must fail the load: %v", err)
+	}
+}
+
+// TestLoadPromptFileRelativeToConfigFile: the single-file path resolves a
+// prompt file: relative to the config file's own directory, so a deployment
+// can be laid out self-contained regardless of the process CWD.
+func TestLoadPromptFileRelativeToConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "prompts"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "prompts", "sys.md"), []byte("SYS"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "agentflow.yaml")
+	if err := os.WriteFile(cfgPath, []byte(`
+version: "1"
+agents:
+  bot: { loop: builtin:per_chat, instructions: {prompt: sys} }
+prompts:
+  sys: { file: ./prompts/sys.md }
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Prompts["sys"].Content; got != "SYS" {
+		t.Fatalf("prompt file not read relative to the config file: %q", got)
+	}
+	if got := cfg.Agents["bot"].Instructions.Prompt; got != "sys" {
+		t.Fatalf("instructions prompt ref lost: %q", got)
 	}
 }
 

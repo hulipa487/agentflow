@@ -12,8 +12,8 @@
 // single-file path, and validation runs only after the merge, so cross-file
 // references (can_contact, workflow step targets, channel agents) check
 // exactly as they do today. <dir> becomes the resolution base for every
-// relative path in the merged config (loops, instructions, router route,
-// persistence, sqlite backend paths, shell key_file).
+// relative path in the merged config (loops, instructions, prompt files,
+// router route, persistence, sqlite backend paths, shell key_file).
 package config
 
 import (
@@ -158,6 +158,10 @@ func LoadDir(dir string, log *slog.Logger) (*Config, error) {
 	// Rebase last so defaults applied by validate (runtime.persistence) pick
 	// up the directory base too. Validation only checks references, not paths.
 	rebaseConfigPaths(dir, c)
+	// Prompt text is read after rebasing so file: paths resolve against dir.
+	if err := resolvePrompts(c); err != nil {
+		return nil, err
+	}
 	return c, nil
 }
 
@@ -283,13 +287,17 @@ func budgetMapString(m map[string]any, key string) string {
 func rebaseConfigPaths(dir string, c *Config) {
 	for name, a := range c.Agents {
 		a.Loop = rebasePath(dir, a.Loop)
-		a.Instructions = rebasePath(dir, a.Instructions)
+		a.Instructions.File = rebasePath(dir, a.Instructions.File)
 		c.Agents[name] = a
 	}
 	for name, p := range c.Profiles.Agent {
 		p.Loop = rebasePath(dir, p.Loop)
-		p.Instructions = rebasePath(dir, p.Instructions)
+		p.Instructions.File = rebasePath(dir, p.Instructions.File)
 		c.Profiles.Agent[name] = p
+	}
+	for name, p := range c.Prompts {
+		p.File = rebasePath(dir, p.File)
+		c.Prompts[name] = p
 	}
 	c.Gateway.Route = rebasePath(dir, c.Gateway.Route)
 	c.Runtime.Persistence = rebasePersistence(dir, c.Runtime.Persistence)

@@ -214,6 +214,35 @@ func OpaqueMarker(raw string) any {
 	}
 }
 
+// OpaqueValue walks arbitrary config data (maps, slices, strings — the shape
+// of Agent.Extras) and renders every string that is a whole secret reference
+// as its opaque marker. Non-reference strings pass through; the walk never
+// resolves anything.
+func OpaqueValue(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, val := range t {
+			out[k] = OpaqueValue(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, val := range t {
+			out[i] = OpaqueValue(val)
+		}
+		return out
+	case string:
+		ref := ParseSecretRef(t)
+		if ref.Cred != "" || ref.Env != "" {
+			return OpaqueMarker(t)
+		}
+		return t
+	default:
+		return v
+	}
+}
+
 // Resolver resolves lazy secret references at consumer construction. The
 // order is process env, then the credential store (engine-wide, under the
 // empty user UUID), then unresolvable. A nil/absent store makes cred:

@@ -1,9 +1,10 @@
 // shim.h — C ABI between Go and the Luau VM (implemented in shim.cpp).
 //
 // One afvm owns one lua_State (main) plus one loop thread (coroutine).
-// All values cross the boundary as JSON strings; the single Lua-visible
-// primitive is `__af_op(request_json)` which YIELDS — Go handles the op
-// and resumes with (response_json, ok).
+// All values cross the boundary as JSON strings; the Lua-visible primitives
+// are `__af_op(request_json)`, which YIELDS (Go handles the op and resumes
+// with (response_json, ok)), and `__af_now()`, which returns the wall clock
+// as Unix seconds without yielding.
 #ifndef AF_SHIM_H
 #define AF_SHIM_H
 

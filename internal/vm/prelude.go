@@ -377,10 +377,13 @@ end
 -- applied before shadowing, so a hidden declared tool does not suppress a
 -- visible Go tool of the same name.
 --
--- tools.run still dispatches a declared name unconditionally: a loop may call
--- its own tool internally, and visibility is a rule about the model's surface,
--- not about the loop's own code. So a hidden declared tool that shares a name
--- with a Go tool still handles tools.run for that name.
+-- tools.run applies the same rule: a declared name this agent cannot see is
+-- not dispatchable and falls through to the Go path, which answers
+-- not-available like it does for any other invisible tool. Registered tools
+-- were always refused at dispatch, and tools.run is the model-facing path — the
+-- one a hallucinated or injected tool call travels — so the two must agree. A
+-- loop that wants its own handler can call the function directly; it does not
+-- need tools.run to reach a tool its model is not shown.
 --
 -- Declared tools are the loop's own code: the Go tools policy (forbidden,
 -- needs_confirm, permission: forbidden) does not gate them.
@@ -433,20 +436,25 @@ local function tool_override_params(params, ovparams)
   return out
 end
 
+-- tool_declared asks the engine which of these declared names this agent can
+-- see, and for the config overrides targeting them. Both tools.list and
+-- tools.run go through it, so the surface the model is shown and the surface
+-- it can invoke are decided by one answer.
+local function tool_declared(names)
+  local res = op({ type = "tools.declared", tool_names = names }) or {}
+  return res.visible or {}, res.overrides or {}
+end
+
 function tools.list()
-  -- Ask which declared tools this agent can see, and for the config
-  -- overrides targeting them. The full declared set goes over the wire either
-  -- way: a declared-but-hidden tool still counts as declared, so an override
-  -- aimed at it is not reported as naming nothing. Resolved per call against
-  -- the live prompt registry, so a reloaded file:-backed prompt shows up here
-  -- without a session restart.
+  -- The full declared set goes over the wire either way: a declared-but-hidden
+  -- tool still counts as declared, so an override aimed at it is not reported
+  -- as naming nothing. Resolved per call against the live prompt registry, so
+  -- a reloaded file:-backed prompt shows up here without a session restart.
   local visible, overrides = {}, {}
   if next(lua_tools) ~= nil then
     local names = {}
     for name in pairs(lua_tools) do names[#names + 1] = name end
-    local res = op({ type = "tools.declared", tool_names = names }) or {}
-    visible = res.visible or {}
-    overrides = res.overrides or {}
+    visible, overrides = tool_declared(names)
   end
 
   local out = {}
@@ -477,6 +485,15 @@ end
 function tools.run(name, args, opts)
   local spec = lua_tools[name]
   if spec == nil then
+    return go_tools_run(name, args, opts)
+  end
+  -- A declared tool this agent cannot see is not dispatchable either: it is
+  -- absent from tools.list, so a call naming it can only come from a
+  -- hallucinated or injected tool call. Registered tools are already refused
+  -- at dispatch; this makes the two surfaces agree. Fall through to the Go
+  -- path so the answer is the same not-available result.
+  local visible = tool_declared({ name })
+  if not visible[name] then
     return go_tools_run(name, args, opts)
   end
   local ok, res = pcall(spec.handler, args or {})

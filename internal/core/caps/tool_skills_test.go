@@ -259,3 +259,65 @@ func TestHiddenDeclaredToolStillCountsAsDeclared(t *testing.T) {
 		t.Fatalf("a genuinely unclaimed override was not reported:\n%s", fx.logs.String())
 	}
 }
+
+// TestHiddenDeclaredToolIsNotDispatchable: a declared tool the agent cannot
+// see is refused at tools.run too, not just omitted from tools.list. It falls
+// through to the Go path, whose "not available" reaches Lua as an error raise —
+// the same answer an invisible registered tool gives. Before this, the handler
+// ran: tools.list() returned nothing while tools.run("lua:secret") still
+// executed it, so a hallucinated or injected tool call could reach a tool
+// skills: was meant to hide.
+func TestHiddenDeclaredToolIsNotDispatchable(t *testing.T) {
+	fx := newToolDefFixture(t, nil, nil)
+	// No skills and default none: the agent sees no tools at all.
+	as := fx.agentFor(nil, config.ToolsPolicy{Default: "none"})
+	got := fx.runLoopAs(t, as, `
+tool.def({
+  name = "lua:secret",
+  handler = function(args)
+    session.send("HANDLER-RAN")
+    return { ok = true, leaked = "RAN" }
+  end,
+})
+function loop()
+  local msg = session.inbox()
+  local n = 0
+  for _ in ipairs(tools.list()) do n = n + 1 end
+  local ok, res = pcall(tools.run, "lua:secret", {})
+  if ok then
+    session.send("DISPATCHED|" .. tostring(res.leaked))
+    return
+  end
+  session.send(n .. "|refused|" .. tostring(res))
+end
+`)
+	if strings.Contains(got, "HANDLER-RAN") || strings.HasPrefix(got, "DISPATCHED") {
+		t.Fatalf("the hidden handler ran: %q", got)
+	}
+	if !strings.HasPrefix(got, "0|refused|") {
+		t.Fatalf("got %q; want an empty surface and a refused call", got)
+	}
+	if !strings.Contains(got, "not available") {
+		t.Fatalf("got %q; want the same not-available answer a registered tool gives", got)
+	}
+}
+
+// TestVisibleDeclaredToolIsDispatchable: the refusal is scoped to hidden tools
+// — a declared tool the agent can see still dispatches to its Lua handler.
+func TestVisibleDeclaredToolIsDispatchable(t *testing.T) {
+	fx := newToolDefFixture(t, nil, nil)
+	as := fx.agentFor([]string{"lua:ok"}, config.ToolsPolicy{})
+	got := fx.runLoopAs(t, as, `
+tool.def({
+  name = "lua:ok",
+  handler = function(args) return { ok = true, ran = "YES" } end,
+})
+function loop()
+  local msg = session.inbox()
+  session.send(tostring(tools.run("lua:ok", {}).ran))
+end
+`)
+	if got != "YES" {
+		t.Fatalf("got %q; want the visible declared tool to dispatch", got)
+	}
+}

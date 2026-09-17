@@ -274,6 +274,14 @@ func main() {
 		os.Exit(1)
 	}
 	luaOverrides := tools.NewLuaOverrides(cfg.Tools.Policy.Overrides, toolReg.Names())
+	// An override naming no registered tool is waiting on a loop to declare it.
+	// Say so once at boot: the per-name warning only fires when a loop reports
+	// its declared tools, which happens inside a work turn, so without this a
+	// misspelling stays quiet until some agent is spoken to.
+	if pending := luaOverrides.Pending(); len(pending) > 0 {
+		log.Info("tools.policy.overrides: not registered; held for a Lua-declared tool",
+			"tools", pending)
+	}
 
 	// Media blob store: one per process. Channels with a media policy land
 	// inbound media here; llm caps resolve handles at request time. Backend

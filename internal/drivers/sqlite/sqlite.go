@@ -280,6 +280,17 @@ func (h *Handle) GC(table string, window int) error {
 	return err
 }
 
+// rowsIter streams a SQLite result set lazily, unlike the PostgreSQL and
+// MongoDB drivers, which drain into memory.DrainRows before returning.
+//
+// That asymmetry is deliberate, not an oversight: those drivers bound their
+// query to a context with a timeout and cancelled it on return, so a cursor
+// handed back live would be torn down before the caller read it. This driver
+// calls db.Query with no context in every query path below, so there is no
+// cancel to outlive and holding the rows open is safe. If a context is ever
+// added here, switch these paths to memory.DrainRows rather than adding a
+// cancel — the bug that pattern causes is intermittent and reads as a
+// cold-start failure.
 type rowsIter struct {
 	rows *sql.Rows
 	rec  memory.Record

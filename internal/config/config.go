@@ -988,7 +988,7 @@ func validate(path string, c *Config) error {
 
 	for bname, b := range c.Memory.Backends {
 		switch b.Provider {
-		case "builtin:sqlite", "builtin:redis", "builtin:mongodb", "builtin:postgres", "builtin:pgvector", "builtin:volatile":
+		case "builtin:sqlite", "builtin:redis", "builtin:mongodb", "builtin:postgres", "builtin:pgvector", "builtin:qdrant", "builtin:redisvector", "builtin:volatile":
 		default:
 			return fmt.Errorf("%s: memory backend %q has unsupported provider %q", path, bname, b.Provider)
 		}

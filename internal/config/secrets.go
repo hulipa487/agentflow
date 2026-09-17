@@ -32,6 +32,7 @@ var secretPathPatterns = []string{
 	"gateway.channels.[].secret",
 	"memory.backends.*.config.url",
 	"memory.backends.*.config.password",
+	"memory.backends.*.config.api_key",
 	"media.s3.access_key",
 	"media.s3.secret_key",
 	"profiles.shell.*.password",

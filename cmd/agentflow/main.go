@@ -50,7 +50,9 @@ import (
 	"agentflow/internal/drivers/mongodb"
 	"agentflow/internal/drivers/pgvector"
 	"agentflow/internal/drivers/postgres"
+	"agentflow/internal/drivers/qdrant"
 	"agentflow/internal/drivers/redis"
+	"agentflow/internal/drivers/redisvector"
 	"agentflow/internal/drivers/s3media"
 	"agentflow/internal/drivers/search"
 	"agentflow/internal/drivers/shell"
@@ -167,6 +169,8 @@ func main() {
 	memReg.RegisterProvider(mongodb.Provider{})
 	memReg.RegisterProvider(postgres.Provider{})
 	memReg.RegisterProvider(pgvector.Provider{})
+	memReg.RegisterProvider(qdrant.Provider{})
+	memReg.RegisterProvider(redisvector.Provider{})
 	memReg.RegisterProvider(volatile.Provider{})
 	for _, a := range cfg.Agents {
 		_ = cfg.ResolveMemoryProfile(a)
@@ -1106,7 +1110,7 @@ func resolveBackendSecrets(ctx context.Context, res *config.Resolver, name strin
 	for k, v := range b.Config {
 		out[k] = v
 	}
-	for _, key := range []string{"url", "password"} {
+	for _, key := range []string{"url", "password", "api_key"} {
 		raw, ok := out[key].(string)
 		if !ok || raw == "" {
 			continue

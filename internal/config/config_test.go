@@ -513,6 +513,36 @@ agents:
 	}
 }
 
+// TestValidateMemoryBackendProviders: every provider the engine registers is
+// accepted, and an unknown name is still a boot error. The two lists — this
+// switch and the RegisterProvider calls in main.go — have to stay in step, or
+// a config naming a real provider fails validation before it can be opened.
+func TestValidateMemoryBackendProviders(t *testing.T) {
+	supported := []string{
+		"builtin:sqlite", "builtin:redis", "builtin:mongodb", "builtin:postgres",
+		"builtin:pgvector", "builtin:qdrant", "builtin:redisvector", "builtin:volatile",
+	}
+	for _, provider := range supported {
+		t.Run(provider, func(t *testing.T) {
+			c := &Config{
+				Agents: map[string]Agent{"bot": {Loop: "./loop.lua"}},
+				Memory: Memory{Backends: map[string]Backend{"b": {Provider: provider}}},
+			}
+			if err := validate("cfg.yaml", c); err != nil {
+				t.Fatalf("provider %q must validate: %v", provider, err)
+			}
+		})
+	}
+
+	c := &Config{
+		Agents: map[string]Agent{"bot": {Loop: "./loop.lua"}},
+		Memory: Memory{Backends: map[string]Backend{"b": {Provider: "builtin:pinecone"}}},
+	}
+	if err := validate("cfg.yaml", c); err == nil || !strings.Contains(err.Error(), "unsupported provider") {
+		t.Fatalf("an unknown provider must fail the boot, got %v", err)
+	}
+}
+
 // TestValidateTimezoneOffset: the cron matching offset is a fixed UTC offset
 // in the real-world range, and TimezoneOffset converts it to a duration.
 func TestValidateTimezoneOffset(t *testing.T) {

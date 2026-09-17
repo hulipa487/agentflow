@@ -142,6 +142,11 @@ search:
 media:
   backend: s3
   s3: { bucket: b, region: r, access_key: "${S3_AK}", secret_key: literal-secret }
+memory:
+  backends:
+    vec:
+      provider: builtin:qdrant
+      config: { url: "${QDRANT_URL}", api_key: "${QDRANT_KEY}" }
 profiles:
   shell:
     box: { provider: ssh, host: h, user: u, password: "${BOX_PW}" }
@@ -185,6 +190,16 @@ triggers:
 	}
 	if got := cfg.Gateway.Channels[0].Token; got != "${TG_TOKEN}" {
 		t.Fatalf("channel token must stay raw, got %q", got)
+	}
+	// A backend api_key is a secret like url/password: raw here, resolved by
+	// the consumer. Expanding it at load would hand the driver a literal that
+	// looks like a credential reference.
+	vec := cfg.Memory.Backends["vec"].Config
+	if got := vec["url"]; got != "${QDRANT_URL}" {
+		t.Fatalf("backend url must stay raw, got %v", got)
+	}
+	if got := vec["api_key"]; got != "${QDRANT_KEY}" {
+		t.Fatalf("backend api_key must stay raw, got %v", got)
 	}
 
 	// Non-secret fields: expanded at load, as today.

@@ -39,16 +39,34 @@ func ToolHandlers(agentSet *tools.AgentSet, w ToolWiring) map[string]session.OpH
 			return string(b), true
 		},
 
-		// tools.overrides answers a loop's declared tool names with the
-		// config overrides targeting them. It resolves here rather than at
-		// boot so the text is current: the prompt registry is snapshotted per
-		// call, and the reload watcher rewrites it from its own goroutine.
-		"tools.overrides": func(ctx context.Context, op session.Op) (string, bool) {
-			res := w.LuaOverrides.For(op.ToolNames, w.Prompts.Snapshot(), w.Log)
-			if res == nil {
-				res = map[string]tools.ResolvedOverride{}
+		// tools.declared answers a loop's declared tool names: which of them
+		// this agent's skills/policy expose, and the config overrides
+		// targeting them. It resolves here rather than at boot so the text is
+		// current: the prompt registry is snapshotted per call, and the reload
+		// watcher rewrites it from its own goroutine.
+		//
+		// Visibility is the same rule Expose applied to the Go tools, taken
+		// from the agent's own set. The full declared-name list is reported to
+		// the overrides resolver either way, so a declared-but-hidden tool
+		// still counts as declared and its override is not misreported as
+		// unclaimed.
+		"tools.declared": func(ctx context.Context, op session.Op) (string, bool) {
+			visible := map[string]bool{}
+			if agentSet != nil {
+				for _, name := range op.ToolNames {
+					if agentSet.Visible.Allows(name) {
+						visible[name] = true
+					}
+				}
 			}
-			b, err := json.Marshal(res)
+			overrides := w.LuaOverrides.For(op.ToolNames, w.Prompts.Snapshot(), w.Log)
+			if overrides == nil {
+				overrides = map[string]tools.ResolvedOverride{}
+			}
+			b, err := json.Marshal(map[string]any{
+				"visible":   visible,
+				"overrides": overrides,
+			})
 			if err != nil {
 				return fmt.Sprintf("%q", err.Error()), false
 			}

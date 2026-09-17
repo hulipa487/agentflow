@@ -366,11 +366,24 @@ end
 -- Lua-declared tools: a loop (or a support chunk) registers its own
 -- model-visible tools with tool.def. Declared tools merge into tools.list and
 -- intercept tools.run; the handler runs synchronously on the loop coroutine,
--- so it may itself call any op (llm.chat, memory.*, ...). A declared name
--- shadows a Go-registered tool of the same name in both list and run.
+-- so it may itself call any op (llm.chat, memory.*, ...).
+--
+-- Visibility follows the same rule as Go-registered tools: the agent's skills
+-- list, or tools.policy.default when skills is empty. A declared tool this
+-- agent cannot see is left out of tools.list — which is what lets one shared
+-- loop directory carry tools only some agents get. That is a behavior change
+-- for a deployment with tools.policy.default: none and no skills: declared
+-- tools used to be listed unconditionally and now are not. The filter is
+-- applied before shadowing, so a hidden declared tool does not suppress a
+-- visible Go tool of the same name.
+--
+-- tools.run still dispatches a declared name unconditionally: a loop may call
+-- its own tool internally, and visibility is a rule about the model's surface,
+-- not about the loop's own code. So a hidden declared tool that shares a name
+-- with a Go tool still handles tools.run for that name.
+--
 -- Declared tools are the loop's own code: the Go tools policy (forbidden,
--- needs_confirm) does not gate them, and they are listed whether or not the
--- agent's skills name them.
+-- needs_confirm, permission: forbidden) does not gate them.
 --
 -- tools.policy.overrides may target a declared tool by name: its description
 -- (literal or {prompt: key} from the prompts registry) replaces the spec's,
@@ -421,32 +434,42 @@ local function tool_override_params(params, ovparams)
 end
 
 function tools.list()
+  -- Ask which declared tools this agent can see, and for the config
+  -- overrides targeting them. The full declared set goes over the wire either
+  -- way: a declared-but-hidden tool still counts as declared, so an override
+  -- aimed at it is not reported as naming nothing. Resolved per call against
+  -- the live prompt registry, so a reloaded file:-backed prompt shows up here
+  -- without a session restart.
+  local visible, overrides = {}, {}
+  if next(lua_tools) ~= nil then
+    local names = {}
+    for name in pairs(lua_tools) do names[#names + 1] = name end
+    local res = op({ type = "tools.declared", tool_names = names }) or {}
+    visible = res.visible or {}
+    overrides = res.overrides or {}
+  end
+
   local out = {}
   for _, def in ipairs(go_tools_list()) do
     local f = def["function"]
-    if not (f and lua_tools[f.name]) then
+    -- A visible declared tool shadows a Go tool of the same name. One this
+    -- agent cannot see must not suppress the Go tool.
+    if not (f and visible[f.name]) then
       out[#out + 1] = def
     end
   end
-  if next(lua_tools) == nil then
-    return out
-  end
-  -- Ask for the config overrides targeting the tools this chunk declared.
-  -- Resolved per call against the live prompt registry, so a reloaded
-  -- file:-backed prompt shows up here without a session restart.
-  local names = {}
-  for name in pairs(lua_tools) do names[#names + 1] = name end
-  local overrides = op({ type = "tools.overrides", tool_names = names }) or {}
   for name, spec in pairs(lua_tools) do
-    local ov = overrides[name]
-    out[#out + 1] = {
-      type = "function",
-      ["function"] = {
-        name = name,
-        description = (ov and ov.description) or spec.description or "",
-        parameters = tool_override_params(spec.params, ov and ov.params),
-      },
-    }
+    if visible[name] then
+      local ov = overrides[name]
+      out[#out + 1] = {
+        type = "function",
+        ["function"] = {
+          name = name,
+          description = (ov and ov.description) or spec.description or "",
+          parameters = tool_override_params(spec.params, ov and ov.params),
+        },
+      }
+    end
   end
   return out
 end

@@ -9,10 +9,15 @@
 //
 // Async bridge: the Lua-visible `__af_op(request_json)` C function yields;
 // the host (Go) handles the op and resumes with (response_json, ok).
+//
+// Wall clock: the Lua-visible `__af_now()` C function returns the process
+// wall clock as Unix seconds. It is the only clock the sandbox has; the
+// prelude builds os.time/os.date (UTC) on top of it.
 #include "shim.h"
 
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 #include <string>
 #include <string_view>
 
@@ -60,6 +65,14 @@ static int af_op(lua_State* L) {
     return lua_yield(L, 1);
 }
 
+// Lua-visible: __af_now() -> unix seconds (wall clock; whole seconds).
+// Cheap and non-yielding, so the prelude's os.time/os.date work anywhere —
+// including chunks evaluated outside the loop thread.
+static int af_now(lua_State* L) {
+    lua_pushnumber(L, (double)time(NULL));
+    return 1;
+}
+
 // ------------------------------------------------------------------ libs ---
 
 static void open_libs(lua_State* L) {
@@ -96,6 +109,8 @@ afvm* afvm_new(long instr_budget) {
 
     lua_pushcfunction(v->L, af_op, "__af_op");
     lua_setglobal(v->L, "__af_op");
+    lua_pushcfunction(v->L, af_now, "__af_now");
+    lua_setglobal(v->L, "__af_now");
     return v;
 }
 

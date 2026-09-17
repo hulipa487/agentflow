@@ -474,10 +474,127 @@ function http.post(url, body, opts)
   opts = opts or {}; opts.method = "POST"; opts.url = url; opts.body = body; return http.request(opts)
 end
 
--- os.env reads a process environment variable at call time (for API keys and
--- other secrets that must not be hardcoded in Lua source). Returns "" if unset.
+-- os: the sandbox's minimal process surface. os.env reads a process
+-- environment variable at call time (for API keys and other secrets that must
+-- not be hardcoded in Lua source); it returns "" if unset. os.time/os.date are
+-- the wall clock, UTC only (see below). No other os.* exists — there is no
+-- io, no filesystem, no process control.
 os = {}
 function os.env(name) return op({ type = "os.env", name = name }) end
+
+-- Wall clock. Everything here is UTC: the engine has no notion of a local
+-- timezone, so the fields are the same on every host. The native primitive is
+-- __af_now() (Unix seconds, from the process clock).
+local SECS_PER_DAY = 86400
+
+-- days-since-epoch -> y, m, d (Howard Hinnant's civil_from_days).
+local function civil_from_days(z)
+  z = z + 719468
+  local era = math.floor(z / 146097)
+  local doe = z - era * 146097
+  local yoe = math.floor((doe - math.floor(doe / 1460) + math.floor(doe / 36524) - math.floor(doe / 146096)) / 365)
+  local y = yoe + era * 400
+  local doy = doe - (365 * yoe + math.floor(yoe / 4) - math.floor(yoe / 100))
+  local mp = math.floor((5 * doy + 2) / 153)
+  local d = doy - math.floor((153 * mp + 2) / 5) + 1
+  local m = mp + (mp < 10 and 3 or -9)
+  if m <= 2 then y = y + 1 end
+  return y, m, d
+end
+
+local function days_from_civil(y, m, d)
+  if m <= 2 then y = y - 1 end
+  local era = math.floor(y / 400)
+  local yoe = y - era * 400
+  local mp = (m + 9) % 12
+  local doy = math.floor((153 * mp + 2) / 5) + d - 1
+  local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+  return era * 146097 + doe - 719468
+end
+
+local WDAY = { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" }
+local MONTH = { "January", "February", "March", "April", "May", "June",
+                "July", "August", "September", "October", "November", "December" }
+
+-- The Lua os.date table for a UTC instant: year/month/day/hour/min/sec, wday
+-- (1 = Sunday .. 7 = Saturday), yday (1-366), isdst (always false).
+local function date_fields(t)
+  local days = math.floor(t / SECS_PER_DAY)
+  local secs = t - days * SECS_PER_DAY
+  local y, m, d = civil_from_days(days)
+  return {
+    year = y, month = m, day = d,
+    hour = math.floor(secs / 3600),
+    min = math.floor((secs % 3600) / 60),
+    sec = secs % 60,
+    wday = (days + 4) % 7 + 1,
+    yday = days - days_from_civil(y, 1, 1) + 1,
+    isdst = false,
+  }
+end
+
+local function pad2(n) return string.format("%02d", n) end
+
+-- strftime subset: %Y %y %m %d %e %H %I %M %S %p %A %a %B %b %j %w %u %Z %%.
+-- An unknown directive is left verbatim (a literal "%" then the character).
+local function strftime(f, t)
+  local dt = date_fields(t)
+  return (f:gsub("%%([%a%%])", function(c)
+    if c == "Y" then return string.format("%04d", dt.year) end
+    if c == "y" then return pad2(dt.year % 100) end
+    if c == "m" then return pad2(dt.month) end
+    if c == "d" then return pad2(dt.day) end
+    if c == "e" then return string.format("%2d", dt.day) end
+    if c == "H" then return pad2(dt.hour) end
+    if c == "I" then return pad2(((dt.hour + 11) % 12) + 1) end
+    if c == "M" then return pad2(dt.min) end
+    if c == "S" then return pad2(dt.sec) end
+    if c == "p" then return dt.hour < 12 and "AM" or "PM" end
+    if c == "A" then return WDAY[dt.wday] end
+    if c == "a" then return string.sub(WDAY[dt.wday], 1, 3) end
+    if c == "B" then return MONTH[dt.month] end
+    if c == "b" then return string.sub(MONTH[dt.month], 1, 3) end
+    if c == "j" then return string.format("%03d", dt.yday) end
+    if c == "w" then return tostring(dt.wday - 1) end
+    if c == "u" then return tostring(dt.wday == 1 and 7 or dt.wday - 1) end
+    if c == "Z" then return "UTC" end
+    if c == "%" then return "%" end
+    return "%" .. c
+  end))
+end
+
+-- os.time() -> Unix seconds, no arguments. (Real Lua's os.time(table) is not
+-- implemented: a table would silently mean "now" here, which is worse than an
+-- error. Convert with os.date/os.time arithmetic instead.)
+function os.time(...)
+  if select("#", ...) > 0 then
+    error("os.time: takes no arguments (UTC Unix seconds)", 2)
+  end
+  return __af_now()
+end
+
+-- os.date([format,] time) -> a UTC date table, or a formatted string when
+-- the format is a strftime string ("*t"/"!*t"/nil all return the table; a
+-- leading "!" is accepted and is a no-op because the clock is always UTC).
+-- The time argument is Unix seconds and defaults to now.
+function os.date(format, t)
+  if type(format) == "number" and t == nil then
+    t, format = format, nil
+  end
+  if t == nil then t = __af_now() end
+  if type(t) ~= "number" then
+    error("os.date: time must be a number (Unix seconds)", 2)
+  end
+  if format == nil or format == "" or format == "*t" or format == "!*t" then
+    return date_fields(t)
+  end
+  if type(format) ~= "string" then
+    error("os.date: format must be a string", 2)
+  end
+  if string.sub(format, 1, 1) == "!" then format = string.sub(format, 2) end
+  if format == "*t" then return date_fields(t) end
+  return strftime(format, t)
+end
 
 -- runtime.config surface: deployment configuration as read-only Lua data.
 runtime = {}
@@ -485,7 +602,9 @@ runtime = {}
 -- {profile}, payload, and the schedule fields (event={channel,match} |
 -- cron | every) }, ... ] } — the merged triggers/*.yaml (or top-level
 -- triggers:) list, snapshotted at boot. This replaces baking CRON_TASKS /
--- ROUTES tables into Lua source; cron expressions pass through verbatim.
+-- ROUTES tables into Lua source. every:/cron: entries are also fired by the
+-- engine itself; reading them here is unchanged and still safe (the shape is
+-- stable), so a loop can use the schedule data for its own bookkeeping.
 function runtime.triggers()
   return op({ type = "runtime.triggers" })
 end

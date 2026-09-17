@@ -57,10 +57,10 @@ type Handle struct {
 // doc is the stored record shape. The ID is the logical key; the table name
 // is the collection name.
 type doc struct {
-	ID        string    `bson:"_id"`
-	Value     any       `bson:"value"`
-	UpdatedAt int64     `bson:"updated_at"`
-	ExpiresAt *int64    `bson:"expires_at,omitempty"`
+	ID        string `bson:"_id"`
+	Value     any    `bson:"value"`
+	UpdatedAt int64  `bson:"updated_at"`
+	ExpiresAt *int64 `bson:"expires_at,omitempty"`
 }
 
 func (h *Handle) Put(table, key string, value any, opts memory.PutOpts) error {
@@ -125,7 +125,26 @@ func (h *Handle) queryPrefix(table, prefix string) (memory.Iterator, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &mongoIter{cur: cur}, nil
+	// Drained here, while ctx is alive: the cursor is bound to the context
+	// Find was given, so the deferred cancel would tear it down mid-iteration.
+	// The engine materializes the whole result set anyway.
+	var recs []memory.Record
+	for cur.Next(ctx) {
+		var d doc
+		if err := cur.Decode(&d); err != nil {
+			_ = cur.Close(ctx)
+			return nil, err
+		}
+		recs = append(recs, memory.Record{Key: d.ID, Value: d.Value})
+	}
+	if err := cur.Err(); err != nil {
+		_ = cur.Close(ctx)
+		return nil, err
+	}
+	if err := cur.Close(ctx); err != nil {
+		return nil, err
+	}
+	return memory.NewSliceIterator(recs), nil
 }
 
 func (h *Handle) queryAll(table string) (memory.Iterator, error) {
@@ -180,38 +199,4 @@ func (h *Handle) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return h.client.Disconnect(ctx)
-}
-
-type mongoIter struct {
-	cur   *mongo.Cursor
-	rec   memory.Record
-	err   error
-	ready bool
-}
-
-func (it *mongoIter) Next() bool {
-	if it.err != nil {
-		return false
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if !it.cur.Next(ctx) {
-		it.err = it.cur.Err()
-		return false
-	}
-	var d doc
-	if err := it.cur.Decode(&d); err != nil {
-		it.err = err
-		return false
-	}
-	it.rec = memory.Record{Key: d.ID, Value: d.Value}
-	return true
-}
-
-func (it *mongoIter) Record() memory.Record { return it.rec }
-func (it *mongoIter) Err() error {
-	if it.err != nil {
-		return it.err
-	}
-	return it.cur.Err()
 }

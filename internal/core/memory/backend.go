@@ -29,14 +29,14 @@ type PutOpts struct {
 
 // Query describes a backend query.
 type Query struct {
-	Kind   string         // "prefix" | "text" | "vector" | "time_range" | "all"
-	Prefix string         // Kind == "prefix"
-	Text   string         // Kind == "text"
-	Vector []float32      // Kind == "vector"
-	K      int            // Kind == "vector" / "text"
-	From   time.Time      // Kind == "time_range"
-	To     time.Time      // Kind == "time_range"
-	Table  string         // optional logical table filter
+	Kind   string    // "prefix" | "text" | "vector" | "time_range" | "all"
+	Prefix string    // Kind == "prefix"
+	Text   string    // Kind == "text"
+	Vector []float32 // Kind == "vector"
+	K      int       // Kind == "vector" / "text"
+	From   time.Time // Kind == "time_range"
+	To     time.Time // Kind == "time_range"
+	Table  string    // optional logical table filter
 }
 
 // Iterator is a pull-style query result.
@@ -49,9 +49,41 @@ type Iterator interface {
 // EmptyIterator is a finished iterator.
 type EmptyIterator struct{}
 
-func (EmptyIterator) Next() bool    { return false }
+func (EmptyIterator) Next() bool     { return false }
 func (EmptyIterator) Record() Record { return Record{} }
-func (EmptyIterator) Err() error    { return nil }
+func (EmptyIterator) Err() error     { return nil }
+
+// SliceIterator is an Iterator over an already-materialized result set. A
+// driver whose underlying query is bound to a context it cannot outlive should
+// drain into a slice and return one of these — see DrainRows.
+type SliceIterator struct {
+	recs []Record
+	i    int
+}
+
+func NewSliceIterator(recs []Record) *SliceIterator {
+	return &SliceIterator{recs: recs}
+}
+
+func (it *SliceIterator) Next() bool {
+	if it.i >= len(it.recs) {
+		return false
+	}
+	it.i++
+	return true
+}
+
+// Record returns the record the last Next produced, or the zero Record before
+// the first Next. Like the drivers' own iterators, it keeps returning the final
+// record once the set is exhausted; callers read it inside the Next loop.
+func (it *SliceIterator) Record() Record {
+	if it.i == 0 || it.i > len(it.recs) {
+		return Record{}
+	}
+	return it.recs[it.i-1]
+}
+
+func (it *SliceIterator) Err() error { return nil }
 
 // BackendHandle is an opened backend instance.
 type BackendHandle interface {
@@ -219,10 +251,10 @@ type StoreBinding struct {
 
 // AgentMemory holds the resolved memory profile for an agent.
 type AgentMemory struct {
-	Stores  map[string]StoreBinding // by logical store name
-	Tables  map[string]StoreBinding // by physical table name
-	Write   []string
-	Recall  string
+	Stores map[string]StoreBinding // by logical store name
+	Tables map[string]StoreBinding // by physical table name
+	Write  []string
+	Recall string
 	// EmbedModel names the models: entry used to embed record text on
 	// write (memory.write) and queries on semantic recall. RerankModel,
 	// when set, reranks oversampled vector hits on semantic recall.

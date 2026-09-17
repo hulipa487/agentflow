@@ -171,47 +171,30 @@ func (h *Handle) Query(table string, q memory.Query) (memory.Iterator, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &vecIter{rows: rows}, nil
+	// Drained here, while ctx is alive: the rows are bound to it and would be
+	// closed by the deferred cancel before the caller could read them.
+	recs, err := memory.DrainRows(rows, scanKV)
+	if err != nil {
+		return nil, err
+	}
+	return memory.NewSliceIterator(recs), nil
+}
+
+// scanKV reads the (key, JSON value) column pair both PostgreSQL drivers store.
+func scanKV(rows *sql.Rows) (memory.Record, error) {
+	var key, raw string
+	if err := rows.Scan(&key, &raw); err != nil {
+		return memory.Record{}, err
+	}
+	var v any
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		return memory.Record{}, err
+	}
+	return memory.Record{Key: key, Value: v}, nil
 }
 
 func (h *Handle) GC(table string, window int) error { return nil }
 func (h *Handle) Close() error                      { return h.db.Close() }
-
-type vecIter struct {
-	rows *sql.Rows
-	rec  memory.Record
-	err  error
-}
-
-func (it *vecIter) Next() bool {
-	if it.err != nil {
-		return false
-	}
-	if !it.rows.Next() {
-		it.err = it.rows.Err()
-		return false
-	}
-	var key, raw string
-	if err := it.rows.Scan(&key, &raw); err != nil {
-		it.err = err
-		return false
-	}
-	var v any
-	if err := json.Unmarshal([]byte(raw), &v); err != nil {
-		it.err = err
-		return false
-	}
-	it.rec = memory.Record{Key: key, Value: v}
-	return true
-}
-
-func (it *vecIter) Record() memory.Record { return it.rec }
-func (it *vecIter) Err() error {
-	if it.err != nil {
-		return it.err
-	}
-	return it.rows.Err()
-}
 
 func floatSliceToVector(v []float32) string {
 	b, err := json.Marshal(v)

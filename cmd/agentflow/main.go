@@ -73,6 +73,12 @@ func main() {
 	noWebUI := flag.Bool("no-webui", false, "disable the web console (admin server keeps token-optional loopback behavior)")
 	flag.Parse()
 
+	// The credential CLI shares the -config/-configdir source selection; it
+	// runs standalone and never boots the engine.
+	if len(os.Args) > 1 && os.Args[1] == "cred" {
+		os.Exit(credMain(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
+	}
+
 	explicit := map[string]bool{}
 	flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
 	if err := checkConfigSource(explicit); err != nil {

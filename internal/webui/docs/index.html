@@ -369,6 +369,9 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
   </table>
   <p>The admin server exposes <code>GET /healthz</code>, <code>GET /readyz</code>, <code>GET /metrics</code> (Prometheus text format), <code>GET /v1/sessions</code>, and <code>/admin/credentials</code>. Live counters include <code>agentflow_sessions_active</code>, <code>agentflow_children_spawned</code>/<code>died</code>, <code>agentflow_llm_calls</code>, <code>agentflow_llm_tokens</code>, and <code>agentflow_budget_denied</code>.</p>
 
+  <h3>Credential CLI</h3>
+  <p><code>agentflow cred set|get|list|delete &lt;name&gt;</code> manages engine-wide credentials in the store named by the loaded config (configdir or <code>-config</code>). <code>set</code> reads the value from an interactive prompt or stdin — never argv (pipe it: <code>printf %s "$TOKEN" | agentflow cred set github_token</code>). The master key comes from the env var named by <code>credentials.master_key_env</code> (default <code>CREDENTIALS_MASTER_KEY</code>); an unset key is a clear error. <code>list</code> prints names only, never values. These are the same records <code>credential.get()</code> and <code>cred:&lt;service&gt;</code> config references resolve against.</p>
+
   <h3>Web console</h3>
   <p>The admin server also hosts an embedded <b>web console</b> (on by default; <code>-no-webui</code> to disable) at <code>http://&lt;admin.listen&gt;/</code> — a single-page UI for the operator, no build step or separate port. It has four tabs:</p>
   <ul>

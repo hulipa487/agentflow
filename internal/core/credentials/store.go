@@ -26,10 +26,10 @@ import (
 
 // Store is an encrypted credential store backed by a sqlite file.
 type Store struct {
-	db       *sql.DB
-	aesgcm   cipher.AEAD
-	path     string
-	log      *slog.Logger
+	db     *sql.DB
+	aesgcm cipher.AEAD
+	path   string
+	log    *slog.Logger
 }
 
 // Secret is a resolved credential ready to inject into an HTTP request.
@@ -116,10 +116,12 @@ func (s *Store) migrate() error {
 func (s *Store) Close() error { return s.db.Close() }
 
 // Put upserts a credential. header/scheme default to "Authorization"/"Bearer"
-// when empty. The secret is encrypted before it touches the database.
+// when empty. The secret is encrypted before it touches the database. An
+// empty userUUID stores the credential engine-wide (the CLI and the lazy
+// config resolver use this tenancy); per-user records use the caller's UUID.
 func (s *Store) Put(ctx context.Context, userUUID, service, kind, secret, header, scheme string) error {
-	if userUUID == "" || service == "" || secret == "" {
-		return fmt.Errorf("credentials: user_uuid, service and secret are required")
+	if service == "" || secret == "" {
+		return fmt.Errorf("credentials: service and secret are required")
 	}
 	if header == "" {
 		header = "Authorization"

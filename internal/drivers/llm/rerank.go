@@ -23,7 +23,7 @@ type RankResult struct {
 // provider "rerank", which speaks the de-facto standard POST
 // {base_url}/rerank shape shared by Jina, Cohere v2, TEI, and vLLM.
 func (m *Manager) Rerank(ctx context.Context, model, query string, docs []string, topN int) ([]RankResult, error) {
-	cfg, err := m.resolve(model)
+	cfg, err := m.resolveModel(model)
 	if err != nil {
 		return nil, err
 	}

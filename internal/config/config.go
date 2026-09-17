@@ -474,10 +474,22 @@ func Load(path string) (*Config, error) {
 }
 
 // decodeStrict decodes one YAML document with KnownFields validation after
-// environment expansion. Shared by the single-file path and every configdir
-// fragment.
+// environment expansion. Used by the single-file path.
 func decodeStrict(data []byte, v any, label string) error {
 	dec := yaml.NewDecoder(bytes.NewReader(expandEnv(data)))
+	dec.KnownFields(true)
+	if err := dec.Decode(v); err != nil {
+		return fmt.Errorf("parse %s: %w", label, err)
+	}
+	return nil
+}
+
+// decodeStrictRaw decodes one YAML document with KnownFields validation but
+// NO environment expansion: secret fields keep their raw reference (${VAR} /
+// cred:<service>) for lazy resolution, and the configdir loader expands the
+// non-secret fields structurally after the merge.
+func decodeStrictRaw(data []byte, v any, label string) error {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(v); err != nil {
 		return fmt.Errorf("parse %s: %w", label, err)
@@ -676,9 +688,10 @@ func validate(path string, c *Config) error {
 				return fmt.Errorf("%s: ghhook channel %q path must end with / (got %q)", path, ch.Name, ch.Path)
 			}
 		case "telegram":
-			if ch.Token == "" {
-				return fmt.Errorf("%s: telegram channel %q has no token", path, ch.Name)
-			}
+			// Token presence is not validated here: the token may be a lazy
+			// secret reference (${VAR} / cred:<service>) resolved at channel
+			// construction, and an unresolvable one skips the channel with a
+			// warning rather than failing the boot.
 			if ch.Mode == "" {
 				ch.Mode = "polling"
 			}
@@ -720,17 +733,13 @@ func validate(path string, c *Config) error {
 	}
 
 	// Search engines are optional; none configured leaves web_search in
-	// honest-unavailable mode. Engine names are the provider selectors.
-	for ename, e := range c.Search.Engines {
+	// honest-unavailable mode. Engine names are the provider selectors. A key
+	// is NOT required at validation: it may be a lazy secret reference and an
+	// unresolvable credential skips the engine at construction with a warning
+	// (uniform honest-degradation), never a boot failure.
+	for ename := range c.Search.Engines {
 		switch ename {
-		case "doubao", "ollama", "youtube", "google_search", "x_search":
-			if e.APIKey == "" {
-				return fmt.Errorf("%s: search engine %q requires api_key", path, ename)
-			}
-		case "stackoverflow":
-			// key optional (anonymous 300 req/day quota; key lifts to 10,000)
-		case "github":
-			// key optional (anonymous 10 req/min search quota; key lifts to 30/min)
+		case "doubao", "ollama", "youtube", "google_search", "x_search", "stackoverflow", "github":
 		default:
 			return fmt.Errorf("%s: unsupported search engine %q (want doubao, ollama, google_search, x_search, stackoverflow, github, or youtube)", path, ename)
 		}
@@ -778,16 +787,14 @@ func validate(path string, c *Config) error {
 		}
 	}
 
-	// Media blob store: fs (default) or s3. S3 requires bucket, region, and
-	// credentials; endpoint/prefix are optional.
+	// Media blob store: fs (default) or s3. S3 requires bucket and region;
+	// credentials may be lazy references and an unresolvable one skips the
+	// store at boot with a warning, never a boot failure.
 	switch c.Media.Backend {
 	case "", "fs":
 	case "s3":
 		if c.Media.S3.Bucket == "" || c.Media.S3.Region == "" {
 			return fmt.Errorf("%s: media backend s3 requires s3.bucket and s3.region", path)
-		}
-		if c.Media.S3.AccessKey == "" || c.Media.S3.SecretKey == "" {
-			return fmt.Errorf("%s: media backend s3 requires s3.access_key and s3.secret_key (env-interpolated)", path)
 		}
 	default:
 		return fmt.Errorf("%s: unsupported media backend %q (want fs or s3)", path, c.Media.Backend)

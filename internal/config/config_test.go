@@ -160,7 +160,10 @@ func TestCredentialsMasterKeyEnvDefault(t *testing.T) {
 }
 
 // TestValidateSearch exercises the search-engine validation rules: known
-// engines, per-engine key requirements, and default resolution.
+// engines and default resolution. A missing api_key is NOT a boot error —
+// engines with unresolvable credentials are skipped with a warning at
+// construction (drivers/search.Build), keeping degradation honest and
+// uniform across both config paths.
 func TestValidateSearch(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -170,19 +173,16 @@ func TestValidateSearch(t *testing.T) {
 	}{
 		{name: "none configured ok", search: Search{}},
 		{
-			name:    "doubao without key",
-			search:  Search{Engines: map[string]SearchEngine{"doubao": {}}},
-			wantErr: "requires api_key",
+			name:   "doubao without key boots (skipped at build)",
+			search: Search{Engines: map[string]SearchEngine{"doubao": {}}},
 		},
 		{
-			name:    "ollama without key",
-			search:  Search{Engines: map[string]SearchEngine{"ollama": {}}},
-			wantErr: "requires api_key",
+			name:   "ollama without key boots (skipped at build)",
+			search: Search{Engines: map[string]SearchEngine{"ollama": {}}},
 		},
 		{
-			name:    "youtube without key",
-			search:  Search{Engines: map[string]SearchEngine{"youtube": {}}},
-			wantErr: "requires api_key",
+			name:   "youtube without key boots (skipped at build)",
+			search: Search{Engines: map[string]SearchEngine{"youtube": {}}},
 		},
 		{
 			name:    "youtube with key defaults to itself",
@@ -253,9 +253,8 @@ func TestValidateMediaAudit(t *testing.T) {
 			wantErr: "requires s3.bucket and s3.region",
 		},
 		{
-			name:    "s3 missing keys",
-			media:   MediaConfig{Backend: "s3", S3: MediaS3{Bucket: "b", Region: "r"}},
-			wantErr: "requires s3.access_key and s3.secret_key",
+			name:  "s3 without keys boots (store skipped at boot)",
+			media: MediaConfig{Backend: "s3", S3: MediaS3{Bucket: "b", Region: "r"}},
 		},
 		{
 			name:  "s3 complete ok",

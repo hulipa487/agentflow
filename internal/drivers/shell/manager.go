@@ -169,6 +169,28 @@ func (m *Manager) Destroy(ctx context.Context, owner string, handleID string) er
 	return p.Destroy(ctx, h)
 }
 
+// Current returns the owner's live (running) handle, or nil when none exists.
+func (m *Manager) Current(owner string) *Handle {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, id := range m.byOwner[owner] {
+		if h, ok := m.handles[id]; ok && h.State == HandleRunning {
+			return h
+		}
+	}
+	return nil
+}
+
+// Ensure returns the owner's live handle, spawning one from the given provider
+// and opts when none exists. Owners are session keys (one loop coroutine
+// each), so the check-then-spawn window cannot double-spawn within a session.
+func (m *Manager) Ensure(ctx context.Context, owner, providerName string, opts SpawnOpts) (*Handle, error) {
+	if h := m.Current(owner); h != nil {
+		return h, nil
+	}
+	return m.Spawn(ctx, owner, providerName, opts)
+}
+
 // ReapSession destroys all shell handles belonging to a session key.
 func (m *Manager) ReapSession(owner string) {
 	m.mu.Lock()

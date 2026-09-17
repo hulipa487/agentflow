@@ -270,7 +270,8 @@ func main() {
 			amPtr = &am
 		}
 
-		agentSet := toolReg.Expose(a.Skills, cfg.Tools.Policy, false)
+		effectiveCaps := capabilitySet(a.Capabilities)
+		agentSet := toolReg.Expose(a.Skills, toolPolicyFor(cfg.Tools.Policy, effectiveCaps), false)
 		handlers := map[string]session.OpHandler{}
 		// Budget metering: if the agent declares tokens_per_day, wrap LLM
 		// handlers with reserve/commit/release.
@@ -305,7 +306,6 @@ func main() {
 			handlers[k] = h
 		}
 
-		effectiveCaps := capabilitySet(a.Capabilities)
 		canContact := stringSet(a.CanContact)
 		safeDispatcher := resolveSafety(cfg, a.Safety)
 		defs[name] = &supervisor.AgentDef{
@@ -373,7 +373,8 @@ func main() {
 			amPtr = &am
 		}
 
-		agentSet := toolReg.Expose(p.Skills, cfg.Tools.Policy, false)
+		profileCaps := capabilitySet(p.Capabilities)
+		agentSet := toolReg.Expose(p.Skills, toolPolicyFor(cfg.Tools.Policy, profileCaps), false)
 		handlers := map[string]session.OpHandler{}
 		// Budget metering for spawn profiles: a profile that declares
 		// budget.tokens_per_day gets a metered LLM pool shared by every child
@@ -417,7 +418,7 @@ func main() {
 			Instructions: p.Instructions,
 			Shell:        shellProfileMap(cfg, p.Shell),
 			CanContact:   stringSet(p.CanContact),
-			Capabilities: capabilitySet(p.Capabilities),
+			Capabilities: profileCaps,
 			Skills:       p.Skills,
 			Handlers:     handlers,
 			Safety:       resolveSafety(cfg, ""),
@@ -777,6 +778,22 @@ func capabilitySet(caps []string) map[string]bool {
 		caps = config.DefaultCapabilities
 	}
 	return stringSet(caps)
+}
+
+// toolPolicyFor returns the tools policy for one agent or spawn profile. An
+// agent without the shell.exec capability must not see the registry shell
+// tools (builtin:shell.exec / shell.write / shell.destroy), even under a
+// permissive tools policy — the same gate as shell profile binding at config
+// load. The forbidden list is cloned before appending so the shared policy is
+// never mutated.
+func toolPolicyFor(policy config.ToolsPolicy, caps map[string]bool) config.ToolsPolicy {
+	if caps["shell.exec"] {
+		return policy
+	}
+	out := policy
+	out.Forbidden = append(append([]string{}, policy.Forbidden...),
+		"builtin:shell.exec", "builtin:shell.write", "builtin:shell.destroy")
+	return out
 }
 
 func stringSet(values []string) map[string]bool {

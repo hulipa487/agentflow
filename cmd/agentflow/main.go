@@ -299,8 +299,12 @@ func main() {
 	runtimeHandlers := caps.RuntimeHandlers(cfg.Triggers)
 	// The resolved prompt registry (name -> text) is surfaced read-only to
 	// every loop by agent.config() and is what {prompt: key} references
-	// (instructions, tool descriptions) resolve against.
-	promptTexts := cfg.PromptTexts()
+	// (instructions, tool descriptions) resolve against. One instance is
+	// shared by every agent def, so the reload watcher refreshing a
+	// file-backed entry is visible to all of them at once; the registry
+	// serializes those writes against the reads agent.config() performs.
+	promptReg := session.NewPromptRegistry(cfg.PromptTexts())
+	promptFiles := cfg.PromptFiles()
 	agentMemories := []memory.AgentMemory{}
 	defs := map[string]*supervisor.AgentDef{}
 	for name, a := range cfg.Agents {
@@ -398,7 +402,7 @@ func main() {
 
 				InstructionsPath:   a.Instructions.File,
 				InstructionsPrompt: instrPrompt,
-				Prompts:            promptTexts,
+				Prompts:            promptReg,
 				Extras:             a.Extras,
 				Credentials:        a.Credentials,
 			},
@@ -520,7 +524,7 @@ func main() {
 
 				InstructionsPath:   p.Instructions.File,
 				InstructionsPrompt: instrPrompt,
-				Prompts:            promptTexts,
+				Prompts:            promptReg,
 				Extras:             p.Extras,
 				Credentials:        p.Credentials,
 			},
@@ -789,7 +793,14 @@ func main() {
 		}
 	}
 
-	watcher := reload.New(sup, log)
+	// The reload watcher also keeps file-backed prompt entries live: it polls
+	// each backing file and republishes the text to the shared registry, and
+	// updates in place the instructions of every agent sourced from that key.
+	var promptSrc *reload.PromptSource
+	if len(promptFiles) > 0 {
+		promptSrc = &reload.PromptSource{Registry: promptReg, Files: promptFiles}
+	}
+	watcher := reload.New(sup, promptSrc, log)
 	watcher.Start()
 
 	// Metrics/admin: authenticated HTTP endpoint with health/readiness/metrics

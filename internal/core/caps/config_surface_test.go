@@ -167,7 +167,7 @@ end
 func TestAgentConfigPrompts(t *testing.T) {
 	info := &session.Info{
 		Name:    "bot",
-		Prompts: map[string]string{"kb_header": "[Knowledge base]", "distiller": "You are a distiller."},
+		Prompts: session.NewPromptRegistry(map[string]string{"kb_header": "[Knowledge base]", "distiller": "You are a distiller."}),
 	}
 	got, _ := runConfigLoop(t, `
 function loop()
@@ -216,7 +216,7 @@ func TestAgentConfigInstructionsPrompt(t *testing.T) {
 	info := &session.Info{
 		Name:               "bot",
 		InstructionsPrompt: "assistant_system",
-		Prompts:            map[string]string{"assistant_system": "You are the assistant."},
+		Prompts:            session.NewPromptRegistry(map[string]string{"assistant_system": "You are the assistant."}),
 	}
 	got, _ := runConfigLoop(t, `
 function loop()
@@ -238,6 +238,29 @@ function loop()
 end
 `, info, nil, nil, nil)
 	if got != "ok" {
+		t.Fatalf("loop failed: %s", got)
+	}
+}
+
+// TestAgentConfigPromptsAreLive: agent.config() reads the shared registry at
+// call time rather than a boot snapshot, so a text republished by the reload
+// watcher reaches the loop without a session restart.
+func TestAgentConfigPromptsAreLive(t *testing.T) {
+	reg := session.NewPromptRegistry(map[string]string{"kb_header": "old text"})
+	reg.Set("kb_header", "reloaded text")
+
+	got, _ := runConfigLoop(t, `
+function loop()
+  local msg = session.inbox()
+  local cfg = agent.config()
+  if cfg.prompts.kb_header ~= "reloaded text" then
+    session.send("err: stale prompt: " .. tostring(cfg.prompts.kb_header))
+    return
+  end
+  session.send("live")
+end
+`, &session.Info{Name: "bot", Prompts: reg}, nil, nil, nil)
+	if got != "live" {
 		t.Fatalf("loop failed: %s", got)
 	}
 }

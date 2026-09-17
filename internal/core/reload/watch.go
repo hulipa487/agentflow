@@ -1,10 +1,20 @@
-// Package reload watches loop plugin files and instructions files.
-// A loop file that fails to compile keeps the old version running — a typo
-// never kills a live agent. Instructions are markdown: they hot-update the
-// shared per-agent content, and loops pick them up on the next turn (no
-// session restart). A loop may be a directory: each member *.lua is watched
-// and an edit to any one re-resolves the whole loop (members concatenate in
-// sorted order).
+// Package reload watches loop plugin files, instructions files, and
+// file-backed prompt registry entries. A loop file that fails to compile keeps
+// the old version running — a typo never kills a live agent. Instructions are
+// markdown: they hot-update the shared per-agent content, and loops pick them
+// up on the next turn (no session restart). A loop may be a directory: each
+// member *.lua is watched and an edit to any one re-resolves the whole loop
+// (members concatenate in sorted order).
+//
+// Prompts are the deployment-wide registry (config `prompts:`). Only the
+// *contents* of a `file:`-backed entry are live: adding a key, deleting one,
+// re-pointing a key at a different file, or switching an entry between
+// `inline:` and `file:` all change the config, and that still needs a restart.
+// `inline:`/`text:` entries have no file to poll and are never watched. Unlike
+// the per-(agent, path) loop bookkeeping, prompt files are tracked once for
+// the whole deployment: the registry is shared by every agent by design, so a
+// single edit updates all of them — keying that by agent would let whichever
+// agent poll() reached first consume the change and leave the rest stale.
 package reload
 
 import (
@@ -16,9 +26,18 @@ import (
 	"strings"
 	"time"
 
+	"agentflow/internal/core/session"
 	"agentflow/internal/core/supervisor"
 	"agentflow/internal/vm"
 )
+
+// PromptSource is the deployment's shared prompt registry plus the file
+// backing each `file:`-sourced key. Keys with an inline/text source are absent
+// — there is nothing to watch. Files is keyed by prompt name.
+type PromptSource struct {
+	Registry *session.PromptRegistry
+	Files    map[string]string
+}
 
 // watchKey identifies one watched path for one agent. Several agents may share
 // a loop path — a supported and useful shape, e.g. one shared loop whose Lua
@@ -34,24 +53,33 @@ type watchKey struct {
 
 // Watcher polls file mtimes (no fsnotify dependency).
 type Watcher struct {
-	sup    *supervisor.Supervisor
-	log    *slog.Logger
-	mtimes map[watchKey]time.Time
+	sup     *supervisor.Supervisor
+	prompts *PromptSource
+	log     *slog.Logger
+	mtimes  map[watchKey]time.Time
 	// members is the set of *.lua member paths last seen for a directory loop,
 	// per (agent, dir). A member's mtime cannot report its own disappearance —
 	// it is simply absent from the next readdir — so the set is what makes a
 	// deleted member a change.
 	members map[watchKey]map[string]bool
-	stop    chan struct{}
+	// promptMtimes and promptBad are keyed by prompt name (not by agent): the
+	// registry is one deployment-wide resource, so a file is polled once and
+	// the update fans out to every agent that reads it.
+	promptMtimes map[string]time.Time
+	promptBad    map[string]bool
+	stop         chan struct{}
 }
 
-func New(sup *supervisor.Supervisor, log *slog.Logger) *Watcher {
+func New(sup *supervisor.Supervisor, prompts *PromptSource, log *slog.Logger) *Watcher {
 	return &Watcher{
-		sup:     sup,
-		log:     log.With("module", "reload"),
-		mtimes:  map[watchKey]time.Time{},
-		members: map[watchKey]map[string]bool{},
-		stop:    make(chan struct{}),
+		sup:          sup,
+		prompts:      prompts,
+		log:          log.With("module", "reload"),
+		mtimes:       map[watchKey]time.Time{},
+		members:      map[watchKey]map[string]bool{},
+		promptMtimes: map[string]time.Time{},
+		promptBad:    map[string]bool{},
+		stop:         make(chan struct{}),
 	}
 }
 
@@ -69,7 +97,21 @@ func (w *Watcher) Start() {
 			}
 		}
 	}
+	w.seedPrompts()
 	go w.loop()
+}
+
+// seedPrompts records the current mtime of every file-backed prompt, so the
+// first edit after startup is what fires — an unchanged file is not a change.
+func (w *Watcher) seedPrompts() {
+	if w.prompts == nil {
+		return
+	}
+	for key, path := range w.prompts.Files {
+		if fi, err := os.Stat(path); err == nil {
+			w.promptMtimes[key] = fi.ModTime()
+		}
+	}
 }
 
 // seedDir records the mtimes and the member set of a directory loop for one
@@ -125,6 +167,9 @@ func (w *Watcher) loop() {
 }
 
 func (w *Watcher) poll() {
+	// Prompts are polled once per tick for the whole deployment, not per
+	// agent: one shared registry means one change fans out to everyone.
+	w.pollPrompts()
 	for name, def := range w.sup.Agents() {
 		if def.LoopFile != "" && w.changed(name, def.LoopFile) {
 			w.reloadLoop(name, def.LoopFile)
@@ -132,6 +177,67 @@ func (w *Watcher) poll() {
 		if def.InstructionsPath != "" && w.changed(name, def.InstructionsPath) {
 			w.reloadInstructions(name, def)
 		}
+	}
+}
+
+// pollPrompts re-reads every file-backed prompt whose mtime advanced and
+// republishes it to the whole deployment. A file that cannot be read keeps its
+// previous text (never an empty prompt) and warns once, not on every tick.
+func (w *Watcher) pollPrompts() {
+	if w.prompts == nil || w.prompts.Registry == nil {
+		return
+	}
+	for key, path := range w.prompts.Files {
+		fi, err := os.Stat(path)
+		if err != nil {
+			w.promptUnreadable(key, path, err)
+			continue
+		}
+		// Unchanged, and not mid-recovery from a failed read.
+		if fi.ModTime().Equal(w.promptMtimes[key]) && !w.promptBad[key] {
+			continue
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			w.promptUnreadable(key, path, err)
+			continue
+		}
+		w.promptMtimes[key] = fi.ModTime()
+		delete(w.promptBad, key)
+		text := string(b)
+		w.prompts.Registry.Set(key, text)
+		w.log.Info("reload: prompt updated", "prompt", key, "file", path)
+		w.updatePromptInstructions(key, text)
+	}
+}
+
+// promptUnreadable warns that a prompt file could not be re-read. The warning
+// is emitted on the transition into the unreadable state only: the mtime is
+// deliberately left alone so the next tick retries, and warning every retry
+// would flood the log at the poll interval.
+func (w *Watcher) promptUnreadable(key, path string, err error) {
+	if w.promptBad[key] {
+		return
+	}
+	w.promptBad[key] = true
+	w.log.Warn("reload: cannot read prompt, keeping current text",
+		"prompt", key, "file", path, "err", err)
+}
+
+// updatePromptInstructions refreshes the system prompt of every agent whose
+// instructions came from this prompt key. It updates in place, exactly as
+// reloadInstructions does — the session is not restarted, so the loop picks
+// the new text up on its next turn.
+func (w *Watcher) updatePromptInstructions(key, text string) {
+	for name, def := range w.sup.Agents() {
+		if def.Info == nil || def.Info.InstructionsPrompt != key {
+			continue
+		}
+		if def.Info.Instructions == nil {
+			continue
+		}
+		def.Info.Instructions.Store(text)
+		w.log.Info("reload: instructions updated", "prompt", key, "agent", name)
 	}
 }
 

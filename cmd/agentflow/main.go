@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"syscall"
 	"time"
 
@@ -169,13 +170,23 @@ func main() {
 	for _, a := range cfg.Agents {
 		_ = cfg.ResolveMemoryProfile(a)
 	}
+	// skippedBackends records backends dropped because a credential could not
+	// be resolved; stores bound to them rebind to a survivor (see
+	// memory.RebindSkipped) instead of failing the boot.
+	skippedBackends := map[string]bool{}
+	var memSurvivors []string
 	for name, b := range cfg.Memory.Backends {
 		cfg2, ok := resolveBackendSecrets(ctx, credResolver, name, b, log)
 		if !ok {
+			skippedBackends[name] = true
 			continue // skipped: warning already logged
 		}
 		memReg.AddBackend(name, b.Provider, cfg2)
+		memSurvivors = append(memSurvivors, name)
 	}
+	// Deterministic fallback choice: pickFallback prefers a text_search
+	// survivor, but among equals the order must not depend on map iteration.
+	sort.Strings(memSurvivors)
 	if err := memReg.Open(ctx); err != nil {
 		log.Error("memory backends failed", "err", err)
 		os.Exit(1)
@@ -310,6 +321,9 @@ func main() {
 			for sname, s := range mp.Stores {
 				profile[sname] = memoryFromConfig(s)
 			}
+			// A store on a credential-skipped backend rebinds to a survivor
+			// (or drops when none survives) — never a boot failure.
+			profile, _ = memory.RebindSkipped(profile, skippedBackends, memSurvivors, memReg.Features, log)
 			// Per-agent isolation: private stores are prefixed with the agent
 			// name at bind time; stores opt into sharing with shared: true.
 			am, err := memReg.ResolveStoresFor(name, profile)
@@ -423,6 +437,8 @@ func main() {
 			for sname, s := range mp.Stores {
 				profile[sname] = memoryFromConfig(s)
 			}
+			// Same credential-skip degradation as the static-agent path above.
+			profile, _ = memory.RebindSkipped(profile, skippedBackends, memSurvivors, memReg.Features, log)
 			am, err := memReg.ResolveStoresFor("spawn:"+pname, profile)
 			if err != nil {
 				log.Error("spawn profile memory resolve failed", "profile", pname, "err", err)

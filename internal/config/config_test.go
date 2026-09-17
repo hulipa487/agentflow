@@ -3,7 +3,69 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
+
+// TestToolOverrideSpecFieldsParse: the tools.policy.overrides schema carries
+// description and per-param description overrides alongside the policy fields,
+// decoded under KnownFields strictness.
+func TestToolOverrideSpecFieldsParse(t *testing.T) {
+	var c Config
+	dec := yaml.NewDecoder(strings.NewReader(`
+version: "1"
+agents:
+  bot: { loop: builtin:per_chat }
+tools:
+  policy:
+    overrides:
+      "builtin:web_search":
+        description: "Search the deployment's runbooks."
+        params:
+          query: { description: "What to look up" }
+        needs_confirm: true
+        autonomous: false
+`))
+	dec.KnownFields(true)
+	if err := dec.Decode(&c); err != nil {
+		t.Fatal(err)
+	}
+	o, ok := c.Tools.Policy.Overrides["builtin:web_search"]
+	if !ok {
+		t.Fatal("override not decoded")
+	}
+	if o.Description == nil || *o.Description != "Search the deployment's runbooks." {
+		t.Fatalf("description override not decoded: %+v", o.Description)
+	}
+	if o.Params["query"].Description != "What to look up" {
+		t.Fatalf("param override not decoded: %+v", o.Params)
+	}
+	if o.NeedsConfirm == nil || !*o.NeedsConfirm {
+		t.Fatalf("needs_confirm not decoded: %+v", o.NeedsConfirm)
+	}
+	if o.Autonomous == nil || *o.Autonomous {
+		t.Fatalf("explicit autonomous: false must decode as a non-nil false: %+v", o.Autonomous)
+	}
+}
+
+// TestToolOverrideUnknownFieldFails: under KnownFields a misspelled override
+// key is a boot error, not a silent no-op.
+func TestToolOverrideUnknownFieldFails(t *testing.T) {
+	var c Config
+	dec := yaml.NewDecoder(strings.NewReader(`
+version: "1"
+agents:
+  bot: { loop: builtin:per_chat }
+tools:
+  policy:
+    overrides:
+      "builtin:web_search": { needs_confrm: true }
+`))
+	dec.KnownFields(true)
+	if err := dec.Decode(&c); err == nil {
+		t.Fatal("misspelled override key should fail strict decode")
+	}
+}
 
 // TestValidateWebhookTimeout exercises the webhook channel timeout rule:
 // unset (driver default) and a valid duration pass; garbage and non-positive

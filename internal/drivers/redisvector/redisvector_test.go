@@ -124,6 +124,8 @@ func TestSearchKeys(t *testing.T) {
 	// Anything unparseable is an error, not a silently empty result.
 	if _, err := searchKeys("nope"); err == nil {
 		t.Fatal("a non-array reply must error")
+	} else if !strings.Contains(err.Error(), "RESP2") {
+		t.Fatalf("the parse error should name the protocol, got %v", err)
 	}
 	if _, err := searchKeys([]any{int64(1), 42}); err == nil {
 		t.Fatal("a non-key element must error")
@@ -201,3 +203,26 @@ func TestIsIndexExists(t *testing.T) {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+// TestParseOptionsPinsRESP2: go-redis v9 negotiates RESP3 by default, and
+// RediSearch replies to FT.SEARCH as a map of named fields under RESP3 rather
+// than the flat [total, key, ...] array searchKeys reads. Without this pin
+// every vector query fails to parse — which is exactly what happened against a
+// live Redis Stack, before the KNN query string was ever reached.
+func TestParseOptionsPinsRESP2(t *testing.T) {
+	opts, err := parseOptions("redis://localhost:6379")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.Protocol != 2 {
+		t.Fatalf("Protocol = %d; want 2 (RESP2). RESP3 makes FT.SEARCH reply as a map and breaks searchKeys", opts.Protocol)
+	}
+	// An explicit protocol in the URL must not win: the reply parsing below
+	// only understands the RESP2 shape.
+	if opts, err := parseOptions("redis://localhost:6379?protocol=3"); err != nil || opts.Protocol != 2 {
+		t.Fatalf("a URL asking for RESP3 must still be pinned: protocol=%d err=%v", opts.Protocol, err)
+	}
+	if _, err := parseOptions("://not-a-url"); err == nil {
+		t.Fatal("a malformed url must error")
+	}
+}

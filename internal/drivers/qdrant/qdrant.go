@@ -192,21 +192,27 @@ func (h *Handle) Put(table, key string, value any, opts memory.PutOpts) error {
 }
 
 // setPayload updates an existing point's payload without touching its vector,
-// and creates the point when it is absent. The create carries no vector: the
-// collection uses a named vector, so a point may be stored without one, which
-// is what a value with no embedding is.
+// and creates the point when it is absent.
+//
+// The create is not unconditional: an upsert replaces the whole point, so
+// following every payload update with one would clear the named vector of a
+// point that already had one. Qdrant reports the missing point instead — the
+// payload endpoint answers 404 — so the upsert runs only in that case. A point
+// cannot be created without a vector field at all (the API rejects the body),
+// so the create carries an empty named-vector set, which is the only way to
+// store a value that has no embedding.
 func (h *Handle) setPayload(ctx context.Context, id string, payload map[string]any) error {
 	status, err := h.do(ctx, http.MethodPost, "/collections/"+h.collection+"/points/payload?wait=true",
 		map[string]any{"payload": payload, "points": []string{id}}, nil)
 	if err != nil {
 		return err
 	}
-	if status != http.StatusOK {
+	if status == http.StatusOK {
+		return nil // updated in place; the stored vector is untouched
+	}
+	if status != http.StatusNotFound {
 		return fmt.Errorf("update payload: unexpected status %d", status)
 	}
-	// Whether the point existed is not reported, so ensure it does: the
-	// upsert is a no-op for an existing point with no vector, and creates one
-	// otherwise.
 	body := map[string]any{"points": []any{map[string]any{
 		"id":      id,
 		"vector":  map[string]any{},

@@ -29,6 +29,9 @@ type fakeQdrant struct {
 	size       int
 	searchHits []map[string]any
 	getPoint   map[string]any // nil => 404
+	// payloadMissing makes the payload-update endpoint answer 404, which is
+	// what the real API does for a point that does not exist.
+	payloadMissing bool
 }
 
 func (f *fakeQdrant) record(r *http.Request) {
@@ -77,6 +80,12 @@ func (f *fakeQdrant) start(t *testing.T) string {
 					"vectors": map[string]any{vectorName: map[string]any{"size": f.size}},
 				}},
 			}})
+		case strings.HasSuffix(r.URL.Path, "/points/payload"):
+			if f.payloadMissing {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			writeJSON(w, map[string]any{"result": map[string]any{"status": "completed"}})
 		case strings.HasSuffix(r.URL.Path, "/points/search"):
 			hits := f.searchHits
 			if hits == nil {
@@ -215,9 +224,13 @@ func TestPutWithVectorUpsertsPoint(t *testing.T) {
 
 // TestPutWithoutVectorPreservesEmbedding: a value written with no embedding
 // goes through the payload endpoint so the vector a previous put stored is not
-// dropped — an upsert replaces the whole point. The follow-up upsert that
-// creates an absent point must carry an empty named-vector set, never a
-// zero-filled embedding that would pollute k-NN results.
+// dropped — an upsert replaces the whole point, so an unconditional upsert
+// here would clear the named vector. Nothing else may be sent for a point that
+// already exists.
+//
+// This is the regression guard for that: against a real server, following the
+// payload update with an upsert carrying "vector": {} wiped the stored
+// embedding, and the point stopped coming back from k-NN searches.
 func TestPutWithoutVectorPreservesEmbedding(t *testing.T) {
 	f := &fakeQdrant{exists: true, size: 3}
 	h := openFake(t, f, map[string]any{"dim": 3})
@@ -225,29 +238,63 @@ func TestPutWithoutVectorPreservesEmbedding(t *testing.T) {
 	if err := h.Put("t", "k", "plain", memory.PutOpts{}); err != nil {
 		t.Fatal(err)
 	}
-	payloadUpdate := false
+	var payloadUpdate, upsert bool
 	for _, r := range f.requests() {
 		if strings.HasSuffix(r.path, "/points/payload") {
 			payloadUpdate = true
 			continue
 		}
-		if !(strings.HasSuffix(r.path, "/points") && r.method == http.MethodPut) {
-			continue
-		}
-		points, _ := r.body["points"].([]any)
-		if len(points) == 0 {
-			continue
-		}
-		p, _ := points[0].(map[string]any)
-		if v, has := p["vector"]; has {
-			named, _ := v.(map[string]any)
-			if len(named) != 0 {
-				t.Fatalf("a vectorless put must not write an embedding: %v", p)
-			}
+		if strings.HasSuffix(r.path, "/points") && r.method == http.MethodPut {
+			upsert = true
 		}
 	}
 	if !payloadUpdate {
 		t.Fatalf("no payload update issued: %+v", f.requests())
+	}
+	if upsert {
+		t.Fatalf("an existing point must not be upserted — that clears its vector: %+v", f.requests())
+	}
+}
+
+// TestPutWithoutVectorCreatesAbsentPoint: when the point does not exist the
+// payload endpoint answers 404 and the value is stored by creating the point
+// with an empty named-vector set. A create without a vector field at all is
+// rejected by the API, so {} is the only way to hold a value with no embedding.
+func TestPutWithoutVectorCreatesAbsentPoint(t *testing.T) {
+	f := &fakeQdrant{exists: true, size: 3, payloadMissing: true}
+	h := openFake(t, f, map[string]any{"dim": 3})
+
+	if err := h.Put("t", "k", "plain", memory.PutOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	var created bool
+	for _, r := range f.requests() {
+		if !(strings.HasSuffix(r.path, "/points") && r.method == http.MethodPut) {
+			continue
+		}
+		points, _ := r.body["points"].([]any)
+		if len(points) != 1 {
+			t.Fatalf("want one point, got %v", r.body)
+		}
+		p, _ := points[0].(map[string]any)
+		if p["id"] != pointID("t", "k") {
+			t.Fatalf("created point id = %v", p["id"])
+		}
+		vec, has := p["vector"]
+		if !has {
+			t.Fatalf("a create without a vector field is rejected by the API: %v", p)
+		}
+		if named, _ := vec.(map[string]any); len(named) != 0 {
+			t.Fatalf("a vectorless create must carry an empty vector set: %v", p)
+		}
+		payload, _ := p["payload"].(map[string]any)
+		if payload["key"] != "k" || payload["value"] != "plain" {
+			t.Fatalf("payload wrong: %v", payload)
+		}
+		created = true
+	}
+	if !created {
+		t.Fatalf("an absent point was not created: %+v", f.requests())
 	}
 }
 

@@ -102,8 +102,57 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Encrypted per-tenant credential store. Enabled via runtime.credentials;
+	// the master key is read from the named env var (never the config file).
+	// When disabled, credStore stays nil and http.request's `auth` fails with a
+	// clear "not enabled" error instead of panicking. Opened before the memory
+	// backends because their credentials resolve lazily against it.
+	var credStore *credentials.Store
+	if cfg.Runtime.Credentials.Enabled {
+		envName := cfg.CredentialsMasterKeyEnv()
+		masterKey := os.Getenv(envName)
+		if masterKey == "" {
+			log.Error("runtime.credentials.enabled but env var unset", "env", envName)
+			os.Exit(1)
+		}
+		credStore, err = credentials.Open(cfg.CredentialsPath(), masterKey, log)
+		if err != nil {
+			log.Error("credential store open failed", "err", err)
+			os.Exit(1)
+		}
+		defer credStore.Close()
+	}
+
+	// Lazy secret resolution: raw references (${VAR} / cred:<service>) in
+	// registry secret fields resolve at consumer construction — env, then this
+	// store, then skip-with-warning (optional components) or a clear
+	// first-call error (model api_key). The legacy single-file path expands at
+	// load, so its values are literals and pass straight through.
+	credResolver := &config.Resolver{Store: credStore}
+
+	// Shell profile passwords may be lazy references; an unresolvable one is
+	// cleared with a warning (the profile itself stays — docker needs no
+	// password, ssh may still authenticate by key).
+	for name, p := range cfg.Profiles.Shell {
+		if p.Password == "" {
+			continue
+		}
+		v, ok := credResolver.Resolve(ctx, p.Password)
+		if !ok {
+			log.Warn("shell profile credential unresolved; password cleared",
+				"profile", name, "credential", config.CredentialName(p.Password))
+			p.Password = ""
+		} else {
+			p.Password = v
+		}
+		cfg.Profiles.Shell[name] = p
+	}
+
 	// Memory backends. Pre-resolve default profiles so builtin:conversational
-	// adds its default backend before we open the registry.
+	// adds its default backend before we open the registry. Backend url /
+	// password entries may be lazy secret references: an unresolvable one
+	// skips the backend with a warning (honest degradation), never a boot
+	// failure.
 	memReg := memory.NewRegistry(log)
 	memReg.RegisterProvider(sqlite.Provider{})
 	memReg.RegisterProvider(redis.Provider{})
@@ -115,7 +164,11 @@ func main() {
 		_ = cfg.ResolveMemoryProfile(a)
 	}
 	for name, b := range cfg.Memory.Backends {
-		memReg.AddBackend(name, b.Provider, b.Config)
+		cfg2, ok := resolveBackendSecrets(ctx, credResolver, name, b, log)
+		if !ok {
+			continue // skipped: warning already logged
+		}
+		memReg.AddBackend(name, b.Provider, cfg2)
 	}
 	if err := memReg.Open(ctx); err != nil {
 		log.Error("memory backends failed", "err", err)
@@ -125,6 +178,9 @@ func main() {
 
 	// Drivers and shared infrastructure.
 	llmMgr := llm.NewManager(cfg.Models, log)
+	llmMgr.SetSecretResolver(func(raw string) (string, bool) {
+		return credResolver.Resolve(ctx, raw)
+	})
 	opPool := pool.New(*workers)
 	gw := gateway.NewRegistry(log)
 
@@ -142,26 +198,6 @@ func main() {
 		shell.NewSSHProvider(log),
 	}, log)
 
-	// Encrypted per-tenant credential store. Enabled via runtime.credentials;
-	// the master key is read from the named env var (never the config file).
-	// When disabled, credStore stays nil and http.request's `auth` fails with a
-	// clear "not enabled" error instead of panicking.
-	var credStore *credentials.Store
-	if cfg.Runtime.Credentials.Enabled {
-		envName := cfg.CredentialsMasterKeyEnv()
-		masterKey := os.Getenv(envName)
-		if masterKey == "" {
-			log.Error("runtime.credentials.enabled but env var unset", "env", envName)
-			os.Exit(1)
-		}
-		credStore, err = credentials.Open(cfg.CredentialsPath(), masterKey, log)
-		if err != nil {
-			log.Error("credential store open failed", "err", err)
-			os.Exit(1)
-		}
-		defer credStore.Close()
-	}
-
 	// Scheduler: session-owned timers. Fires are delivered as timer messages,
 	// never by invoking a Luau state from a timer goroutine.
 	schedSvc := scheduler.New(log)
@@ -176,7 +212,7 @@ func main() {
 	// Tool registry: builtins + shell builtins + MCP discovery. The web_search
 	// tool is backed by the configured search engines (config.Search); with no
 	// engines it reports honest-unavailable.
-	searchSet, err := search.Build(cfg.Search)
+	searchSet, err := search.Build(cfg.Search, credResolver, log)
 	if err != nil {
 		log.Error("search engines failed", "err", err)
 		os.Exit(1)
@@ -220,10 +256,15 @@ func main() {
 
 	// Media blob store: one per process. Channels with a media policy land
 	// inbound media here; llm caps resolve handles at request time. Backend
-	// is fs (rooted beside the runtime persistence data) or s3.
+	// is fs (rooted beside the runtime persistence data) or s3. S3
+	// credentials may be lazy references: unresolvable skips the store with a
+	// warning (channels then run with media disabled), never a boot failure.
 	var mediaStore media.Store
 	if cfg.Media.Backend == "s3" {
-		mediaStore, err = s3media.New(cfg.Media.S3)
+		s3cfg, ok := resolveMediaS3(ctx, credResolver, cfg.Media.S3, log)
+		if ok {
+			mediaStore, err = s3media.New(s3cfg)
+		}
 	} else {
 		mediaDir := cfg.Media.Dir
 		if mediaDir == "" {
@@ -665,11 +706,27 @@ func main() {
 			d := webhook.New(name, ch.Path, ch.Agent, sink, httpSrv, mstore, mpol, wopts, log)
 			gw.Register(d)
 		case "telegram":
-			d := telegram.New(name, ch.Token, ch.Agent, ch.Mode, ch.AllowUsers, ch.Path, cfg.Gateway.PublicURL, sink, httpSrv, mstore, mpol, log)
+			token, ok := credResolver.Resolve(ctx, ch.Token)
+			if !ok {
+				log.Warn("channel skipped: unresolved credential",
+					"channel", name, "field", "token", "credential", config.CredentialName(ch.Token))
+				continue
+			}
+			d := telegram.New(name, token, ch.Agent, ch.Mode, ch.AllowUsers, ch.Path, cfg.Gateway.PublicURL, sink, httpSrv, mstore, mpol, log)
 			gw.Register(d)
 			telegramDrivers = append(telegramDrivers, d)
 		case "ghhook":
-			d := ghhook.New(name, ch.Path, ch.Agent, ch.Secret, sink, httpSrv, log)
+			secret := ch.Secret
+			if secret != "" {
+				v, ok := credResolver.Resolve(ctx, secret)
+				if !ok {
+					log.Warn("channel skipped: unresolved credential",
+						"channel", name, "field", "secret", "credential", config.CredentialName(secret))
+					continue
+				}
+				secret = v
+			}
+			d := ghhook.New(name, ch.Path, ch.Agent, secret, sink, httpSrv, log)
 			gw.Register(d)
 		}
 	}
@@ -905,6 +962,59 @@ func memoryFromConfig(s config.Store) memory.Store {
 		}
 	}
 	return ret
+}
+
+// resolveBackendSecrets resolves the secret-bearing entries (url, password)
+// of one memory backend config. An unresolvable credential logs a warning
+// naming it and reports ok=false — the backend is skipped, never a boot
+// failure. The input map is cloned; the config struct is not mutated.
+func resolveBackendSecrets(ctx context.Context, res *config.Resolver, name string, b config.Backend, log *slog.Logger) (map[string]any, bool) {
+	if b.Config == nil {
+		return nil, true
+	}
+	out := make(map[string]any, len(b.Config))
+	for k, v := range b.Config {
+		out[k] = v
+	}
+	for _, key := range []string{"url", "password"} {
+		raw, ok := out[key].(string)
+		if !ok || raw == "" {
+			continue
+		}
+		v, ok := res.Resolve(ctx, raw)
+		if !ok {
+			log.Warn("memory backend skipped: unresolved credential",
+				"backend", name, "field", key, "credential", config.CredentialName(raw))
+			return nil, false
+		}
+		out[key] = v
+	}
+	return out, true
+}
+
+// resolveMediaS3 resolves the S3 credential pair. Unresolvable logs a warning
+// naming the credential and reports ok=false — the store is skipped.
+func resolveMediaS3(ctx context.Context, res *config.Resolver, s3 config.MediaS3, log *slog.Logger) (config.MediaS3, bool) {
+	out := s3
+	for _, key := range []struct {
+		field string
+		dst   *string
+	}{
+		{"access_key", &out.AccessKey},
+		{"secret_key", &out.SecretKey},
+	} {
+		if *key.dst == "" {
+			continue
+		}
+		v, ok := res.Resolve(ctx, *key.dst)
+		if !ok {
+			log.Warn("media store skipped: unresolved credential",
+				"field", key.field, "credential", config.CredentialName(*key.dst))
+			return config.MediaS3{}, false
+		}
+		*key.dst = v
+	}
+	return out, true
 }
 
 func shellProfileMap(cfg *config.Config, name string) map[string]any {

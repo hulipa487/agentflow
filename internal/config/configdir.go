@@ -74,7 +74,7 @@ func LoadDir(dir string, log *slog.Logger) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("configdir %s: system.yaml: %w", dir, err)
 	}
-	if err := decodeStrict(b, c, sysPath); err != nil {
+	if err := decodeStrictRaw(b, c, sysPath); err != nil {
 		return nil, err
 	}
 	if len(c.Agents) > 0 {
@@ -90,7 +90,7 @@ func LoadDir(dir string, log *slog.Logger) (*Config, error) {
 		var frag struct {
 			Channels []Channel `yaml:"channels"`
 		}
-		if err := decodeStrict(b, &frag, chPath); err != nil {
+		if err := decodeStrictRaw(b, &frag, chPath); err != nil {
 			return nil, err
 		}
 		c.Gateway.Channels = frag.Channels
@@ -111,7 +111,7 @@ func LoadDir(dir string, log *slog.Logger) (*Config, error) {
 			return nil, fmt.Errorf("configdir %s: %s: %w", dir, pf, err)
 		}
 		var f agentFile
-		if err := decodeStrict(b, &f, pf); err != nil {
+		if err := decodeStrictRaw(b, &f, pf); err != nil {
 			return nil, err
 		}
 		if f.Name == "" {
@@ -153,7 +153,7 @@ func LoadDir(dir string, log *slog.Logger) (*Config, error) {
 		var frag struct {
 			Triggers []Trigger `yaml:"triggers"`
 		}
-		if err := decodeStrict(b, &frag, tf); err != nil {
+		if err := decodeStrictRaw(b, &frag, tf); err != nil {
 			return nil, err
 		}
 		for _, tr := range frag.Triggers {
@@ -170,6 +170,11 @@ func LoadDir(dir string, log *slog.Logger) (*Config, error) {
 			c.Triggers = append(c.Triggers, tr)
 		}
 	}
+
+	// Structured env expansion: every non-secret field expands ${VAR} now, as
+	// the single-file path does; registry secret fields keep their raw
+	// reference (${VAR} / cred:<service>) for lazy resolution at consumers.
+	expandDeferredSecrets(c)
 
 	if err := validate(dir, c); err != nil {
 		return nil, err

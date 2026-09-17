@@ -47,7 +47,7 @@ type EmbedOpts struct {
 // space) and jina-clip-v2. A nil/zero store on a handle part is resolved by
 // the caps layer before this point; here Data must already be inline.
 func (m *Manager) EmbedParts(ctx context.Context, model string, parts []media.Part, eo EmbedOpts) ([][]float32, Usage, error) {
-	cfg, err := m.resolve(model)
+	cfg, err := m.resolveModel(model)
 	if err != nil {
 		return nil, Usage{}, err
 	}

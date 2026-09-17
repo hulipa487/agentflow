@@ -8,6 +8,7 @@ package search
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 
@@ -117,16 +118,63 @@ func NewEngine(name string, cfg config.SearchEngine) (Searcher, error) {
 	return nil, fmt.Errorf("search: unsupported engine %q", name)
 }
 
+// keyedEngines require an API key; a missing or unresolvable credential skips
+// the engine with a warning (honest degradation), it never fails the boot.
+var keyedEngines = map[string]bool{
+	"doubao": true, "ollama": true, "youtube": true,
+	"google_search": true, "x_search": true,
+}
+
 // Build constructs the full engine set from config. With no engines it
 // returns an empty Set (not an error) — the tool reports honest-unavailable.
-func Build(cfg config.Search) (*Set, error) {
+// res lazily resolves api_key references (${VAR} / cred:<service>): env, then
+// the credential store, then the engine is skipped with a warning naming the
+// missing credential. log may be nil.
+func Build(cfg config.Search, res *config.Resolver, log *slog.Logger) (*Set, error) {
 	set := &Set{Engines: map[string]Searcher{}, Default: cfg.Default}
 	for name, ecfg := range cfg.Engines {
+		if keyedEngines[name] && ecfg.APIKey != "" {
+			v, ok := res.Resolve(context.Background(), ecfg.APIKey)
+			if !ok {
+				warnSkip(log, name, ecfg.APIKey)
+				continue
+			}
+			ecfg.APIKey = v
+		}
 		e, err := NewEngine(name, ecfg)
 		if err != nil {
+			if keyedEngines[name] {
+				// Keyless after resolution — degrade, don't fail the boot.
+				warnSkip(log, name, ecfg.APIKey)
+				continue
+			}
 			return nil, err
 		}
 		set.Engines[name] = e
 	}
+	// If the configured default was skipped, fall back to the sole remaining
+	// engine (or none — calls then name an engine explicitly).
+	if set.Default != "" {
+		if _, ok := set.Engines[set.Default]; !ok {
+			if log != nil {
+				log.Warn("search default engine unavailable after credential resolution; clearing default",
+					"engine", set.Default)
+			}
+			set.Default = ""
+			if len(set.Engines) == 1 {
+				for n := range set.Engines {
+					set.Default = n
+				}
+			}
+		}
+	}
 	return set, nil
+}
+
+func warnSkip(log *slog.Logger, engine, raw string) {
+	if log == nil {
+		return
+	}
+	log.Warn("search engine skipped: unresolved credential",
+		"engine", engine, "credential", config.CredentialName(raw))
 }

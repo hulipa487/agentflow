@@ -705,7 +705,7 @@ func TestBuildAndSetDispatch(t *testing.T) {
 			"doubao": {APIKey: "dk", BaseURL: srv.URL},
 			"ollama": {APIKey: "ok", BaseURL: srv.URL},
 		},
-	})
+	}, &config.Resolver{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -731,7 +731,7 @@ func TestBuildAndSetDispatch(t *testing.T) {
 }
 
 func TestBuildEmptyConfig(t *testing.T) {
-	set, err := Build(config.Search{})
+	set, err := Build(config.Search{}, &config.Resolver{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

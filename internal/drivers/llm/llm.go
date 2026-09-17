@@ -106,6 +106,37 @@ type Manager struct {
 	seq     atomic.Uint64
 	mu      sync.Mutex
 	streams map[string]*Stream
+
+	// resolveSecret lazily resolves a model api_key that is still a raw
+	// reference (${VAR} / cred:<service>) — i.e. loaded via the configdir
+	// path. Wired from main with a config.Resolver; nil means "treat every
+	// key as a literal" (the legacy path expands at load, so keys arrive
+	// literal). A failed resolution is NOT cached: the next call retries.
+	resolveSecret func(raw string) (string, bool)
+}
+
+// SetSecretResolver installs the lazy api_key resolver (see the field).
+func (m *Manager) SetSecretResolver(fn func(string) (string, bool)) {
+	m.resolveSecret = fn
+}
+
+// resolveModel is resolve plus lazy api_key resolution. A model whose key
+// cannot be resolved stays configured — the first LLM call fails here with
+// an error naming the model and the unresolved credential, rather than the
+// boot failing or a bare 401 reaching the provider.
+func (m *Manager) resolveModel(name string) (config.Model, error) {
+	cfg, err := m.resolve(name)
+	if err != nil {
+		return config.Model{}, err
+	}
+	if m.resolveSecret != nil && cfg.APIKey != "" {
+		v, ok := m.resolveSecret(cfg.APIKey)
+		if !ok {
+			return config.Model{}, fmt.Errorf("model %q: cannot resolve api_key %q (set the env var or store the credential)", name, cfg.APIKey)
+		}
+		cfg.APIKey = v
+	}
+	return cfg, nil
 }
 
 func NewManager(models map[string]config.Model, log *slog.Logger) *Manager {
@@ -177,7 +208,7 @@ func (m *Manager) Get(name string) (config.Model, error) { return m.resolve(name
 // Chat performs a full completion and returns the buffered text plus any
 // tool_calls the model requested at stream end.
 func (m *Manager) Chat(ctx context.Context, model string, msgs []Message, opts Opts) (string, []ToolCall, Usage, error) {
-	cfg, err := m.resolve(model)
+	cfg, err := m.resolveModel(model)
 	if err != nil {
 		return "", nil, Usage{}, err
 	}
@@ -209,7 +240,7 @@ type Stream struct {
 
 // StreamOpen starts a completion and returns a stream id for StreamNext.
 func (m *Manager) StreamOpen(ctx context.Context, model string, msgs []Message, opts Opts) (string, error) {
-	cfg, err := m.resolve(model)
+	cfg, err := m.resolveModel(model)
 	if err != nil {
 		return "", err
 	}

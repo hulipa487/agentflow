@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -278,12 +279,14 @@ type Info struct {
 	// instructions came from a prompts: registry key instead.
 	InstructionsPath string
 	// InstructionsPrompt is the prompts: registry key the agent's instructions
-	// were sourced from ("" when they came from a file path).
+	// were sourced from ("" when they came from a file path). A reload that
+	// rewrites that key's text updates Instructions in place too.
 	InstructionsPrompt string
-	// Prompts is the deployment's resolved prompt registry (name -> text),
-	// surfaced read-only to the loop by agent.config(). Nil when the config
-	// declares no prompts.
-	Prompts map[string]string
+	// Prompts is the deployment's shared prompt registry, surfaced read-only
+	// to the loop by agent.config(). Every agent def holds the same instance,
+	// so a file-backed prompt refreshed by the reload watcher is visible to
+	// all of them. Nil is a valid empty registry.
+	Prompts *PromptRegistry
 	// Extras is the agent profile's deployment-specific data, surfaced
 	// read-only by agent.config() with secret references rendered as opaque
 	// markers.
@@ -302,6 +305,67 @@ func (b *StringBox) Load() string {
 }
 
 func (b *StringBox) Store(s string) { b.v.Store(s) }
+
+// PromptRegistry is the deployment's resolved prompt text (name -> text),
+// shared by every agent: one registry instance is handed to every agent def,
+// so a file-backed prompt updated at reload time is visible to all of them at
+// once. Reads and writes are serialized — a reload watcher rewrites one key's
+// text while sessions snapshot the whole map on every agent.config().
+//
+// A nil *PromptRegistry is a valid empty registry, so an Info built without
+// one (tests, builtin loops) needs no special case.
+type PromptRegistry struct {
+	mu    sync.RWMutex
+	texts map[string]string
+}
+
+// NewPromptRegistry returns a registry over a copy of texts.
+func NewPromptRegistry(texts map[string]string) *PromptRegistry {
+	cp := make(map[string]string, len(texts))
+	for k, v := range texts {
+		cp[k] = v
+	}
+	return &PromptRegistry{texts: cp}
+}
+
+// Snapshot returns a copy of the current text. Callers get their own map, so
+// it is safe to marshal or hold while the watcher writes.
+func (r *PromptRegistry) Snapshot() map[string]string {
+	out := map[string]string{}
+	if r == nil {
+		return out
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for k, v := range r.texts {
+		out[k] = v
+	}
+	return out
+}
+
+// Set replaces one key's text (the reload watcher's only write).
+func (r *PromptRegistry) Set(key, text string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.texts == nil {
+		r.texts = map[string]string{}
+	}
+	r.texts[key] = text
+}
+
+// Get returns one key's current text.
+func (r *PromptRegistry) Get(key string) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	v, ok := r.texts[key]
+	return v, ok
+}
 
 // blockingOps run on the worker pool; everything else is inline.
 var blockingOps = map[string]bool{
@@ -821,11 +885,10 @@ func (a *Actor) configJSON() string {
 		extras[k] = config.OpaqueValue(v)
 	}
 	// The prompt registry is always a table, even when empty, so a loop can
-	// index cfg.prompts without a nil check.
-	prompts := map[string]string{}
-	for k, v := range a.Info.Prompts {
-		prompts[k] = v
-	}
+	// index cfg.prompts without a nil check. Snapshot copies under the
+	// registry's lock: a file-backed prompt may be rewritten by the reload
+	// watcher between here and the marshal.
+	prompts := a.Info.Prompts.Snapshot()
 	out := map[string]any{
 		"name":              a.Info.Name,
 		"model":             a.Info.Model,

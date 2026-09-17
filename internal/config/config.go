@@ -429,6 +429,20 @@ func (c *Config) PromptTexts() map[string]string {
 	return out
 }
 
+// PromptFiles returns the file backing each `file:`-sourced prompt, keyed by
+// prompt name — what the reload watcher polls. inline:/text: entries have no
+// file and are absent; the key set of the prompts: block itself is not live,
+// so adding or re-pointing a key still needs a restart.
+func (c *Config) PromptFiles() map[string]string {
+	out := map[string]string{}
+	for name, p := range c.Prompts {
+		if p.File != "" {
+			out[name] = p.File
+		}
+	}
+	return out
+}
+
 // Search configures the builtin:web_search tool: a set of named engines and
 // the default used when a call omits `engine`. With no engines configured the
 // tool reports honest-unavailable rather than failing. Engine names double as

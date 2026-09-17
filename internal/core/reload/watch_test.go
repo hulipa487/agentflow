@@ -151,6 +151,263 @@ func touch(t *testing.T, path string) {
 	}
 }
 
+// promptFixture is a prompt-registry fixture: one registry instance shared by
+// every agent (exactly what main.go wires), one file-backed key, one inline
+// key, and a live session per agent parked on its mailbox.
+type promptFixture struct {
+	dir   string
+	file  string
+	sup   *supervisor.Supervisor
+	reg   *session.PromptRegistry
+	files map[string]string
+	defs  map[string]*supervisor.AgentDef
+	logs  *syncBuf
+	log   *slog.Logger
+}
+
+const (
+	promptFirst  = "first version\n"
+	promptSecond = "second version\n"
+	promptInline = "[Knowledge base]"
+)
+
+func newPromptFixture(t *testing.T, names ...string) *promptFixture {
+	t.Helper()
+	dir := t.TempDir()
+	file := filepath.Join(dir, "assistant.md")
+	if err := os.WriteFile(file, []byte(promptFirst), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	logs := &syncBuf{}
+	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	reg := session.NewPromptRegistry(map[string]string{
+		"assistant_system": promptFirst,
+		"kb_header":        promptInline,
+	})
+	files := map[string]string{"assistant_system": file}
+
+	defs := map[string]*supervisor.AgentDef{}
+	for _, name := range names {
+		box := &session.StringBox{}
+		box.Store(promptFirst)
+		defs[name] = &supervisor.AgentDef{
+			Info: &session.Info{
+				Name:               name,
+				HistoryBudget:      100,
+				Prompts:            reg,
+				InstructionsPrompt: "assistant_system",
+				Instructions:       box,
+			},
+			Capabilities: map[string]bool{},
+			Handlers:     map[string]session.OpHandler{},
+			LoopSrc:      "function loop() while true do session.inbox() end end",
+		}
+	}
+
+	sup := supervisor.New(defs, gateway.NewRegistry(log), pool.New(2), nil, log)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sup.Start(ctx)
+	for _, name := range names {
+		if err := sup.Deliver(name, "k", session.Message{ID: "m1", Type: "user", From: "u", Text: "hi"}); err != nil {
+			t.Fatalf("deliver to %s: %v", name, err)
+		}
+	}
+	for _, name := range names {
+		skey := "session=" + name + "|k"
+		waitFor(t, "session "+name+" to load its loop", 10*time.Second, func() bool {
+			return loggedLine(logs.String(), "loop started", skey)
+		})
+	}
+	return &promptFixture{dir: dir, file: file, sup: sup, reg: reg, files: files, defs: defs, logs: logs, log: log}
+}
+
+// startWatcher runs the watcher against the fixture's prompt source.
+func (fx *promptFixture) startWatcher(t *testing.T) *Watcher {
+	t.Helper()
+	w := New(fx.sup, &PromptSource{Registry: fx.reg, Files: fx.files}, fx.log)
+	w.Start()
+	t.Cleanup(w.Stop)
+	return w
+}
+
+// editPrompt rewrites the backing file and forces a distinct mtime.
+func (fx *promptFixture) editPrompt(t *testing.T, text string) {
+	t.Helper()
+	if err := os.WriteFile(fx.file, []byte(text), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	touch(t, fx.file)
+}
+
+// countLogged counts log lines containing every fragment.
+func countLogged(logs string, fragments ...string) int {
+	n := 0
+	for _, line := range strings.Split(logs, "\n") {
+		all := true
+		for _, f := range fragments {
+			if !strings.Contains(line, f) {
+				all = false
+				break
+			}
+		}
+		if all {
+			n++
+		}
+	}
+	return n
+}
+
+// TestPromptFileReloadsEveryAgent: editing a file-backed prompt republishes it
+// to the deployment-wide registry, so every agent's agent.config() text for
+// that key reflects the new content. The registry is one shared instance, and
+// the poll bookkeeping is keyed by prompt name rather than by agent — keyed
+// per agent (as loop paths are), whichever agent poll() reached first would
+// consume the change and the rest would keep the stale text.
+func TestPromptFileReloadsEveryAgent(t *testing.T) {
+	fx := newPromptFixture(t, "alpha", "beta")
+	fx.startWatcher(t)
+
+	fx.editPrompt(t, promptSecond)
+
+	waitFor(t, "the shared registry to pick up the new text", 10*time.Second, func() bool {
+		s, _ := fx.reg.Get("assistant_system")
+		return s == promptSecond
+	})
+	// Every agent reads the same registry instance.
+	for name, def := range fx.defs {
+		if got, _ := def.Info.Prompts.Get("assistant_system"); got != promptSecond {
+			t.Fatalf("agent %s still sees %q", name, got)
+		}
+	}
+	if _, ok := fx.reg.Get("kb_header"); !ok {
+		t.Fatal("an unrelated prompt key disappeared")
+	}
+	if !loggedLine(fx.logs.String(), "reload: prompt updated", "prompt=assistant_system") {
+		t.Fatalf("prompt reload not logged with its key and file:\n%s", fx.logs.String())
+	}
+}
+
+// TestPromptFileReloadsInstructionsInPlace: an agent whose system prompt came
+// from a prompt key gets the new text in place — no session restart, so the
+// running loop keeps its state and picks the text up on its next turn.
+func TestPromptFileReloadsInstructionsInPlace(t *testing.T) {
+	fx := newPromptFixture(t, "alpha")
+	fx.startWatcher(t)
+
+	fx.editPrompt(t, promptSecond)
+
+	waitFor(t, "the agent's system prompt to update in place", 10*time.Second, func() bool {
+		s, _ := fx.reg.Get("assistant_system")
+		return s == promptSecond && fx.defs["alpha"].Info.Instructions.Load() == promptSecond
+	})
+	if !loggedLine(fx.logs.String(), "reload: instructions updated", "agent=alpha") {
+		t.Fatalf("instructions update not logged:\n%s", fx.logs.String())
+	}
+	if strings.Contains(fx.logs.String(), "hot reload: restarting loop") {
+		t.Fatalf("a prompt change must not restart the session:\n%s", fx.logs.String())
+	}
+}
+
+// TestPromptInlineEntryIsNotWatched: an inline:/text: entry has no backing
+// file, so it is polled by nothing and produces no reload — and in particular
+// is never blanked by a read that has no file to make.
+func TestPromptInlineEntryIsNotWatched(t *testing.T) {
+	fx := newPromptFixture(t, "alpha")
+	fx.startWatcher(t)
+
+	// Several poll ticks (the watcher ticks at 500ms).
+	time.Sleep(1600 * time.Millisecond)
+
+	if strings.Contains(fx.logs.String(), "reload: prompt updated") {
+		t.Fatalf("an inline prompt must not be watched:\n%s", fx.logs.String())
+	}
+	if got, _ := fx.reg.Get("kb_header"); got != promptInline {
+		t.Fatalf("inline prompt text changed: %q", got)
+	}
+}
+
+// TestPromptUnreadableKeepsPreviousText: a prompt file that cannot be re-read
+// warns and keeps the text already published — never an empty prompt. Both
+// ways it can fail are covered: the path is gone (stat fails) and the path is
+// no longer a readable file (stat succeeds, read fails).
+func TestPromptUnreadableKeepsPreviousText(t *testing.T) {
+	cases := map[string]func(t *testing.T, fx *promptFixture){
+		"removed": func(t *testing.T, fx *promptFixture) {
+			if err := os.Remove(fx.file); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"no longer a file": func(t *testing.T, fx *promptFixture) {
+			if err := os.Remove(fx.file); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(fx.file, 0o750); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	for name, break_ := range cases {
+		t.Run(name, func(t *testing.T) {
+			fx := newPromptFixture(t, "alpha")
+			fx.startWatcher(t)
+
+			break_(t, fx)
+
+			waitFor(t, "the failure to be reported", 10*time.Second, func() bool {
+				return loggedLine(fx.logs.String(), "reload: cannot read prompt", "prompt=assistant_system")
+			})
+			// Long enough for several more polls: the previous text must hold,
+			// and the warning must not repeat on every tick.
+			time.Sleep(1600 * time.Millisecond)
+
+			if got, _ := fx.reg.Get("assistant_system"); got != promptFirst {
+				t.Fatalf("previous prompt text not retained: %q", got)
+			}
+			if fx.defs["alpha"].Info.Instructions.Load() != promptFirst {
+				t.Fatal("previous instructions not retained")
+			}
+			if n := countLogged(fx.logs.String(), "reload: cannot read prompt"); n != 1 {
+				t.Fatalf("unreadable prompt warned %d times; want exactly 1 (no warn storm)", n)
+			}
+		})
+	}
+}
+
+// TestUnchangedPromptDoesNotReload: an untouched prompt file stays quiet
+// across polls — the mtime is seeded at Start, so only a real edit fires.
+func TestUnchangedPromptDoesNotReload(t *testing.T) {
+	fx := newPromptFixture(t, "alpha")
+	fx.startWatcher(t)
+
+	time.Sleep(1600 * time.Millisecond)
+
+	if strings.Contains(fx.logs.String(), "reload: prompt updated") {
+		t.Fatalf("an untouched prompt must not reload:\n%s", fx.logs.String())
+	}
+}
+
+// TestSharedPromptKeyUpdatesBothAgents: two agents sourced from one prompt key
+// both observe a single edit — one file edit, one republish, both system
+// prompts updated. The change must not be consumed by only the first agent
+// polled.
+func TestSharedPromptKeyUpdatesBothAgents(t *testing.T) {
+	fx := newPromptFixture(t, "alpha", "beta")
+	fx.startWatcher(t)
+
+	fx.editPrompt(t, promptSecond)
+
+	waitFor(t, "both agents to pick up the new system prompt", 10*time.Second, func() bool {
+		return fx.defs["alpha"].Info.Instructions.Load() == promptSecond &&
+			fx.defs["beta"].Info.Instructions.Load() == promptSecond
+	})
+	if n := countLogged(fx.logs.String(), "reload: prompt updated"); n != 1 {
+		t.Fatalf("one edit produced %d reloads; want exactly 1", n)
+	}
+}
+
 // TestSharedLoopPathReloadsEveryAgent: two agents bound to one loop directory
 // must both reload when a member changes. The watcher's mtime bookkeeping is
 // per (agent, path) — keyed by path alone, whichever agent poll() visited first
@@ -159,7 +416,7 @@ func touch(t *testing.T, path string) {
 func TestSharedLoopPathReloadsEveryAgent(t *testing.T) {
 	fx := newDirLoop(t, "alpha", "beta")
 
-	w := New(fx.sup, fx.log)
+	w := New(fx.sup, nil, fx.log)
 	w.Start()
 	defer w.Stop()
 
@@ -182,7 +439,7 @@ func TestSharedLoopPathReloadsEveryAgent(t *testing.T) {
 func TestDeletedLoopMemberReloadsEveryAgent(t *testing.T) {
 	fx := newDirLoop(t, "alpha", "beta")
 
-	w := New(fx.sup, fx.log)
+	w := New(fx.sup, nil, fx.log)
 	w.Start()
 	defer w.Stop()
 
@@ -204,7 +461,7 @@ func TestDeletedLoopMemberReloadsEveryAgent(t *testing.T) {
 func TestUnchangedDirectoryMembersDoNotReload(t *testing.T) {
 	fx := newDirLoop(t, "alpha", "beta")
 
-	w := New(fx.sup, fx.log)
+	w := New(fx.sup, nil, fx.log)
 	w.Start()
 	defer w.Stop()
 
@@ -224,7 +481,7 @@ func TestDeletedMemberEntryIsPruned(t *testing.T) {
 	fx := newDirLoop(t, "alpha")
 	gone := filepath.Join(fx.dir, "20-tools.lua")
 
-	w := New(fx.sup, fx.log)
+	w := New(fx.sup, nil, fx.log)
 	w.seedDir("alpha", fx.dir) // what Start() does for a directory loop
 
 	if w.changed("alpha", fx.dir) {
@@ -262,7 +519,7 @@ func TestEmptyDirectoryLoopIsRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	w := New(fx.sup, fx.log)
+	w := New(fx.sup, nil, fx.log)
 	w.Start()
 	defer w.Stop()
 
@@ -315,7 +572,7 @@ func TestSharedInstructionsPathUpdatesEveryAgent(t *testing.T) {
 	sup := supervisor.New(defs, gateway.NewRegistry(log), pool.New(1), nil, log)
 	sup.Start(context.Background())
 
-	w := New(sup, log)
+	w := New(sup, nil, log)
 	w.Start()
 	defer w.Stop()
 
@@ -352,7 +609,7 @@ func TestUnchangedPathDoesNotReload(t *testing.T) {
 	sup := supervisor.New(defs, gateway.NewRegistry(log), pool.New(1), nil, log)
 	sup.Start(context.Background())
 
-	w := New(sup, log)
+	w := New(sup, nil, log)
 	w.Start()
 	defer w.Stop()
 

@@ -19,11 +19,23 @@ import (
 	"agentflow/internal/vm"
 )
 
+// watchKey identifies one watched path for one agent. Several agents may share
+// a loop path — a supported and useful shape, e.g. one shared loop whose Lua
+// tools each profile narrows via its skills list — and every one of them has
+// to be reloaded when that path changes. Bookkeeping keyed by path alone would
+// let the first agent polled consume the change (it is the one that records the
+// new mtime) and leave every other agent bound to that path stale, so an edit
+// would appear half-applied depending on map iteration order.
+type watchKey struct {
+	agent string
+	path  string
+}
+
 // Watcher polls file mtimes (no fsnotify dependency).
 type Watcher struct {
 	sup    *supervisor.Supervisor
 	log    *slog.Logger
-	mtimes map[string]time.Time
+	mtimes map[watchKey]time.Time
 	stop   chan struct{}
 }
 
@@ -31,21 +43,21 @@ func New(sup *supervisor.Supervisor, log *slog.Logger) *Watcher {
 	return &Watcher{
 		sup:    sup,
 		log:    log.With("module", "reload"),
-		mtimes: map[string]time.Time{},
+		mtimes: map[watchKey]time.Time{},
 		stop:   make(chan struct{}),
 	}
 }
 
 func (w *Watcher) Start() {
-	for _, def := range w.sup.Agents() {
+	for name, def := range w.sup.Agents() {
 		for _, p := range []string{def.LoopFile, def.InstructionsPath} {
 			if p == "" {
 				continue
 			}
 			if fi, err := os.Stat(p); err == nil {
-				w.mtimes[p] = fi.ModTime()
+				w.mtimes[watchKey{name, p}] = fi.ModTime()
 				if fi.IsDir() {
-					w.seedDir(p)
+					w.seedDir(name, p)
 				}
 			}
 		}
@@ -53,9 +65,9 @@ func (w *Watcher) Start() {
 	go w.loop()
 }
 
-// seedDir records the mtimes of a directory loop's members so the first
-// member edit after startup is detected.
-func (w *Watcher) seedDir(dir string) {
+// seedDir records the mtimes of a directory loop's members for one agent, so
+// the first member edit after startup is detected.
+func (w *Watcher) seedDir(agent, dir string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
@@ -66,7 +78,7 @@ func (w *Watcher) seedDir(dir string) {
 		}
 		p := filepath.Join(dir, e.Name())
 		if fi, err := os.Stat(p); err == nil {
-			w.mtimes[p] = fi.ModTime()
+			w.mtimes[watchKey{agent, p}] = fi.ModTime()
 		}
 	}
 }
@@ -88,28 +100,32 @@ func (w *Watcher) loop() {
 
 func (w *Watcher) poll() {
 	for name, def := range w.sup.Agents() {
-		if def.LoopFile != "" && w.changed(def.LoopFile) {
+		if def.LoopFile != "" && w.changed(name, def.LoopFile) {
 			w.reloadLoop(name, def.LoopFile)
 		}
-		if def.InstructionsPath != "" && w.changed(def.InstructionsPath) {
+		if def.InstructionsPath != "" && w.changed(name, def.InstructionsPath) {
 			w.reloadInstructions(name, def)
 		}
 	}
 }
 
-// changed reports whether the path's mtime advanced since the last poll and
-// records the new mtime. For a directory loop, it reports whether any member
-// *.lua changed (the directory's own mtime is unreliable for member edits).
-func (w *Watcher) changed(path string) bool {
+// changed reports whether the path's mtime advanced since this agent last
+// looked and records the new mtime. For a directory loop, it reports whether
+// any member *.lua changed (the directory's own mtime is unreliable for member
+// edits). The bookkeeping is per (agent, path): a path shared by several agents
+// is tracked separately for each of them, so one agent's poll cannot consume
+// another's change.
+func (w *Watcher) changed(agent, path string) bool {
+	key := watchKey{agent, path}
 	fi, err := os.Stat(path)
 	if err != nil {
 		return false
 	}
 	if !fi.IsDir() {
-		if fi.ModTime().Equal(w.mtimes[path]) {
+		if fi.ModTime().Equal(w.mtimes[key]) {
 			return false
 		}
-		w.mtimes[path] = fi.ModTime()
+		w.mtimes[key] = fi.ModTime()
 		return true
 	}
 	// Directory: check each member's mtime; also re-seed so newly added
@@ -128,8 +144,9 @@ func (w *Watcher) changed(path string) bool {
 		if err != nil {
 			continue
 		}
-		if !mfi.ModTime().Equal(w.mtimes[p]) {
-			w.mtimes[p] = mfi.ModTime()
+		mk := watchKey{agent, p}
+		if !mfi.ModTime().Equal(w.mtimes[mk]) {
+			w.mtimes[mk] = mfi.ModTime()
 			changed = true
 		}
 	}

@@ -262,38 +262,75 @@ func applyParamOverrides(t *ToolSpec, params map[string]config.ToolParamOverride
 	return unresolved
 }
 
+// ToolVisibility is the per-agent rule deciding which tool names reach the
+// model: an agent's `skills` list intersected with the global
+// `tools.policy.default`. It is the single source of truth for that decision,
+// shared by Go-registered tools (Expose) and Lua-declared ones (the prelude's
+// tools.list via the tools.declared op), so the two surfaces cannot drift.
+//
+// The rule: skills non-empty -> visible iff the name is listed; skills empty
+// and default "none" -> nothing visible; skills empty and default all/""
+// -> everything visible.
+//
+// It deliberately does not encode `forbidden` or the `permission: forbidden`
+// override. Those gate Go tools only: a Lua-declared tool is the loop's own
+// code and the Go tools policy has never applied to it.
+//
+// The zero value exposes nothing — an AgentSet built without one is a set with
+// no visible tools, which is what a caller that never ran Expose should get.
+type ToolVisibility struct {
+	skills       map[string]bool
+	anySkills    bool
+	defaultAllow bool
+}
+
+// NewToolVisibility derives the rule from one agent's skills and the global
+// tools policy.
+func NewToolVisibility(skills []string, policy config.ToolsPolicy) ToolVisibility {
+	v := ToolVisibility{defaultAllow: policy.Default != "none"}
+	if len(skills) > 0 {
+		v.anySkills = true
+		v.skills = make(map[string]bool, len(skills))
+		for _, s := range skills {
+			v.skills[s] = true
+		}
+	}
+	return v
+}
+
+// Allows reports whether a tool of this name is visible to the agent.
+func (v ToolVisibility) Allows(name string) bool {
+	if !v.anySkills {
+		return v.defaultAllow
+	}
+	return v.skills[name]
+}
+
 // AgentSet is the resolved tool list for one agent.
 type AgentSet struct {
 	Registry *Registry
 	Tools    []ToolSpec
 	ByName   map[string]ToolSpec
+	// Visible is the rule this set was filtered by, re-exported so the
+	// Lua-declared tools can be filtered by the same one.
+	Visible ToolVisibility
 }
 
 // Expose computes the tools available to an agent given its skills, the global
 // policy, and the execution context.
+//
+// This is where `skills` and `tools.policy.default` decide visibility, and it
+// governs Lua-declared tools (tool.def) exactly as it governs registered ones:
+// the same ToolVisibility rule reaches the prelude through AgentSet.Visible.
+// That is a behavior change for a deployment with `tools.policy.default: none`
+// and no skills — a loop's declared tools were listed before and are not now,
+// because before them `skills` filtered nothing on that path. `forbidden` and
+// the `permission: forbidden` override still gate registered tools only.
 func (r *Registry) Expose(skills []string, policy config.ToolsPolicy, autonomous bool) *AgentSet {
-	defaultAllow := true
-	switch policy.Default {
-	case "none":
-		defaultAllow = false
-	case "all", "":
-		defaultAllow = true
-	}
+	vis := NewToolVisibility(skills, policy)
 	forbidden := map[string]bool{}
 	for _, f := range policy.Forbidden {
 		forbidden[f] = true
-	}
-
-	allowed := map[string]bool{}
-	if len(skills) > 0 {
-		for _, s := range skills {
-			allowed[s] = true
-		}
-	} else if !defaultAllow {
-		// Default none and no skills -> nothing, regardless of what is
-		// registered. (Overrides only adjust policy of exposed tools; they
-		// never allow-list on their own.)
-		return &AgentSet{Registry: r, Tools: []ToolSpec{}, ByName: map[string]ToolSpec{}}
 	}
 
 	r.mu.RLock()
@@ -302,10 +339,10 @@ func (r *Registry) Expose(skills []string, policy config.ToolsPolicy, autonomous
 	out := []ToolSpec{}
 	byName := map[string]ToolSpec{}
 	for name, t := range r.tools {
-		if forbidden[name] {
-			continue
-		}
-		if len(skills) > 0 && !allowed[name] {
+		// Default none with no skills exposes nothing, regardless of what is
+		// registered. (Overrides only adjust policy of exposed tools; they
+		// never allow-list on their own.)
+		if forbidden[name] || !vis.Allows(name) {
 			continue
 		}
 		if override, ok := policy.Overrides[name]; ok {
@@ -331,7 +368,7 @@ func (r *Registry) Expose(skills []string, policy config.ToolsPolicy, autonomous
 		out = append(out, t)
 		byName[name] = t
 	}
-	return &AgentSet{Registry: r, Tools: out, ByName: byName}
+	return &AgentSet{Registry: r, Tools: out, ByName: byName, Visible: vis}
 }
 
 // Invoke runs a tool from the agent's exposed set.

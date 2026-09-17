@@ -93,12 +93,25 @@ func newToolDefFixture(t *testing.T, overrides map[string]config.ToolSpecOverrid
 // and mailbox, so a test can pump several turns and watch tools.list() change.
 func (fx *toolDefFixture) start(t *testing.T, loopSrc string) (*schemaGW, *session.Actor) {
 	t.Helper()
+	return fx.startAs(t, fx.agentSet, loopSrc)
+}
+
+// agentFor returns the tool surface for one agent on this fixture's shared
+// registry: in main.go the registry and the LuaOverrides are deployment-wide,
+// while the AgentSet is per agent.
+func (fx *toolDefFixture) agentFor(skills []string, policy config.ToolsPolicy) *tools.AgentSet {
+	return fx.reg.Expose(skills, policy, false)
+}
+
+// startAs launches an actor with an explicitly chosen tool surface.
+func (fx *toolDefFixture) startAs(t *testing.T, agentSet *tools.AgentSet, loopSrc string) (*schemaGW, *session.Actor) {
+	t.Helper()
 	gw := &schemaGW{}
 	a := session.New("main|test",
 		session.Identity{SessionID: "main|test", Agent: "main", Capabilities: map[string]bool{"tools": true}},
 		&session.Info{Name: "main", HistoryBudget: 100},
 		gw, nil, nil, nil, nil,
-		ToolHandlers(fx.agentSet, ToolWiring{LuaOverrides: fx.lua, Prompts: fx.prompts, Log: fx.log}),
+		ToolHandlers(agentSet, ToolWiring{LuaOverrides: fx.lua, Prompts: fx.prompts, Log: fx.log}),
 		pool.New(1), fx.log)
 	a.LoopSrc = loopSrc
 
@@ -127,7 +140,13 @@ func deliver(t *testing.T, a *session.Actor, gw *schemaGW, idx int, text string)
 // session.send text.
 func (fx *toolDefFixture) runLoop(t *testing.T, loopSrc string) string {
 	t.Helper()
-	gw, a := fx.start(t, loopSrc)
+	return fx.runLoopAs(t, fx.agentSet, loopSrc)
+}
+
+// runLoopAs drives one actor with an explicitly chosen tool surface.
+func (fx *toolDefFixture) runLoopAs(t *testing.T, agentSet *tools.AgentSet, loopSrc string) string {
+	t.Helper()
+	gw, a := fx.startAs(t, agentSet, loopSrc)
 	return deliver(t, a, gw, 0, "m1")
 }
 

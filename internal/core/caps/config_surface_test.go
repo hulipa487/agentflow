@@ -160,6 +160,88 @@ end
 	}
 }
 
+// TestAgentConfigPrompts: agent.config() surfaces the deployment's resolved
+// prompt registry under .prompts — the text, not the {file: ...} reference —
+// and an empty table when the config declares no prompts, so a loop can index
+// cfg.prompts without a nil check.
+func TestAgentConfigPrompts(t *testing.T) {
+	info := &session.Info{
+		Name:    "bot",
+		Prompts: map[string]string{"kb_header": "[Knowledge base]", "distiller": "You are a distiller."},
+	}
+	got, _ := runConfigLoop(t, `
+function loop()
+  local msg = session.inbox()
+  local cfg = agent.config()
+  if cfg.prompts.kb_header ~= "[Knowledge base]" then
+    session.send("err: kb_header: " .. tostring(cfg.prompts.kb_header))
+    return
+  end
+  if cfg.prompts.distiller ~= "You are a distiller." then
+    session.send("err: distiller: " .. tostring(cfg.prompts.distiller))
+    return
+  end
+  session.send("ok")
+end
+`, info, nil, nil, nil)
+	if got != "ok" {
+		t.Fatalf("loop failed: %s", got)
+	}
+
+	got, _ = runConfigLoop(t, `
+function loop()
+  local msg = session.inbox()
+  local cfg = agent.config()
+  if type(cfg.prompts) ~= "table" then
+    session.send("err: prompts is not a table: " .. type(cfg.prompts))
+    return
+  end
+  if next(cfg.prompts) ~= nil then
+    session.send("err: prompts should be empty: " .. json.encode(cfg.prompts))
+    return
+  end
+  session.send("empty")
+end
+`, &session.Info{Name: "bot"}, nil, nil, nil)
+	if got != "empty" {
+		t.Fatalf("empty-registry loop failed: %s", got)
+	}
+}
+
+// TestAgentConfigInstructionsPrompt: when the instructions came from a
+// prompts: registry key, agent.config() reports the key and leaves
+// instructions_path empty, so a loop can tell a registry-sourced system
+// prompt from a file-sourced one and fetch the text from cfg.prompts.
+func TestAgentConfigInstructionsPrompt(t *testing.T) {
+	info := &session.Info{
+		Name:               "bot",
+		InstructionsPrompt: "assistant_system",
+		Prompts:            map[string]string{"assistant_system": "You are the assistant."},
+	}
+	got, _ := runConfigLoop(t, `
+function loop()
+  local msg = session.inbox()
+  local cfg = agent.config()
+  if cfg.instructions_prompt ~= "assistant_system" then
+    session.send("err: prompt key: " .. tostring(cfg.instructions_prompt))
+    return
+  end
+  if cfg.instructions_path ~= "" then
+    session.send("err: path should be empty for a prompt source: " .. tostring(cfg.instructions_path))
+    return
+  end
+  if cfg.prompts[cfg.instructions_prompt] ~= "You are the assistant." then
+    session.send("err: registry lookup failed")
+    return
+  end
+  session.send("ok")
+end
+`, info, nil, nil, nil)
+	if got != "ok" {
+		t.Fatalf("loop failed: %s", got)
+	}
+}
+
 // TestRuntimeTriggersMerge: runtime.triggers() returns the merged list with
 // kind, schedule fields, target, and payload.
 func TestRuntimeTriggersMerge(t *testing.T) {

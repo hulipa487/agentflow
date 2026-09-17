@@ -274,8 +274,16 @@ type Info struct {
 	Capabilities  []string
 
 	// InstructionsPath is the config value (after configdir rebasing) — the
-	// path, not the content, which agent.config() surfaces.
+	// path, not the content, which agent.config() surfaces. Empty when the
+	// instructions came from a prompts: registry key instead.
 	InstructionsPath string
+	// InstructionsPrompt is the prompts: registry key the agent's instructions
+	// were sourced from ("" when they came from a file path).
+	InstructionsPrompt string
+	// Prompts is the deployment's resolved prompt registry (name -> text),
+	// surfaced read-only to the loop by agent.config(). Nil when the config
+	// declares no prompts.
+	Prompts map[string]string
 	// Extras is the agent profile's deployment-specific data, surfaced
 	// read-only by agent.config() with secret references rendered as opaque
 	// markers.
@@ -797,9 +805,10 @@ func (a *Actor) egress(ctx context.Context, channel, replyTo, text string, attac
 }
 
 // configJSON answers the agent.config op: this agent's own profile as Lua
-// data — name, model, the instructions path, the goal block and any other
-// profile extras. Secrets never appear: every string in the extras tree that
-// is a whole secret reference renders as the opaque marker {env="VAR"} or
+// data — name, model, the instructions path (or prompt key), the goal block,
+// any other profile extras, and the deployment's resolved prompt registry.
+// Secrets never appear: every string in the extras tree that is a whole
+// secret reference renders as the opaque marker {env="VAR"} or
 // {cred="service"}; resolved values never cross the Lua bridge.
 func (a *Actor) configJSON() string {
 	extras := map[string]any{}
@@ -811,11 +820,21 @@ func (a *Actor) configJSON() string {
 		}
 		extras[k] = config.OpaqueValue(v)
 	}
+	// The prompt registry is always a table, even when empty, so a loop can
+	// index cfg.prompts without a nil check.
+	prompts := map[string]string{}
+	for k, v := range a.Info.Prompts {
+		prompts[k] = v
+	}
 	out := map[string]any{
 		"name":              a.Info.Name,
 		"model":             a.Info.Model,
 		"instructions_path": a.Info.InstructionsPath,
+		"prompts":           prompts,
 		"extras":            extras,
+	}
+	if a.Info.InstructionsPrompt != "" {
+		out["instructions_prompt"] = a.Info.InstructionsPrompt
 	}
 	if goal != nil {
 		out["goal"] = goal

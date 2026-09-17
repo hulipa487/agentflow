@@ -8,8 +8,17 @@ import (
 	"agentflow/internal/config"
 )
 
-func strPtr(s string) *string { return &s }
-func boolPtr(b bool) *bool    { return &b }
+// strPtr is a literal description override.
+func strPtr(s string) *config.PromptString {
+	return &config.PromptString{Value: s}
+}
+
+// promptRef is a description override sourced from the prompts registry.
+func promptRef(key string) *config.PromptString {
+	return &config.PromptString{Value: key, IsRef: true}
+}
+
+func boolPtr(b bool) *bool { return &b }
 
 // overrideRegistry returns a registry with one schema-carrying tool.
 func overrideRegistry() *Registry {
@@ -39,7 +48,7 @@ func TestApplyOverridesReplacesDescription(t *testing.T) {
 	r := overrideRegistry()
 	err := r.ApplyOverrides(map[string]config.ToolSpecOverride{
 		"builtin:web_search": {Description: strPtr("Search the deployment's runbooks.")},
-	}, nil)
+	}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,11 +66,11 @@ func TestApplyOverridesMergesParamDescription(t *testing.T) {
 	err := r.ApplyOverrides(map[string]config.ToolSpecOverride{
 		"builtin:web_search": {
 			Params: map[string]config.ToolParamOverride{
-				"query": {Description: "What to look up, in the user's words"},
-				"bogus": {Description: "not in the schema"},
+				"query": {Description: config.PromptString{Value: "What to look up, in the user's words"}},
+				"bogus": {Description: config.PromptString{Value: "not in the schema"}},
 			},
 		},
-	}, nil)
+	}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +101,7 @@ func TestApplyOverridesUnknownToolFails(t *testing.T) {
 	r := overrideRegistry()
 	err := r.ApplyOverrides(map[string]config.ToolSpecOverride{
 		"builtin:web_serach": {Description: strPtr("typo")},
-	}, nil)
+	}, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "builtin:web_serach") {
 		t.Fatalf("unknown tool must fail, got %v", err)
 	}
@@ -104,7 +113,7 @@ func TestApplyOverridesPolicyFieldsFlip(t *testing.T) {
 	r := overrideRegistry()
 	err := r.ApplyOverrides(map[string]config.ToolSpecOverride{
 		"builtin:web_search": {NeedsConfirm: boolPtr(true), Autonomous: boolPtr(false)},
-	}, nil)
+	}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,15 +132,57 @@ func TestApplyOverridesPolicyFieldsFlip(t *testing.T) {
 	}
 }
 
+// TestApplyOverridesPromptDescription: a description override may name a
+// prompts: registry key instead of a literal; the registry text replaces the
+// registered description, and an unknown key fails the boot.
+func TestApplyOverridesPromptDescription(t *testing.T) {
+	prompts := map[string]string{"search_desc": "Search the deployment's runbooks."}
+
+	r := overrideRegistry()
+	err := r.ApplyOverrides(map[string]config.ToolSpecOverride{
+		"builtin:web_search": {
+			Description: promptRef("search_desc"),
+			Params: map[string]config.ToolParamOverride{
+				"query": {Description: config.PromptString{Value: "query_help", IsRef: true}},
+			},
+		},
+	}, map[string]string{"search_desc": "Search the deployment's runbooks.", "query_help": "What to look up"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	as := r.Expose(nil, config.ToolsPolicy{}, false)
+	spec := as.ByName["builtin:web_search"]
+	if spec.Description != prompts["search_desc"] {
+		t.Fatalf("prompt description not resolved: %q", spec.Description)
+	}
+	props := spec.Parameters["properties"].(map[string]any)
+	if got := props["query"].(map[string]any)["description"]; got != "What to look up" {
+		t.Fatalf("param prompt description not resolved: %v", got)
+	}
+}
+
+// TestApplyOverridesUnknownPromptFails: a description referencing a prompt key
+// the registry does not define is a boot error naming the tool, never a silent
+// empty description.
+func TestApplyOverridesUnknownPromptFails(t *testing.T) {
+	r := overrideRegistry()
+	err := r.ApplyOverrides(map[string]config.ToolSpecOverride{
+		"builtin:web_search": {Description: promptRef("missing")},
+	}, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("unknown prompt key must fail, got %v", err)
+	}
+}
+
 // TestApplyOverridesEmptyUnchanged: the no-override path is byte-identical to
 // today — nothing is mutated, nothing errors.
 func TestApplyOverridesEmptyUnchanged(t *testing.T) {
 	r := overrideRegistry()
 	before := r.Expose(nil, config.ToolsPolicy{}, false).ByName["builtin:web_search"]
-	if err := r.ApplyOverrides(nil, nil); err != nil {
+	if err := r.ApplyOverrides(nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.ApplyOverrides(map[string]config.ToolSpecOverride{}, nil); err != nil {
+	if err := r.ApplyOverrides(map[string]config.ToolSpecOverride{}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	after := r.Expose(nil, config.ToolsPolicy{}, false).ByName["builtin:web_search"]
@@ -149,9 +200,9 @@ func TestApplyOverridesThenJSONNormalized(t *testing.T) {
 	err := r.ApplyOverrides(map[string]config.ToolSpecOverride{
 		"builtin:web_search": {
 			Description: strPtr("Search the deployment's runbooks."),
-			Params:      map[string]config.ToolParamOverride{"query": {Description: "What to look up"}},
+			Params:      map[string]config.ToolParamOverride{"query": {Description: config.PromptString{Value: "What to look up"}}},
 		},
-	}, nil)
+	}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

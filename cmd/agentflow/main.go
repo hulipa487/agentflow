@@ -266,8 +266,8 @@ func main() {
 	// Bake config-level tool spec overrides (tools.policy.overrides) into the
 	// registry — after every Register* call (builtins, legal, shell, MCP) and
 	// before any Expose. An override naming an unregistered tool is a typo and
-	// fails the boot.
-	if err := toolReg.ApplyOverrides(cfg.Tools.Policy.Overrides, log); err != nil {
+	// fails the boot, as does a description referencing an unknown prompt key.
+	if err := toolReg.ApplyOverrides(cfg.Tools.Policy.Overrides, cfg.PromptTexts(), log); err != nil {
 		log.Error("tool overrides failed", "err", err)
 		os.Exit(1)
 	}
@@ -297,6 +297,10 @@ func main() {
 
 	// Resolve per-agent memory and build handler maps.
 	runtimeHandlers := caps.RuntimeHandlers(cfg.Triggers)
+	// The resolved prompt registry (name -> text) is surfaced read-only to
+	// every loop by agent.config() and is what {prompt: key} references
+	// (instructions, tool descriptions) resolve against.
+	promptTexts := cfg.PromptTexts()
 	agentMemories := []memory.AgentMemory{}
 	defs := map[string]*supervisor.AgentDef{}
 	for name, a := range cfg.Agents {
@@ -305,15 +309,13 @@ func main() {
 			log.Error("agent loop resolve failed", "agent", name, "err", err)
 			os.Exit(1)
 		}
-		instructions := &session.StringBox{}
-		if a.Instructions != "" {
-			b, err := os.ReadFile(a.Instructions)
-			if err != nil {
-				log.Error("instructions read failed", "agent", name, "file", a.Instructions, "err", err)
-				os.Exit(1)
-			}
-			instructions.Store(string(b))
+		instrText, instrPrompt, err := resolveInstructions(a.Instructions, cfg.Prompts)
+		if err != nil {
+			log.Error("instructions read failed", "agent", name, "err", err)
+			os.Exit(1)
 		}
+		instructions := &session.StringBox{}
+		instructions.Store(instrText)
 
 		var amPtr *memory.AgentMemory
 		mp := cfg.ResolveMemoryProfile(a)
@@ -394,13 +396,15 @@ func main() {
 				Skills:        a.Skills,
 				Capabilities:  a.Capabilities,
 
-				InstructionsPath: a.Instructions,
-				Extras:           a.Extras,
-				Credentials:      a.Credentials,
+				InstructionsPath:   a.Instructions.File,
+				InstructionsPrompt: instrPrompt,
+				Prompts:            promptTexts,
+				Extras:             a.Extras,
+				Credentials:        a.Credentials,
 			},
 			LoopFile:         watchPath,
 			LoopSrc:          src,
-			InstructionsPath: a.Instructions,
+			InstructionsPath: a.Instructions.File,
 			Handlers:         handlers,
 			CanContact:       canContact,
 			Capabilities:     effectiveCaps,
@@ -418,15 +422,13 @@ func main() {
 			log.Error("spawn profile loop resolve failed", "profile", pname, "err", err)
 			os.Exit(1)
 		}
-		instructions := &session.StringBox{}
-		if p.Instructions != "" {
-			b, err := os.ReadFile(p.Instructions)
-			if err != nil {
-				log.Error("spawn profile instructions read failed", "profile", pname, "file", p.Instructions, "err", err)
-				os.Exit(1)
-			}
-			instructions.Store(string(b))
+		instrText, instrPrompt, err := resolveInstructions(p.Instructions, cfg.Prompts)
+		if err != nil {
+			log.Error("spawn profile instructions read failed", "profile", pname, "err", err)
+			os.Exit(1)
 		}
+		instructions := &session.StringBox{}
+		instructions.Store(instrText)
 
 		var amPtr *memory.AgentMemory
 		mp, hasProfile := cfg.Profiles.Memory[p.Memory]
@@ -500,7 +502,7 @@ func main() {
 			LoopFile:     watchPath,
 			LoopSrc:      src,
 			Model:        p.Model,
-			Instructions: p.Instructions,
+			Instructions: p.Instructions.File,
 			Shell:        shellProfileMap(cfg, p.Shell),
 			CanContact:   stringSet(p.CanContact),
 			Capabilities: profileCaps,
@@ -516,9 +518,11 @@ func main() {
 				Skills:        p.Skills,
 				Capabilities:  p.Capabilities,
 
-				InstructionsPath: p.Instructions,
-				Extras:           p.Extras,
-				Credentials:      p.Credentials,
+				InstructionsPath:   p.Instructions.File,
+				InstructionsPrompt: instrPrompt,
+				Prompts:            promptTexts,
+				Extras:             p.Extras,
+				Credentials:        p.Credentials,
 			},
 		}
 		defs["__spawn__"+pname] = &supervisor.AgentDef{
@@ -922,6 +926,29 @@ func capabilitySet(caps []string) map[string]bool {
 		caps = config.DefaultCapabilities
 	}
 	return stringSet(caps)
+}
+
+// resolveInstructions sources an agent's or spawn profile's system prompt from
+// either a file path or a prompts: registry key. It returns the text and the
+// registry key ("" for a file source), which agent.config() surfaces as
+// instructions_path vs instructions_prompt. An unreadable file or an unknown
+// key is a boot error — a prompt never silently degrades to empty.
+func resolveInstructions(ref config.InstructionsRef, prompts map[string]config.Prompt) (text, promptKey string, err error) {
+	if ref.Prompt != "" {
+		p, ok := prompts[ref.Prompt]
+		if !ok {
+			return "", "", fmt.Errorf("instructions references unknown prompt %q", ref.Prompt)
+		}
+		return p.Content, ref.Prompt, nil
+	}
+	if ref.File == "" {
+		return "", "", nil
+	}
+	b, err := os.ReadFile(ref.File)
+	if err != nil {
+		return "", "", fmt.Errorf("read %s: %w", ref.File, err)
+	}
+	return string(b), "", nil
 }
 
 // triggerTarget resolves a trigger's target.profile to the supervisor address

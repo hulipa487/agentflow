@@ -127,12 +127,14 @@ func (r *Registry) Register(t ToolSpec) {
 // into the registry's canonical specs. Call once at boot, after every
 // Register* call and before any Expose: an override naming an unregistered
 // tool is a typo and fails the boot. A description override replaces the
-// registered description verbatim; param overrides shallow-merge into
-// parameters.properties[name]; the policy fields are applied here and again
-// per-agent in Expose (same values, idempotent). Schemas still pass through
-// NormalizeSchema at emit time (JSON, llm.chat), so an override can never
-// produce a mangled "required": {}.
-func (r *Registry) ApplyOverrides(overrides map[string]config.ToolSpecOverride, log *slog.Logger) error {
+// registered description verbatim — either a literal or the text of a
+// prompts: registry key (prompts maps prompt names to resolved text); a
+// reference to a key that is not in prompts fails the boot. Param overrides
+// shallow-merge into parameters.properties[name]; the policy fields are
+// applied here and again per-agent in Expose (same values, idempotent).
+// Schemas still pass through NormalizeSchema at emit time (JSON, llm.chat),
+// so an override can never produce a mangled "required": {}.
+func (r *Registry) ApplyOverrides(overrides map[string]config.ToolSpecOverride, prompts map[string]string, log *slog.Logger) error {
 	if len(overrides) == 0 {
 		return nil
 	}
@@ -142,6 +144,7 @@ func (r *Registry) ApplyOverrides(overrides map[string]config.ToolSpecOverride, 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	unknown := []string{}
+	unresolved := []string{}
 	for name, o := range overrides {
 		t, ok := r.tools[name]
 		if !ok {
@@ -149,9 +152,14 @@ func (r *Registry) ApplyOverrides(overrides map[string]config.ToolSpecOverride, 
 			continue
 		}
 		if o.Description != nil {
-			t.Description = *o.Description
+			text, ok := o.Description.Resolve(prompts)
+			if !ok {
+				unresolved = append(unresolved, fmt.Sprintf("%s description -> %q", name, o.Description.Value))
+				continue
+			}
+			t.Description = text
 		}
-		applyParamOverrides(&t, o.Params, log)
+		unresolved = append(unresolved, applyParamOverrides(&t, o.Params, prompts, log)...)
 		if o.NeedsConfirm != nil {
 			t.NeedsConfirm = *o.NeedsConfirm
 		}
@@ -173,21 +181,28 @@ func (r *Registry) ApplyOverrides(overrides map[string]config.ToolSpecOverride, 
 		sort.Strings(unknown)
 		return fmt.Errorf("tools.policy.overrides names unregistered tool(s): %s", strings.Join(unknown, ", "))
 	}
+	if len(unresolved) > 0 {
+		sort.Strings(unresolved)
+		return fmt.Errorf("tools.policy.overrides references unknown prompt(s): %s", strings.Join(unresolved, ", "))
+	}
 	return nil
 }
 
 // applyParamOverrides shallow-merges param overrides into the tool schema's
 // properties. Only declared params can be overridden — anything else warns
 // and is skipped (a config naming a dropped param must not break the boot).
-func applyParamOverrides(t *ToolSpec, params map[string]config.ToolParamOverride, log *slog.Logger) {
+// It returns the description overrides whose prompt key does not exist, as
+// "tool param -> key" descriptors.
+func applyParamOverrides(t *ToolSpec, params map[string]config.ToolParamOverride, prompts map[string]string, log *slog.Logger) []string {
 	if len(params) == 0 {
-		return
+		return nil
 	}
 	props, ok := t.Parameters["properties"].(map[string]any)
 	if !ok {
 		log.Warn("tool override: schema declares no properties", "tool", t.Name)
-		return
+		return nil
 	}
+	var unresolved []string
 	for pname, po := range params {
 		raw, declared := props[pname]
 		if !declared {
@@ -199,10 +214,17 @@ func applyParamOverrides(t *ToolSpec, params map[string]config.ToolParamOverride
 			log.Warn("tool override: param schema is not an object, ignoring", "tool", t.Name, "param", pname)
 			continue
 		}
-		if po.Description != "" {
-			m["description"] = po.Description
+		if !po.Description.IsRef && po.Description.Value == "" {
+			continue
 		}
+		text, ok := po.Description.Resolve(prompts)
+		if !ok {
+			unresolved = append(unresolved, fmt.Sprintf("%s param %s -> %q", t.Name, pname, po.Description.Value))
+			continue
+		}
+		m["description"] = text
 	}
+	return unresolved
 }
 
 // AgentSet is the resolved tool list for one agent.

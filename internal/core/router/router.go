@@ -36,18 +36,31 @@ type Router struct {
 	mailbox chan Inbound
 	log     *slog.Logger
 
+	// triggers is the prebuilt runtime.triggers response (the same JSON the
+	// agent-facing op returns). Route Lua calls runtime.triggers() to read the
+	// deployment's trigger list instead of having event routes baked into
+	// source. Empty (the default) answers an empty list.
+	triggers string
+
 	// Journal, when set, records every inbound event (routed or dropped) to
 	// the core-owned message journal. Set once at boot; channel drivers never
 	// see it, so a misbehaving channel cannot bypass the audit trail.
 	Journal func(in Inbound, status string)
 }
 
-func New(src string, sup *supervisor.Supervisor, log *slog.Logger) *Router {
+// New builds the router. triggersResp is the runtime.triggers op body shared
+// with the agent surface (caps.TriggersResponse(cfg.Triggers)); pass "" when
+// the deployment has no triggers.
+func New(src, triggersResp string, sup *supervisor.Supervisor, log *slog.Logger) *Router {
+	if triggersResp == "" {
+		triggersResp = `{"ok":true,"triggers":[]}`
+	}
 	return &Router{
-		src:     src,
-		sup:     sup,
-		mailbox: make(chan Inbound, 256),
-		log:     log.With("module", "router"),
+		src:      src,
+		sup:      sup,
+		mailbox:  make(chan Inbound, 256),
+		triggers: triggersResp,
+		log:      log.With("module", "router"),
 	}
 }
 
@@ -145,6 +158,10 @@ func (r *Router) runOnce(ctx context.Context) bool {
 			if err := r.sup.Deliver(op.Agent, op.Key, op.Message); err != nil {
 				r.log.Warn("deliver failed", "agent", op.Agent, "key", op.Key, "err", err)
 			}
+		case "runtime.triggers":
+			// Same response shape as the agent-facing op, so route Lua and loop
+			// Lua read the merged trigger list identically.
+			resp = r.triggers
 		case "log":
 			r.log.Log(ctx, levelOf(op.Level), op.Msg)
 		default:

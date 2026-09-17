@@ -14,13 +14,11 @@ import (
 	"agentflow/internal/core/session"
 )
 
-// RuntimeHandlers serves the merged trigger list (configdir triggers/*.yaml,
-// or the top-level triggers: key) as read-only Lua data. The list is
-// snapshotted at boot — a loop calling runtime.triggers() replaces the
-// downstream pattern of baking CRON_TASKS / ROUTES tables into Lua source.
-// Cron/every expressions pass through verbatim; the engine never reduces
-// them to timers.
-func RuntimeHandlers(triggers []config.Trigger) map[string]session.OpHandler {
+// TriggersPayload renders the merged trigger list as the JSON array string
+// shared by the agent-facing runtime.triggers op and the gateway router, so
+// both surfaces answer with byte-identical data. Cron/every expressions pass
+// through verbatim; the engine never reduces them to timers.
+func TriggersPayload(triggers []config.Trigger) string {
 	out := make([]map[string]any, 0, len(triggers))
 	for _, tr := range triggers {
 		entry := map[string]any{
@@ -46,12 +44,27 @@ func RuntimeHandlers(triggers []config.Trigger) map[string]session.OpHandler {
 	}
 	b, err := json.Marshal(out)
 	if err != nil {
-		b = []byte("[]") // triggers carry no unmarshalable values
+		return "[]" // triggers carry no unmarshalable values
 	}
-	payload := string(b)
+	return string(b)
+}
+
+// TriggersResponse is the full op response both the agent runtime.triggers
+// handler and the router op switch return: the shared payload wrapped in the
+// {"ok":true,"triggers":[...]} envelope.
+func TriggersResponse(triggers []config.Trigger) string {
+	return `{"ok":true,"triggers":` + TriggersPayload(triggers) + `}`
+}
+
+// RuntimeHandlers serves the merged trigger list (configdir triggers/*.yaml,
+// or the top-level triggers: key) as read-only Lua data. The list is
+// snapshotted at boot — a loop calling runtime.triggers() replaces the
+// downstream pattern of baking CRON_TASKS / ROUTES tables into Lua source.
+func RuntimeHandlers(triggers []config.Trigger) map[string]session.OpHandler {
+	response := TriggersResponse(triggers)
 	return map[string]session.OpHandler{
 		"runtime.triggers": func(ctx context.Context, op session.Op) (string, bool) {
-			return `{"ok":true,"triggers":` + payload + `}`, true
+			return response, true
 		},
 	}
 }

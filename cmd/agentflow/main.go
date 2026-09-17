@@ -643,7 +643,7 @@ func main() {
 		log.Error("route plugin resolve failed", "err", err)
 		os.Exit(1)
 	}
-	rtr := router.New(routeSrc, sup, log)
+	rtr := router.New(routeSrc, caps.TriggersResponse(cfg.Triggers), sup, log)
 	if cfg.Audit.AuditEnabled() {
 		rtr.Journal = func(in router.Inbound, status string) {
 			msg := in.Message

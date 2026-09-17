@@ -5,8 +5,9 @@
 /agentflow.exe
 /agentflow.exe~
 /agentflow~
-# cgo build objects and the compiled Luau static library
-build/obj/
+# the local build scratch dir — cgo objects, cross-compiled binaries, and the
+# test runtime data under it — plus the compiled Luau static library
+/build/
 internal/vm/lib/
 
 # runtime data (sqlite stores, logs)

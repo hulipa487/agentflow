@@ -8,6 +8,7 @@
 package reload
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -202,7 +203,10 @@ func (w *Watcher) reloadLoop(agent, path string) {
 }
 
 // readLoop reads a loop source path, concatenating a directory's *.lua members
-// in sorted order (matching builtins.Resolve).
+// in sorted order (matching builtins.Resolve). An empty directory is an error,
+// not an empty loop: builtins.Resolve — which the actor calls on every restart
+// — rejects that same condition, so accepting it here would install a loop the
+// runtime cannot load, and the session would crash-restart once a second.
 func readLoop(path string) (string, error) {
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -215,6 +219,9 @@ func readLoop(path string) (string, error) {
 	names, err := dirMembers(path)
 	if err != nil {
 		return "", err
+	}
+	if len(names) == 0 {
+		return "", fmt.Errorf("loop dir %s has no .lua files", path)
 	}
 	var parts []string
 	for _, n := range names {

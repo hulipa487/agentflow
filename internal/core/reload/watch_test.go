@@ -105,7 +105,33 @@ func newDirLoop(t *testing.T, names ...string) *dirLoop {
 			t.Fatalf("deliver to %s: %v", name, err)
 		}
 	}
+	// Wait for each session's first loop load to finish before handing the
+	// fixture over: every test here edits these files immediately, and on
+	// Windows a file the actor is still reading cannot be removed.
+	for _, name := range names {
+		skey := "session=" + name + "|k"
+		waitFor(t, "session "+name+" to load its loop", 10*time.Second, func() bool {
+			return loggedLine(logs.String(), "loop started", skey)
+		})
+	}
 	return &dirLoop{dir: dir, sup: sup, logs: logs, log: log}
+}
+
+// loggedLine reports whether some single log line contains every fragment.
+func loggedLine(logs string, fragments ...string) bool {
+	for _, line := range strings.Split(logs, "\n") {
+		all := true
+		for _, f := range fragments {
+			if !strings.Contains(line, f) {
+				all = false
+				break
+			}
+		}
+		if all {
+			return true
+		}
+	}
+	return false
 }
 
 func writeMember(t *testing.T, dir, name, body string) {
@@ -218,6 +244,49 @@ func TestDeletedMemberEntryIsPruned(t *testing.T) {
 	}
 	if w.changed("alpha", fx.dir) {
 		t.Fatal("a deletion must be reported once, not on every poll")
+	}
+}
+
+// TestEmptyDirectoryLoopIsRefused: deleting the last member of a directory loop
+// must not install an empty loop. A directory with no members is a condition
+// builtins.Resolve rejects — and the actor re-resolves the directory on every
+// restart — so "accepting" it here does not yield an idle agent: the restarted
+// session cannot load its loop and crash-restarts once a second. The watcher
+// must refuse the reload and keep the old version running.
+func TestEmptyDirectoryLoopIsRefused(t *testing.T) {
+	fx := newDirLoop(t, "alpha")
+	// Start from a one-member directory: drop the second member before the
+	// watcher seeds, reproducing a loop directory that holds exactly one .lua.
+	last := filepath.Join(fx.dir, "10-main.lua")
+	if err := os.Remove(filepath.Join(fx.dir, "20-tools.lua")); err != nil {
+		t.Fatal(err)
+	}
+
+	w := New(fx.sup, fx.log)
+	w.Start()
+	defer w.Stop()
+
+	if err := os.Remove(last); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "the watcher to refuse the empty loop", 10*time.Second, func() bool {
+		return strings.Contains(fx.logs.String(), "reload: cannot read loop")
+	})
+	// Long enough for several polls and for a session that had been restarted
+	// onto the empty loop to crash-restart more than once (the actor retries
+	// after a second).
+	time.Sleep(2500 * time.Millisecond)
+
+	got := fx.logs.String()
+	if strings.Contains(got, "reload: new version accepted") {
+		t.Fatalf("an empty directory loop must not be accepted:\n%s", got)
+	}
+	if strings.Contains(got, "cannot read loop plugin") {
+		t.Fatalf("the agent entered the crash-restart path:\n%s", got)
+	}
+	if !strings.Contains(got, "reload: cannot read loop") {
+		t.Fatalf("the refusal is not explained:\n%s", got)
 	}
 }
 

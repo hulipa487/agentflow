@@ -152,7 +152,13 @@ func (h *Handle) queryPrefix(table, prefix string) (memory.Iterator, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &rowsIter{rows: rows}, nil
+	// Drained here, while ctx is alive: the rows are bound to it and would be
+	// closed by the deferred cancel before the caller could read them.
+	recs, err := memory.DrainRows(rows, scanKV)
+	if err != nil {
+		return nil, err
+	}
+	return memory.NewSliceIterator(recs), nil
 }
 
 func (h *Handle) queryText(table string, text string, k int) (memory.Iterator, error) {
@@ -172,7 +178,13 @@ func (h *Handle) queryText(table string, text string, k int) (memory.Iterator, e
 	if err != nil {
 		return nil, err
 	}
-	return &rowsIter{rows: rows}, nil
+	// Drained here, while ctx is alive: the rows are bound to it and would be
+	// closed by the deferred cancel before the caller could read them.
+	recs, err := memory.DrainRows(rows, scanKV)
+	if err != nil {
+		return nil, err
+	}
+	return memory.NewSliceIterator(recs), nil
 }
 
 func (h *Handle) queryAll(table string) (memory.Iterator, error) {
@@ -186,7 +198,13 @@ func (h *Handle) queryAll(table string) (memory.Iterator, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &rowsIter{rows: rows}, nil
+	// Drained here, while ctx is alive: the rows are bound to it and would be
+	// closed by the deferred cancel before the caller could read them.
+	recs, err := memory.DrainRows(rows, scanKV)
+	if err != nil {
+		return nil, err
+	}
+	return memory.NewSliceIterator(recs), nil
 }
 
 func (h *Handle) GC(table string, window int) error {
@@ -215,38 +233,15 @@ func (h *Handle) GC(table string, window int) error {
 
 func (h *Handle) Close() error { return h.db.Close() }
 
-type rowsIter struct {
-	rows *sql.Rows
-	rec  memory.Record
-	err  error
-}
-
-func (it *rowsIter) Next() bool {
-	if it.err != nil {
-		return false
-	}
-	if !it.rows.Next() {
-		it.err = it.rows.Err()
-		return false
-	}
+// scanKV reads the (key, JSON value) column pair the store_kv table holds.
+func scanKV(rows *sql.Rows) (memory.Record, error) {
 	var key, raw string
-	if err := it.rows.Scan(&key, &raw); err != nil {
-		it.err = err
-		return false
+	if err := rows.Scan(&key, &raw); err != nil {
+		return memory.Record{}, err
 	}
 	var v any
 	if err := json.Unmarshal([]byte(raw), &v); err != nil {
-		it.err = err
-		return false
+		return memory.Record{}, err
 	}
-	it.rec = memory.Record{Key: key, Value: v}
-	return true
-}
-
-func (it *rowsIter) Record() memory.Record { return it.rec }
-func (it *rowsIter) Err() error {
-	if it.err != nil {
-		return it.err
-	}
-	return it.rows.Err()
+	return memory.Record{Key: key, Value: v}, nil
 }

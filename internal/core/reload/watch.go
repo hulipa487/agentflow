@@ -36,15 +36,21 @@ type Watcher struct {
 	sup    *supervisor.Supervisor
 	log    *slog.Logger
 	mtimes map[watchKey]time.Time
-	stop   chan struct{}
+	// members is the set of *.lua member paths last seen for a directory loop,
+	// per (agent, dir). A member's mtime cannot report its own disappearance —
+	// it is simply absent from the next readdir — so the set is what makes a
+	// deleted member a change.
+	members map[watchKey]map[string]bool
+	stop    chan struct{}
 }
 
 func New(sup *supervisor.Supervisor, log *slog.Logger) *Watcher {
 	return &Watcher{
-		sup:    sup,
-		log:    log.With("module", "reload"),
-		mtimes: map[watchKey]time.Time{},
-		stop:   make(chan struct{}),
+		sup:     sup,
+		log:     log.With("module", "reload"),
+		mtimes:  map[watchKey]time.Time{},
+		members: map[watchKey]map[string]bool{},
+		stop:    make(chan struct{}),
 	}
 }
 
@@ -65,22 +71,41 @@ func (w *Watcher) Start() {
 	go w.loop()
 }
 
-// seedDir records the mtimes of a directory loop's members for one agent, so
-// the first member edit after startup is detected.
+// seedDir records the mtimes and the member set of a directory loop for one
+// agent, so the first member edit after startup is detected — and so a member
+// deleted later is compared against what was there at startup.
 func (w *Watcher) seedDir(agent, dir string) {
-	entries, err := os.ReadDir(dir)
+	names, err := dirMembers(dir)
 	if err != nil {
 		return
 	}
+	members := map[string]bool{}
+	for _, n := range names {
+		p := filepath.Join(dir, n)
+		if fi, err := os.Stat(p); err == nil {
+			w.mtimes[watchKey{agent, p}] = fi.ModTime()
+			members[p] = true
+		}
+	}
+	w.members[watchKey{agent, dir}] = members
+}
+
+// dirMembers lists a directory's *.lua member names, sorted (the concatenation
+// order builtins.Resolve uses).
+func dirMembers(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".lua") {
 			continue
 		}
-		p := filepath.Join(dir, e.Name())
-		if fi, err := os.Stat(p); err == nil {
-			w.mtimes[watchKey{agent, p}] = fi.ModTime()
-		}
+		names = append(names, e.Name())
 	}
+	sort.Strings(names)
+	return names, nil
 }
 
 func (w *Watcher) Stop() { close(w.stop) }
@@ -111,10 +136,10 @@ func (w *Watcher) poll() {
 
 // changed reports whether the path's mtime advanced since this agent last
 // looked and records the new mtime. For a directory loop, it reports whether
-// any member *.lua changed (the directory's own mtime is unreliable for member
-// edits). The bookkeeping is per (agent, path): a path shared by several agents
-// is tracked separately for each of them, so one agent's poll cannot consume
-// another's change.
+// any member *.lua changed — an edit, an addition, or a deletion (the
+// directory's own mtime is unreliable for member edits). The bookkeeping is per
+// (agent, path): a path shared by several agents is tracked separately for each
+// of them, so one agent's poll cannot consume another's change.
 func (w *Watcher) changed(agent, path string) bool {
 	key := watchKey{agent, path}
 	fi, err := os.Stat(path)
@@ -128,18 +153,16 @@ func (w *Watcher) changed(agent, path string) bool {
 		w.mtimes[key] = fi.ModTime()
 		return true
 	}
-	// Directory: check each member's mtime; also re-seed so newly added
-	// members are tracked on subsequent polls.
-	entries, err := os.ReadDir(path)
+	names, err := dirMembers(path)
 	if err != nil {
+		// A transient readdir failure must not look like every member vanishing.
 		return false
 	}
+	seen := make(map[string]bool, len(names))
 	var changed bool
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".lua") {
-			continue
-		}
-		p := filepath.Join(path, e.Name())
+	for _, n := range names {
+		p := filepath.Join(path, n)
+		seen[p] = true
 		mfi, err := os.Stat(p)
 		if err != nil {
 			continue
@@ -150,6 +173,17 @@ func (w *Watcher) changed(agent, path string) bool {
 			changed = true
 		}
 	}
+	// A member that is gone is a change too — the concatenated loop source
+	// shrank, and no mtime on disk can report that (a deleted file is simply
+	// absent from the listing above). Drop its entry in the same pass so
+	// removed members do not accumulate.
+	for p := range w.members[key] {
+		if !seen[p] {
+			delete(w.mtimes, watchKey{agent, p})
+			changed = true
+		}
+	}
+	w.members[key] = seen
 	return changed
 }
 
@@ -178,17 +212,10 @@ func readLoop(path string) (string, error) {
 		b, err := os.ReadFile(path)
 		return string(b), err
 	}
-	entries, err := os.ReadDir(path)
+	names, err := dirMembers(path)
 	if err != nil {
 		return "", err
 	}
-	var names []string
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".lua") {
-			names = append(names, e.Name())
-		}
-	}
-	sort.Strings(names)
 	var parts []string
 	for _, n := range names {
 		b, err := os.ReadFile(filepath.Join(path, n))

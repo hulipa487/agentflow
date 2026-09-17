@@ -216,6 +216,7 @@ func (f *agentFile) spawnProfile() (SpawnProfile, error) {
 		Skills:       a.Skills,
 		Capabilities: a.Capabilities,
 		CanContact:   a.CanContact,
+		Credentials:  a.Credentials,
 	}
 	if len(a.Budget) > 0 {
 		sp.Budget = BudgetConfig{

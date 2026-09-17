@@ -278,6 +278,7 @@ func main() {
 	}
 
 	// Resolve per-agent memory and build handler maps.
+	runtimeHandlers := caps.RuntimeHandlers(cfg.Triggers)
 	agentMemories := []memory.AgentMemory{}
 	defs := map[string]*supervisor.AgentDef{}
 	for name, a := range cfg.Agents {
@@ -354,6 +355,10 @@ func main() {
 		for k, h := range caps.MailHandlers(log, credStore) {
 			handlers[k] = h
 		}
+		for k, h := range runtimeHandlers {
+			handlers[k] = h
+		}
+		handlers["credential.get"] = caps.CredentialHandler(credStore, a.Credentials, log)
 
 		canContact := stringSet(a.CanContact)
 		safeDispatcher := resolveSafety(cfg, a.Safety)
@@ -367,6 +372,10 @@ func main() {
 				Shell:         shellProfileMap(cfg, a.Shell),
 				Skills:        a.Skills,
 				Capabilities:  a.Capabilities,
+
+				InstructionsPath: a.Instructions,
+				Extras:           a.Extras,
+				Credentials:      a.Credentials,
 			},
 			LoopFile:         watchPath,
 			LoopSrc:          src,
@@ -458,6 +467,10 @@ func main() {
 		for k, h := range caps.MailHandlers(log, credStore) {
 			handlers[k] = h
 		}
+		for k, h := range runtimeHandlers {
+			handlers[k] = h
+		}
+		handlers["credential.get"] = caps.CredentialHandler(credStore, p.Credentials, log)
 
 		tmpl := &supervisor.SpawnTemplate{
 			Name:         pname,

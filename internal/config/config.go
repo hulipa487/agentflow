@@ -231,6 +231,7 @@ type SpawnProfile struct {
 	Skills       []string           `yaml:"skills"`
 	Capabilities []string           `yaml:"capabilities"`
 	CanContact   []string           `yaml:"can_contact"`
+	Credentials  []string           `yaml:"credentials"` // credential.get allow-list for spawned children
 	Ephemeral    EphemeralLifecycle `yaml:"ephemeral"`
 	Budget       BudgetConfig       `yaml:"budget"`
 }
@@ -380,6 +381,14 @@ type Agent struct {
 	Lifecycle     map[string]any    `yaml:"lifecycle"`
 	Budget        map[string]any    `yaml:"budget"`
 	Channels      []string          `yaml:"channels"`
+	// Credentials is the allow-list of engine-wide credential names this
+	// agent may fetch with credential.get(). Empty or missing = no access.
+	Credentials []string `yaml:"credentials"`
+	// Extras carries deployment-specific profile data (a pm options block, a
+	// workflow name, a goal{type, success_signal, max_turns, on_goal_met}...)
+	// surfaced read-only to the loop via agent.config(). Secret references
+	// render as opaque markers there — resolved values never appear.
+	Extras map[string]any `yaml:"extras"`
 }
 
 type Gateway struct {

@@ -234,6 +234,14 @@ agent = {}
 function agent.info()
   return op({ type = "agent.info" })
 end
+-- agent.config() -> this agent's own profile: name, model, the instructions
+-- path, goal{type, success_signal, max_turns, on_goal_met} (when the profile
+-- declares one under extras.goal), and the remaining extras (a pm options
+-- block, a workflow name, ...). Secret references render as opaque markers
+-- ({env="VAR"} / {cred="service"}) — resolved values never appear here.
+function agent.config()
+  return op({ type = "agent.config" })
+end
 function agent.send(address, payload)
   return op({ type = "agent.send", address = address, payload = payload or {} })
 end
@@ -470,6 +478,27 @@ end
 -- other secrets that must not be hardcoded in Lua source). Returns "" if unset.
 os = {}
 function os.env(name) return op({ type = "os.env", name = name }) end
+
+-- runtime.config surface: deployment configuration as read-only Lua data.
+runtime = {}
+-- runtime.triggers() -> { ok, triggers = [ { name, kind, run_on_boot, target =
+-- {profile}, payload, and the schedule fields (event={channel,match} |
+-- cron | every) }, ... ] } — the merged triggers/*.yaml (or top-level
+-- triggers:) list, snapshotted at boot. This replaces baking CRON_TASKS /
+-- ROUTES tables into Lua source; cron expressions pass through verbatim.
+function runtime.triggers()
+  return op({ type = "runtime.triggers" })
+end
+
+-- credential.get(name) -> { ok, name, value } — the stored engine-wide
+-- secret, ONLY when the agent's profile lists the name under credentials:[]
+-- (empty/missing list = denied, error says so). Every access is logged and
+-- counted; the value is never journaled (op responses are not journal
+-- records) and should never be echoed into session.send.
+credential = {}
+function credential.get(name)
+  return op({ type = "credential.get", cred_name = name })
+end
 
 -- mail: IMAP fetch and SMTP send, in-process via the net.mail runtime cap.
 -- Like http.request, auth={service=...} names a stored credential resolved by

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"agentflow/internal/builtins"
+	"agentflow/internal/config"
 	"agentflow/internal/core/address"
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/memory"
@@ -146,6 +147,9 @@ type Op struct {
 	QueryParams map[string]string `json:"query_params,omitempty"`
 	// EnvName is the os.env op's variable name.
 	EnvName string `json:"name,omitempty"`
+	// CredName is the credential.get op's credential name (a stored secret's
+	// service name — never the value).
+	CredName string `json:"cred_name,omitempty"`
 	// Auth names a stored credential to resolve at request time (never the
 	// secret itself). The loop references it; Go injects the resolved value.
 	Auth *CredentialRef `json:"auth,omitempty"`
@@ -268,6 +272,16 @@ type Info struct {
 	Shell         map[string]any
 	Skills        []string
 	Capabilities  []string
+
+	// InstructionsPath is the config value (after configdir rebasing) — the
+	// path, not the content, which agent.config() surfaces.
+	InstructionsPath string
+	// Extras is the agent profile's deployment-specific data, surfaced
+	// read-only by agent.config() with secret references rendered as opaque
+	// markers.
+	Extras map[string]any
+	// Credentials is the credential.get allow-list (empty = no access).
+	Credentials []string
 }
 
 // StringBox is a race-free string cell (this toolchain's sync/atomic lacks
@@ -303,6 +317,7 @@ var blockingOps = map[string]bool{
 	"http.request":      true,
 	"mail.imap.fetch":   true,
 	"mail.smtp.send":    true,
+	"credential.get":    true,
 	"agent.send":        true,
 	"agent.request":     true,
 	"agent.reply":       true,
@@ -559,6 +574,9 @@ func (a *Actor) dispatchInline(ctx context.Context, op Op, current *Message) (re
 	case "agent.info":
 		return a.infoJSON(), true, true
 
+	case "agent.config":
+		return a.configJSON(), true, true
+
 	default:
 		// Stamp the tenant user UUID for inline handlers, mirroring execBlocking.
 		ctx = WithUserUUID(ctx, userFromMessage(current))
@@ -776,6 +794,34 @@ func (a *Actor) egress(ctx context.Context, channel, replyTo, text string, attac
 	}
 	journal("delivered", "")
 	return "true", true
+}
+
+// configJSON answers the agent.config op: this agent's own profile as Lua
+// data — name, model, the instructions path, the goal block and any other
+// profile extras. Secrets never appear: every string in the extras tree that
+// is a whole secret reference renders as the opaque marker {env="VAR"} or
+// {cred="service"}; resolved values never cross the Lua bridge.
+func (a *Actor) configJSON() string {
+	extras := map[string]any{}
+	var goal any
+	for k, v := range a.Info.Extras {
+		if k == "goal" {
+			goal = config.OpaqueValue(v)
+			continue
+		}
+		extras[k] = config.OpaqueValue(v)
+	}
+	out := map[string]any{
+		"name":              a.Info.Name,
+		"model":             a.Info.Model,
+		"instructions_path": a.Info.InstructionsPath,
+		"extras":            extras,
+	}
+	if goal != nil {
+		out["goal"] = goal
+	}
+	r, _ := jsonString(out)
+	return r
 }
 
 func (a *Actor) infoJSON() string {

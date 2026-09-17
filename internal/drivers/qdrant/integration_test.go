@@ -13,8 +13,12 @@ import (
 // It is skipped unless AF_QDRANT_URL points at a running Qdrant, because the
 // shapes asserted here are the ones the unit tests cannot check — those run
 // against this package's own fake, which encodes what we believe the API to be
-// rather than what it is. Run it against a real server before trusting the
-// driver:
+// rather than what it is.
+//
+// Last verified green against Qdrant 1.19.1 (2026-09-17), which covered
+// collection create, upsert with a vector, k-NN search, payload round-trip,
+// cross-table isolation, get, delete, and the vectorless put. Re-run it after
+// a Qdrant upgrade:
 //
 //	AF_QDRANT_URL=http://localhost:6333 go test ./internal/drivers/qdrant/ -run Integration -v
 func TestIntegrationAgainstLiveQdrant(t *testing.T) {

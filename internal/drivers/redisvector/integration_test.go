@@ -15,8 +15,13 @@ import (
 // It is skipped unless AF_REDIS_URL points at Redis Stack, because this is the
 // only place the FT.CREATE / FT.SEARCH command shapes are checked against a
 // server that actually parses them — the unit tests assert the arguments
-// against this package's own expectation, not against RediSearch. Run it
-// before trusting the driver:
+// against this package's own expectation, not against RediSearch.
+//
+// Last verified green against Redis Stack with RediSearch module 81000
+// (2026-09-17), which covered index creation, the k-NN query string, the
+// kv/scan paths, delete, and the vectorless put. Note the k-NN query needs
+// RESP2 (see parseOptions); this test is what caught that. Re-run it after a
+// Redis or module upgrade:
 //
 //	AF_REDIS_URL=redis://localhost:6379 go test ./internal/drivers/redisvector/ -run Integration -v
 func TestIntegrationAgainstLiveRediSearch(t *testing.T) {

@@ -596,6 +596,9 @@ func (a *Actor) dispatchBlocking(ctx context.Context, op Op, current *Message) (
 func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (string, bool) {
 	ctx = WithOwner(ctx, a.Name)
 	ctx = WithUserUUID(ctx, userFromMessage(current))
+	if a.Info != nil {
+		ctx = WithShell(ctx, a.Info.Shell)
+	}
 	if op.Type == "send" {
 		if current.Channel == "" {
 			return `"no active message to reply to"`, false
@@ -876,6 +879,26 @@ func OwnerFromCtx(ctx context.Context) string {
 	v := ctx.Value(ownerKey)
 	s, _ := v.(string)
 	return s
+}
+
+type shellKeyType struct{}
+
+var shellKey shellKeyType
+
+// WithShell returns a context carrying the session agent's bound shell
+// profile (nil when unbound). The registry shell tools (builtin:shell.*)
+// resolve it to lazily spawn or reuse the session's handle.
+func WithShell(ctx context.Context, profile map[string]any) context.Context {
+	return context.WithValue(ctx, shellKey, profile)
+}
+
+// ShellFromCtx extracts the bound shell profile injected by WithShell, or nil.
+func ShellFromCtx(ctx context.Context) map[string]any {
+	if ctx == nil {
+		return nil
+	}
+	v, _ := ctx.Value(shellKey).(map[string]any)
+	return v
 }
 
 type userKeyType struct{}

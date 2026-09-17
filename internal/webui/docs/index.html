@@ -796,6 +796,7 @@ shell.destroy(id)
 --   -- SSH only:
 --   host = "1.2.3.4:22", user = "root", password = "...", key_file = "/path" }</code></pre>
   <p>Docker handles are persistent: files written in one <code>shell.exec</code> are visible in the next. Handles are owned by the session and reaped automatically when the session dies.</p>
+  <p>Agents with a bound shell profile (<code>agents.&lt;name&gt;.shell</code>) also get registry tools that resolve the profile implicitly — no <code>shell.spawn</code> glue in the loop: <code>builtin:shell.exec</code> (<code>{ command }</code> → <code>{ ok, stdout, stderr, exit_code, duration_ms, handle_id }</code>), <code>builtin:shell.write</code> (<code>{ path, content }</code>), and <code>builtin:shell.destroy</code>. The first call lazily spawns a handle from the profile; later calls reuse it; destroy tears it down (a later call spawns a fresh one). An agent without a bound profile gets honest-unavailable, and agents without the <code>shell.exec</code> capability do not see these tools at all, even under <code>tools.policy.default: all</code>. All three default to <code>needs_confirm: true</code> — relax per deployment via <code>tools.policy.overrides</code>.</p>
 
   <h4><code>http</code> and <code>os</code> — cap: <code>net.http</code></h4>
   <pre><code>http.request(opts) -> { ok, status, headers, body, truncated? }

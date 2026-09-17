@@ -2,6 +2,7 @@ package tools
 
 import (
 	"log/slog"
+	"sort"
 	"sync"
 
 	"agentflow/internal/config"
@@ -11,8 +12,8 @@ import (
 // Lua-declared tool. A declared tool never enters the Go registry — it exists
 // only once a loop chunk loads — so its override cannot be baked at boot the
 // way a registered tool's is. These entries are held here and resolved per
-// call by the tools.overrides op, which the prelude's tools.list consults with
-// the names its chunk declared.
+// call by the tools.declared op, which the prelude's tools.list and tools.run
+// consult with the names their chunk declared.
 //
 // Registered tool names are held too, not just unknown ones: a loop may
 // declare a tool that shadows a Go tool, and the winner still has to carry the
@@ -61,6 +62,29 @@ func NewLuaOverrides(overrides map[string]config.ToolSpecOverride, registered []
 		declared:   map[string]bool{},
 		reported:   map[string]bool{},
 	}
+}
+
+// Pending returns, sorted, the override names that are not registered Go
+// tools — the ones held for a Lua declaration. Boot logs them so an operator
+// sees an override that will not take effect until a loop declares it, rather
+// than hearing nothing until an agent happens to take a work turn. A
+// legitimate declared-tool override belongs here too, which is why this is one
+// informational line and not a per-name warning; the warning is reserved for
+// names no loop ever declares.
+func (l *LuaOverrides) Pending() []string {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []string
+	for name := range l.specs {
+		if !l.registered[name] {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ResolvedOverride is one declared tool's override as the loop consumes it:

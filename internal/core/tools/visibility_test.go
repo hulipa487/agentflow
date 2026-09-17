@@ -66,3 +66,36 @@ func TestExposeEmptySurface(t *testing.T) {
 		t.Fatal("the carried rule must agree with the empty surface")
 	}
 }
+
+// TestLuaOverridesPending: the boot-time signal lists exactly the override
+// names waiting on a Lua declaration — registered names excluded, sorted so
+// the log line is stable.
+func TestLuaOverridesPending(t *testing.T) {
+	lua := NewLuaOverrides(map[string]config.ToolSpecOverride{
+		"builtin:web_search": {Description: strPtr("registered")},
+		"lua:b":              {Description: strPtr("pending")},
+		"lua:a":              {Description: strPtr("pending")},
+	}, []string{"builtin:web_search"})
+
+	got := lua.Pending()
+	if len(got) != 2 || got[0] != "lua:a" || got[1] != "lua:b" {
+		t.Fatalf("Pending() = %v; want [lua:a lua:b]", got)
+	}
+
+	// No overrides at all: no signal, and the nil receiver is safe.
+	if p := NewLuaOverrides(nil, nil).Pending(); p != nil {
+		t.Fatalf("Pending() with no overrides = %v; want nil", p)
+	}
+	var nilLua *LuaOverrides
+	if p := nilLua.Pending(); p != nil {
+		t.Fatalf("nil receiver Pending() = %v; want nil", p)
+	}
+
+	// A registered-only set has nothing pending: the boot line stays quiet.
+	reg := NewLuaOverrides(map[string]config.ToolSpecOverride{
+		"builtin:web_search": {Description: strPtr("registered")},
+	}, []string{"builtin:web_search"})
+	if p := reg.Pending(); len(p) != 0 {
+		t.Fatalf("Pending() = %v; want nothing for registered-only overrides", p)
+	}
+}

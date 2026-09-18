@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -48,6 +49,24 @@ var sources = map[string]string{
 
 // supportOrder fixes the evaluation order of support chunks in every session.
 var supportOrder = []string{"token_budget", "routing_table", "recency", "semantic", "fact_extractor", "exec_policy", "ttl"}
+
+// Names returns the builtin loop/plugin names as config spells them —
+// "builtin:per_chat", not "per_chat".
+//
+// They share that prefix with tool names (builtin:web_search) and memory
+// provider names (builtin:sqlite), but the three are separate vocabularies that
+// share nothing: a name from one is never valid in another's field, and nothing
+// about the string says which it is. Returning the config spelling is what lets
+// a caller compare a configured value against this list directly and say which
+// vocabulary it actually belongs to, instead of reporting "unknown builtin".
+func Names() []string {
+	out := make([]string, 0, len(sources))
+	for n := range sources {
+		out = append(out, "builtin:"+n)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // pluginDir is the deployment's plugins.dir, set once at boot via
 // SetPluginDir. A file <pluginDir>/<name>.lua shadows the embedded builtin

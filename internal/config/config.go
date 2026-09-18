@@ -552,6 +552,23 @@ type NetHTTP struct {
 type Plugins struct {
 	Dir               string   `yaml:"dir"`
 	AllowCapabilities []string `yaml:"allow_capabilities"`
+
+	// EnforceCapabilities makes the declared capability lists binding at
+	// runtime, defaulting to true when unset.
+	//
+	// Before this existed the lists were validated at boot and then ignored:
+	// every agent was handed llm.chat, store.*, tools.*, shell.*, http.* and
+	// mail.* whatever it declared, so omitting net.http or net.mail changed
+	// nothing. Set this false only to keep a configuration running that relied
+	// on that — an agent then regains the ops its capabilities do not mention,
+	// and the boot warning stops. Prefer declaring the capability.
+	EnforceCapabilities *bool `yaml:"enforce_capabilities"`
+}
+
+// EnforceCaps reports whether declared capabilities gate ops at runtime
+// (default true).
+func (p Plugins) EnforceCaps() bool {
+	return p.EnforceCapabilities == nil || *p.EnforceCapabilities
 }
 
 // Agent is a configured agent.

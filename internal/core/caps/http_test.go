@@ -1,6 +1,7 @@
 package caps
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -11,8 +12,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"agentflow/internal/core/credentials"
+	"agentflow/internal/core/metrics"
+	"agentflow/internal/core/netguard"
+	"agentflow/internal/core/pool"
 	"agentflow/internal/core/session"
 )
 
@@ -20,10 +25,28 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// permissive is the policy every test in this file needs, because httptest
+// servers bind 127.0.0.1 and the real default refuses loopback. The guard
+// itself is exercised against the strict zero Policy in
+// TestHTTPRefusesPrivateAddresses; everything else here is testing something
+// else and must not trip over it.
+var permissive = netguard.Policy{AllowPrivate: true}
+
 // runHTTP spins up the handler map and invokes http.request.
+//
+// The policy is permissive because every httptest server in this file binds
+// 127.0.0.1, which the real default refuses. The guard itself is tested
+// through runHTTPPolicy, which takes the policy explicitly.
 func runHTTP(t *testing.T, op session.Op) (map[string]any, bool) {
 	t.Helper()
-	h := HTTPHandlers(discardLogger(), nil)
+	return runHTTPPolicy(t, discardLogger(), permissive, op)
+}
+
+// runHTTPPolicy runs one op under a given policy and logger, so the address
+// guard can be exercised against the same fixture every other test uses.
+func runHTTPPolicy(t *testing.T, log *slog.Logger, policy netguard.Policy, op session.Op) (map[string]any, bool) {
+	t.Helper()
+	h := HTTPHandlers(log, nil, policy)
 	ctx := session.WithOwner(context.Background(), "session-1")
 	resp, ok := h["http.request"](ctx, op)
 	if !ok {
@@ -179,6 +202,143 @@ func TestHTTPMissingURL(t *testing.T) {
 	}
 }
 
+// TestHTTPRefusesPrivateAddresses is the regression test for the SSRF hole in
+// this op: it validated the scheme but never the address, so any agent — net.http
+// is in the default capability set and the handler is merged in unconditionally
+// — could reach cloud metadata, this process's own admin server, or anything
+// else on the host's network.
+//
+// The guard sits in the dialer, so these cases exercise the real path rather
+// than a check that only inspects the URL the loop typed.
+func TestHTTPRefusesPrivateAddresses(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("no request may reach the server")
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+
+	targets := map[string]string{
+		srv.URL: "loopback",
+		"http://169.254.169.254/latest/meta-data/": "cloud metadata",
+		"http://10.0.0.1/":                         "RFC1918",
+		"http://192.168.1.1/":                      "RFC1918",
+		"http://[::1]:8080/":                       "v6 loopback",
+		"http://[fc00::1%25en0]/":                  "zoned unique-local",
+	}
+	for target, what := range targets {
+		res, ok := runHTTPPolicy(t, log, netguard.Policy{}, session.Op{
+			Type: "http.request", Method: "GET", URL: target,
+		})
+		if ok {
+			t.Fatalf("%s (%s) must be refused, got %v", target, what, res)
+		}
+		// Distinguish a guard refusal from an ordinary dial failure: without
+		// this, an unroutable address would pass the test for the wrong reason.
+		raw, _ := res["_raw"].(string)
+		if !strings.Contains(raw, "refusing to connect") {
+			t.Fatalf("%s (%s): expected a guard refusal, got %s", target, what, raw)
+		}
+	}
+
+	if out := buf.String(); !strings.Contains(out, "address guard") {
+		t.Fatalf("a refusal must be warned about: %s", out)
+	}
+}
+
+// TestHTTPGuardRefusalReachesTheLoop drives a real Luau loop, so the refusal is
+// proven to survive the VM bridge rather than only existing in the Go handler.
+// What the model finally sees is what matters, and it sees a raised error — the
+// prelude's `op` raises when the handler reports failure.
+func TestHTTPGuardRefusalReachesTheLoop(t *testing.T) {
+	handlers := map[string]session.OpHandler{}
+	for k, h := range HTTPHandlers(discardLogger(), nil, netguard.Policy{}) {
+		handlers[k] = h
+	}
+	gw := &schemaGW{}
+	a := session.New("main|test",
+		session.Identity{SessionID: "main|test", Agent: "main", Capabilities: map[string]bool{"net.http": true}},
+		&session.Info{Name: "main", HistoryBudget: 100},
+		gw, nil, nil, nil, nil, handlers, pool.New(1), discardLogger())
+	a.LoopSrc = `
+function loop()
+  local msg = session.inbox()
+  local ok, res = pcall(http.request, { url = "http://169.254.169.254/latest/meta-data/" })
+  if ok then session.send("resolved: " .. tostring(res.status)) else session.send("refused: " .. tostring(res)) end
+end
+`
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go a.Run(ctx)
+	a.Mailbox <- session.Message{ID: "m1", Type: "user", From: "u", Text: "go", Channel: "webhook", ReplyTo: "1"}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		gw.mu.Lock()
+		n := len(gw.sends)
+		gw.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	gw.mu.Lock()
+	sends := append([]string(nil), gw.sends...)
+	gw.mu.Unlock()
+	if len(sends) == 0 {
+		t.Fatal("the loop produced no reply")
+	}
+	if !strings.Contains(sends[0], "refused") {
+		t.Fatalf("the loop reached cloud metadata: %s", sends[0])
+	}
+	if !strings.Contains(sends[0], "refusing to connect") {
+		t.Fatalf("the refusal must name itself: %s", sends[0])
+	}
+}
+
+// TestHTTPPrivateRefusalIsCounted: the alert is a metric plus a log line, the
+// house pattern for a non-message security event. The counter is registered in
+// DefaultCounters — metrics.Inc is a no-op for an unregistered name, so a
+// missing registration would look exactly like "it never happened".
+func TestHTTPPrivateRefusalIsCounted(t *testing.T) {
+	counter, ok := metrics.Global().Get("agentflow_http_private_blocked")
+	if !ok {
+		t.Fatal("agentflow_http_private_blocked must be registered in DefaultCounters")
+	}
+	before := counter.Value()
+
+	_, ok = runHTTPPolicy(t, discardLogger(), netguard.Policy{}, session.Op{
+		Type: "http.request", Method: "GET", URL: "http://169.254.169.254/",
+	})
+	if ok {
+		t.Fatal("expected a refusal")
+	}
+	if after := counter.Value(); after != before+1 {
+		t.Fatalf("counter went %d -> %d; want +1", before, after)
+	}
+}
+
+// TestHTTPAllowPrivateReachesLoopback: the documented escape hatch works, so a
+// deployment that legitimately calls an internal service is not broken by the
+// guard. Same request as the refusal test, opposite policy.
+func TestHTTPAllowPrivateReachesLoopback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer srv.Close()
+
+	res, ok := runHTTPPolicy(t, discardLogger(), netguard.Policy{AllowPrivate: true}, session.Op{
+		Type: "http.request", Method: "GET", URL: srv.URL,
+	})
+	if !ok {
+		t.Fatalf("allow_private must permit a loopback request: %v", res)
+	}
+	if res["status"] != float64(200) {
+		t.Fatalf("status = %v", res["status"])
+	}
+}
+
 func TestHTTPTimeout(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Slower than the per-call timeout.
@@ -223,7 +383,7 @@ func TestHTTPSecretRedactionInError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := HTTPHandlers(discardLogger(), nil)
+	h := HTTPHandlers(discardLogger(), nil, permissive)
 	ctx := session.WithOwner(context.Background(), "session-1")
 	resp, ok := h["http.request"](ctx, session.Op{
 		Type:    "http.request",
@@ -265,7 +425,7 @@ func TestHTTPBodyCap(t *testing.T) {
 }
 
 func TestOSEnv(t *testing.T) {
-	h := HTTPHandlers(discardLogger(), nil)
+	h := HTTPHandlers(discardLogger(), nil, permissive)
 	ctx := context.Background()
 
 	// Set a var, read it.
@@ -298,7 +458,7 @@ func TestOSEnv(t *testing.T) {
 }
 
 func TestOSEnvMissingName(t *testing.T) {
-	h := HTTPHandlers(discardLogger(), nil)
+	h := HTTPHandlers(discardLogger(), nil, permissive)
 	_, ok := h["os.env"](context.Background(), session.Op{Type: "os.env"})
 	if ok {
 		t.Fatal("expected error for missing name")
@@ -330,7 +490,7 @@ func TestHTTPAuthInjectsHeader(t *testing.T) {
 	defer srv.Close()
 
 	creds := seededStore(t, "u_oscar", "weather", "sk-test-123")
-	h := HTTPHandlers(discardLogger(), creds)
+	h := HTTPHandlers(discardLogger(), creds, permissive)
 	ctx := session.WithUserUUID(context.Background(), "u_oscar")
 
 	resp, ok := h["http.request"](ctx, session.Op{
@@ -350,7 +510,7 @@ func TestHTTPAuthInjectsHeader(t *testing.T) {
 // cleanly rather than reaching out.
 func TestHTTPAuthNoUserFails(t *testing.T) {
 	creds := seededStore(t, "u_oscar", "weather", "sk-test-123")
-	h := HTTPHandlers(discardLogger(), creds)
+	h := HTTPHandlers(discardLogger(), creds, permissive)
 
 	_, ok := h["http.request"](context.Background(), session.Op{
 		Type: "http.request",
@@ -366,7 +526,7 @@ func TestHTTPAuthNoUserFails(t *testing.T) {
 // not resolve, and must not leak anything.
 func TestHTTPAuthUnknownServiceFails(t *testing.T) {
 	creds := seededStore(t, "u_oscar", "weather", "sk-test-123")
-	h := HTTPHandlers(discardLogger(), creds)
+	h := HTTPHandlers(discardLogger(), creds, permissive)
 	ctx := session.WithUserUUID(context.Background(), "u_oscar")
 
 	_, ok := h["http.request"](ctx, session.Op{
@@ -389,7 +549,7 @@ func TestHTTPAuthTenantIsolation(t *testing.T) {
 	defer srv.Close()
 
 	creds := seededStore(t, "u_a", "weather", "sk-a")
-	h := HTTPHandlers(discardLogger(), creds)
+	h := HTTPHandlers(discardLogger(), creds, permissive)
 	ctx := session.WithUserUUID(context.Background(), "u_b")
 
 	_, ok := h["http.request"](ctx, session.Op{
@@ -414,7 +574,7 @@ func TestHTTPAuthRedactedOnError(t *testing.T) {
 	defer srv.Close()
 
 	creds := seededStore(t, "u_oscar", "weather", "super-secret-value-xyz")
-	h := HTTPHandlers(discardLogger(), creds)
+	h := HTTPHandlers(discardLogger(), creds, permissive)
 	ctx := session.WithUserUUID(context.Background(), "u_oscar")
 
 	resp, ok := h["http.request"](ctx, session.Op{

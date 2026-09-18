@@ -35,6 +35,7 @@ var secretPathPatterns = []string{
 	"memory.backends.*.config.api_key",
 	"media.s3.access_key",
 	"media.s3.secret_key",
+	"browser.api_token",
 	"profiles.shell.*.password",
 }
 

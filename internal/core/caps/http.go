@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"agentflow/internal/core/credentials"
+	"agentflow/internal/core/metrics"
+	"agentflow/internal/core/netguard"
 	"agentflow/internal/core/session"
 )
 
@@ -29,11 +31,6 @@ const (
 	maxTimeout     = 120 * time.Second
 )
 
-// sharedClient is reused across all http.request calls. Per-call timeouts are
-// applied via context, not via Client.Timeout, so different calls can have
-// different bounds.
-var sharedClient = &http.Client{Timeout: 0}
-
 // secretHeaderRe matches header names that carry secrets; values of such
 // headers are redacted from any error/log output so secrets never land in logs.
 var secretHeaderRe = regexp.MustCompile(`(?i)authorization|token|api[_-]?key|secret|password`)
@@ -46,10 +43,20 @@ var secretHeaderRe = regexp.MustCompile(`(?i)authorization|token|api[_-]?key|sec
 // http.request op resolves an `auth={service=...}` reference into a request
 // header at call time. When nil, auth references fail with a clear error.
 //
-// Both are registered the same way as LLM/Shell/Tool handlers and merged into
-// the actor's handler map in cmd/agentflow.
-func HTTPHandlers(log *slog.Logger, creds *credentials.Store) map[string]session.OpHandler {
+// policy governs where a connection may go. It is enforced in the dialer, not
+// here, so it also covers redirect hops and a hostname that resolves somewhere
+// private after the fact — see internal/core/netguard. A refusal is reported
+// like any other transport failure, plus a metric and a warning.
+//
+// Both ops are registered the same way as LLM/Shell/Tool handlers and merged
+// into the actor's handler map in cmd/agentflow.
+func HTTPHandlers(log *slog.Logger, creds *credentials.Store, policy netguard.Policy) map[string]session.OpHandler {
 	logger := log.With("module", "caps.http")
+	// One client per handler map. Constructing it here rather than using a
+	// package-level default is what lets the policy be a parameter, and the
+	// transport is safe for concurrent use across the ops that share it.
+	// Per-call timeouts come from the request context, not Client.Timeout.
+	client := &http.Client{Timeout: 0, Transport: policy.Transport()}
 	fail := func(err error) (string, bool) {
 		b, _ := json.Marshal(err.Error())
 		return string(b), false
@@ -169,8 +176,15 @@ func HTTPHandlers(log *slog.Logger, creds *credentials.Store) map[string]session
 			defer cancel()
 			req = req.WithContext(callCtx)
 
-			resp, err := sharedClient.Do(req)
+			resp, err := client.Do(req)
 			if err != nil {
+				// Test for a guard refusal before redactErr, which rebuilds the
+				// error and would break the chain netguard.IsBlocked walks.
+				if netguard.IsBlocked(err) {
+					metrics.Inc("agentflow_http_private_blocked")
+					logger.Warn("http.request refused by the address guard",
+						"agent", session.OwnerFromCtx(ctx), "url", rawURL, "err", err.Error())
+				}
 				// Redact secret header values from the error string (Go's
 				// http error can include the URL but not headers by default;
 				// be defensive anyway).

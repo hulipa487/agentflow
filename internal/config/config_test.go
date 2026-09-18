@@ -543,6 +543,119 @@ func TestValidateMemoryBackendProviders(t *testing.T) {
 	}
 }
 
+// TestValidateBrowser: account_id and api_token are set together or not at
+// all. A half-configured block is a mistake the operator can fix now, so it
+// fails the boot. Whether the token *resolves* is deliberately not checked
+// here — it may be a lazy secret reference, and an unresolvable credential
+// degrades at construction with a warning instead of failing the boot, the
+// same rule the search engines and memory backends follow.
+func TestValidateBrowser(t *testing.T) {
+	cfgWith := func(b Browser) *Config {
+		return &Config{
+			Agents:  map[string]Agent{"bot": {Loop: "./loop.lua"}},
+			Browser: b,
+		}
+	}
+
+	valid := map[string]Browser{
+		"unset":            {},
+		"fully set":        {AccountID: "acct", APIToken: "tok"},
+		"lazy token":       {AccountID: "acct", APIToken: "${CF_TOKEN}"},
+		"credential token": {AccountID: "acct", APIToken: "cred:cloudflare"},
+		"with base_url":    {AccountID: "acct", APIToken: "tok", BaseURL: "http://localhost:1234"},
+		"with a timeout":   {AccountID: "acct", APIToken: "tok", Timeout: "45s"},
+	}
+	for name, b := range valid {
+		t.Run(name, func(t *testing.T) {
+			if err := validate("cfg.yaml", cfgWith(b)); err != nil {
+				t.Fatalf("must validate: %v", err)
+			}
+		})
+	}
+
+	if err := validate("cfg.yaml", cfgWith(Browser{AccountID: "acct"})); err == nil ||
+		!strings.Contains(err.Error(), "api_token is empty") {
+		t.Fatalf("an account without a token must fail the boot, got %v", err)
+	}
+	if err := validate("cfg.yaml", cfgWith(Browser{APIToken: "tok"})); err == nil ||
+		!strings.Contains(err.Error(), "account_id is empty") {
+		t.Fatalf("a token without an account must fail the boot, got %v", err)
+	}
+}
+
+// TestBrowserTimeoutD: the default is 60s rather than the search engines' 30s,
+// because a page load may consume the full 60s gotoOptions timeout before the
+// action itself runs.
+func TestBrowserTimeoutD(t *testing.T) {
+	if got := (Browser{}).TimeoutD(); got != 60*time.Second {
+		t.Fatalf("default = %v; want 60s", got)
+	}
+	if got := (Browser{Timeout: "45s"}).TimeoutD(); got != 45*time.Second {
+		t.Fatalf("explicit = %v; want 45s", got)
+	}
+	if got := (Browser{Timeout: "nonsense"}).TimeoutD(); got != 60*time.Second {
+		t.Fatalf("unparseable = %v; want the 60s default", got)
+	}
+}
+
+// TestLoadNetBlock: the outbound-HTTP policy parses under KnownFields
+// strictness and round-trips, and the guard is on unless asked otherwise.
+//
+// Validation has nothing to add here — a bool cannot be malformed — so the
+// boot warning the NetHTTP doc promises is emitted where the policy is built,
+// in main.go, rather than at load.
+func TestLoadNetBlock(t *testing.T) {
+	const base = `
+version: "1"
+models:
+  default:
+    provider: openai
+    model: m
+    api_key: k
+gateway:
+  listen: ":0"
+`
+	const profile = `
+name: bot
+loop: builtin:per_chat
+`
+
+	on := writeDir(t, map[string]string{
+		"system.yaml":       base + "net:\n  http:\n    allow_private: true\n",
+		"profiles/bot.yaml": profile,
+	})
+	cfg, err := LoadDir(on, discardLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Net.HTTP.AllowPrivate {
+		t.Fatal("net.http.allow_private must round-trip")
+	}
+
+	// Unset means guard. This is the default that matters: the zero value has
+	// to be the safe one.
+	off := writeDir(t, map[string]string{
+		"system.yaml":       base,
+		"profiles/bot.yaml": profile,
+	})
+	cfg, err = LoadDir(off, discardLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Net.HTTP.AllowPrivate {
+		t.Fatal("the address guard must be on by default")
+	}
+
+	// An unknown key is still a boot error, like every other block.
+	bad := writeDir(t, map[string]string{
+		"system.yaml":       base + "net:\n  http:\n    allow_private: true\n    allow_everything: true\n",
+		"profiles/bot.yaml": profile,
+	})
+	if _, err := LoadDir(bad, discardLog()); err == nil {
+		t.Fatal("an unknown key under net.http must fail the boot")
+	}
+}
+
 // TestValidateTimezoneOffset: the cron matching offset is a fixed UTC offset
 // in the real-world range, and TimezoneOffset converts it to a duration.
 func TestValidateTimezoneOffset(t *testing.T) {

@@ -139,6 +139,9 @@ models:
 search:
   engines:
     youtube: { api_key: "${SEARCH_KEY}" }
+browser:
+  account_id: acct
+  api_token: "${CF_TOKEN}"
 media:
   backend: s3
   s3: { bucket: b, region: r, access_key: "${S3_AK}", secret_key: literal-secret }
@@ -178,6 +181,13 @@ triggers:
 	}
 	if got := cfg.Search.Engines["youtube"].APIKey; got != "${SEARCH_KEY}" {
 		t.Fatalf("search api_key must stay raw, got %q", got)
+	}
+	// The browser api_token is a secret like the rest: raw here, resolved by
+	// the driver at construction. Were it not registered, an unset ${VAR}
+	// would expand to "" at load and the empty token — not the reference —
+	// would be what the driver reports as unresolvable.
+	if got := cfg.Browser.APIToken; got != "${CF_TOKEN}" {
+		t.Fatalf("browser api_token must stay raw, got %q", got)
 	}
 	if got := cfg.Media.S3.AccessKey; got != "${S3_AK}" {
 		t.Fatalf("s3 access_key must stay raw, got %q", got)

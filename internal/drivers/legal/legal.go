@@ -1,7 +1,7 @@
 // Package legal implements legal-database backends for the builtin:legal_search
-// and builtin:legal_fetch tools. An Engine is one provider (hklii.go speaks the
+// and builtin:legal_read tools. An Engine is one provider (hklii.go speaks the
 // Hong Kong Legal Information Institute API). legal_search returns case /
-// legislation metadata (citations, court, parties); legal_fetch retrieves one
+// legislation metadata (citations, court, parties); legal_read retrieves one
 // full judgment as plain text. With no engine configured both tools report
 // honest-unavailable rather than failing.
 package legal
@@ -39,7 +39,7 @@ type FetchRequest struct {
 // Case is one search hit — a judgment or a piece of legislation.
 type Case struct {
 	Title    string `json:"title"`
-	Path     string `json:"path"` // fetch key for legal_fetch
+	Path     string `json:"path"` // fetch key for legal_read
 	URL      string `json:"url"`  // absolute page on the provider
 	Court    string `json:"court"`
 	Date     string `json:"date"`

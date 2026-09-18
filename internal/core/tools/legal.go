@@ -136,6 +136,12 @@ func RegisterLegalBuiltins(r *Registry, legalSet *legal.Set) {
 	if len(readFacts) > 0 {
 		readWhat += " " + strings.Join(readFacts, " ")
 	}
+	if len(names) > 1 {
+		// Two engines shape paths differently, and the one that issued a path is
+		// the only one that can read it — so say that the caller does not have
+		// to carry the engine across from the search call.
+		readWhat += " The path is routed to the engine that issued it, so `engine` need not be repeated from the search call."
+	}
 	readWhat += " Long bodies can be read in parts with `start` and capped with `max_chars`."
 
 	pathDesc := "The `path` from a legal_search hit."

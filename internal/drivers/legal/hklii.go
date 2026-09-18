@@ -214,7 +214,10 @@ func (fr FetchRequest) identity() (lang, abbr, year, num string, err error) {
 		parts := strings.Split(strings.Trim(fr.Path, "/"), "/")
 		// {lang}/cases/{abbr}/{year}/{num}
 		if len(parts) != 5 || parts[1] != "cases" {
-			return "", "", "", "", fmt.Errorf("legal hklii: path %q is not a case judgment path (want /{lang}/cases/{abbr}/{year}/{num})", fr.Path)
+			// Wrapped so Set.Fetch can hand the path to another engine: it is
+			// not malformed, it belongs to a backend that shapes paths
+			// differently.
+			return "", "", "", "", fmt.Errorf("legal hklii: path %q is not a case judgment path (want /{lang}/cases/{abbr}/{year}/{num}): %w", fr.Path, ErrPathNotForEngine)
 		}
 		if lang == "" {
 			lang = parts[0]

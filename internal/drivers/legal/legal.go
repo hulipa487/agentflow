@@ -8,12 +8,23 @@ package legal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
 	"agentflow/internal/config"
 )
+
+// ErrPathNotForEngine reports that an engine cannot read a path at all, because
+// the path belongs to a different backend. It is deliberately distinct from a
+// fetch that failed: "this is not my kind of path" is answerable by trying the
+// other configured engines, while a network or upstream error is not.
+//
+// Without the distinction, reading an npc hit on an hklii-default deployment
+// produced "not a case judgment path" — an error that names the wrong problem,
+// since the path is perfectly valid and simply went to the wrong backend.
+var ErrPathNotForEngine = errors.New("path is not readable by this engine")
 
 // Request is a normalized legal-search request.
 type Request struct {
@@ -137,17 +148,60 @@ func (s *Set) Search(ctx context.Context, engine string, req Request) (string, *
 	return name, res, nil
 }
 
-// Fetch retrieves one judgment through the named engine (or the default).
+// Fetch retrieves one document through the named engine (or the default).
+//
+// A named engine is honoured exactly — the caller asked for it, and an error
+// there is the answer. With no engine named, a path the default cannot read
+// falls through to the other configured engines.
+//
+// That fall-through is the point. A hit's path is an opaque token whose owner
+// is the engine that issued it, so making the caller name that engine again is
+// a way to fail at something the runtime already knows. A legal_search on npc
+// followed by a legal_read of one of its hits used to fail whenever any other
+// engine was configured as the default, which is precisely the deployment where
+// two engines are in play and the distinction matters.
 func (s *Set) Fetch(ctx context.Context, engine string, fr FetchRequest) (string, *Judgment, error) {
-	name, e, err := s.engine(engine)
+	if engine != "" {
+		name, e, err := s.engine(engine)
+		if err != nil {
+			return name, nil, err
+		}
+		j, err := e.Fetch(ctx, fr)
+		if err != nil {
+			return name, nil, err
+		}
+		return name, j, nil
+	}
+
+	name, e, err := s.engine("")
 	if err != nil {
 		return name, nil, err
 	}
 	j, err := e.Fetch(ctx, fr)
-	if err != nil {
-		return name, nil, err
+	if err == nil || !errors.Is(err, ErrPathNotForEngine) {
+		return name, j, err
 	}
-	return name, j, nil
+	firstErr := err
+
+	// Names() is sorted, so the order is deterministic rather than map order.
+	for _, other := range s.Names() {
+		if other == name {
+			continue
+		}
+		j, oerr := s.Engines[other].Fetch(ctx, fr)
+		if oerr == nil {
+			return other, j, nil
+		}
+		if !errors.Is(oerr, ErrPathNotForEngine) {
+			// This engine does own the path and the fetch itself failed — that
+			// is the real answer, so stop rather than keep hunting for one that
+			// will merely fail differently.
+			return other, nil, oerr
+		}
+	}
+	// Nobody owns it: report the default's refusal, which is the one that
+	// describes the path the caller actually passed.
+	return name, nil, firstErr
 }
 
 // NewEngine builds one engine driver by name. The name selects the wire

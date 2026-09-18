@@ -168,6 +168,13 @@ func (n *npc) Fetch(ctx context.Context, fr FetchRequest) (*Judgment, error) {
 	if bbbs == "" {
 		return nil, fmt.Errorf("legal npc: need the document id (path from a legal_search hit) to fetch")
 	}
+	// A bbbs id is an opaque token with no separators. A slash means this is a
+	// path shaped for another engine, so say so rather than spend a request on
+	// something that could only fail — and let Set.Fetch route it to the engine
+	// that can read it.
+	if strings.Contains(bbbs, "/") {
+		return nil, fmt.Errorf("legal npc: %q is not a document id (npc ids contain no separators): %w", bbbs, ErrPathNotForEngine)
+	}
 	dlURL := fmt.Sprintf("%s/law-search/download/pc?format=docx&bbbs=%s", n.baseURL, url.QueryEscape(bbbs))
 	hreq, err := http.NewRequestWithContext(ctx, http.MethodGet, dlURL, nil)
 	if err != nil {

@@ -198,3 +198,18 @@ func TestLegalReadOmitsFieldsTheEngineDoesNotFill(t *testing.T) {
 		t.Fatalf("npc's neutral carries the document id: %v", m["neutral"])
 	}
 }
+
+// TestLegalReadSaysItRoutesThePath: with two engines configured the description
+// must say the engine need not be carried over from the search call — that is
+// precisely the deployment where forgetting to repeat it used to fail, because
+// the default engine rejected the other one's path.
+func TestLegalReadSaysItRoutesThePath(t *testing.T) {
+	both := legalSpec(t, legalSetFor("hklii", "npc"), "builtin:legal_read")
+	if !strings.Contains(both.Description, "routed to the engine that issued it") {
+		t.Fatalf("the routing must be described: %s", both.Description)
+	}
+	one := legalSpec(t, legalSetFor("npc"), "builtin:legal_read")
+	if strings.Contains(one.Description, "routed to the engine") {
+		t.Fatalf("with one engine there is nothing to route: %s", one.Description)
+	}
+}

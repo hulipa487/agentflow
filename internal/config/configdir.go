@@ -306,7 +306,7 @@ func rebaseConfigPaths(dir string, c *Config) {
 	c.Media.Dir = rebasePath(dir, c.Media.Dir)
 	c.Plugins.Dir = rebasePath(dir, c.Plugins.Dir)
 	for name, b := range c.Memory.Backends {
-		if b.Provider != "builtin:sqlite" || b.Config == nil {
+		if b.Provider != "sqlite" || b.Config == nil {
 			continue
 		}
 		if p, ok := b.Config["path"].(string); ok && p != "" {
@@ -321,7 +321,15 @@ func rebaseConfigPaths(dir string, c *Config) {
 }
 
 func rebasePath(base, p string) string {
-	if p == "" || filepath.IsAbs(p) || strings.HasPrefix(p, "builtin:") {
+	if p == "" || filepath.IsAbs(p) {
+		return p
+	}
+	// "plugin:" is the loop-reference prefix. "builtin:" is its retired
+	// spelling: it is no longer accepted, but it is left intact rather than
+	// rebased into a path, so the failure names it as an unknown plugin and can
+	// say what to write — instead of reporting a missing file at
+	// <configdir>/builtin:per_chat, which is where rebasing it would look.
+	if strings.HasPrefix(p, "plugin:") || strings.HasPrefix(p, "builtin:") {
 		return p
 	}
 	return filepath.Join(base, p)

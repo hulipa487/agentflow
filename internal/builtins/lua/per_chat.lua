@@ -1,4 +1,4 @@
--- builtin:per_chat — the default gateway.route handler.
+-- plugin:per_chat — the default gateway.route handler.
 --
 -- Runs in the router's service state (singleton), not in a session. One
 -- session per (agent, channel, chat): two users on the same channel never

@@ -130,7 +130,7 @@ func TestConfigDirCronRunOnBootReachesItsAgent(t *testing.T) {
 		"system.yaml": "version: \"1\"\ngateway:\n  listen: \":0\"\nruntime:\n  timezone_offset_hours: 8\n",
 		"profiles/bot.yaml": `
 name: bot
-loop: builtin:per_chat
+loop: plugin:per_chat
 `,
 		"profiles/pm.yaml": `
 name: pm

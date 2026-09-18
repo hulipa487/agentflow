@@ -1,4 +1,4 @@
--- builtin:ttl — shell.teardown handler.
+-- plugin:ttl — shell.teardown handler.
 --
 -- Tracks shell handle creation times and reports whether a handle's TTL has
 -- elapsed. The Go side can call shell_ttl.check(handle_id) before each exec

@@ -19,7 +19,7 @@ func TestPluginDirShadowsBuiltin(t *testing.T) {
 	SetPluginDir(dir)
 	defer SetPluginDir("")
 
-	src, watch, err := Resolve("builtin:recency")
+	src, watch, err := Resolve("plugin:recency")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +40,7 @@ func TestPluginDirShadowsBuiltin(t *testing.T) {
 	}
 
 	// An unshadowed builtin still resolves to the embedded source, unwatched.
-	src, watch, err = Resolve("builtin:ttl")
+	src, watch, err = Resolve("plugin:ttl")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestPluginDirShadowsBuiltin(t *testing.T) {
 // the pre-shadowing loader.
 func TestNoPluginDirKeepsEmbedded(t *testing.T) {
 	SetPluginDir("")
-	src, watch, err := Resolve("builtin:recency")
+	src, watch, err := Resolve("plugin:recency")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,11 +65,14 @@ func TestNoPluginDirKeepsEmbedded(t *testing.T) {
 	}
 }
 
-// TestUnknownBuiltinStillRejected: shadowing does not invent builtins.
+// TestUnknownBuiltinStillRejected: shadowing does not invent plugins. The
+// error names the prefix the caller actually wrote, and gives a working
+// example, because "unknown plugin:per_chat" alone leaves you guessing at the
+// spelling.
 func TestUnknownBuiltinStillRejected(t *testing.T) {
 	SetPluginDir(t.TempDir())
 	defer SetPluginDir("")
-	if _, _, err := Resolve("builtin:nope"); err == nil || !strings.Contains(err.Error(), "unknown builtin") {
+	if _, _, err := Resolve("plugin:nope"); err == nil || !strings.Contains(err.Error(), "unknown plugin") {
 		t.Fatalf("expected unknown builtin error, got %v", err)
 	}
 }

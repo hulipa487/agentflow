@@ -23,7 +23,7 @@ runtime:
     path: ` + filepath.ToSlash(filepath.Join(dir, "credentials.db")) + `
     master_key_env: AF_TEST_MASTER_KEY
 agents:
-  bot: { loop: builtin:per_chat }
+  bot: { loop: plugin:per_chat }
 `
 	if err := os.WriteFile(cfg, []byte(body), 0o600); err != nil {
 		t.Fatal(err)

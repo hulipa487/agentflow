@@ -1,4 +1,4 @@
-// Package router runs the gateway.route handler (builtin:per_chat by
+// Package router runs the gateway.route handler (plugin:per_chat by
 // default) in a singleton Luau service state. Channel drivers submit inbound
 // events; the Lua route handler computes a session key; the router resolves
 // and forwards through the supervisor.

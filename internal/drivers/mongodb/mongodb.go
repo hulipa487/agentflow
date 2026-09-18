@@ -1,4 +1,4 @@
-// Package mongodb implements the builtin:mongodb memory backend provider.
+// Package mongodb implements the mongodb memory backend provider.
 // It provides kv, prefix_scan, and ttl features via a MongoDB server.
 //
 // Requires a MongoDB 4.0+ server. The connection URI is set in the backend
@@ -18,10 +18,10 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
-// Provider implements memory.BackendProvider for "builtin:mongodb".
+// Provider implements memory.BackendProvider for "mongodb".
 type Provider struct{}
 
-func (Provider) Name() string { return "builtin:mongodb" }
+func (Provider) Name() string { return "mongodb" }
 
 func (Provider) Features() []string {
 	return []string{"kv", "prefix_scan", "ttl"}
@@ -30,7 +30,7 @@ func (Provider) Features() []string {
 func (Provider) Open(config map[string]any) (memory.BackendHandle, error) {
 	uri, _ := config["url"].(string)
 	if uri == "" {
-		return nil, fmt.Errorf("builtin:mongodb: url is required")
+		return nil, fmt.Errorf("mongodb: url is required")
 	}
 	dbName, _ := config["database"].(string)
 	if dbName == "" {
@@ -41,10 +41,10 @@ func (Provider) Open(config map[string]any) (memory.BackendHandle, error) {
 	defer cancel()
 	client, err := mongo.Connect(options.Client().ApplyURI(uri))
 	if err != nil {
-		return nil, fmt.Errorf("builtin:mongodb: connect: %w", err)
+		return nil, fmt.Errorf("mongodb: connect: %w", err)
 	}
 	if err := client.Ping(ctx, nil); err != nil {
-		return nil, fmt.Errorf("builtin:mongodb: ping: %w", err)
+		return nil, fmt.Errorf("mongodb: ping: %w", err)
 	}
 	return &Handle{client: client, db: client.Database(dbName)}, nil
 }
@@ -112,7 +112,7 @@ func (h *Handle) Query(table string, q memory.Query) (memory.Iterator, error) {
 	case "all":
 		return h.queryAll(table)
 	default:
-		return nil, fmt.Errorf("builtin:mongodb: unsupported query kind %q", q.Kind)
+		return nil, fmt.Errorf("mongodb: unsupported query kind %q", q.Kind)
 	}
 }
 

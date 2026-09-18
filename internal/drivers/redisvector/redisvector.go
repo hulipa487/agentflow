@@ -1,17 +1,17 @@
-// Package redisvector implements the builtin:redisvector vector backend
+// Package redisvector implements the redisvector vector backend
 // provider. It provides the kv, prefix_scan, ttl, and vector features over a
 // Redis server with the RediSearch module (Redis Stack).
 //
-// It is deliberately a separate provider from builtin:redis rather than an
+// It is deliberately a separate provider from redis rather than an
 // extension of it. Provider features are declared per provider name with no
 // instance negotiation (memory.BackendProvider.Features), so folding "vector"
-// into builtin:redis would claim vector support on every Redis, including the
-// ones without the module; and RediSearch indexes hashes, while builtin:redis
+// into redis would claim vector support on every Redis, including the
+// ones without the module; and RediSearch indexes hashes, while redis
 // stores plain SET strings, so the layout could not be shared without breaking
 // existing stored data anyway.
 //
 // Layout: one hash per record at "<table>:<key>" — the same key convention
-// builtin:redis uses — with fields value (JSON), updated_at, and embedding (a
+// redis uses — with fields value (JSON), updated_at, and embedding (a
 // little-endian float32 blob) when one was supplied. One RediSearch index per
 // table, created lazily on first use.
 package redisvector
@@ -32,10 +32,10 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Provider implements memory.BackendProvider for "builtin:redisvector".
+// Provider implements memory.BackendProvider for "redisvector".
 type Provider struct{}
 
-func (Provider) Name() string { return "builtin:redisvector" }
+func (Provider) Name() string { return "redisvector" }
 
 func (Provider) Features() []string {
 	// The value is stored next to the vector, so the kv features come free.
@@ -43,13 +43,13 @@ func (Provider) Features() []string {
 }
 
 // defaultDim matches the embedding size of OpenAI's text-embedding-ada-002
-// family, as builtin:pgvector does; most self-hosted models are smaller.
+// family, as pgvector does; most self-hosted models are smaller.
 const defaultDim = 1536
 
 func (Provider) Open(config map[string]any) (memory.BackendHandle, error) {
 	url, _ := config["url"].(string)
 	if url == "" {
-		return nil, fmt.Errorf("builtin:redisvector: url is required")
+		return nil, fmt.Errorf("redisvector: url is required")
 	}
 	opts, err := parseOptions(url)
 	if err != nil {
@@ -65,14 +65,14 @@ func (Provider) Open(config map[string]any) (memory.BackendHandle, error) {
 		dim = int(v)
 	}
 	if dim <= 0 {
-		return nil, fmt.Errorf("builtin:redisvector: dim must be positive, got %d", dim)
+		return nil, fmt.Errorf("redisvector: dim must be positive, got %d", dim)
 	}
 	client := redis.NewClient(opts)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := client.Ping(ctx).Err(); err != nil {
 		_ = client.Close()
-		return nil, fmt.Errorf("builtin:redisvector: ping: %w", err)
+		return nil, fmt.Errorf("redisvector: ping: %w", err)
 	}
 	return &Handle{client: client, dim: dim, indexed: map[string]bool{}}, nil
 }
@@ -92,7 +92,7 @@ func (Provider) Open(config map[string]any) (memory.BackendHandle, error) {
 func parseOptions(url string) (*redis.Options, error) {
 	opts, err := redis.ParseURL(url)
 	if err != nil {
-		return nil, fmt.Errorf("builtin:redisvector: parse url: %w", err)
+		return nil, fmt.Errorf("redisvector: parse url: %w", err)
 	}
 	opts.Protocol = 2
 	return opts, nil
@@ -111,7 +111,7 @@ type Handle struct {
 
 func (h *Handle) Put(table, key string, value any, opts memory.PutOpts) error {
 	if len(opts.Vector) > 0 && len(opts.Vector) != h.dim {
-		return fmt.Errorf("builtin:redisvector: embedding has %d dimensions, backend configured for %d (set dim in the backend config to match the embedding model)", len(opts.Vector), h.dim)
+		return fmt.Errorf("redisvector: embedding has %d dimensions, backend configured for %d (set dim in the backend config to match the embedding model)", len(opts.Vector), h.dim)
 	}
 	b, err := json.Marshal(value)
 	if err != nil {
@@ -128,7 +128,7 @@ func (h *Handle) Put(table, key string, value any, opts memory.PutOpts) error {
 	fullKey := h.fullKey(table, key)
 	// HSET without the embedding field leaves any stored embedding alone, so
 	// a value written with no vector keeps the one a previous Put stored —
-	// the same behaviour builtin:pgvector gets from an ON CONFLICT update.
+	// the same behaviour pgvector gets from an ON CONFLICT update.
 	args := []any{"HSET", fullKey, "value", b, "updated_at", time.Now().Unix()}
 	if len(opts.Vector) > 0 {
 		args = append(args, "embedding", encodeVector(opts.Vector))
@@ -174,7 +174,7 @@ func (h *Handle) Query(table string, q memory.Query) (memory.Iterator, error) {
 	case "vector":
 		return h.queryVector(table, q)
 	default:
-		return nil, fmt.Errorf("builtin:redisvector: unsupported query kind %q", q.Kind)
+		return nil, fmt.Errorf("redisvector: unsupported query kind %q", q.Kind)
 	}
 }
 
@@ -199,13 +199,13 @@ func (h *Handle) queryScan(table, prefix string) (memory.Iterator, error) {
 
 func (h *Handle) queryVector(table string, q memory.Query) (memory.Iterator, error) {
 	if len(q.Vector) == 0 {
-		return nil, fmt.Errorf("builtin:redisvector: vector query requires a query vector")
+		return nil, fmt.Errorf("redisvector: vector query requires a query vector")
 	}
 	if len(q.Vector) != h.dim {
-		return nil, fmt.Errorf("builtin:redisvector: query vector has %d dimensions, backend configured for %d", len(q.Vector), h.dim)
+		return nil, fmt.Errorf("redisvector: query vector has %d dimensions, backend configured for %d", len(q.Vector), h.dim)
 	}
 	if table == "" {
-		return nil, fmt.Errorf("builtin:redisvector: vector queries need a table (the index is per table)")
+		return nil, fmt.Errorf("redisvector: vector queries need a table (the index is per table)")
 	}
 	if err := h.ensureIndex(table); err != nil {
 		return nil, err
@@ -253,7 +253,7 @@ func (h *Handle) queryVector(table string, q memory.Query) (memory.Iterator, err
 	return &sliceIter{recs: recs}, nil
 }
 
-// GC is a no-op: Redis TTL handles expiry natively, as in builtin:redis.
+// GC is a no-op: Redis TTL handles expiry natively, as in redis.
 func (h *Handle) GC(table string, window int) error { return nil }
 
 func (h *Handle) Close() error { return h.client.Close() }
@@ -264,7 +264,7 @@ func (h *Handle) Close() error { return h.client.Close() }
 // RediSearch is not part of plain Redis.
 func (h *Handle) ensureIndex(table string) error {
 	if table == "" {
-		return fmt.Errorf("builtin:redisvector: a table is required")
+		return fmt.Errorf("redisvector: a table is required")
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -276,7 +276,7 @@ func (h *Handle) ensureIndex(table string) error {
 	err := h.client.Do(ctx, indexArgs(indexFor(table), h.fullKey(table, ""), h.dim)...).Err()
 	// An index left from a previous process is not an error.
 	if err != nil && !isIndexExists(err) {
-		return fmt.Errorf("builtin:redisvector: create index for table %q (needs the RediSearch module, e.g. Redis Stack): %w", table, err)
+		return fmt.Errorf("redisvector: create index for table %q (needs the RediSearch module, e.g. Redis Stack): %w", table, err)
 	}
 	h.indexed[table] = true
 	return nil
@@ -321,7 +321,7 @@ func searchArgs(index string, k int, vec []float32) []any {
 func searchKeys(reply any) ([]string, error) {
 	arr, ok := reply.([]any)
 	if !ok {
-		return nil, fmt.Errorf("builtin:redisvector: unexpected search reply %T (expected the flat RESP2 form; is the client negotiating RESP3?)", reply)
+		return nil, fmt.Errorf("redisvector: unexpected search reply %T (expected the flat RESP2 form; is the client negotiating RESP3?)", reply)
 	}
 	if len(arr) == 0 {
 		return nil, nil
@@ -334,7 +334,7 @@ func searchKeys(reply any) ([]string, error) {
 		case []byte:
 			out = append(out, string(v))
 		default:
-			return nil, fmt.Errorf("builtin:redisvector: unexpected search reply element %T", e)
+			return nil, fmt.Errorf("redisvector: unexpected search reply element %T", e)
 		}
 	}
 	return out, nil
@@ -352,7 +352,7 @@ func encodeVector(v []float32) []byte {
 
 func indexFor(table string) string { return "idx:" + table }
 
-// fullKey is builtin:redis's key convention: "<table>:<key>", or the bare key
+// fullKey is redis's key convention: "<table>:<key>", or the bare key
 // when there is no table.
 func (h *Handle) fullKey(table, key string) string {
 	if table == "" {

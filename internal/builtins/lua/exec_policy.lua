@@ -1,4 +1,4 @@
--- builtin:exec_policy — shell.before_exec filter.
+-- plugin:exec_policy — shell.before_exec filter.
 --
 -- Inspects a command before it is sent to a shell handle. Returns "allow",
 -- "deny", or a rewritten command string.

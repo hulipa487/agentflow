@@ -35,7 +35,7 @@ models:
   default: { provider: openai, model: gpt-4o-mini, base_url: http://127.0.0.1:11434/v1 }
 memory:
   backends:
-    main_db: { provider: builtin:sqlite, config: { path: ./data/agentflow.db } }
+    main_db: { provider: sqlite, config: { path: ./data/agentflow.db } }
 profiles:
   shell:
     box: { provider: ssh, host: 10.0.0.1, user: ops, key_file: ./keys/box.pem }
@@ -163,12 +163,12 @@ func TestLoadDirRebasesRelativePaths(t *testing.T) {
 		"system.yaml": dirSystem + "plugins: { dir: ./plugins }\n",
 		"profiles/greeter.yaml": `
 name: greeter
-loop: builtin:per_chat
+loop: plugin:per_chat
 instructions: ` + absInstr + `
 `,
 		"profiles/builtinbot.yaml": `
 name: builtinbot
-loop: builtin:per_chat
+loop: plugin:per_chat
 `,
 	})
 	cfg, err := LoadDir(dir, discardLog())
@@ -176,7 +176,7 @@ loop: builtin:per_chat
 		t.Fatal(err)
 	}
 	g := cfg.Agents["greeter"]
-	if g.Loop != "builtin:per_chat" {
+	if g.Loop != "plugin:per_chat" {
 		t.Fatalf("builtin: ref must not be rebased: %q", g.Loop)
 	}
 	if g.Instructions.File != absInstr {
@@ -213,7 +213,7 @@ func TestLoadDirStrictFragment(t *testing.T) {
 		},
 		"profile unknown field": {
 			"system.yaml":       dirSystem,
-			"profiles/bad.yaml": "name: bad\nloop: builtin:per_chat\nmodle: default\n",
+			"profiles/bad.yaml": "name: bad\nloop: plugin:per_chat\nmodle: default\n",
 		},
 		"trigger unknown field": {
 			"system.yaml":       dirSystem,
@@ -236,7 +236,7 @@ func TestLoadDirStrictFragment(t *testing.T) {
 // pointed at their proper homes instead of being silently merged.
 func TestLoadDirAgentsInSystemRejected(t *testing.T) {
 	dir := writeDir(t, map[string]string{
-		"system.yaml": dirSystem + "agents:\n  bot: { loop: builtin:per_chat }\n",
+		"system.yaml": dirSystem + "agents:\n  bot: { loop: plugin:per_chat }\n",
 	})
 	if _, err := LoadDir(dir, discardLog()); err == nil ||
 		!strings.Contains(err.Error(), "profiles/*.yaml") {
@@ -259,8 +259,8 @@ func TestLoadDirDuplicateProfileRejected(t *testing.T) {
 	// nested subdirectories are not part of the glob at all.
 	dir := writeDir(t, map[string]string{
 		"system.yaml":       dirSystem,
-		"profiles/one.yaml": "name: greeter\nloop: builtin:per_chat\n",
-		"profiles/two.yaml": "name: greeter\nloop: builtin:per_chat\n",
+		"profiles/one.yaml": "name: greeter\nloop: plugin:per_chat\n",
+		"profiles/two.yaml": "name: greeter\nloop: plugin:per_chat\n",
 	})
 	if _, err := LoadDir(dir, discardLog()); err == nil ||
 		!strings.Contains(err.Error(), "duplicate agent") {
@@ -273,7 +273,7 @@ func TestLoadDirDuplicateProfileRejected(t *testing.T) {
 func TestLoadDirSpawnRejectsAgentFields(t *testing.T) {
 	dir := writeDir(t, map[string]string{
 		"system.yaml":     dirSystem,
-		"profiles/w.yaml": "name: w\nspawn: true\nloop: builtin:per_chat\npersistent: true\n",
+		"profiles/w.yaml": "name: w\nspawn: true\nloop: plugin:per_chat\npersistent: true\n",
 	})
 	if _, err := LoadDir(dir, discardLog()); err == nil ||
 		!strings.Contains(err.Error(), "persistent") {
@@ -288,7 +288,7 @@ func TestLoadDirValidatesAfterMerge(t *testing.T) {
 		"system.yaml": dirSystem,
 		"profiles/lonely.yaml": `
 name: lonely
-loop: builtin:per_chat
+loop: plugin:per_chat
 can_contact: [ghost]
 `,
 	})
@@ -414,7 +414,7 @@ model: default
 func TestLoadDirPromptMissingFile(t *testing.T) {
 	dir := writeDir(t, map[string]string{
 		"system.yaml":         dirSystem + "prompts:\n  sys: { file: ./prompts/nope.md }\n",
-		"profiles/plain.yaml": "name: plain\nloop: builtin:per_chat\n",
+		"profiles/plain.yaml": "name: plain\nloop: plugin:per_chat\n",
 	})
 	if _, err := LoadDir(dir, discardLog()); err == nil || !strings.Contains(err.Error(), "nope.md") {
 		t.Fatalf("unreadable prompt file must fail the load: %v", err)
@@ -428,7 +428,7 @@ func TestLoadDirPromptUnknownKey(t *testing.T) {
 		"system.yaml": dirSystem + "prompts:\n  sys: { inline: \"hi\" }\n",
 		"profiles/bot.yaml": `
 name: bot
-loop: builtin:per_chat
+loop: plugin:per_chat
 instructions: {prompt: ghost}
 `,
 	})
@@ -452,7 +452,7 @@ func TestLoadPromptFileRelativeToConfigFile(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte(`
 version: "1"
 agents:
-  bot: { loop: builtin:per_chat, instructions: {prompt: sys} }
+  bot: { loop: plugin:per_chat, instructions: {prompt: sys} }
 prompts:
   sys: { file: ./prompts/sys.md }
 `), 0o600); err != nil {
@@ -550,5 +550,27 @@ triggers:
 	}
 	if _, err := LoadTriggers(dir, discardLog()); err == nil {
 		t.Fatal("a malformed trigger fragment must be an error")
+	}
+}
+
+// TestRebasePathKeepsRetiredLoopPrefix: a loop reference is not a path, and the
+// retired "builtin:" spelling is left intact too — rebasing it into
+// <configdir>/builtin:per_chat turns a name error (which can say what to write)
+// into a missing-file error that names a path the operator never typed.
+func TestRebasePathKeepsRetiredLoopPrefix(t *testing.T) {
+	// filepath.Join, not a literal: the separator is platform-specific.
+	dir := filepath.Join("cfg")
+	sub := filepath.Join(dir, "loops", "bot.lua")
+	cases := map[string]string{
+		"plugin:per_chat":  "plugin:per_chat",
+		"builtin:per_chat": "builtin:per_chat",
+		"":                 "",
+		"loops/bot.lua":    sub,
+		"./loops/bot.lua":  sub,
+	}
+	for in, want := range cases {
+		if got := rebasePath(dir, in); got != want {
+			t.Fatalf("rebasePath(%q) = %q; want %q", in, got, want)
+		}
 	}
 }

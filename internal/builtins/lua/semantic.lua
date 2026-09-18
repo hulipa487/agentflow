@@ -1,6 +1,6 @@
--- builtin:semantic — embedding-based memory.recall handler.
+-- plugin:semantic — embedding-based memory.recall handler.
 --
--- Selected by `recall: builtin:semantic` on the agent's memory profile; the
+-- Selected by `recall: plugin:semantic` on the agent's memory profile; the
 -- prelude's memory.recall dispatches here. The pipeline:
 --
 --   embed query text (profile embed_model)

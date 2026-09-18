@@ -14,7 +14,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -349,7 +351,11 @@ func main() {
 	for name, a := range cfg.Agents {
 		src, watchPath, err := builtins.Resolve(a.Loop)
 		if err != nil {
-			log.Error("agent loop resolve failed", "agent", name, "err", err)
+			fields := []any{"agent", name, "err", err}
+			if h := loopHint(a.Loop, toolReg.Names()); h != "" {
+				fields = append(fields, "hint", h)
+			}
+			log.Error("agent loop resolve failed", fields...)
 			os.Exit(1)
 		}
 		instrText, instrPrompt, err := resolveInstructions(a.Instructions, cfg.Prompts)
@@ -388,7 +394,16 @@ func main() {
 
 		effectiveCaps := capabilitySet(a.Capabilities)
 		agentSet := toolReg.Expose(a.Skills, toolPolicyFor(cfg.Tools.Policy, effectiveCaps), false)
+		// A skills entry naming a builtin loop matches no tool and is dropped
+		// silently, so say so rather than letting the agent look toolless.
+		for _, s := range a.Skills {
+			if h := skillHint(s, builtins.Names()); h != "" {
+				log.Warn("skills entry names a loop, not a tool", "agent", name, "skill", s, "hint", h)
+			}
+		}
 		handlers := map[string]session.OpHandler{}
+		enforce := cfg.Plugins.EnforceCaps()
+		var withheld []string
 		// Budget metering: if the agent declares tokens_per_day, wrap LLM
 		// handlers with reserve/commit/release.
 		llmHandlers := caps.LLMHandlers(llmMgr, mediaStore)
@@ -403,28 +418,34 @@ func main() {
 			}
 			llmHandlers = caps.MeteredLLMHandlers(llmMgr, mediaStore, pool)
 		}
-		for k, h := range llmHandlers {
+		for k, h := range gateOps(enforce, name, effectiveCaps, "llm.chat", llmHandlers, &withheld) {
 			handlers[k] = h
 		}
-		for k, h := range caps.StoreHandlers(amPtr, memMgr) {
+		for k, h := range gateOps(enforce, name, effectiveCaps, "memory", caps.StoreHandlers(amPtr, memMgr), &withheld) {
 			handlers[k] = h
 		}
-		for k, h := range caps.ToolHandlers(agentSet, toolWiring) {
+		for k, h := range gateOps(enforce, name, effectiveCaps, "tools", caps.ToolHandlers(agentSet, toolWiring), &withheld) {
 			handlers[k] = h
 		}
-		for k, h := range caps.ShellHandlers(shellMgr) {
+		for k, h := range gateOps(enforce, name, effectiveCaps, "shell.exec", caps.ShellHandlers(shellMgr), &withheld) {
 			handlers[k] = h
 		}
-		for k, h := range caps.HTTPHandlers(log, credStore, netPolicy) {
+		for k, h := range gateOps(enforce, name, effectiveCaps, "net.http", caps.HTTPHandlers(log, credStore, netPolicy), &withheld) {
 			handlers[k] = h
 		}
-		for k, h := range caps.MailHandlers(log, credStore) {
+		for k, h := range gateOps(enforce, name, effectiveCaps, "net.mail", caps.MailHandlers(log, credStore), &withheld) {
 			handlers[k] = h
 		}
+		// runtime.* and credential.get stay ungated: the first is loop
+		// machinery every agent needs, the second is already scoped by the
+		// agent's own credential list.
 		for k, h := range runtimeHandlers {
 			handlers[k] = h
 		}
 		handlers["credential.get"] = caps.CredentialHandler(credStore, a.Credentials, log)
+		if len(withheld) > 0 {
+			log.Warn("capabilities withheld from agent", "agent", name, "ops", strings.Join(withheld, "; "))
+		}
 
 		canContact := stringSet(a.CanContact)
 		safeDispatcher := resolveSafety(cfg, a.Safety)
@@ -462,7 +483,11 @@ func main() {
 	for pname, p := range cfg.Profiles.Agent {
 		src, watchPath, err := builtins.Resolve(p.Loop)
 		if err != nil {
-			log.Error("spawn profile loop resolve failed", "profile", pname, "err", err)
+			fields := []any{"profile", pname, "err", err}
+			if h := loopHint(p.Loop, toolReg.Names()); h != "" {
+				fields = append(fields, "hint", h)
+			}
+			log.Error("spawn profile loop resolve failed", fields...)
 			os.Exit(1)
 		}
 		instrText, instrPrompt, err := resolveInstructions(p.Instructions, cfg.Prompts)
@@ -501,7 +526,14 @@ func main() {
 
 		profileCaps := capabilitySet(p.Capabilities)
 		agentSet := toolReg.Expose(p.Skills, toolPolicyFor(cfg.Tools.Policy, profileCaps), false)
+		for _, s := range p.Skills {
+			if h := skillHint(s, builtins.Names()); h != "" {
+				log.Warn("skills entry names a loop, not a tool", "profile", pname, "skill", s, "hint", h)
+			}
+		}
 		handlers := map[string]session.OpHandler{}
+		enforce := cfg.Plugins.EnforceCaps()
+		var withheld []string
 		// Budget metering for spawn profiles: a profile that declares
 		// budget.tokens_per_day gets a metered LLM pool shared by every child
 		// spawned from it — e.g. a manager variant or worker pool gets its
@@ -517,28 +549,31 @@ func main() {
 			}
 			llmHandlers = caps.MeteredLLMHandlers(llmMgr, mediaStore, pool)
 		}
-		for k, h := range llmHandlers {
+		for k, h := range gateOps(enforce, pname, profileCaps, "llm.chat", llmHandlers, &withheld) {
 			handlers[k] = h
 		}
-		for k, h := range caps.StoreHandlers(amPtr, memMgr) {
+		for k, h := range gateOps(enforce, pname, profileCaps, "memory", caps.StoreHandlers(amPtr, memMgr), &withheld) {
 			handlers[k] = h
 		}
-		for k, h := range caps.ToolHandlers(agentSet, toolWiring) {
+		for k, h := range gateOps(enforce, pname, profileCaps, "tools", caps.ToolHandlers(agentSet, toolWiring), &withheld) {
 			handlers[k] = h
 		}
-		for k, h := range caps.ShellHandlers(shellMgr) {
+		for k, h := range gateOps(enforce, pname, profileCaps, "shell.exec", caps.ShellHandlers(shellMgr), &withheld) {
 			handlers[k] = h
 		}
-		for k, h := range caps.HTTPHandlers(log, credStore, netPolicy) {
+		for k, h := range gateOps(enforce, pname, profileCaps, "net.http", caps.HTTPHandlers(log, credStore, netPolicy), &withheld) {
 			handlers[k] = h
 		}
-		for k, h := range caps.MailHandlers(log, credStore) {
+		for k, h := range gateOps(enforce, pname, profileCaps, "net.mail", caps.MailHandlers(log, credStore), &withheld) {
 			handlers[k] = h
 		}
 		for k, h := range runtimeHandlers {
 			handlers[k] = h
 		}
 		handlers["credential.get"] = caps.CredentialHandler(credStore, p.Credentials, log)
+		if len(withheld) > 0 {
+			log.Warn("capabilities withheld from spawn profile", "profile", pname, "ops", strings.Join(withheld, "; "))
+		}
 
 		tmpl := &supervisor.SpawnTemplate{
 			Name:         pname,
@@ -976,6 +1011,61 @@ func capabilitySet(caps []string) map[string]bool {
 		caps = config.DefaultCapabilities
 	}
 	return stringSet(caps)
+}
+
+// gateOps restricts one op group to the capabilities the agent actually holds,
+// appending what it withheld to *withheld so the boot notice reports what
+// really happened rather than a hand-kept list that can drift from the wiring.
+//
+// enforce is plugins.enforce_capabilities; setting it false returns the map
+// untouched, which is the migration escape for a configuration that relied on
+// every agent having every op.
+func gateOps(enforce bool, agent string, granted map[string]bool, capability string,
+	hs map[string]session.OpHandler, withheld *[]string) map[string]session.OpHandler {
+	if !enforce || granted[capability] {
+		return hs
+	}
+	names := make([]string, 0, len(hs))
+	for n := range hs {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	*withheld = append(*withheld, fmt.Sprintf("%s (needs %s)", strings.Join(names, ", "), capability))
+	return caps.Gate(hs, capability, agent, granted)
+}
+
+// loopHint explains a loop: value that names a tool, or "" when there is
+// nothing to say.
+//
+// "builtin:" is spelled by three vocabularies that have nothing to do with each
+// other — loop/plugin names (builtin:per_chat), tool names (builtin:web_search)
+// and memory provider names (builtin:sqlite). Nothing in the string says which
+// one a name belongs to, so a name from the wrong one produces "unknown
+// builtin:web_search", which is true but does not tell you what to write
+// instead.
+func loopHint(value string, toolNames []string) string {
+	if slices.Contains(toolNames, value) {
+		return value + " is a tool name, not a loop — tools are listed under skills:, while loop: takes a builtin loop name or a .lua path"
+	}
+	return ""
+}
+
+// skillHint explains a skills: entry that names a builtin loop instead of a
+// tool, or "" when there is nothing to say.
+//
+// This one is worth catching because it fails silently: a loop name matches no
+// registered tool, the entry is simply ignored, and the agent ends up with an
+// empty tool list that looks like the tools being unavailable rather than
+// misspelled.
+//
+// The reverse — a skills entry matching no registered tool — is deliberately
+// not warned about, because a loop may legitimately list tools it declares
+// itself with tool.def, which do not exist at boot.
+func skillHint(value string, loopNames []string) string {
+	if slices.Contains(loopNames, value) {
+		return value + " is a loop/plugin name, not a tool — loops go in loop:, tools in skills:"
+	}
+	return ""
 }
 
 // resolveInstructions sources an agent's or spawn profile's system prompt from

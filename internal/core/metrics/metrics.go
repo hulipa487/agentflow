@@ -209,6 +209,8 @@ func DefaultCounters() map[string]*Counter {
 		"agentflow_credential_gets":        NewCounter("agentflow_credential_gets", "credential.get accesses granted"),
 		"agentflow_credential_gets_denied": NewCounter("agentflow_credential_gets_denied", "credential.get accesses denied or failed"),
 		"agentflow_trigger_fires":          NewCounter("agentflow_trigger_fires", "Scheduled every:/cron: triggers fired by the engine"),
+		"agentflow_http_private_blocked":   NewCounter("agentflow_http_private_blocked", "Outbound HTTP connections refused by the private-address guard"),
+		"agentflow_http_insecure_tls":      NewCounter("agentflow_http_insecure_tls", "Outbound HTTP requests that skipped TLS verification"),
 	}
 }
 

@@ -32,6 +32,7 @@ import (
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/memory"
 	"agentflow/internal/core/metrics"
+	"agentflow/internal/core/netguard"
 	"agentflow/internal/core/pool"
 	"agentflow/internal/core/reload"
 	"agentflow/internal/core/router"
@@ -42,6 +43,8 @@ import (
 	"agentflow/internal/core/supervisor"
 	"agentflow/internal/core/tools"
 	"agentflow/internal/core/triggers"
+	"agentflow/internal/drivers/browser"
+	"agentflow/internal/drivers/fetch"
 	"agentflow/internal/drivers/ghhook"
 	"agentflow/internal/drivers/httpd"
 	"agentflow/internal/drivers/legal"
@@ -139,6 +142,18 @@ func main() {
 	// first-call error (model api_key). The legacy single-file path expands at
 	// load, so its values are literals and pass straight through.
 	credResolver := &config.Resolver{Store: credStore}
+
+	// Outbound HTTP policy, shared by the Lua http.request op and the
+	// builtin:fetch tool so the two cannot disagree. The guard lives in the
+	// dialer — see internal/core/netguard — which is what makes it cover
+	// redirect hops and DNS rebinding rather than just the URL as typed.
+	netPolicy := netguard.Policy{AllowPrivate: cfg.Net.HTTP.AllowPrivate}
+	if cfg.Net.HTTP.AllowPrivate {
+		// Loud on purpose: this is the one setting that lets a prompt-injected
+		// agent reach the host's own network, including the admin server and
+		// any cloud metadata endpoint.
+		log.Warn("net.http.allow_private is enabled: outbound HTTP may reach loopback, private, link-local and reserved addresses")
+	}
 
 	// Shell profile passwords may be lazy references; an unresolvable one is
 	// cleared with a warning (the profile itself stays — docker needs no
@@ -244,9 +259,15 @@ func main() {
 		log.Error("legal engines failed", "err", err)
 		os.Exit(1)
 	}
+	// The browser tool is opt-in and degrades rather than failing: no account
+	// means an empty client and honest-unavailable, and a token that will not
+	// resolve is skipped with a warning inside Build.
+	browserClient := browser.Build(cfg.Browser, credResolver, log)
 	toolReg := tools.NewRegistry()
 	tools.RegisterBuiltins(toolReg, searchSet)
 	tools.RegisterLegalBuiltins(toolReg, legalSet)
+	tools.RegisterBrowserBuiltins(toolReg, browserClient)
+	tools.RegisterFetchBuiltins(toolReg, fetch.New(netPolicy), log)
 	tools.RegisterShellBuiltins(toolReg, shellMgr)
 	mcpClients := map[string]*mcp.Client{}
 	for sname, s := range cfg.MCP.Servers {
@@ -394,7 +415,7 @@ func main() {
 		for k, h := range caps.ShellHandlers(shellMgr) {
 			handlers[k] = h
 		}
-		for k, h := range caps.HTTPHandlers(log, credStore) {
+		for k, h := range caps.HTTPHandlers(log, credStore, netPolicy) {
 			handlers[k] = h
 		}
 		for k, h := range caps.MailHandlers(log, credStore) {
@@ -508,7 +529,7 @@ func main() {
 		for k, h := range caps.ShellHandlers(shellMgr) {
 			handlers[k] = h
 		}
-		for k, h := range caps.HTTPHandlers(log, credStore) {
+		for k, h := range caps.HTTPHandlers(log, credStore, netPolicy) {
 			handlers[k] = h
 		}
 		for k, h := range caps.MailHandlers(log, credStore) {

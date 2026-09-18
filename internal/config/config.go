@@ -28,6 +28,8 @@ type Config struct {
 	Tools    Tools             `yaml:"tools"`
 	Search   Search            `yaml:"search"`
 	Legal    LegalSearch       `yaml:"legal_search"`
+	Browser  Browser           `yaml:"browser"`
+	Net      NetConfig         `yaml:"net"`
 	Media    MediaConfig       `yaml:"media"`
 	Audit    AuditConfig       `yaml:"audit"`
 	Agents   map[string]Agent  `yaml:"agents"`
@@ -476,7 +478,7 @@ func (e SearchEngine) TimeoutD() time.Duration {
 	return d
 }
 
-// LegalSearch configures the builtin:legal_search / builtin:legal_fetch tools:
+// LegalSearch configures the builtin:legal_search / builtin:legal_read tools:
 // a set of named legal-database engines and the default used when a call omits
 // `engine`. Supported: hklii (Hong Kong Legal Information Institute) and npc
 // (China National Database of Laws and Regulations); neither needs a key. With
@@ -485,6 +487,65 @@ func (e SearchEngine) TimeoutD() time.Duration {
 type LegalSearch struct {
 	Default string                  `yaml:"default"` // engine used when a call omits `engine`
 	Engines map[string]SearchEngine `yaml:"engines"`
+}
+
+// Browser configures the builtin:browser tool: Cloudflare Browser Run
+// (formerly Browser Rendering) Quick Actions, which read a page through a real
+// headless browser so JavaScript-rendered content is present. With no account
+// configured the tool reports honest-unavailable rather than failing.
+//
+// AccountID and APIToken are set together or not at all — validation rejects a
+// half-configured block, because a missing account id is a mistake the
+// operator can fix now. APIToken is not validated for resolvability: it may be
+// a lazy secret reference whose value only exists at runtime, and an
+// unresolvable credential skips the capability with a warning rather than
+// failing the boot, the same rule the search engines and memory backends
+// follow. The token needs the "Browser Rendering - Edit" permission.
+type Browser struct {
+	AccountID string `yaml:"account_id"` // Cloudflare account id; not a secret
+	APIToken  string `yaml:"api_token"`  // env-interpolated (${VAR}) or cred:<service>
+	BaseURL   string `yaml:"base_url"`   // optional endpoint override (testing / proxy)
+	Timeout   string `yaml:"timeout"`    // per-request bound; default 60s
+}
+
+// TimeoutD parses Timeout with a sane default.
+//
+// The default is 60s rather than the search engines' 30s because a page load
+// may consume the full 60s gotoOptions.timeout before the action itself runs,
+// so a 30s client bound would cancel work Cloudflare is still doing and report
+// a timeout where the request would have succeeded.
+func (b Browser) TimeoutD() time.Duration {
+	if b.Timeout == "" {
+		return 60 * time.Second
+	}
+	d, err := time.ParseDuration(b.Timeout)
+	if err != nil {
+		return 60 * time.Second
+	}
+	return d
+}
+
+// NetConfig is the engine's outbound-connection safety policy. It governs both
+// outbound HTTP paths — the builtin:fetch tool and the Lua http.request op —
+// from one setting, so a deployment cannot end up with one guarded and the
+// other not.
+type NetConfig struct {
+	HTTP NetHTTP `yaml:"http"`
+}
+
+// NetHTTP is the policy for HTTP(S) connections.
+//
+// AllowPrivate disables the private-address guard. With it on, these paths may
+// reach loopback (including the engine's own admin server), RFC1918, CGNAT,
+// link-local — which includes the cloud metadata endpoint at 169.254.169.254 —
+// unique-local, and the reserved/special-purpose ranges.
+//
+// It is false by default because the guard is the only thing between a
+// prompt-injected agent and the host's own network. It exists so a deployment
+// that legitimately calls an internal service can keep working, and enabling
+// it logs a WARN at boot so it cannot be turned on silently.
+type NetHTTP struct {
+	AllowPrivate bool `yaml:"allow_private"`
 }
 
 // Plugins controls the global capability ceiling.
@@ -965,7 +1026,7 @@ func validate(path string, c *Config) error {
 	}
 
 	// Legal-search engines are optional; none configured leaves legal_search /
-	// legal_fetch in honest-unavailable mode. hklii and npc need no key.
+	// legal_read in honest-unavailable mode. hklii and npc need no key.
 	for ename := range c.Legal.Engines {
 		switch ename {
 		case "hklii", "npc":
@@ -984,6 +1045,20 @@ func validate(path string, c *Config) error {
 		} else if _, ok := c.Legal.Engines[c.Legal.Default]; !ok {
 			return fmt.Errorf("%s: legal_search.default %q is not a configured engine", path, c.Legal.Default)
 		}
+	}
+
+	// The browser tool is optional; no account configured leaves builtin:browser
+	// in honest-unavailable mode. account_id and api_token are set together or
+	// not at all: account_id is not a secret, so one present without the other
+	// is a mistake worth failing the boot over. The token's *resolvability* is
+	// deliberately not checked — it may be a lazy secret reference, and an
+	// unresolvable credential skips the capability at construction with a
+	// warning rather than failing the boot, as everywhere else.
+	if c.Browser.AccountID != "" && c.Browser.APIToken == "" {
+		return fmt.Errorf("%s: browser.account_id is set but browser.api_token is empty", path)
+	}
+	if c.Browser.AccountID == "" && c.Browser.APIToken != "" {
+		return fmt.Errorf("%s: browser.api_token is set but browser.account_id is empty", path)
 	}
 
 	for bname, b := range c.Memory.Backends {

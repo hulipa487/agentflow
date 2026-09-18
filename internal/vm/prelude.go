@@ -341,11 +341,11 @@ function memory.write(record)
   return true
 end
 function memory.recall(query, opts)
-  -- The memory profile selects the recall handler; builtin:semantic is
+  -- The memory profile selects the recall handler; plugin:semantic is
   -- handled by its support chunk, everything else uses the default.
   local info = agent.info()
   local recall = info.memory and info.memory.recall
-  if recall == "builtin:semantic" and memory_semantic_recall_handler then
+  if recall == "plugin:semantic" and memory_semantic_recall_handler then
     return memory_semantic_recall_handler(query, opts)
   end
   return memory_recall_handler(query, opts)

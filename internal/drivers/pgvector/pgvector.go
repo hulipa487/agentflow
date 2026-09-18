@@ -1,7 +1,7 @@
-// Package pgvector implements the builtin:pgvector vector backend provider.
+// Package pgvector implements the pgvector vector backend provider.
 // It provides the "vector" feature via PostgreSQL + the pgvector extension.
 //
-// The connection string is the same as builtin:postgres. The provider requires
+// The connection string is the same as postgres. The provider requires
 // the pgvector extension to be installed on the target database. Each logical
 // table maps to a vector table named "vec_<table>".
 package pgvector
@@ -17,10 +17,10 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-// Provider implements memory.BackendProvider for "builtin:pgvector".
+// Provider implements memory.BackendProvider for "pgvector".
 type Provider struct{}
 
-func (Provider) Name() string { return "builtin:pgvector" }
+func (Provider) Name() string { return "pgvector" }
 
 func (Provider) Features() []string {
 	return []string{"vector"}
@@ -34,7 +34,7 @@ const defaultDim = 1536
 func (Provider) Open(config map[string]any) (memory.BackendHandle, error) {
 	url, _ := config["url"].(string)
 	if url == "" {
-		return nil, fmt.Errorf("builtin:pgvector: url is required")
+		return nil, fmt.Errorf("pgvector: url is required")
 	}
 	dim := defaultDim
 	switch v := config["dim"].(type) {
@@ -46,20 +46,20 @@ func (Provider) Open(config map[string]any) (memory.BackendHandle, error) {
 		dim = int(v)
 	}
 	if dim <= 0 {
-		return nil, fmt.Errorf("builtin:pgvector: dim must be positive, got %d", dim)
+		return nil, fmt.Errorf("pgvector: dim must be positive, got %d", dim)
 	}
 	db, err := sql.Open("pgx", url)
 	if err != nil {
-		return nil, fmt.Errorf("builtin:pgvector: open: %w", err)
+		return nil, fmt.Errorf("pgvector: open: %w", err)
 	}
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("builtin:pgvector: ping: %w", err)
+		return nil, fmt.Errorf("pgvector: ping: %w", err)
 	}
 	h := &Handle{db: db, dim: dim}
 	if err := h.migrate(); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("builtin:pgvector: migrate: %w", err)
+		return nil, fmt.Errorf("pgvector: migrate: %w", err)
 	}
 	return h, nil
 }
@@ -103,7 +103,7 @@ func (h *Handle) Put(table, key string, value any, opts memory.PutOpts) error {
 	defer cancel()
 	if len(opts.Vector) > 0 {
 		if len(opts.Vector) != h.dim {
-			return fmt.Errorf("builtin:pgvector: embedding has %d dimensions, backend configured for %d (set dim in the backend config to match the embedding model)", len(opts.Vector), h.dim)
+			return fmt.Errorf("pgvector: embedding has %d dimensions, backend configured for %d (set dim in the backend config to match the embedding model)", len(opts.Vector), h.dim)
 		}
 		_, err = h.db.ExecContext(ctx,
 			`INSERT INTO vec_kv (table_name, key, value, embedding, updated_at) VALUES ($1, $2, $3, $4::vector, $5)
@@ -150,10 +150,10 @@ func (h *Handle) Delete(table, key string) error {
 
 func (h *Handle) Query(table string, q memory.Query) (memory.Iterator, error) {
 	if q.Kind != "vector" {
-		return nil, fmt.Errorf("builtin:pgvector: only vector queries are supported")
+		return nil, fmt.Errorf("pgvector: only vector queries are supported")
 	}
 	if len(q.Vector) == 0 {
-		return nil, fmt.Errorf("builtin:pgvector: vector query requires a query vector")
+		return nil, fmt.Errorf("pgvector: vector query requires a query vector")
 	}
 	k := q.K
 	if k <= 0 {

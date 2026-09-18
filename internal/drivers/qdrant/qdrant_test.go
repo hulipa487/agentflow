@@ -355,7 +355,7 @@ func TestQueryVectorFiltersOnTable(t *testing.T) {
 }
 
 // TestQueryRejectsNonVectorKinds: this provider is vector-only, like
-// builtin:pgvector — anything else is an explicit error, never a silent empty.
+// pgvector — anything else is an explicit error, never a silent empty.
 func TestQueryRejectsNonVectorKinds(t *testing.T) {
 	f := &fakeQdrant{exists: true, size: 2}
 	h := openFake(t, f, map[string]any{"dim": 2})

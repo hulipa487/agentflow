@@ -16,7 +16,7 @@ func TestToolOverrideSpecFieldsParse(t *testing.T) {
 	dec := yaml.NewDecoder(strings.NewReader(`
 version: "1"
 agents:
-  bot: { loop: builtin:per_chat }
+  bot: { loop: plugin:per_chat }
 tools:
   policy:
     overrides:
@@ -56,7 +56,7 @@ func TestToolOverrideUnknownFieldFails(t *testing.T) {
 	dec := yaml.NewDecoder(strings.NewReader(`
 version: "1"
 agents:
-  bot: { loop: builtin:per_chat }
+  bot: { loop: plugin:per_chat }
 tools:
   policy:
     overrides:
@@ -74,7 +74,7 @@ tools:
 func TestValidateWebhookTimeout(t *testing.T) {
 	base := func() *Config {
 		return &Config{
-			Agents: map[string]Agent{"bot": {Loop: "builtin:per_chat"}},
+			Agents: map[string]Agent{"bot": {Loop: "plugin:per_chat"}},
 			Gateway: Gateway{
 				Channels: []Channel{{Name: "wh", Type: "webhook", Agent: "bot"}},
 			},
@@ -468,10 +468,10 @@ func TestInstructionsRefDecode(t *testing.T) {
 version: "1"
 agents:
   promptbot:
-    loop: builtin:per_chat
+    loop: plugin:per_chat
     instructions: {prompt: assistant_system}
   filebot:
-    loop: builtin:per_chat
+    loop: plugin:per_chat
     instructions: ./prompts/filebot.md
 prompts:
   assistant_system: { inline: "You are the assistant." }
@@ -505,7 +505,7 @@ tools:
 	// A malformed instructions reference is a decode error, not a silent path.
 	bad := yaml.NewDecoder(strings.NewReader(`
 agents:
-  bot: { loop: builtin:per_chat, instructions: {nope: 1} }
+  bot: { loop: plugin:per_chat, instructions: {nope: 1} }
 `))
 	bad.KnownFields(true)
 	if err := bad.Decode(&Config{}); err == nil {
@@ -519,8 +519,8 @@ agents:
 // a config naming a real provider fails validation before it can be opened.
 func TestValidateMemoryBackendProviders(t *testing.T) {
 	supported := []string{
-		"builtin:sqlite", "builtin:redis", "builtin:mongodb", "builtin:postgres",
-		"builtin:pgvector", "builtin:qdrant", "builtin:redisvector", "builtin:volatile",
+		"sqlite", "redis", "mongodb", "postgres",
+		"pgvector", "qdrant", "redisvector", "volatile",
 	}
 	for _, provider := range supported {
 		t.Run(provider, func(t *testing.T) {
@@ -540,6 +540,39 @@ func TestValidateMemoryBackendProviders(t *testing.T) {
 	}
 	if err := validate("cfg.yaml", c); err == nil || !strings.Contains(err.Error(), "unsupported provider") {
 		t.Fatalf("an unknown provider must fail the boot, got %v", err)
+	}
+
+	// The retired "builtin:" spelling is recognized by name, so the message
+	// says what to write instead of implying the backend does not exist.
+	c = &Config{
+		Agents: map[string]Agent{"bot": {Loop: "./loop.lua"}},
+		Memory: Memory{Backends: map[string]Backend{"b": {Provider: "builtin:sqlite"}}},
+	}
+	if err := validate("cfg.yaml", c); err == nil || !strings.Contains(err.Error(), "providers are unprefixed") {
+		t.Fatalf("the pre-rename spelling must be called out, got %v", err)
+	}
+}
+
+// TestValidateReservedMemoryProfileName: "conversational" is the one built-in
+// memory profile and is resolved before profiles.memory is consulted, so a
+// user profile of that name would never run. Refusing the name beats silently
+// ignoring it.
+func TestValidateReservedMemoryProfileName(t *testing.T) {
+	c := &Config{
+		Agents:   map[string]Agent{"bot": {Loop: "./loop.lua"}},
+		Profiles: Profiles{Memory: map[string]MemoryProfile{"conversational": {}}},
+	}
+	if err := validate("cfg.yaml", c); err == nil || !strings.Contains(err.Error(), "reserved for the built-in profile") {
+		t.Fatalf("the built-in profile name must be reserved, got %v", err)
+	}
+
+	// Any other name is fine.
+	c = &Config{
+		Agents:   map[string]Agent{"bot": {Loop: "./loop.lua"}},
+		Profiles: Profiles{Memory: map[string]MemoryProfile{"chatty": {}}},
+	}
+	if err := validate("cfg.yaml", c); err != nil {
+		t.Fatalf("an unrelated profile name must validate: %v", err)
 	}
 }
 
@@ -617,7 +650,7 @@ gateway:
 `
 	const profile = `
 name: bot
-loop: builtin:per_chat
+loop: plugin:per_chat
 `
 
 	on := writeDir(t, map[string]string{

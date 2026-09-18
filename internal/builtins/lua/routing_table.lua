@@ -1,4 +1,4 @@
--- builtin:routing_table — default memory.write filter chain.
+-- plugin:routing_table — default memory.write filter chain.
 --
 -- The chain receives the record written by the agent and returns a list of
 -- targets. Each target is { store = <logical>, key = ..., value = ..., ttl = ... }.

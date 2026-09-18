@@ -305,7 +305,7 @@ func TestWatchConfigDirPicksUpEdits(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "profiles"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "profiles", "bot.yaml"), []byte("name: bot\nloop: builtin:per_chat\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "profiles", "bot.yaml"), []byte("name: bot\nloop: plugin:per_chat\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	write(`

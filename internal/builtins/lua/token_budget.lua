@@ -1,4 +1,4 @@
--- builtin:token_budget — the default prompt.budget handler.
+-- plugin:token_budget — the default prompt.budget handler.
 --
 -- Loaded into every session state before the loop plugin (as the global
 -- `token_budget`). Approximates tokens as ceil(chars/4) — cheap and

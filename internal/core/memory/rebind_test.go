@@ -50,8 +50,8 @@ func TestRebindSkippedVectorToSQLite(t *testing.T) {
 	}
 	// The fallback must satisfy the degraded requires, or the boot still dies.
 	reg := NewRegistry(log)
-	reg.RegisterProvider(featureProvider{name: "builtin:sqlite", features: feats("main_db")})
-	reg.AddBackend("main_db", "builtin:sqlite", nil)
+	reg.RegisterProvider(featureProvider{name: "sqlite", features: feats("main_db")})
+	reg.AddBackend("main_db", "sqlite", nil)
 	if err := reg.Open(nil); err != nil {
 		t.Fatal(err)
 	}

@@ -1,4 +1,4 @@
-// Package sqlite implements the builtin:sqlite memory backend provider.
+// Package sqlite implements the sqlite memory backend provider.
 // It stores JSON values keyed by (table, key) with optional TTL, supports
 // prefix and text search (via FTS5), and keeps recent insertion order for
 // recency queries.
@@ -19,10 +19,10 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Provider implements memory.BackendProvider for "builtin:sqlite".
+// Provider implements memory.BackendProvider for "sqlite".
 type Provider struct{}
 
-func (Provider) Name() string { return "builtin:sqlite" }
+func (Provider) Name() string { return "sqlite" }
 
 func (Provider) Features() []string {
 	return []string{"kv", "prefix_scan", "text_search", "ttl", "transaction"}
@@ -183,8 +183,8 @@ func (h *Handle) Query(table string, q memory.Query) (memory.Iterator, error) {
 		// SQLite does not support vector queries. Return an explicit error
 		// rather than a silent empty iterator — silent empty results would
 		// mask a missing vector backend as "no matches", which is unsafe for
-		// recall. Use a vector-capable backend (builtin:pgvector) instead.
-		return nil, fmt.Errorf("vector queries are not supported by builtin:sqlite; configure a vector-capable backend")
+		// recall. Use a vector-capable backend (pgvector) instead.
+		return nil, fmt.Errorf("vector queries are not supported by sqlite; configure a vector-capable backend")
 	default:
 		return nil, fmt.Errorf("unsupported query kind %q", q.Kind)
 	}

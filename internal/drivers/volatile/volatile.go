@@ -1,4 +1,4 @@
-// Package volatile is the builtin:volatile memory backend provider: an
+// Package volatile is the volatile memory backend provider: an
 // in-process, non-persisted key-value store. It survives loop reloads (the
 // registry, not the Luau state, owns the map) but is lost on process exit.
 // Use it for decaying private buffers that must outlive one loop instance
@@ -15,10 +15,10 @@ import (
 	"agentflow/internal/core/memory"
 )
 
-// Provider implements memory.BackendProvider for "builtin:volatile".
+// Provider implements memory.BackendProvider for "volatile".
 type Provider struct{}
 
-func (Provider) Name() string { return "builtin:volatile" }
+func (Provider) Name() string { return "volatile" }
 
 func (Provider) Features() []string {
 	return []string{"kv", "prefix_scan", "ttl"}
@@ -33,7 +33,7 @@ func (Provider) Open(_ map[string]any) (memory.BackendHandle, error) {
 // entry is one stored value with its write time and optional expiry. The
 // value is stored both as the raw Go any and its JSON bytes: Put marshals so
 // Get/Query return JSON-normalized values (int->float64, etc.), matching the
-// builtin:sqlite backend's semantics and keeping backends substitutable.
+// sqlite backend's semantics and keeping backends substitutable.
 type entry struct {
 	raw     []byte
 	value   any
@@ -114,9 +114,9 @@ func (h *Handle) Query(table string, q memory.Query) (memory.Iterator, error) {
 	case "time_range":
 		return h.queryTimeRange(table, q.From, q.To)
 	case "text":
-		return nil, fmt.Errorf("text queries are not supported by builtin:volatile; use a text-capable backend")
+		return nil, fmt.Errorf("text queries are not supported by volatile; use a text-capable backend")
 	case "vector":
-		return nil, fmt.Errorf("vector queries are not supported by builtin:volatile; configure a vector-capable backend")
+		return nil, fmt.Errorf("vector queries are not supported by volatile; configure a vector-capable backend")
 	default:
 		return nil, fmt.Errorf("unsupported query kind %q", q.Kind)
 	}

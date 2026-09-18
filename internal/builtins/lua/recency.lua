@@ -1,4 +1,4 @@
--- builtin:recency — default memory.recall handler.
+-- plugin:recency — default memory.recall handler.
 --
 -- Returns the most recent records from the agent's stores. Query.kind selects
 -- the access pattern:

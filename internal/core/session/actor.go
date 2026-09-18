@@ -421,7 +421,7 @@ type Actor struct {
 	OnExit      func(Identity, EndReason)
 	LoopFile    string   // re-read on restart; empty for builtins
 	LoopSrc     string   // source used when LoopFile is empty
-	SupportSrc  string   // extra chunk loaded before the plugin (builtin:token_budget)
+	SupportSrc  string   // extra chunk loaded before the plugin (plugin:token_budget)
 	SupportSrcs []string // support chunks loaded before the loop plugin
 	InstrBudget int64
 
@@ -545,7 +545,7 @@ func (a *Actor) runOnce(ctx context.Context) (crashed bool) {
 		return true
 	}
 	if a.SupportSrc != "" {
-		if err := st.Eval("@builtin:token_budget", a.SupportSrc); err != nil {
+		if err := st.Eval("@plugin:token_budget", a.SupportSrc); err != nil {
 			a.log.Warn("support chunk load failed", "err", err)
 			return true
 		}

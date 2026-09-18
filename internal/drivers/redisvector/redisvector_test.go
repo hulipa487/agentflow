@@ -132,7 +132,7 @@ func TestSearchKeys(t *testing.T) {
 	}
 }
 
-// TestKeysAndIndexNaming: "<table>:<key>" is builtin:redis's convention, the
+// TestKeysAndIndexNaming: "<table>:<key>" is redis's convention, the
 // index is per table, and a record key round-trips through stripTable.
 func TestKeysAndIndexNaming(t *testing.T) {
 	h := &Handle{}
@@ -178,7 +178,7 @@ func TestQueryRejectsUnsupportedAndMisconfigured(t *testing.T) {
 }
 
 // TestDimMismatchOnPut: a vector of the wrong width is refused with both
-// numbers named, as builtin:pgvector does.
+// numbers named, as pgvector does.
 func TestDimMismatchOnPut(t *testing.T) {
 	h := &Handle{dim: 3}
 	err := h.Put("t", "k", "v", memory.PutOpts{Vector: []float32{1, 2}})

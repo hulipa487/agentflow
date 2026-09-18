@@ -1,4 +1,4 @@
--- builtin:fact_extractor — cheap after_turn tap that extracts facts.
+-- plugin:fact_extractor — cheap after_turn tap that extracts facts.
 --
 -- Called as fact_extractor_turn(turn) after the assistant reply is sent.
 -- Returns a list of memory records to write, or nil if nothing to remember.

@@ -1,4 +1,4 @@
-// Package postgres implements the builtin:postgres memory backend provider.
+// Package postgres implements the postgres memory backend provider.
 // It provides kv, prefix_scan, text_search, and transaction features via a
 // PostgreSQL server.
 //
@@ -19,10 +19,10 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-// Provider implements memory.BackendProvider for "builtin:postgres".
+// Provider implements memory.BackendProvider for "postgres".
 type Provider struct{}
 
-func (Provider) Name() string { return "builtin:postgres" }
+func (Provider) Name() string { return "postgres" }
 
 func (Provider) Features() []string {
 	return []string{"kv", "prefix_scan", "text_search", "transaction"}
@@ -31,20 +31,20 @@ func (Provider) Features() []string {
 func (Provider) Open(config map[string]any) (memory.BackendHandle, error) {
 	url, _ := config["url"].(string)
 	if url == "" {
-		return nil, fmt.Errorf("builtin:postgres: url is required")
+		return nil, fmt.Errorf("postgres: url is required")
 	}
 	db, err := sql.Open("pgx", url)
 	if err != nil {
-		return nil, fmt.Errorf("builtin:postgres: open: %w", err)
+		return nil, fmt.Errorf("postgres: open: %w", err)
 	}
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("builtin:postgres: ping: %w", err)
+		return nil, fmt.Errorf("postgres: ping: %w", err)
 	}
 	h := &Handle{db: db}
 	if err := h.migrate(); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("builtin:postgres: migrate: %w", err)
+		return nil, fmt.Errorf("postgres: migrate: %w", err)
 	}
 	return h, nil
 }
@@ -137,7 +137,7 @@ func (h *Handle) Query(table string, q memory.Query) (memory.Iterator, error) {
 	case "all":
 		return h.queryAll(table)
 	default:
-		return nil, fmt.Errorf("builtin:postgres: unsupported query kind %q", q.Kind)
+		return nil, fmt.Errorf("postgres: unsupported query kind %q", q.Kind)
 	}
 }
 

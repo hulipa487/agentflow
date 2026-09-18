@@ -237,7 +237,7 @@ type MemoryProfile struct {
 	Recall string           `yaml:"recall"`
 	// EmbedModel names a models: entry used to embed record text on write
 	// (memory.write attaches the vector) and queries under
-	// recall: builtin:semantic. RerankModel names a provider:"rerank"
+	// recall: plugin:semantic. RerankModel names a provider:"rerank"
 	// entry; when set, semantic recall oversamples vector hits by
 	// Oversample (default 4) and reranks down to k.
 	EmbedModel  string `yaml:"embed_model"`
@@ -311,7 +311,7 @@ type BudgetConfig struct {
 }
 
 // AgentConfig can be a string profile reference or an inline profile.
-// YAML: `memory: builtin:conversational` or `memory: { stores: ... }`.
+// YAML: `memory: conversational` or `memory: { stores: ... }`.
 type MemoryAgentConfig struct {
 	Profile  string
 	IsInline bool
@@ -637,7 +637,17 @@ type ChannelMedia struct {
 // DefaultCapabilities is what an agent gets if capabilities are omitted.
 var DefaultCapabilities = []string{"llm.chat", "memory", "tools", "agent.send", "net.http"}
 
-// DefaultMemoryProfile is the expansion of `memory: builtin:conversational`.
+// memoryProviderKnown reports whether name is a supported memory backend
+// provider, for the hint that catches the retired "builtin:" spelling.
+func memoryProviderKnown(name string) bool {
+	switch name {
+	case "sqlite", "redis", "mongodb", "postgres", "pgvector", "qdrant", "redisvector", "volatile":
+		return true
+	}
+	return false
+}
+
+// DefaultMemoryProfile is the expansion of `memory: conversational`.
 func DefaultMemoryProfile() MemoryProfile {
 	return MemoryProfile{
 		Stores: map[string]Store{
@@ -655,8 +665,8 @@ func DefaultMemoryProfile() MemoryProfile {
 				Requires:  []string{"kv", "text_search"},
 			},
 		},
-		Write:  []string{"builtin:routing_table"},
-		Recall: "builtin:recency",
+		Write:  []string{"plugin:routing_table"},
+		Recall: "plugin:recency",
 	}
 }
 
@@ -856,7 +866,7 @@ func validate(path string, c *Config) error {
 			if !allowedCaps["memory"] {
 				return fmt.Errorf("%s: agent %q uses memory but lacks memory capability", path, name)
 			}
-			if a.Memory.Profile == "builtin:conversational" {
+			if a.Memory.Profile == "conversational" {
 				continue
 			}
 			// Resolve the store set: a named profiles.memory reference or an
@@ -1080,10 +1090,24 @@ func validate(path string, c *Config) error {
 
 	for bname, b := range c.Memory.Backends {
 		switch b.Provider {
-		case "builtin:sqlite", "builtin:redis", "builtin:mongodb", "builtin:postgres", "builtin:pgvector", "builtin:qdrant", "builtin:redisvector", "builtin:volatile":
+		case "sqlite", "redis", "mongodb", "postgres", "pgvector", "qdrant", "redisvector", "volatile":
 		default:
+			// The prefix used to be required. Saying so beats "unsupported
+			// provider", which reads as if the backend were unknown when it is
+			// only misspelled.
+			if name, ok := strings.CutPrefix(b.Provider, "builtin:"); ok && memoryProviderKnown(name) {
+				return fmt.Errorf("%s: memory backend %q has provider %q — providers are unprefixed now, write %q",
+					path, bname, b.Provider, name)
+			}
 			return fmt.Errorf("%s: memory backend %q has unsupported provider %q", path, bname, b.Provider)
 		}
+	}
+
+	// "conversational" is the one built-in memory profile, and it is resolved
+	// before profiles.memory is consulted — so a user profile of that name
+	// would never run. Refusing the name is better than silently ignoring it.
+	if _, clash := c.Profiles.Memory["conversational"]; clash {
+		return fmt.Errorf("%s: profiles.memory defines %q, which is reserved for the built-in profile", path, "conversational")
 	}
 
 	// Media blob store: fs (default) or s3. S3 requires bucket and region;
@@ -1161,10 +1185,10 @@ func validateShellProfile(path, owner, name string, p ShellProfile) error {
 }
 
 // ResolveMemoryProfile returns the concrete memory profile for an agent.
-// It expands `builtin:conversational`, then named profiles.memory entries,
+// It expands `conversational`, then named profiles.memory entries,
 // then inline profiles.
 func (c *Config) ResolveMemoryProfile(a Agent) MemoryProfile {
-	if a.Memory.Profile == "builtin:conversational" {
+	if a.Memory.Profile == "conversational" {
 		// Ensure the default backend is present if not already defined.
 		mp := DefaultMemoryProfile()
 		if c.Memory.Backends == nil {
@@ -1172,7 +1196,7 @@ func (c *Config) ResolveMemoryProfile(a Agent) MemoryProfile {
 		}
 		if _, ok := c.Memory.Backends["main_db"]; !ok {
 			c.Memory.Backends["main_db"] = Backend{
-				Provider: "builtin:sqlite",
+				Provider: "sqlite",
 				Config: map[string]any{
 					"path": "./data/agentflow.db",
 				},

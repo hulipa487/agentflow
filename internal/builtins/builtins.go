@@ -50,19 +50,22 @@ var sources = map[string]string{
 // supportOrder fixes the evaluation order of support chunks in every session.
 var supportOrder = []string{"token_budget", "routing_table", "recency", "semantic", "fact_extractor", "exec_policy", "ttl"}
 
-// Names returns the builtin loop/plugin names as config spells them —
-// "builtin:per_chat", not "per_chat".
+// Names returns the builtin plugin names as config spells them —
+// "plugin:per_chat", not "per_chat".
 //
-// They share that prefix with tool names (builtin:web_search) and memory
-// provider names (builtin:sqlite), but the three are separate vocabularies that
-// share nothing: a name from one is never valid in another's field, and nothing
-// about the string says which it is. Returning the config spelling is what lets
-// a caller compare a configured value against this list directly and say which
-// vocabulary it actually belongs to, instead of reporting "unknown builtin".
+// The "plugin:" prefix marks this vocabulary alone. It used to be "builtin:",
+// which loop names, tool names (builtin:web_search) and memory provider names
+// (builtin:sqlite) all spelled: a name from one was never valid in another's
+// field, and nothing in the string said which it was. The prefix now also
+// settles the loop-vs-path question outright — a path never begins with
+// "plugin:", where before a file named "per_chat" was unreachable.
+//
+// Returning the config spelling is what lets a caller compare a configured
+// value against this list directly and say which vocabulary it belongs to.
 func Names() []string {
 	out := make([]string, 0, len(sources))
 	for n := range sources {
-		out = append(out, "builtin:"+n)
+		out = append(out, "plugin:"+n)
 	}
 	sort.Strings(out)
 	return out
@@ -106,7 +109,7 @@ func SupportChunks() []string {
 	return out
 }
 
-// Resolve turns a loop/route reference into Lua source. "builtin:<name>"
+// Resolve turns a loop/route reference into Lua source. "plugin:<name>"
 // resolves to an embedded builtin unless plugins.dir shadows it (the shadow
 // file then also becomes the hot-reload watch path); anything else is a file
 // or directory path. The second return value is the watch path for
@@ -114,9 +117,9 @@ func SupportChunks() []string {
 // directory is concatenated as its *.lua files in sorted name order and the
 // directory is watched as a whole.
 func Resolve(ref string) (src string, watchPath string, err error) {
-	if name, ok := strings.CutPrefix(ref, "builtin:"); ok {
+	if name, ok := strings.CutPrefix(ref, "plugin:"); ok {
 		if _, found := sources[name]; !found {
-			return "", "", fmt.Errorf("unknown builtin %q", ref)
+			return "", "", fmt.Errorf("unknown plugin %q (builtins are named plugin:<name>, e.g. plugin:per_chat)", ref)
 		}
 		if src, path, ok := shadow(name); ok {
 			return src, path, nil

@@ -148,7 +148,7 @@ media:
 memory:
   backends:
     vec:
-      provider: builtin:qdrant
+      provider: qdrant
       config: { url: "${QDRANT_URL}", api_key: "${QDRANT_KEY}" }
 profiles:
   shell:
@@ -163,7 +163,7 @@ channels:
 `,
 		"profiles/bot.yaml": `
 name: bot
-loop: builtin:per_chat
+loop: plugin:per_chat
 `,
 		"triggers/t.yaml": `
 triggers:
@@ -246,7 +246,7 @@ version: "1"
 models:
   default: { provider: openai, model: m, api_key: ${LEGACY_KEY}, base_url: ${MISSING_BASE:-http://localhost/v1} }
 agents:
-  bot: { loop: builtin:per_chat, model: default }
+  bot: { loop: plugin:per_chat, model: default }
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +277,7 @@ func TestExtrasReferencesStayOpaque(t *testing.T) {
 		"system.yaml": dirSystem,
 		"profiles/bot.yaml": `
 name: bot
-loop: builtin:per_chat
+loop: plugin:per_chat
 extras:
   api_key: "${PM_API_KEY}"
   fallback: "${PM_REGION:-us-east-1}"
@@ -288,7 +288,7 @@ extras:
 		"profiles/w.yaml": `
 name: w
 spawn: true
-loop: builtin:per_chat
+loop: plugin:per_chat
 extras:
   api_key: "${PM_API_KEY}"
 `,

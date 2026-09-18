@@ -66,7 +66,7 @@
   </table>
 
   <div class="callout">
-    <strong>Current status</strong>: <span>The core runtime (actors, memory, tools, shell, multi-agent, scheduler, budget, safety, metrics) is implemented and tested. Every storage backend is a real provider — SQLite, Redis, MongoDB, and PostgreSQL for KV/document storage, an in-memory volatile store for ephemeral data, and three vector stores for vector recall — pgvector, Qdrant, and Redis Stack/RediSearch (SQLite vector queries return an explicit unsupported error, never silent empties). LLM providers cover four API shapes: Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, and the Gemini Interactions API, each targeting self-hosted/proxied endpoints via <code>base_url</code>; per-model <code>server_tools</code> enable provider-native server-side tools such as Google Search grounding. Channels — webhook, GitHub webhook (<code>ghhook</code>), and Telegram (polling, webhook, and self-configuring <code>auto</code> mode) — all mount on one shared HTTP listener with a built-in <code>/health</code> probe. An in-process mail capability (<code>mail.imap_fetch</code> / <code>mail.smtp_send</code>) resolves passwords from the credential store at call time. <strong>Multimodal</strong> is supported: channels ingest media into a content-addressed blob store (per-channel allow-list + size ceiling; filesystem or S3 backend), loops forward part descriptors into <code>llm.chat</code>, and the runtime resolves blob handles at request time — Chat Completions takes images + audio, Anthropic/Responses/Gemini take images + PDFs (Gemini also video, uploaded to the Gemini Files API and referenced by URI — files auto-delete after 48h). A core-owned <strong>audit journal</strong> records every inbound and outbound message (text + attachment handles) to the runtime store with a 90-day default retention. Embeddings (<code>llm.embed</code>, OpenAI-compatible) and cross-encoder reranking (<code>llm.rerank</code>) close the semantic-memory loop: pgvector stores vectors on write and <code>builtin:semantic</code> recall pipelines embed -> vector k-NN -> rerank. Token budgets support daily reset or rolling-window accounting, and spawn profiles carry their own shared metered pool.</span>
+    <strong>Current status</strong>: <span>The core runtime (actors, memory, tools, shell, multi-agent, scheduler, budget, safety, metrics) is implemented and tested. Every storage backend is a real provider — SQLite, Redis, MongoDB, and PostgreSQL for KV/document storage, an in-memory volatile store for ephemeral data, and three vector stores for vector recall — pgvector, Qdrant, and Redis Stack/RediSearch (SQLite vector queries return an explicit unsupported error, never silent empties). LLM providers cover four API shapes: Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, and the Gemini Interactions API, each targeting self-hosted/proxied endpoints via <code>base_url</code>; per-model <code>server_tools</code> enable provider-native server-side tools such as Google Search grounding. Channels — webhook, GitHub webhook (<code>ghhook</code>), and Telegram (polling, webhook, and self-configuring <code>auto</code> mode) — all mount on one shared HTTP listener with a built-in <code>/health</code> probe. An in-process mail capability (<code>mail.imap_fetch</code> / <code>mail.smtp_send</code>) resolves passwords from the credential store at call time. <strong>Multimodal</strong> is supported: channels ingest media into a content-addressed blob store (per-channel allow-list + size ceiling; filesystem or S3 backend), loops forward part descriptors into <code>llm.chat</code>, and the runtime resolves blob handles at request time — Chat Completions takes images + audio, Anthropic/Responses/Gemini take images + PDFs (Gemini also video, uploaded to the Gemini Files API and referenced by URI — files auto-delete after 48h). A core-owned <strong>audit journal</strong> records every inbound and outbound message (text + attachment handles) to the runtime store with a 90-day default retention. Embeddings (<code>llm.embed</code>, OpenAI-compatible) and cross-encoder reranking (<code>llm.rerank</code>) close the semantic-memory loop: pgvector stores vectors on write and <code>plugin:semantic</code> recall pipelines embed -> vector k-NN -> rerank. Token budgets support daily reset or rolling-window accounting, and spawn profiles carry their own shared metered pool.</span>
   </div>
 </section>
 
@@ -417,30 +417,30 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
   <table class="table config-table">
     <thead><tr><th>Provider</th><th>Kind</th><th>Features</th></tr></thead>
     <tbody>
-      <tr><td><code>builtin:sqlite</code></td><td>storage</td><td>kv, prefix_scan, text_search, ttl, transaction</td></tr>
-      <tr><td><code>builtin:redis</code></td><td>storage</td><td>kv, prefix_scan, ttl</td></tr>
-      <tr><td><code>builtin:mongodb</code></td><td>storage</td><td>kv, prefix_scan, ttl</td></tr>
-      <tr><td><code>builtin:postgres</code></td><td>storage</td><td>kv, prefix_scan, text_search, transaction</td></tr>
-      <tr><td><code>builtin:volatile</code></td><td>storage</td><td>kv, prefix_scan, ttl — in-memory, non-persistent</td></tr>
-      <tr><td><code>builtin:pgvector</code></td><td>vector</td><td>vector (cosine k-NN; embedding dim configurable via <code>dim</code>, default 1536)</td></tr>
-      <tr><td><code>builtin:qdrant</code></td><td>vector</td><td>vector (cosine k-NN over Qdrant's REST API; <code>dim</code> default 1536, <code>collection</code> default <code>agentflow</code>, optional <code>api_key</code>)</td></tr>
-      <tr><td><code>builtin:redisvector</code></td><td>vector</td><td>kv, prefix_scan, ttl, vector (needs the RediSearch module, e.g. Redis Stack; cosine k-NN, <code>dim</code> default 1536)</td></tr>
+      <tr><td><code>sqlite</code></td><td>storage</td><td>kv, prefix_scan, text_search, ttl, transaction</td></tr>
+      <tr><td><code>redis</code></td><td>storage</td><td>kv, prefix_scan, ttl</td></tr>
+      <tr><td><code>mongodb</code></td><td>storage</td><td>kv, prefix_scan, ttl</td></tr>
+      <tr><td><code>postgres</code></td><td>storage</td><td>kv, prefix_scan, text_search, transaction</td></tr>
+      <tr><td><code>volatile</code></td><td>storage</td><td>kv, prefix_scan, ttl — in-memory, non-persistent</td></tr>
+      <tr><td><code>pgvector</code></td><td>vector</td><td>vector (cosine k-NN; embedding dim configurable via <code>dim</code>, default 1536)</td></tr>
+      <tr><td><code>qdrant</code></td><td>vector</td><td>vector (cosine k-NN over Qdrant's REST API; <code>dim</code> default 1536, <code>collection</code> default <code>agentflow</code>, optional <code>api_key</code>)</td></tr>
+      <tr><td><code>redisvector</code></td><td>vector</td><td>kv, prefix_scan, ttl, vector (needs the RediSearch module, e.g. Redis Stack; cosine k-NN, <code>dim</code> default 1536)</td></tr>
     </tbody>
   </table>
   <pre><code>memory:
   backends:
     main_db:
-      provider: builtin:sqlite
+      provider: sqlite
       config:
         path: ./data/agentflow.db
     vec:                                # any one vector store serves the semantic profile
-      provider: builtin:pgvector
+      provider: pgvector
       config: { url: "postgres://user:pw@host/db", dim: 1536 }
-    # provider: builtin:qdrant
+    # provider: qdrant
     # config: { url: "http://localhost:6333", dim: 1536, collection: agentflow, api_key: "${QDRANT_KEY}" }
-    # provider: builtin:redisvector      # Redis Stack (RediSearch), not plain Redis
+    # provider: redisvector      # Redis Stack (RediSearch), not plain Redis
     # config: { url: "redis://localhost:6379", dim: 1536 }</code></pre>
-  <p>All three vector stores are vector-query-only, like <code>builtin:pgvector</code>: any other query kind is an explicit error, never a silent empty iterator. <code>dim</code> is fixed when the store is first created, so it must match the embedding model; changing it later needs a manual migration. <code>builtin:redisvector</code> stores the value beside the vector, so it also serves kv, prefix_scan and ttl; <code>builtin:redis</code> is unchanged and remains the plain-KV option.</p>
+  <p>All three vector stores are vector-query-only, like <code>pgvector</code>: any other query kind is an explicit error, never a silent empty iterator. <code>dim</code> is fixed when the store is first created, so it must match the embedding model; changing it later needs a manual migration. <code>redisvector</code> stores the value beside the vector, so it also serves kv, prefix_scan and ttl; <code>redis</code> is unchanged and remains the plain-KV option.</p>
   <p>A backend whose <code>config.url</code>/<code>config.password</code>/<code>config.api_key</code> secret reference cannot be resolved is <strong>skipped with a warning</strong> rather than failing the boot: stores bound to it rebind to a surviving backend (preferring one whose provider offers <code>text_search</code>, so a vector store degrades to full-text search; loops feature-detect from the binding's features) with <code>requires</code> lowered to what the fallback offers, or are dropped when no backend survives. A genuinely unknown backend name is still a boot error.</p>
 
   <h3><code>profiles</code> — reusable configs</h3>
@@ -452,18 +452,18 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
     stores:
       dialogue: { backend: main_db, table: dialogue, window: 1000, retention: 30d }
       facts: { backend: main_db, table: facts, requires: [kv, text_search] }
-    write: [builtin:routing_table]
-    recall: builtin:recency
+    write: [plugin:routing_table]
+    recall: plugin:recency
 
   memory/semantic:                        # embedding + rerank recall
     stores:
       semantic: { backend: vec, table: semantic, requires: [vector] }
-    write: [builtin:routing_table]
-    recall: builtin:semantic
+    write: [plugin:routing_table]
+    recall: plugin:semantic
     embed_model: embed                    # models: entry; auto-embeds writes to vector stores
     rerank_model: rerank                  # optional provider:"rerank" entry
     oversample: 4                         # fetch k*4 vector hits, rerank down to k</code></pre>
-  <p>With <code>recall: builtin:semantic</code>, <code>memory.recall({ text = "...", k = 5 })</code> embeds the query, runs cosine k-NN over the vector store, and reranks when <code>rerank_model</code> is set. Queries without text fall back to recency recall.</p>
+  <p>With <code>recall: plugin:semantic</code>, <code>memory.recall({ text = "...", k = 5 })</code> embeds the query, runs cosine k-NN over the vector store, and reranks when <code>rerank_model</code> is set. Queries without text fall back to recency recall.</p>
   <table class="table config-table">
     <thead><tr><th>Store key</th><th>Description</th></tr></thead>
     <tbody>
@@ -476,7 +476,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
     </tbody>
   </table>
   <div class="callout warn">
-    <strong>Isolation change</strong>: <span>memory stores are <b>private per agent by default</b> — two agents on the same profile (or <code>builtin:conversational</code>) no longer share physical tables; each binds <code>&lt;agent&gt;.&lt;table&gt;</code> (e.g. <code>writer.dialogue</code>). Loops keep using the profile's table names; the prefix is applied at bind time. <b>Migration:</b> deployments that deliberately share a table across agents must mark that store <code>shared: true</code>; existing per-agent rows written before the change stay under the old unprefixed table (re-point with <code>shared: true</code> or migrate the rows).</span>
+    <strong>Isolation change</strong>: <span>memory stores are <b>private per agent by default</b> — two agents on the same profile (or <code>conversational</code>) no longer share physical tables; each binds <code>&lt;agent&gt;.&lt;table&gt;</code> (e.g. <code>writer.dialogue</code>). Loops keep using the profile's table names; the prefix is applied at bind time. <b>Migration:</b> deployments that deliberately share a table across agents must mark that store <code>shared: true</code>; existing per-agent rows written before the change stay under the old unprefixed table (re-point with <code>shared: true</code> or migrate the rows).</span>
   </div>
 
   <h4>Safety profile</h4>
@@ -674,7 +674,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
     instructions: ./prompts/bot.md     # or {prompt: assistant_system} — see prompts:
     capabilities: [llm.chat, memory, tools, agent.send, shell.exec, net.mail]
     skills: [builtin:web_search, builtin:fs.read]
-    memory: builtin:conversational     # preset, or inline
+    memory: conversational     # preset, or inline
     safety: default
     shell: sandboxed                    # optional
     can_contact: [worker]               # ACL
@@ -689,7 +689,14 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
       workflow: release-train</code></pre>
   <p><strong>Capability ceiling</strong>: <code>plugins.allow_capabilities</code> (global) ⊇ <code>agents.&lt;name&gt;.capabilities</code> (per-agent) ⊇ spawn-spec grants (child). You cannot delegate what you lack. If an agent omits <code>capabilities</code> it gets the defaults <code>[llm.chat, memory, tools, agent.send, net.http]</code> — note <code>net.mail</code> is <em>not</em> a default and must be declared explicitly.</p>
   <p><strong>Capabilities are enforced at runtime</strong>, not merely validated at boot. Each capability gates the Lua ops behind it: <code>llm.chat</code> → <code>llm.*</code>, <code>memory</code> → <code>store.*</code>, <code>tools</code> → <code>tools.*</code>, <code>shell.exec</code> → <code>shell.*</code>, <code>net.http</code> → <code>http.request</code> and <code>os.env</code>, <code>net.mail</code> → <code>mail.*</code>. An agent that omits one is refused with a message naming the op, the agent and the missing capability — the op stays addressable and fails clearly rather than vanishing into <em>"attempt to call a nil value"</em>. <code>agent.send</code>, <code>agent.request</code> and <code>agent.spawn</code> were always enforced this way; the rest now match. <code>runtime.*</code> and <code>credential.get</code> are deliberately ungated — the first is loop machinery every agent needs, the second is already scoped by the agent's own credential list. A boot warning lists exactly what was withheld from each agent and profile. Set <code>plugins.enforce_capabilities: false</code> (default <code>true</code>) only to keep a configuration running that depended on every agent having every op.</p>
-  <p><strong>Three <code>builtin:</code> vocabularies.</strong> The prefix is spelled by loops (<code>builtin:per_chat</code>, <code>builtin:recency</code>, <code>builtin:ttl</code>), tools (<code>builtin:web_search</code>, <code>builtin:fetch</code>, <code>builtin:browser</code>) and memory providers (<code>builtin:sqlite</code>, <code>builtin:qdrant</code>). They share nothing: a name from one is never valid in another's field, and nothing in the string says which it is. Two mistakes follow from that, and both are now reported — a <code>loop:</code> holding a tool name fails the boot with a hint naming the field it belongs in, and a <code>skills:</code> entry holding a loop name warns, because that one is otherwise silent (it matches no tool, is dropped, and the agent simply looks toolless). A <code>skills:</code> entry matching no registered tool at all is <em>not</em> reported, since a loop may legitimately list tools it declares itself with <code>tool.def</code>.</p>
+  <p><strong><code>builtin:</code> is the tool namespace.</strong> Four vocabularies used to spell it — loop/plugin names, tool names, memory provider names, and the built-in memory profile — and nothing in the string said which one a name belonged to. Each now has its own spelling, so the prefix means exactly one thing:</p>
+  <ul>
+    <li><strong>tools</strong> keep it: <code>builtin:web_search</code>, <code>builtin:fetch</code>, <code>builtin:browser</code>, <code>builtin:legal_read</code>;</li>
+    <li><strong>loops and plugins</strong> are <code>plugin:&lt;name&gt;</code>: <code>plugin:per_chat</code>, <code>plugin:recency</code>, <code>plugin:ttl</code>. This also settles the loop-versus-path question outright, since a path never begins with <code>plugin:</code> — where before a file named <code>per_chat</code> was unreachable;</li>
+    <li><strong>memory providers</strong> are bare: <code>sqlite</code>, <code>qdrant</code>, <code>redisvector</code> — the <code>provider:</code> key already says what kind of name it is;</li>
+    <li>the <strong>built-in memory profile</strong> is <code>conversational</code>, and that name is now reserved: a <code>profiles.memory</code> entry of the same name is a boot error rather than a profile that could never run.</li>
+  </ul>
+  <p>The old spellings are recognized by name rather than reported as unknown, so the error says what to write: a <code>loop:</code> of <code>builtin:per_chat</code> is answered with <code>loops are spelled plugin: now</code>, and a provider of <code>builtin:sqlite</code> with <code>providers are unprefixed now</code>. Two other mistakes are reported too — a <code>loop:</code> holding a <em>tool</em> name fails the boot with a hint naming the field it belongs in, and a <code>skills:</code> entry holding a loop name warns, because that one is otherwise silent (it matches no tool, is dropped, and the agent simply looks toolless). A <code>skills:</code> entry matching no registered tool at all is <em>not</em> reported, since a loop may legitimately list tools it declares itself with <code>tool.def</code>.</p>
   <p><strong>Profile extras &amp; credentials</strong>: <code>extras</code> is deployment-specific, read-only profile data surfaced to the loop by <code>agent.config()</code> (a <code>goal</code> block is hoisted to a top-level <code>goal</code> key; everything else lands under <code>extras</code>). Values that are <em>exactly</em> a secret reference — <code>${VAR}</code>, <code>${VAR:-default}</code>, or <code>cred:&lt;service&gt;</code> — are never resolved for this surface: on the configdir path they stay raw and render as opaque markers (<code>{env="VAR"}</code> / <code>{cred="service"}</code>), so no resolved secret reaches a loop (or a spawned child); a string that merely embeds a reference (<code>prefix-${VAR}</code>) is an ordinary literal and expands as usual. <code>credentials</code> is the allow-list for <code>credential.get()</code>: an agent can only fetch a stored secret it names here; empty or missing = no access. Both fields apply to spawn profiles too and reach every child.</p>
   <p><strong>Daemon agents</strong>: sessions normally spawn lazily on first message. An agent with <code>persistent: true</code> receives a synthetic <code>{ type = "boot", from = "system:supervisor" }</code> message once the runtime is up (after channels register), so cron schedulers and queue consumers start without external traffic.</p>
   <p><strong>Budget</strong>: <code>tokens_per_day</code> wraps LLM calls in reserve/commit/release against a token pool. By default the pool resets daily; set <code>window</code> (e.g. <code>24h</code>, <code>168h</code>) for rolling-window accounting where usage drains continuously as commits age out — no midnight cliff. A call that would exceed the budget is denied (counted in <code>agentflow_budget_denied</code>).</p>
@@ -721,7 +728,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
     - agent.send
     - agent.request
   enforce_capabilities: true    # default; false restores pre-enforcement behavior</code></pre>
-  <p><code>plugins.dir</code> also <strong>shadows builtins by name</strong>: a file <code>&lt;dir&gt;/&lt;name&gt;.lua</code> (e.g. <code>./plugins/recency.lua</code>) replaces the embedded builtin of that name everywhere — loop/route refs (<code>loop: builtin:recency</code>, including the hot-reload watch path) and the support chunks loaded into every session. Shadowed support chunks are re-read from disk at each session spawn, so edits take effect on new sessions without a restart.</p>
+  <p><code>plugins.dir</code> also <strong>shadows builtins by name</strong>: a file <code>&lt;dir&gt;/&lt;name&gt;.lua</code> (e.g. <code>./plugins/recency.lua</code>) replaces the embedded builtin of that name everywhere — loop/route refs (<code>loop: plugin:recency</code>, including the hot-reload watch path) and the support chunks loaded into every session. Shadowed support chunks are re-read from disk at each session spawn, so edits take effect on new sessions without a restart.</p>
 
   <h3><code>triggers</code> — scheduled and event tasks</h3>
   <pre><code>triggers:                       # top-level, or triggers/*.yaml in a -configdir
@@ -752,7 +759,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
   <p>AgentFlow plugins are plain <a href="https://luau-lang.org/">Luau</a> scripts. YAML defines which plugin runs for which agent; the plugin defines the behavior. There are three kinds of plugin:</p>
   <ul>
     <li><strong>Loop plugin</strong> — defines a global <code>loop()</code> function that owns the session coroutine for its lifetime. The canonical pattern is <code>while true do local msg = session.inbox() ... end</code>.</li>
-    <li><strong>Support chunk</strong> — loaded into every session state <em>before</em> the loop plugin. Support chunks define globals and helper functions the loop reads. Builtins like <code>builtin:token_budget</code>, <code>builtin:routing_table</code>, <code>builtin:recency</code>, <code>builtin:semantic</code>, <code>builtin:fact_extractor</code>, <code>builtin:exec_policy</code>, and <code>builtin:ttl</code> are support chunks.</li>
+    <li><strong>Support chunk</strong> — loaded into every session state <em>before</em> the loop plugin. Support chunks define globals and helper functions the loop reads. Builtins like <code>plugin:token_budget</code>, <code>plugin:routing_table</code>, <code>plugin:recency</code>, <code>plugin:semantic</code>, <code>plugin:fact_extractor</code>, <code>plugin:exec_policy</code>, and <code>plugin:ttl</code> are support chunks.</li>
     <li><strong>Shadow</strong> — a user plugin placed in <code>plugins/</code> with the same name as a builtin. It replaces the builtin instance-wide at load time.</li>
   </ul>
 
@@ -879,7 +886,7 @@ scheduler.cancel(timer_id)</code></pre>
   <p>These are <em>session-scoped</em> timers: they need the <code>scheduler</code> capability and die with the session. A deployment-wide schedule declared in YAML (<code>every:</code>/<code>cron:</code> triggers) is engine infrastructure instead — fired by the engine with no capability involved and delivered as <code>Message{ type = "cron" }</code>, so a loop does not have to run a timer loop to be scheduled. Use <code>os.time()</code>/<code>os.date()</code> (UTC) when a loop needs to reason about the clock itself.</p>
 
   <h4><code>memory</code> and <code>store</code> — cap: <code>memory</code> / <code>store.raw</code></h4>
-  <pre><code>memory.write(record) -> boolean          -- routed by builtin:routing_table
+  <pre><code>memory.write(record) -> boolean          -- routed by plugin:routing_table
 memory.recall(query, opts?) -> {records} -- active recall handler
 
 store.put(table, key, value, opts?)      -- opts: { ttl = seconds, vector = {...} }
@@ -956,7 +963,7 @@ json.encode(value) / json.decode(text)
 time.sleep(seconds)        -- yields; never blocks a thread</code></pre>
 
   <h3>Writing support chunks</h3>
-  <p>Support chunks are evaluated into the session state before the loop plugin. They can define globals that the loop or other support chunks read. For example, to replace the default recall strategy, shadow <code>builtin:recency</code> with a file in <code>plugins/recency.lua</code> that defines <code>memory_recall_handler(query, opts)</code>.</p>
+  <p>Support chunks are evaluated into the session state before the loop plugin. They can define globals that the loop or other support chunks read. For example, to replace the default recall strategy, shadow <code>plugin:recency</code> with a file in <code>plugins/recency.lua</code> that defines <code>memory_recall_handler(query, opts)</code>.</p>
   <pre><code>-- plugins/recency.lua (shadow example)
 function memory_recall_handler(query, opts)
   local info = agent.info()
@@ -1053,7 +1060,7 @@ end</code></pre>
     <thead><tr><th>Hook</th><th>Kind</th><th>Signature</th><th>Default</th></tr></thead>
     <tbody>
       <tr><td><code>gateway.ingress</code></td><td>filter</td><td><code>(raw, ctx) -> Message?</code></td><td>channel normalizers</td></tr>
-      <tr><td><code>gateway.route</code></td><td>handler</td><td><code>(msg, ctx) -> SessionAddr | {spawn}</code></td><td><code>builtin:per_chat</code></td></tr>
+      <tr><td><code>gateway.route</code></td><td>handler</td><td><code>(msg, ctx) -> SessionAddr | {spawn}</code></td><td><code>plugin:per_chat</code></td></tr>
       <tr><td><code>gateway.egress</code></td><td>filter</td><td><code>(msg, ctx) -> Message?</code></td><td>channel formatters</td></tr>
       <tr><td><code>gateway.undeliverable</code></td><td>handler</td><td><code>(msg, err, ctx) -> ()</code></td><td>—</td></tr>
     </tbody>
@@ -1088,8 +1095,8 @@ end</code></pre>
   <table class="table hook-table">
     <thead><tr><th>Hook</th><th>Kind</th><th>Signature</th><th>Default</th></tr></thead>
     <tbody>
-      <tr><td><code>memory.write</code></td><td>filter</td><td><code>(record, ctx) -> MemoryRecord?</code></td><td><code>builtin:routing_table</code></td></tr>
-      <tr><td><code>memory.recall</code></td><td>handler</td><td><code>(query, ctx) -> {Memory}</code></td><td><code>builtin:recency</code></td></tr>
+      <tr><td><code>memory.write</code></td><td>filter</td><td><code>(record, ctx) -> MemoryRecord?</code></td><td><code>plugin:routing_table</code></td></tr>
+      <tr><td><code>memory.recall</code></td><td>handler</td><td><code>(query, ctx) -> {Memory}</code></td><td><code>plugin:recency</code></td></tr>
       <tr><td><code>memory.compact</code></td><td>handler</td><td><code>(scope) -> ()</code></td><td>—</td></tr>
       <tr><td><code>memory.on_write</code></td><td>tap</td><td><code>(record) -> ()</code></td><td>Audit</td></tr>
     </tbody>
@@ -1100,8 +1107,8 @@ end</code></pre>
     <thead><tr><th>Hook</th><th>Kind</th><th>Signature</th><th>Default</th></tr></thead>
     <tbody>
       <tr><td><code>shell.provision</code></td><td>handler</td><td><code>(session) -> ShellHandle</code></td><td>Docker / SSH provider</td></tr>
-      <tr><td><code>shell.before_exec</code></td><td>filter</td><td><code>(cmd, ctx) -> "allow" | "deny" | string</code></td><td><code>builtin:exec_policy</code></td></tr>
-      <tr><td><code>shell.teardown</code></td><td>handler</td><td><code>(handle) -> ()</code></td><td><code>builtin:ttl</code></td></tr>
+      <tr><td><code>shell.before_exec</code></td><td>filter</td><td><code>(cmd, ctx) -> "allow" | "deny" | string</code></td><td><code>plugin:exec_policy</code></td></tr>
+      <tr><td><code>shell.teardown</code></td><td>handler</td><td><code>(handle) -> ()</code></td><td><code>plugin:ttl</code></td></tr>
       <tr><td><code>shell.on_exec</code></td><td>tap</td><td><code>(cmd, result) -> ()</code></td><td>—</td></tr>
     </tbody>
   </table>

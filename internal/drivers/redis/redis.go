@@ -1,4 +1,4 @@
-// Package redis implements the builtin:redis memory backend provider.
+// Package redis implements the redis memory backend provider.
 // It provides kv, prefix_scan, and ttl features via a Redis server.
 package redis
 
@@ -12,10 +12,10 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Provider implements memory.BackendProvider for "builtin:redis".
+// Provider implements memory.BackendProvider for "redis".
 type Provider struct{}
 
-func (Provider) Name() string { return "builtin:redis" }
+func (Provider) Name() string { return "redis" }
 
 func (Provider) Features() []string {
 	return []string{"kv", "prefix_scan", "ttl"}
@@ -24,17 +24,17 @@ func (Provider) Features() []string {
 func (Provider) Open(config map[string]any) (memory.BackendHandle, error) {
 	url, _ := config["url"].(string)
 	if url == "" {
-		return nil, fmt.Errorf("builtin:redis: url is required")
+		return nil, fmt.Errorf("redis: url is required")
 	}
 	opts, err := redis.ParseURL(url)
 	if err != nil {
-		return nil, fmt.Errorf("builtin:redis: parse url: %w", err)
+		return nil, fmt.Errorf("redis: parse url: %w", err)
 	}
 	client := redis.NewClient(opts)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := client.Ping(ctx).Err(); err != nil {
-		return nil, fmt.Errorf("builtin:redis: ping: %w", err)
+		return nil, fmt.Errorf("redis: ping: %w", err)
 	}
 	return &Handle{client: client}, nil
 }
@@ -88,7 +88,7 @@ func (h *Handle) Query(table string, q memory.Query) (memory.Iterator, error) {
 	case "all":
 		return h.queryAll(table)
 	default:
-		return nil, fmt.Errorf("builtin:redis: unsupported query kind %q", q.Kind)
+		return nil, fmt.Errorf("redis: unsupported query kind %q", q.Kind)
 	}
 }
 

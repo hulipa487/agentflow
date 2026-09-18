@@ -352,7 +352,7 @@ func main() {
 		src, watchPath, err := builtins.Resolve(a.Loop)
 		if err != nil {
 			fields := []any{"agent", name, "err", err}
-			if h := loopHint(a.Loop, toolReg.Names()); h != "" {
+			if h := loopHint(a.Loop, toolReg.Names(), builtins.Names()); h != "" {
 				fields = append(fields, "hint", h)
 			}
 			log.Error("agent loop resolve failed", fields...)
@@ -484,7 +484,7 @@ func main() {
 		src, watchPath, err := builtins.Resolve(p.Loop)
 		if err != nil {
 			fields := []any{"profile", pname, "err", err}
-			if h := loopHint(p.Loop, toolReg.Names()); h != "" {
+			if h := loopHint(p.Loop, toolReg.Names(), builtins.Names()); h != "" {
 				fields = append(fields, "hint", h)
 			}
 			log.Error("spawn profile loop resolve failed", fields...)
@@ -500,7 +500,7 @@ func main() {
 
 		var amPtr *memory.AgentMemory
 		mp, hasProfile := cfg.Profiles.Memory[p.Memory]
-		if p.Memory == "builtin:conversational" {
+		if p.Memory == "conversational" {
 			mp, hasProfile = config.DefaultMemoryProfile(), true
 		}
 		if hasProfile {
@@ -723,7 +723,7 @@ func main() {
 	// Router: routing is Lua (builtin:per_chat unless overridden).
 	routeRef := cfg.Gateway.Route
 	if routeRef == "" {
-		routeRef = "builtin:per_chat"
+		routeRef = "plugin:per_chat"
 	}
 	routeSrc, _, err := builtins.Resolve(routeRef)
 	if err != nil {
@@ -1034,23 +1034,26 @@ func gateOps(enforce bool, agent string, granted map[string]bool, capability str
 	return caps.Gate(hs, capability, agent, granted)
 }
 
-// loopHint explains a loop: value that names a tool, or "" when there is
-// nothing to say.
+// loopHint explains a loop: value that names something else, or "" when there
+// is nothing to say.
 //
-// "builtin:" is spelled by three vocabularies that have nothing to do with each
-// other — loop/plugin names (builtin:per_chat), tool names (builtin:web_search)
-// and memory provider names (builtin:sqlite). Nothing in the string says which
-// one a name belongs to, so a name from the wrong one produces "unknown
-// builtin:web_search", which is true but does not tell you what to write
-// instead.
-func loopHint(value string, toolNames []string) string {
+// Two mistakes land here. A tool name produces "unknown plugin", which is true
+// but says nothing about what to write instead. And a loop name in its
+// pre-rename spelling ("builtin:per_chat") now names nothing at all, because
+// that prefix was exactly the ambiguity the rename removed: it used to be
+// spelled by loops, tools and memory providers alike, and nothing in the string
+// said which one a name belonged to.
+func loopHint(value string, toolNames, loopNames []string) string {
 	if slices.Contains(toolNames, value) {
-		return value + " is a tool name, not a loop — tools are listed under skills:, while loop: takes a builtin loop name or a .lua path"
+		return value + " is a tool name, not a loop — tools are listed under skills:, while loop: takes a plugin:<name> reference or a .lua path"
+	}
+	if name, ok := strings.CutPrefix(value, "builtin:"); ok && slices.Contains(loopNames, "plugin:"+name) {
+		return "loops are spelled plugin: now, not builtin: — write plugin:" + name
 	}
 	return ""
 }
 
-// skillHint explains a skills: entry that names a builtin loop instead of a
+// skillHint explains a skills: entry that names a loop or plugin instead of a
 // tool, or "" when there is nothing to say.
 //
 // This one is worth catching because it fails silently: a loop name matches no
@@ -1064,6 +1067,9 @@ func loopHint(value string, toolNames []string) string {
 func skillHint(value string, loopNames []string) string {
 	if slices.Contains(loopNames, value) {
 		return value + " is a loop/plugin name, not a tool — loops go in loop:, tools in skills:"
+	}
+	if name, ok := strings.CutPrefix(value, "builtin:"); ok && slices.Contains(loopNames, "plugin:"+name) {
+		return "loops are spelled plugin: now, and never belong in skills: — did you mean plugin:" + name + " under loop:?"
 	}
 	return ""
 }

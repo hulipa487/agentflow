@@ -1,14 +1,14 @@
-// Package qdrant implements the builtin:qdrant vector backend provider. It
+// Package qdrant implements the qdrant vector backend provider. It
 // provides the "vector" feature over Qdrant's REST API.
 //
 // One collection holds every logical table (config "collection", default
-// "agentflow"), matching how builtin:pgvector puts every table in one vec_kv
+// "agentflow"), matching how pgvector puts every table in one vec_kv
 // table. The physical table a store resolves to is agent + "." + store table
 // (see memory.ResolveStoresFor), and a "." is not legal in a Qdrant collection
 // name, so tables ride in the point payload and searches filter on them rather
 // than mapping each table to its own collection.
 //
-// Only vector queries are supported, like builtin:pgvector: any other query
+// Only vector queries are supported, like pgvector: any other query
 // kind is an explicit error, never a silent empty iterator.
 package qdrant
 
@@ -27,10 +27,10 @@ import (
 	"github.com/google/uuid"
 )
 
-// Provider implements memory.BackendProvider for "builtin:qdrant".
+// Provider implements memory.BackendProvider for "qdrant".
 type Provider struct{}
 
-func (Provider) Name() string { return "builtin:qdrant" }
+func (Provider) Name() string { return "qdrant" }
 
 func (Provider) Features() []string {
 	return []string{"vector"}
@@ -38,7 +38,7 @@ func (Provider) Features() []string {
 
 const (
 	// defaultDim matches the embedding size of OpenAI's text-embedding-ada-002
-	// family, as builtin:pgvector does; most self-hosted models are smaller.
+	// family, as pgvector does; most self-hosted models are smaller.
 	defaultDim = 1536
 	// defaultCollection is the collection created when config omits one.
 	defaultCollection = "agentflow"
@@ -58,7 +58,7 @@ var pointNamespace = uuid.MustParse("1b4e28ba-2fa1-11d2-883f-0016d3cca427")
 func (Provider) Open(config map[string]any) (memory.BackendHandle, error) {
 	url, _ := config["url"].(string)
 	if url == "" {
-		return nil, fmt.Errorf("builtin:qdrant: url is required")
+		return nil, fmt.Errorf("qdrant: url is required")
 	}
 	apiKey, _ := config["api_key"].(string)
 
@@ -77,7 +77,7 @@ func (Provider) Open(config map[string]any) (memory.BackendHandle, error) {
 		dim = int(v)
 	}
 	if dim <= 0 {
-		return nil, fmt.Errorf("builtin:qdrant: dim must be positive, got %d", dim)
+		return nil, fmt.Errorf("qdrant: dim must be positive, got %d", dim)
 	}
 
 	distance, _ := config["distance"].(string)
@@ -89,7 +89,7 @@ func (Provider) Open(config map[string]any) (memory.BackendHandle, error) {
 	if s, ok := config["timeout"].(string); ok && s != "" {
 		d, err := time.ParseDuration(s)
 		if err != nil || d <= 0 {
-			return nil, fmt.Errorf("builtin:qdrant: invalid timeout %q (use e.g. \"30s\")", s)
+			return nil, fmt.Errorf("qdrant: invalid timeout %q (use e.g. \"30s\")", s)
 		}
 		timeout = d
 	}
@@ -102,7 +102,7 @@ func (Provider) Open(config map[string]any) (memory.BackendHandle, error) {
 		http:       &http.Client{Timeout: timeout},
 	}
 	if err := h.ensureCollection(context.Background(), distance); err != nil {
-		return nil, fmt.Errorf("builtin:qdrant: %w", err)
+		return nil, fmt.Errorf("qdrant: %w", err)
 	}
 	return h, nil
 }
@@ -163,7 +163,7 @@ func (h *Handle) ensureCollection(ctx context.Context, distance string) error {
 
 func (h *Handle) Put(table, key string, value any, opts memory.PutOpts) error {
 	if len(opts.Vector) > 0 && len(opts.Vector) != h.dim {
-		return fmt.Errorf("builtin:qdrant: embedding has %d dimensions, backend configured for %d (set dim in the backend config to match the embedding model)", len(opts.Vector), h.dim)
+		return fmt.Errorf("qdrant: embedding has %d dimensions, backend configured for %d (set dim in the backend config to match the embedding model)", len(opts.Vector), h.dim)
 	}
 	b, err := json.Marshal(value)
 	if err != nil {
@@ -176,7 +176,7 @@ func (h *Handle) Put(table, key string, value any, opts memory.PutOpts) error {
 	// A value stored without an embedding keeps any embedding the point
 	// already has: an upsert replaces the whole point, so it would drop the
 	// vector a previous Put stored. Setting only the payload leaves the vector
-	// alone, matching builtin:pgvector's ON CONFLICT update.
+	// alone, matching pgvector's ON CONFLICT update.
 	payload := map[string]any{tableField: table, "key": key, "value": json.RawMessage(b)}
 	if len(opts.Vector) == 0 {
 		if err := h.setPayload(ctx, point["id"].(string), payload); err != nil {
@@ -243,7 +243,7 @@ func (h *Handle) Get(table, key string) (any, bool, error) {
 		return nil, false, nil
 	}
 	if status != http.StatusOK {
-		return nil, false, fmt.Errorf("builtin:qdrant: get: unexpected status %d", status)
+		return nil, false, fmt.Errorf("qdrant: get: unexpected status %d", status)
 	}
 	if got.Result.Payload.Table != table || got.Result.Payload.Key != key {
 		return nil, false, nil
@@ -267,13 +267,13 @@ func (h *Handle) Delete(table, key string) error {
 
 func (h *Handle) Query(table string, q memory.Query) (memory.Iterator, error) {
 	if q.Kind != "vector" {
-		return nil, fmt.Errorf("builtin:qdrant: only vector queries are supported")
+		return nil, fmt.Errorf("qdrant: only vector queries are supported")
 	}
 	if len(q.Vector) == 0 {
-		return nil, fmt.Errorf("builtin:qdrant: vector query requires a query vector")
+		return nil, fmt.Errorf("qdrant: vector query requires a query vector")
 	}
 	if len(q.Vector) != h.dim {
-		return nil, fmt.Errorf("builtin:qdrant: query vector has %d dimensions, backend configured for %d", len(q.Vector), h.dim)
+		return nil, fmt.Errorf("qdrant: query vector has %d dimensions, backend configured for %d", len(q.Vector), h.dim)
 	}
 	k := q.K
 	if k <= 0 {

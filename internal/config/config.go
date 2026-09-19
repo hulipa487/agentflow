@@ -613,16 +613,21 @@ type Gateway struct {
 }
 
 type Channel struct {
-	Name       string       `yaml:"name"`
-	Type       string       `yaml:"type"` // webhook | telegram | ghhook
-	Mode       string       `yaml:"mode"` // telegram: polling (default) | webhook | auto
-	Agent      string       `yaml:"agent"`
-	Path       string       `yaml:"path"`   // route mounted on the shared server, e.g. /webhook/<chan>/<uuid>/
-	Prefix     string       `yaml:"prefix"` // reserved for future per-channel secret-prefix use
-	Token      string       `yaml:"token"`
-	Secret     string       `yaml:"secret"` // ghhook: webhook secret for HMAC verification (env-interpolated)
-	AllowUsers []int64      `yaml:"allow_users"`
-	Media      ChannelMedia `yaml:"media"` // inbound media policy; absent = media disabled
+	Name   string `yaml:"name"`
+	Type   string `yaml:"type"` // webhook | telegram | ghhook
+	Mode   string `yaml:"mode"` // telegram: polling (default) | webhook | auto
+	Agent  string `yaml:"agent"`
+	Path   string `yaml:"path"`   // route mounted on the shared server, e.g. /webhook/<chan>/<uuid>/
+	Prefix string `yaml:"prefix"` // reserved for future per-channel secret-prefix use
+	Token  string `yaml:"token"`
+	Secret string `yaml:"secret"` // ghhook: webhook secret for HMAC verification (env-interpolated)
+	// SecretToken is the telegram webhook secret (env-interpolated or cred:
+	// reference, resolved like Token). Telegram presents it as the
+	// X-Telegram-Bot-Api-Secret-Token header on every delivery. Empty with
+	// webhook/auto mode generates a random per-boot one.
+	SecretToken string       `yaml:"secret_token"`
+	AllowUsers  []int64      `yaml:"allow_users"`
+	Media       ChannelMedia `yaml:"media"` // inbound media policy; absent = media disabled
 	// Timeout is the webhook sync reply wait (default "55s"). Multi-agent
 	// pipelines that outrun it should raise this or use async mode.
 	Timeout string `yaml:"timeout"`

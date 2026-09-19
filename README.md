@@ -225,6 +225,11 @@ Migration checklist:
   webhooks registered for you. Telegram's new `mode: auto` health-probes
   `<public_url>/health` at startup and calls `setWebhook` when reachable,
   falling back to `deleteWebhook` + long-poll when not.
+- Telegram webhook deliveries are authenticated: set a channel's
+  `secret_token:` (or let one be generated per boot) and the driver verifies
+  Telegram's `X-Telegram-Bot-Api-Secret-Token` header on every POST before
+  parsing. Polling modes clear any stale Telegram-side webhook at startup so
+  `getUpdates` can't 409 against one left over from a webhook deployment.
 - The shared server serves `GET /health` → `200 {"ok":true}` for probes and
   reverse-proxy health checks.
 

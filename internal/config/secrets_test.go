@@ -158,7 +158,7 @@ gateway:
 `,
 		"channels.yaml": `
 channels:
-  - { name: tg, type: telegram, agent: bot, token: "${TG_TOKEN}" }
+  - { name: tg, type: telegram, agent: bot, token: "${TG_TOKEN}", secret_token: "${TG_SECRET}" }
   - { name: wh, type: webhook, agent: bot, path: /h/ }
 `,
 		"profiles/bot.yaml": `
@@ -200,6 +200,9 @@ triggers:
 	}
 	if got := cfg.Gateway.Channels[0].Token; got != "${TG_TOKEN}" {
 		t.Fatalf("channel token must stay raw, got %q", got)
+	}
+	if got := cfg.Gateway.Channels[0].SecretToken; got != "${TG_SECRET}" {
+		t.Fatalf("channel secret_token must stay raw, got %q", got)
 	}
 	// A backend api_key is a secret like url/password: raw here, resolved by
 	// the consumer. Expanding it at load would hand the driver a literal that

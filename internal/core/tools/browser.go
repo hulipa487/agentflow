@@ -2,9 +2,11 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
+	"agentflow/internal/core/files"
 	"agentflow/internal/drivers/browser"
 )
 
@@ -35,7 +37,7 @@ const maxCharsDefault = 20000
 // builtin:web_search carries an `engine` enum: the actions share nearly every
 // parameter, so six near-identical schemas would spend every agent's context
 // on the difference between them.
-func RegisterBrowserBuiltins(r *Registry, b *browser.Client) {
+func RegisterBrowserBuiltins(r *Registry, b *browser.Client, fm *files.Manager) {
 	actions := browser.Actions()
 	r.Register(ToolSpec{
 		Name: "builtin:browser",
@@ -77,6 +79,10 @@ func RegisterBrowserBuiltins(r *Registry, b *browser.Client) {
 			"max_chars": map[string]any{
 				"type":        "number",
 				"description": fmt.Sprintf("Cap on returned text (default %d, 0 = no cap). The result reports the true length and whether it was cut.", maxCharsDefault),
+			},
+			"save_to": map[string]any{
+				"type":        "string",
+				"description": "Scratch file name: the page's text (markdown / html / accessibility tree) also lands in this session's files scratch space. Text actions only; other actions report saved.error.",
 			},
 		}, []string{"action"}),
 		Autonomous: true,
@@ -160,6 +166,24 @@ func RegisterBrowserBuiltins(r *Registry, b *browser.Client) {
 				out["response"] = res.Response
 			case browser.ActionAccessibilityTree:
 				out["tree"] = res.Tree
+			}
+			if name := argString(args["save_to"]); name != "" {
+				var text string
+				switch res.Action {
+				case browser.ActionMarkdown:
+					text = res.Markdown
+				case browser.ActionContent:
+					text = res.Content
+				case browser.ActionAccessibilityTree:
+					if b, err := json.Marshal(res.Tree); err == nil {
+						text = string(b)
+					}
+				}
+				if text == "" {
+					out["saved"] = map[string]any{"name": name, "error": fmt.Sprintf("action=%s has no text payload to save", res.Action)}
+				} else {
+					saveToScratch(ctx, fm, out, name, []byte(text), "text/plain; charset=utf-8")
+				}
 			}
 			return out, nil
 		},

@@ -305,8 +305,8 @@ func main() {
 	toolReg := tools.NewRegistry()
 	tools.RegisterBuiltins(toolReg, searchSet)
 	tools.RegisterLegalBuiltins(toolReg, legalSet)
-	tools.RegisterBrowserBuiltins(toolReg, browserClient)
-	tools.RegisterFetchBuiltins(toolReg, fetch.New(netPolicy), log)
+	tools.RegisterBrowserBuiltins(toolReg, browserClient, filesMgr)
+	tools.RegisterFetchBuiltins(toolReg, fetch.New(netPolicy), log, filesMgr)
 	tools.RegisterShellBuiltins(toolReg, shellMgr)
 	mcpClients := map[string]*mcp.Client{}
 	for sname, s := range cfg.MCP.Servers {
@@ -464,10 +464,10 @@ func main() {
 		for k, h := range gateOps(enforce, name, effectiveCaps, "tools", caps.ToolHandlers(agentSet, toolWiring), &withheld) {
 			handlers[k] = h
 		}
-		for k, h := range gateOps(enforce, name, effectiveCaps, "shell.exec", caps.ShellHandlers(shellMgr), &withheld) {
+		for k, h := range gateOps(enforce, name, effectiveCaps, "shell.exec", caps.ShellHandlers(shellMgr, filesMgr, name), &withheld) {
 			handlers[k] = h
 		}
-		for k, h := range gateOps(enforce, name, effectiveCaps, "net.http", caps.HTTPHandlers(log, credStore, netPolicy), &withheld) {
+		for k, h := range gateOps(enforce, name, effectiveCaps, "net.http", caps.HTTPHandlers(log, credStore, netPolicy, filesMgr), &withheld) {
 			handlers[k] = h
 		}
 		for k, h := range gateOps(enforce, name, effectiveCaps, "net.mail", caps.MailHandlers(log, credStore), &withheld) {
@@ -598,10 +598,10 @@ func main() {
 		for k, h := range gateOps(enforce, pname, profileCaps, "tools", caps.ToolHandlers(agentSet, toolWiring), &withheld) {
 			handlers[k] = h
 		}
-		for k, h := range gateOps(enforce, pname, profileCaps, "shell.exec", caps.ShellHandlers(shellMgr), &withheld) {
+		for k, h := range gateOps(enforce, pname, profileCaps, "shell.exec", caps.ShellHandlers(shellMgr, filesMgr, pname), &withheld) {
 			handlers[k] = h
 		}
-		for k, h := range gateOps(enforce, pname, profileCaps, "net.http", caps.HTTPHandlers(log, credStore, netPolicy), &withheld) {
+		for k, h := range gateOps(enforce, pname, profileCaps, "net.http", caps.HTTPHandlers(log, credStore, netPolicy, filesMgr), &withheld) {
 			handlers[k] = h
 		}
 		for k, h := range gateOps(enforce, pname, profileCaps, "net.mail", caps.MailHandlers(log, credStore), &withheld) {

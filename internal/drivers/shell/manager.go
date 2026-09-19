@@ -30,6 +30,11 @@ type SpawnOpts struct {
 	MemLimit string            // e.g. "512m"
 	CPULimit float64           // e.g. 1.0
 
+	// Volumes are docker bind specs ("host_dir:/container_dir[:ro]"), one per
+	// entry, passed to `docker run -v`. They are how checked-out project files
+	// and per-session scratch reach a container's filesystem.
+	Volumes []string
+
 	// SSH provider fields.
 	Host     string // host:port
 	User     string

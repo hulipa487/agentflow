@@ -74,7 +74,7 @@ func TestGateFailsClosedOnNilCapabilities(t *testing.T) {
 func TestGatedOpDeniesInsideALoop(t *testing.T) {
 	handlers := map[string]session.OpHandler{}
 	granted := map[string]bool{"memory": true} // deliberately no net.http
-	for k, h := range Gate(HTTPHandlers(discardLogger(), nil, permissive), "net.http", "writer", granted) {
+	for k, h := range Gate(HTTPHandlers(discardLogger(), nil, permissive, nil), "net.http", "writer", granted) {
 		handlers[k] = h
 	}
 

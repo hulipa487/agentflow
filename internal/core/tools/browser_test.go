@@ -32,7 +32,7 @@ func browserClientFor(srv *httptest.Server) *browser.Client {
 func invokeBrowser(t *testing.T, srv *httptest.Server, args map[string]any) map[string]any {
 	t.Helper()
 	r := NewRegistry()
-	RegisterBrowserBuiltins(r, browserClientFor(srv))
+	RegisterBrowserBuiltins(r, browserClientFor(srv), nil)
 	as := r.Expose([]string{"builtin:browser"}, config.ToolsPolicy{}, false)
 	res, err := as.Invoke(context.Background(), "builtin:browser", args)
 	if err != nil {
@@ -364,7 +364,7 @@ func TestBrowserTransportErrorIsAnError(t *testing.T) {
 	defer srv.Close()
 
 	r := NewRegistry()
-	RegisterBrowserBuiltins(r, browserClientFor(srv))
+	RegisterBrowserBuiltins(r, browserClientFor(srv), nil)
 	as := r.Expose([]string{"builtin:browser"}, config.ToolsPolicy{}, false)
 	_, err := as.Invoke(context.Background(), "builtin:browser",
 		map[string]any{"action": "markdown", "url": "https://example.com"})
@@ -380,7 +380,7 @@ func TestBrowserTransportErrorIsAnError(t *testing.T) {
 // and action is the only required parameter — url and html are alternatives.
 func TestBrowserSchemaDeclaresAction(t *testing.T) {
 	r := NewRegistry()
-	RegisterBrowserBuiltins(r, nil)
+	RegisterBrowserBuiltins(r, nil, nil)
 	spec, ok := r.tools["builtin:browser"]
 	if !ok {
 		t.Fatal("builtin:browser must be registered even when unconfigured")

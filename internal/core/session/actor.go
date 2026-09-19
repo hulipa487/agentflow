@@ -154,6 +154,17 @@ type Op struct {
 	Ref       string `json:"ref,omitempty"` // snapshot ref name or commit id
 	CommitMsg string `json:"commit_msg,omitempty"`
 
+	// Shell spawn extras: docker bind mounts, and materialization requests —
+	// Project+Ref check out a snapshot into the first mount's container dir,
+	// ScratchMount copies this session's scratch into the given container dir;
+	// both happen before the handle reports ready.
+	Volumes      []string `json:"volumes,omitempty"`
+	ScratchMount string   `json:"scratch_mount,omitempty"`
+
+	// SaveTo names a scratch file; http.request / builtin:fetch /
+	// builtin:browser save the response body there (keyed by the session).
+	SaveTo string `json:"save_to,omitempty"`
+
 	// Owner is the owning session key, stamped by the actor at dispatch (never
 	// Lua-settable). It scopes scratch space and tags engine-side saves so a
 	// session's temp files cannot collide with or leak into another's.
@@ -682,6 +693,7 @@ func (a *Actor) dispatchInline(ctx context.Context, op Op, current *Message) (re
 	default:
 		// Stamp the tenant user UUID for inline handlers, mirroring execBlocking.
 		ctx = WithUserUUID(ctx, userFromMessage(current))
+		ctx = WithSessionKey(ctx, a.Identity.SessionID)
 		op.Owner = a.Identity.SessionID
 		if h, found := a.handlers[op.Type]; found {
 			r, ok := h(ctx, op)
@@ -717,6 +729,7 @@ func (a *Actor) dispatchBlocking(ctx context.Context, op Op, current *Message) (
 func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (string, bool) {
 	ctx = WithOwner(ctx, a.Name)
 	ctx = WithUserUUID(ctx, userFromMessage(current))
+	ctx = WithSessionKey(ctx, a.Identity.SessionID)
 	op.Owner = a.Identity.SessionID
 	if a.Info != nil {
 		ctx = WithShell(ctx, a.Info.Shell)
@@ -1083,6 +1096,26 @@ func UserUUIDFromCtx(ctx context.Context) string {
 	return s
 }
 
+type sessionKeyType struct{}
+
+var sessionKey sessionKeyType
+
+// WithSessionKey returns a context carrying the owning session key (the actor
+// stamps it from Identity.SessionID at dispatch). Tools that need per-session
+// state — scratch saves from builtin:fetch / builtin:browser — read it here;
+// it is finer-grained than the agent-name owner stamp.
+func WithSessionKey(ctx context.Context, key string) context.Context {
+	return context.WithValue(ctx, sessionKey, key)
+}
+
+// SessionKeyFromCtx extracts the session key injected by WithSessionKey.
+func SessionKeyFromCtx(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	s, _ := ctx.Value(sessionKey).(string)
+	return s
+}
 
 // userFromMessage recovers the user UUID from an inbound message: prefer the
 // identity-stashed payload field, else strip "user:" from From.

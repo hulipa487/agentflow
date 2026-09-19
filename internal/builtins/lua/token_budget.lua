@@ -14,9 +14,25 @@ local function est_tokens(content)
   return math.ceil(#content / 4)
 end
 
+-- Real wire cost of one message. thinking_blocks replayed on assistant turns
+-- ride outside content but are billed by the provider on every continuation
+-- request (chars/4 over the thinking text and over redacted data blobs — the
+-- latter overestimates, which is the safe direction).
+local function est_msg(m)
+  local n = est_tokens(m.content) + 4
+  if type(m.thinking_blocks) == "table" then
+    for _, b in ipairs(m.thinking_blocks) do
+      if type(b) == "table" then
+        n = n + est_tokens(b.thinking) + est_tokens(b.data)
+      end
+    end
+  end
+  return n
+end
+
 local function total(messages)
   local n = 0
-  for _, m in ipairs(messages) do n = n + est_tokens(m.content) + 4 end
+  for _, m in ipairs(messages) do n = n + est_msg(m) end
   return n
 end
 
@@ -40,7 +56,7 @@ function token_budget(messages, budget)
   local n = total(kept)
   local last = math.max(1, #body) -- always keep the newest message
   for i = #body, 1, -1 do
-    local cost = est_tokens(body[i].content) + 4
+    local cost = est_msg(body[i])
     if i < last and n + cost > budget then break end
     table.insert(kept, #head + 1, body[i])
     n = n + cost

@@ -21,14 +21,19 @@ import (
 // multimodal content (text + media descriptors) when set — the plain-text
 // path is untouched for existing callers. ToolCalls is set on an assistant
 // turn that requested tools; ToolCallID and ToolResult are set on a "tool"
-// role turn that carries a tool's result back to the model.
+// role turn that carries a tool's result back to the model. ThinkingBlocks
+// on an assistant turn replays reasoning content captured from an earlier
+// reply (Anthropic requires it on continuations when thinking is enabled);
+// only the Anthropic serializer consumes it — providers without replay
+// semantics ignore the field.
 type Message struct {
-	Role       string       `json:"role"`
-	Content    string       `json:"content,omitempty"`
-	Parts      []media.Part `json:"parts,omitempty"`
-	ToolCalls  []ToolCall   `json:"tool_calls,omitempty"`
-	ToolCallID string       `json:"tool_call_id,omitempty"`
-	ToolResult any          `json:"tool_result,omitempty"`
+	Role           string           `json:"role"`
+	Content        string           `json:"content,omitempty"`
+	Parts          []media.Part     `json:"parts,omitempty"`
+	ToolCalls      []ToolCall       `json:"tool_calls,omitempty"`
+	ToolCallID     string           `json:"tool_call_id,omitempty"`
+	ToolResult     any              `json:"tool_result,omitempty"`
+	ThinkingBlocks []map[string]any `json:"thinking_blocks,omitempty"`
 }
 
 // hasMedia reports whether any message in the list carries non-text parts.

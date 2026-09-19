@@ -28,10 +28,11 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 		out := make([]llm.Message, len(ms0))
 		for i, mm := range ms0 {
 			out[i] = llm.Message{
-				Role:       mm.Role,
-				Content:    mm.Content,
-				ToolCallID: mm.ToolCallID,
-				ToolResult: mm.ToolResult,
+				Role:           mm.Role,
+				Content:        mm.Content,
+				ToolCallID:     mm.ToolCallID,
+				ToolResult:     mm.ToolResult,
+				ThinkingBlocks: mm.ThinkingBlocks,
 			}
 			if len(mm.Parts) > 0 {
 				parts := make([]media.Part, len(mm.Parts))

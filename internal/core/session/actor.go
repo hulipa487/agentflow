@@ -65,14 +65,18 @@ type Message struct {
 // Role+Content. Multimodal turns carry Parts (text + media descriptors);
 // Content stays the plain-text fast path and existing loops are unaffected.
 // An assistant turn that requested tools sets ToolCalls; a "tool" role turn
-// carrying a result sets ToolCallID (+ ToolResult or Content).
+// carrying a result sets ToolCallID (+ ToolResult or Content). An assistant
+// turn may replay ThinkingBlocks (raw provider blocks from an earlier
+// reply.thinking_blocks) — Anthropic requires it on continuations when
+// thinking is enabled; other providers ignore it.
 type ChatMessage struct {
-	Role       string         `json:"role"`
-	Content    string         `json:"content,omitempty"`
-	Parts      []media.Part   `json:"parts,omitempty"`
-	ToolCalls  []ToolCallSpec `json:"tool_calls,omitempty"`
-	ToolCallID string         `json:"tool_call_id,omitempty"`
-	ToolResult any            `json:"tool_result,omitempty"`
+	Role           string           `json:"role"`
+	Content        string           `json:"content,omitempty"`
+	Parts          []media.Part     `json:"parts,omitempty"`
+	ToolCalls      []ToolCallSpec   `json:"tool_calls,omitempty"`
+	ToolCallID     string           `json:"tool_call_id,omitempty"`
+	ToolResult     any              `json:"tool_result,omitempty"`
+	ThinkingBlocks []map[string]any `json:"thinking_blocks,omitempty"`
 }
 
 // ToolCallSpec is one tool invocation crossing the bridge (name + parsed args).

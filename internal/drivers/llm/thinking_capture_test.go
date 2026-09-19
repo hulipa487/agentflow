@@ -237,6 +237,76 @@ data: [DONE]
 	}
 }
 
+// TestThinkingReplayWire: thinking_blocks on an assistant message replay
+// verbatim and ahead of text/tool_use — the Anthropic continuation contract —
+// and a thinking-only assistant turn takes the content-array form.
+func TestThinkingReplayWire(t *testing.T) {
+	blocks := []map[string]any{
+		{"type": "thinking", "thinking": "because", "signature": "sig9"},
+		{"type": "redacted_thinking", "data": "OPAQUE"},
+	}
+	cases := []struct {
+		name   string
+		msgs   []Message
+		want   []string    // substrings present in the request body
+		before [][2]string // first substring must appear before the second
+	}{
+		{
+			name: "blocks precede tool_use",
+			msgs: []Message{
+				{Role: "user", Content: "q"},
+				{Role: "assistant", ThinkingBlocks: blocks,
+					ToolCalls: []ToolCall{{ID: "tu_1", Name: "calc", Args: map[string]any{"x": 1}}}},
+				{Role: "tool", ToolCallID: "tu_1", Content: "42"},
+			},
+			want: []string{`"thinking":"because"`, `"signature":"sig9"`, `"data":"OPAQUE"`, `"tool_use_id":"tu_1"`, `"content":"42"`},
+			before: [][2]string{
+				{`"thinking":"because"`, `"type":"tool_use"`},
+				{`"data":"OPAQUE"`, `"type":"tool_use"`},
+			},
+		},
+		{
+			name: "thinking-only assistant turn takes the array form",
+			msgs: []Message{
+				{Role: "user", Content: "q"},
+				{Role: "assistant", Content: "final", ThinkingBlocks: blocks},
+			},
+			want: []string{`"thinking":"because"`, `"data":"OPAQUE"`},
+			before: [][2]string{
+				{`"thinking":"because"`, `"type":"text"`},
+				{`"data":"OPAQUE"`, `"type":"text"`},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var body string
+			srv := captureServer(t, "anthropic", anthropicTextSSE, &body)
+			defer srv.Close()
+			m := NewManager(map[string]config.Model{
+				"default": {Provider: "anthropic", Model: "m", BaseURL: srv.URL},
+			}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			if _, err := m.Chat(context.Background(), "default", tc.msgs, Opts{Thinking: "low"}); err != nil {
+				t.Fatalf("Chat: %v", err)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(body, want) {
+					t.Fatalf("body missing %q\nbody: %s", want, body)
+				}
+			}
+			for _, pair := range tc.before {
+				i, j := strings.Index(body, pair[0]), strings.Index(body, pair[1])
+				if i < 0 || j < 0 {
+					t.Fatalf("body missing %q or %q\nbody: %s", pair[0], pair[1], body)
+				}
+				if i > j {
+					t.Fatalf("%q must precede %q\nbody: %s", pair[0], pair[1], body)
+				}
+			}
+		})
+	}
+}
+
 // TestThinkingCaptureStreamTerminal: the stream path surfaces the same
 // terminal thinking payload on its done frame.
 func TestThinkingCaptureStreamTerminal(t *testing.T) {

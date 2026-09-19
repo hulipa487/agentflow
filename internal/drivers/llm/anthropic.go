@@ -219,7 +219,10 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 // remaining turns are reshaped so that assistant tool_calls become tool_use
 // content blocks and "tool" role turns become user tool_result blocks. Adjacent
 // tool results are merged into one user message, as Anthropic requires.
-// Multimodal turns carry Parts as image/document content blocks.
+// Multimodal turns carry Parts as image/document content blocks. An assistant
+// turn with ThinkingBlocks replays them ahead of everything else (thinking
+// blocks must open the content array) — required on continuations when
+// thinking is enabled; a thinking-only assistant turn also takes the array form.
 func anthropicTurns(msgs []Message) (system string, turns []map[string]any, err error) {
 	if len(msgs) > 0 && msgs[0].Role == "system" {
 		system = msgs[0].Content
@@ -227,8 +230,11 @@ func anthropicTurns(msgs []Message) (system string, turns []map[string]any, err 
 	}
 	for _, m := range msgs {
 		switch {
-		case m.Role == "assistant" && len(m.ToolCalls) > 0:
+		case m.Role == "assistant" && (len(m.ToolCalls) > 0 || len(m.ThinkingBlocks) > 0):
 			content := []map[string]any{}
+			// Replayed thinking blocks go first, verbatim (signatures are
+			// validated by the provider).
+			content = append(content, m.ThinkingBlocks...)
 			if m.Content != "" {
 				content = append(content, map[string]any{"type": "text", "text": m.Content})
 			}

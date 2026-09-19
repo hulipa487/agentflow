@@ -757,6 +757,10 @@ llm = {}
 -- opts.thinking overrides the model's default thinking level for this call:
 -- "off" | "low" | "medium" | "high" | "xhigh" | "max" — one vocabulary,
 -- mapped per provider (Anthropic budget, OpenAI effort, Gemini budget).
+-- The reply carries reasoning the provider sent: reply.thinking (text),
+-- reply.thinking_blocks (raw blocks), usage.reasoning (token count). Pass
+-- the blocks back on an assistant turn (thinking_blocks = reply.thinking_blocks)
+-- to continue Anthropic tool loops with thinking enabled.
 function llm.chat(messages, opts)
   return op(with_opts({ type = "llm.chat", messages = messages }, opts))
 end

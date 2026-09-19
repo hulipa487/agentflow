@@ -203,12 +203,10 @@ data: [DONE]
 	if !ok {
 		t.Fatalf("follow-up llm.chat failed: %s", resp2)
 	}
-	body := string(bodies[1])
-	for _, want := range []string{`"tool_calls"`, `"call_1"`, `"role":"tool"`, `"tool_call_id":"call_1"`} {
-		if !strings.Contains(body, want) {
-			t.Errorf("follow-up request missing %q\nbody: %s", want, body)
-		}
-	}
+	// The follow-up request's native tool-turn reshaping is owned by the
+	// driver layer (llm/toolcall_test.go: TestToolTurnEcho, per provider);
+	// this layer's unique concern is that the response JSON surfaces the
+	// final answer.
 	var result2 map[string]any
 	if err := json.Unmarshal([]byte(resp2), &result2); err != nil {
 		t.Fatal(err)

@@ -179,7 +179,7 @@ func TestForbidden(t *testing.T) {
 
 func TestRegisterShellBuiltins(t *testing.T) {
 	r := NewRegistry()
-	mgr := shell.NewManager([]shell.ShellProvider{&testShellProvider{name: "docker"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	mgr := shell.NewManager([]shell.ShellProvider{&fakeShellProvider{name: "docker"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	RegisterShellBuiltins(r, mgr)
 	as := r.Expose([]string{"builtin:fs.read", "builtin:fs.write"}, config.ToolsPolicy{}, false)
 	for _, name := range []string{"builtin:fs.read", "builtin:fs.write"} {
@@ -194,7 +194,7 @@ func TestRegisterShellBuiltins(t *testing.T) {
 
 func TestFSReadTool(t *testing.T) {
 	r := NewRegistry()
-	mgr := shell.NewManager([]shell.ShellProvider{&testShellProvider{name: "docker"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	mgr := shell.NewManager([]shell.ShellProvider{&fakeShellProvider{name: "docker"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	h, err := mgr.Spawn(context.Background(), "session-1", "docker", shell.SpawnOpts{Image: "alpine"})
 	if err != nil {
 		t.Fatal(err)
@@ -211,21 +211,3 @@ func TestFSReadTool(t *testing.T) {
 		t.Fatalf("unexpected fs.read result: %v", m)
 	}
 }
-
-type testShellProvider struct{ name string }
-
-func (p *testShellProvider) Name() string { return p.name }
-func (p *testShellProvider) Spawn(ctx context.Context, opts shell.SpawnOpts) (*shell.Handle, error) {
-	return &shell.Handle{ID: "h-1", State: shell.HandleRunning, Image: opts.Image}, nil
-}
-func (p *testShellProvider) Exec(ctx context.Context, handle *shell.Handle, cmd string) (*shell.ExecResult, error) {
-	return &shell.ExecResult{Stdout: "ran: " + cmd, ExitCode: 0}, nil
-}
-func (p *testShellProvider) Read(ctx context.Context, handle *shell.Handle, path string) ([]byte, error) {
-	return []byte("content:" + path), nil
-}
-func (p *testShellProvider) Write(ctx context.Context, handle *shell.Handle, path string, content []byte) error {
-	return nil
-}
-func (p *testShellProvider) Destroy(ctx context.Context, handle *shell.Handle) error { return nil }
-func (p *testShellProvider) Alive(handle *shell.Handle) bool                         { return true }

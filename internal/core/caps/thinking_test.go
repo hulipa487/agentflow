@@ -4,8 +4,6 @@ import (
 	"context"
 	"io"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -20,14 +18,7 @@ import (
 // request, and an invalid level fails the call rather than being dropped.
 func TestLLMChatThinking(t *testing.T) {
 	var bodies [][]byte
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
-		bodies = append(bodies, b)
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
-	}))
-	defer srv.Close()
+	srv := recordBodyServer(t, &bodies)
 
 	mgr := llm.NewManager(map[string]config.Model{
 		"default": {Provider: "openai", Model: "m", BaseURL: srv.URL},
@@ -64,14 +55,7 @@ func TestLLMChatThinking(t *testing.T) {
 // keys into the op, and the op carries it across the bridge.
 func TestThinkingSurvivesTheLuaBridge(t *testing.T) {
 	var bodies [][]byte
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
-		bodies = append(bodies, b)
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
-	}))
-	defer srv.Close()
+	srv := recordBodyServer(t, &bodies)
 
 	mgr := llm.NewManager(map[string]config.Model{
 		"default": {Provider: "openai", Model: "m", BaseURL: srv.URL},

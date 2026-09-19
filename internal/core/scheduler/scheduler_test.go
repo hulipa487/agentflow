@@ -72,14 +72,6 @@ func TestCronRejectsUnsupportedFields(t *testing.T) {
 	}
 }
 
-// Ensure scheduler compiles with zero timers and no goroutine leak.
-func TestPendingStartsAtZero(t *testing.T) {
-	s := New(nil)
-	if s.Pending() != 0 {
-		t.Fatalf("pending=%d, want 0", s.Pending())
-	}
-}
-
 // TestFiresCarryTimerID: two timers on one owner deliver distinguishable
 // fires — each carrying the registering timer's id — so a session can run
 // multiple independent timers.

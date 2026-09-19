@@ -50,10 +50,9 @@ var (
 	rtfMagic = []byte("{\\rtf")
 )
 
-// Sniff detects the document format from magic bytes (and a light content
-// probe for HTML/TXT). filenameHint is optional and currently unused — magic
-// bytes are authoritative.
-func Sniff(data []byte) Format {
+// sniff detects the document format from magic bytes (and a light content
+// probe for HTML/TXT). Magic bytes are authoritative.
+func sniff(data []byte) Format {
 	if bytes.HasPrefix(data, zipMagic) {
 		return DOCX
 	}
@@ -79,7 +78,7 @@ func Sniff(data []byte) Format {
 // Text detects the format and extracts plain text. PDF and Unknown return an
 // honest error; the caller can then fall back to offering the raw download.
 func Text(data []byte) (string, Format, error) {
-	f := Sniff(data)
+	f := sniff(data)
 	switch f {
 	case DOCX:
 		s, err := DocxToText(data)

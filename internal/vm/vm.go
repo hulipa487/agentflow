@@ -32,8 +32,12 @@ type Status int
 
 const (
 	Finished Status = iota // loop returned (session over)
-	Yielded                // loop made an op request (see message)
-	Failed                 // Lua error (see message)
+	// Yielded is never named in Go — the actor/router handle the yielded op
+	// directly — but its VALUE is load-bearing: the C shim returns
+	// AF_YIELDED=1 / AF_ERROR=2, so removing this member renumbers Failed
+	// onto the yielded status and every op request reads as a Lua error.
+	Yielded // loop made an op request (see message)
+	Failed  // Lua error (see message)
 )
 
 // State is a Luau state + loop thread. Not safe for concurrent use.

@@ -129,11 +129,11 @@ func TestSharedStoreOptIn(t *testing.T) {
 	}
 }
 
-// TestResolveStoresUnscoped: ResolveStores (no agent) binds tables as-is —
+// TestResolveStoresUnscoped: an empty agent (no identity) binds tables as-is —
 // the pre-isolation behavior, kept for callers with no agent identity.
 func TestResolveStoresUnscoped(t *testing.T) {
 	reg := openMemRegistry(t)
-	am, err := reg.ResolveStores(conversationalProfile())
+	am, err := reg.ResolveStoresFor("", conversationalProfile())
 	if err != nil {
 		t.Fatal(err)
 	}

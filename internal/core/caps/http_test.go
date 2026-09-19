@@ -25,6 +25,23 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// recordBodyServer returns an httptest server that records every request body
+// and answers with a minimal text/event-stream "data: [DONE]" reply — the
+// common stand-in for a streaming chat-completions endpoint in this package's
+// tests.
+func recordBodyServer(t *testing.T, bodies *[][]byte) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		*bodies = append(*bodies, b)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
 // permissive is the policy every test in this file needs, because httptest
 // servers bind 127.0.0.1 and the real default refuses loopback. The guard
 // itself is exercised against the strict zero Policy in
@@ -465,15 +482,17 @@ func TestOSEnvMissingName(t *testing.T) {
 	}
 }
 
-// seededStore opens a temp credential store with one service provisioned.
-func seededStore(t *testing.T, user, service, secret string) *credentials.Store {
+// seededStore opens a temp credential store with one service provisioned
+// under the given secret kind ("api_key" for HTTP auth headers, "password"
+// for mail).
+func seededStore(t *testing.T, user, service, kind, secret string) *credentials.Store {
 	t.Helper()
 	s, err := credentials.Open(filepath.Join(t.TempDir(), "creds.db"), "test-master-key", discardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { s.Close() })
-	if err := s.Put(context.Background(), user, service, "api_key", secret, "", ""); err != nil {
+	if err := s.Put(context.Background(), user, service, kind, secret, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	return s
@@ -489,7 +508,7 @@ func TestHTTPAuthInjectsHeader(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	creds := seededStore(t, "u_oscar", "weather", "sk-test-123")
+	creds := seededStore(t, "u_oscar", "weather", "api_key", "sk-test-123")
 	h := HTTPHandlers(discardLogger(), creds, permissive)
 	ctx := session.WithUserUUID(context.Background(), "u_oscar")
 
@@ -509,7 +528,7 @@ func TestHTTPAuthInjectsHeader(t *testing.T) {
 // TestHTTPAuthNoUserFails: without a stamped user UUID, resolution must fail
 // cleanly rather than reaching out.
 func TestHTTPAuthNoUserFails(t *testing.T) {
-	creds := seededStore(t, "u_oscar", "weather", "sk-test-123")
+	creds := seededStore(t, "u_oscar", "weather", "api_key", "sk-test-123")
 	h := HTTPHandlers(discardLogger(), creds, permissive)
 
 	_, ok := h["http.request"](context.Background(), session.Op{
@@ -525,7 +544,7 @@ func TestHTTPAuthNoUserFails(t *testing.T) {
 // TestHTTPAuthUnknownServiceFails: a service the user hasn't provisioned must
 // not resolve, and must not leak anything.
 func TestHTTPAuthUnknownServiceFails(t *testing.T) {
-	creds := seededStore(t, "u_oscar", "weather", "sk-test-123")
+	creds := seededStore(t, "u_oscar", "weather", "api_key", "sk-test-123")
 	h := HTTPHandlers(discardLogger(), creds, permissive)
 	ctx := session.WithUserUUID(context.Background(), "u_oscar")
 
@@ -548,7 +567,7 @@ func TestHTTPAuthTenantIsolation(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	creds := seededStore(t, "u_a", "weather", "sk-a")
+	creds := seededStore(t, "u_a", "weather", "api_key", "sk-a")
 	h := HTTPHandlers(discardLogger(), creds, permissive)
 	ctx := session.WithUserUUID(context.Background(), "u_b")
 
@@ -573,7 +592,7 @@ func TestHTTPAuthRedactedOnError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	creds := seededStore(t, "u_oscar", "weather", "super-secret-value-xyz")
+	creds := seededStore(t, "u_oscar", "weather", "api_key", "super-secret-value-xyz")
 	h := HTTPHandlers(discardLogger(), creds, permissive)
 	ctx := session.WithUserUUID(context.Background(), "u_oscar")
 

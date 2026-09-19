@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"agentflow/internal/core/files"
 	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/netguard"
 	"agentflow/internal/core/session"
@@ -24,7 +25,7 @@ import (
 // (internal/core/netguard), so it also covers redirect hops and DNS rebinding,
 // not just the URL the model typed. net.http.allow_private turns it off for
 // deployments that legitimately call internal services.
-func RegisterFetchBuiltins(r *Registry, c *fetch.Client, log *slog.Logger) {
+func RegisterFetchBuiltins(r *Registry, c *fetch.Client, log *slog.Logger, fm *files.Manager) {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -61,6 +62,10 @@ func RegisterFetchBuiltins(r *Registry, c *fetch.Client, log *slog.Logger) {
 			"insecure": map[string]any{
 				"type":        "boolean",
 				"description": "Skip TLS certificate verification (default false). Logged and flagged in the result.",
+			},
+			"save_to": map[string]any{
+				"type":        "string",
+				"description": "Scratch file name: the response body also lands in this session's files scratch space (readable via files.scratch.read). Bytes never enter the model context.",
 			},
 		}, []string{"url"}),
 		Autonomous: true,
@@ -130,6 +135,9 @@ func RegisterFetchBuiltins(r *Registry, c *fetch.Client, log *slog.Logger) {
 			}
 			if res.Truncated {
 				out["truncated"] = true
+			}
+			if name := argString(args["save_to"]); name != "" {
+				saveToScratch(ctx, fm, out, name, []byte(res.Body), res.ContentType)
 			}
 			return out, nil
 		},

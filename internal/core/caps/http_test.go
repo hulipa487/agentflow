@@ -63,7 +63,7 @@ func runHTTP(t *testing.T, op session.Op) (map[string]any, bool) {
 // guard can be exercised against the same fixture every other test uses.
 func runHTTPPolicy(t *testing.T, log *slog.Logger, policy netguard.Policy, op session.Op) (map[string]any, bool) {
 	t.Helper()
-	h := HTTPHandlers(log, nil, policy)
+	h := HTTPHandlers(log, nil, policy, nil)
 	ctx := session.WithOwner(context.Background(), "session-1")
 	resp, ok := h["http.request"](ctx, op)
 	if !ok {
@@ -270,7 +270,7 @@ func TestHTTPRefusesPrivateAddresses(t *testing.T) {
 // prelude's `op` raises when the handler reports failure.
 func TestHTTPGuardRefusalReachesTheLoop(t *testing.T) {
 	handlers := map[string]session.OpHandler{}
-	for k, h := range HTTPHandlers(discardLogger(), nil, netguard.Policy{}) {
+	for k, h := range HTTPHandlers(discardLogger(), nil, netguard.Policy{}, nil) {
 		handlers[k] = h
 	}
 	gw := &schemaGW{}
@@ -400,7 +400,7 @@ func TestHTTPSecretRedactionInError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := HTTPHandlers(discardLogger(), nil, permissive)
+	h := HTTPHandlers(discardLogger(), nil, permissive, nil)
 	ctx := session.WithOwner(context.Background(), "session-1")
 	resp, ok := h["http.request"](ctx, session.Op{
 		Type:    "http.request",
@@ -442,7 +442,7 @@ func TestHTTPBodyCap(t *testing.T) {
 }
 
 func TestOSEnv(t *testing.T) {
-	h := HTTPHandlers(discardLogger(), nil, permissive)
+	h := HTTPHandlers(discardLogger(), nil, permissive, nil)
 	ctx := context.Background()
 
 	// Set a var, read it.
@@ -475,7 +475,7 @@ func TestOSEnv(t *testing.T) {
 }
 
 func TestOSEnvMissingName(t *testing.T) {
-	h := HTTPHandlers(discardLogger(), nil, permissive)
+	h := HTTPHandlers(discardLogger(), nil, permissive, nil)
 	_, ok := h["os.env"](context.Background(), session.Op{Type: "os.env"})
 	if ok {
 		t.Fatal("expected error for missing name")
@@ -509,7 +509,7 @@ func TestHTTPAuthInjectsHeader(t *testing.T) {
 	defer srv.Close()
 
 	creds := seededStore(t, "u_oscar", "weather", "api_key", "sk-test-123")
-	h := HTTPHandlers(discardLogger(), creds, permissive)
+	h := HTTPHandlers(discardLogger(), creds, permissive, nil)
 	ctx := session.WithUserUUID(context.Background(), "u_oscar")
 
 	resp, ok := h["http.request"](ctx, session.Op{
@@ -529,7 +529,7 @@ func TestHTTPAuthInjectsHeader(t *testing.T) {
 // cleanly rather than reaching out.
 func TestHTTPAuthNoUserFails(t *testing.T) {
 	creds := seededStore(t, "u_oscar", "weather", "api_key", "sk-test-123")
-	h := HTTPHandlers(discardLogger(), creds, permissive)
+	h := HTTPHandlers(discardLogger(), creds, permissive, nil)
 
 	_, ok := h["http.request"](context.Background(), session.Op{
 		Type: "http.request",
@@ -545,7 +545,7 @@ func TestHTTPAuthNoUserFails(t *testing.T) {
 // not resolve, and must not leak anything.
 func TestHTTPAuthUnknownServiceFails(t *testing.T) {
 	creds := seededStore(t, "u_oscar", "weather", "api_key", "sk-test-123")
-	h := HTTPHandlers(discardLogger(), creds, permissive)
+	h := HTTPHandlers(discardLogger(), creds, permissive, nil)
 	ctx := session.WithUserUUID(context.Background(), "u_oscar")
 
 	_, ok := h["http.request"](ctx, session.Op{
@@ -568,7 +568,7 @@ func TestHTTPAuthTenantIsolation(t *testing.T) {
 	defer srv.Close()
 
 	creds := seededStore(t, "u_a", "weather", "api_key", "sk-a")
-	h := HTTPHandlers(discardLogger(), creds, permissive)
+	h := HTTPHandlers(discardLogger(), creds, permissive, nil)
 	ctx := session.WithUserUUID(context.Background(), "u_b")
 
 	_, ok := h["http.request"](ctx, session.Op{
@@ -593,7 +593,7 @@ func TestHTTPAuthRedactedOnError(t *testing.T) {
 	defer srv.Close()
 
 	creds := seededStore(t, "u_oscar", "weather", "api_key", "super-secret-value-xyz")
-	h := HTTPHandlers(discardLogger(), creds, permissive)
+	h := HTTPHandlers(discardLogger(), creds, permissive, nil)
 	ctx := session.WithUserUUID(context.Background(), "u_oscar")
 
 	resp, ok := h["http.request"](ctx, session.Op{

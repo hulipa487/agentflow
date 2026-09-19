@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"agentflow/internal/core/credentials"
+	"agentflow/internal/core/files"
 	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/netguard"
 	"agentflow/internal/core/session"
@@ -50,7 +51,7 @@ var secretHeaderRe = regexp.MustCompile(`(?i)authorization|token|api[_-]?key|sec
 //
 // Both ops are registered the same way as LLM/Shell/Tool handlers and merged
 // into the actor's handler map in cmd/agentflow.
-func HTTPHandlers(log *slog.Logger, creds *credentials.Store, policy netguard.Policy) map[string]session.OpHandler {
+func HTTPHandlers(log *slog.Logger, creds *credentials.Store, policy netguard.Policy, fm *files.Manager) map[string]session.OpHandler {
 	logger := log.With("module", "caps.http")
 	// One client per handler map. Constructing it here rather than using a
 	// package-level default is what lets the policy be a parameter, and the
@@ -217,6 +218,22 @@ func HTTPHandlers(log *slog.Logger, creds *credentials.Store, policy netguard.Po
 			if truncated {
 				result["truncated"] = true
 				logger.Warn("http.response truncated", "url", rawURL, "cap", maxBodyBytes)
+			}
+			if op.SaveTo != "" {
+				// save_to: the body lands in the calling session's scratch
+				// space (bytes never cross Lua). A failed save never discards
+				// the response — it is reported alongside it.
+				if fm == nil {
+					result["save_error"] = "files store unavailable (disabled at boot)"
+				} else if e, err := fm.ScratchPut(ctx, op.Owner, op.SaveTo, bytes.NewReader(bodyBytes), resp.Header.Get("Content-Type")); err != nil {
+					result["save_error"] = err.Error()
+				} else {
+					saved := map[string]any{"name": e.Path, "handle": e.Handle, "size": e.Size}
+					if truncated {
+						saved["truncated"] = true
+					}
+					result["saved"] = saved
+				}
 			}
 			return okJSON(result)
 		},

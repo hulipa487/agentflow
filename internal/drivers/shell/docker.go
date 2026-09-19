@@ -63,6 +63,9 @@ func (p *DockerProvider) Spawn(ctx context.Context, opts SpawnOpts) (*Handle, er
 	if wd := opts.WorkDir; wd != "" {
 		args = append(args, "-w", wd)
 	}
+	for _, v := range opts.Volumes {
+		args = append(args, "-v", v)
+	}
 	for k, v := range opts.Env {
 		args = append(args, "-e", k+"="+v)
 	}

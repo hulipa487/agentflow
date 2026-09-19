@@ -7,12 +7,17 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"agentflow/internal/config"
+	"agentflow/internal/core/files"
+	"agentflow/internal/core/media"
 	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/netguard"
+	"agentflow/internal/core/runtime"
 	"agentflow/internal/core/session"
 	"agentflow/internal/drivers/fetch"
 )
@@ -26,7 +31,7 @@ func permitting() *fetch.Client { return fetch.New(netguard.Policy{AllowPrivate:
 func invoking(t *testing.T, c *fetch.Client, log *slog.Logger, args map[string]any) (map[string]any, error) {
 	t.Helper()
 	r := NewRegistry()
-	RegisterFetchBuiltins(r, c, log)
+	RegisterFetchBuiltins(r, c, log, nil)
 	as := r.Expose([]string{"builtin:fetch"}, config.ToolsPolicy{}, false)
 	ctx := session.WithOwner(context.Background(), "writer")
 	res, err := as.Invoke(ctx, "builtin:fetch", args)
@@ -317,7 +322,7 @@ func TestFetchHTTPErrorStatusIsAResult(t *testing.T) {
 // tools.policy.overrides.
 func TestFetchSchemaDeclaresURL(t *testing.T) {
 	r := NewRegistry()
-	RegisterFetchBuiltins(r, permitting(), quiet())
+	RegisterFetchBuiltins(r, permitting(), quiet(), nil)
 	spec, ok := r.tools["builtin:fetch"]
 	if !ok {
 		t.Fatal("builtin:fetch must be registered")
@@ -334,5 +339,50 @@ func TestFetchSchemaDeclaresURL(t *testing.T) {
 		if _, has := props[key]; !has {
 			t.Fatalf("the curl option %q must be exposed", key)
 		}
+	}
+}
+
+// TestFetchSaveToScratch: save_to lands the response body in the calling
+// session's scratch (keyed by the session-key stamp) and reports the record.
+func TestFetchSaveToScratch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/csv")
+		_, _ = w.Write([]byte("a,b\n1,2\n"))
+	}))
+	defer srv.Close()
+
+	blobs, err := media.Open(filepath.Join(t.TempDir(), "blobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt, err := runtime.Open(filepath.Join(t.TempDir(), "rt.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { rt.Close() })
+	fm := files.New(blobs, rt, time.Hour, 1<<20, quiet())
+
+	r := NewRegistry()
+	RegisterFetchBuiltins(r, permitting(), quiet(), fm)
+	as := r.Expose([]string{"builtin:fetch"}, config.ToolsPolicy{}, false)
+	ctx := session.WithSessionKey(session.WithOwner(context.Background(), "writer"), "writer|chat1")
+
+	res, err := as.Invoke(ctx, "builtin:fetch", map[string]any{"url": srv.URL, "save_to": "table.csv"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, _ := res.(map[string]any)["saved"].(map[string]any)
+	if saved == nil || saved["name"] != "table.csv" || !strings.HasPrefix(saved["handle"].(string), "media:") {
+		t.Fatalf("result missing saved record: %v", res)
+	}
+
+	// Readable through the scratch API under the same session key.
+	e, err := fm.ScratchGet(context.Background(), "writer|chat1", "table.csv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := fm.ReadBlob(context.Background(), e.Handle, 1<<20)
+	if err != nil || string(b) != "a,b\n1,2\n" {
+		t.Fatalf("scratch bytes %q err %v", b, err)
 	}
 }

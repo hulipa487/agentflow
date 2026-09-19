@@ -115,10 +115,11 @@ models:
     model: gpt-4o-mini
     base_url: http://127.0.0.1:11434/v1   # Ollama / vLLM / LiteLLM / OpenRouter
     api_key: ${OPENAI_API_KEY}            # may be empty for keyless local endpoints
+    thinking: medium                      # off | low | medium | high | xhigh | max; empty = provider default
     server_tools: []                      # provider-native tools, e.g. [google_search] on gemini
 ```
 
-`provider` selects the request/response shape (`anthropic` | `openai` | `openai-responses` | `gemini` | `rerank`); `base_url` selects the host. `server_tools` injects provider-native, server-side tools (e.g. Google Search grounding on `gemini`, `web_search` on `openai-responses`) that run inside the provider's completion.
+`provider` selects the request/response shape (`anthropic` | `openai` | `openai-responses` | `gemini` | `rerank`); `base_url` selects the host. `thinking` sets the model's default thinking level — one provider-neutral vocabulary (`off` | `low` | `medium` | `high` | `xhigh` | `max`) mapped per provider (Anthropic `budget_tokens`, OpenAI `reasoning_effort`, Gemini `thinking_budget`); overridable per call via `llm.chat` `opts.thinking`. `server_tools` injects provider-native, server-side tools (e.g. Google Search grounding on `gemini`, `web_search` on `openai-responses`) that run inside the provider's completion.
 
 The runtime ships as a standalone engine. Reference product apps built on top
 of agentflow — for example a full multi-agent orchestrator (main + expert +

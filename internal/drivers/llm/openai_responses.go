@@ -33,6 +33,10 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 	if err != nil {
 		return nil, false, err
 	}
+	thinking, err := thinkingOf(cfg, opts)
+	if err != nil {
+		return nil, false, err
+	}
 
 	body := map[string]any{
 		"model":  cfg.Model,
@@ -47,6 +51,11 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 	}
 	if mt := maxTokensOf(cfg, opts); mt > 0 {
 		body["max_output_tokens"] = mt
+	}
+	if thinking != "" {
+		if effort, ok := openaiEffort[thinking]; ok {
+			body["reasoning"] = map[string]any{"effort": effort}
+		}
 	}
 	if len(opts.Tools) > 0 || len(cfg.ServerTools) > 0 {
 		// Responses uses a flat function shape (no "function" wrapper).

@@ -754,6 +754,9 @@ llm = {}
 --    name="..."} — media parts typically come from msg.attachments and the
 --   runtime resolves the handle to bytes; data (base64) and url also work.
 -- Providers that cannot take a part type fail the call with a clear error.
+-- opts.thinking overrides the model's default thinking level for this call:
+-- "off" | "low" | "medium" | "high" | "xhigh" | "max" — one vocabulary,
+-- mapped per provider (Anthropic budget, OpenAI effort, Gemini budget).
 function llm.chat(messages, opts)
   return op(with_opts({ type = "llm.chat", messages = messages }, opts))
 end

@@ -184,6 +184,12 @@ type Model struct {
 	Timeout   string `yaml:"timeout,omitempty"`
 	Retry     int    `yaml:"retry,omitempty"`
 	MaxTokens int    `yaml:"max_tokens,omitempty"`
+	// Thinking is the default thinking level for this model: off | low |
+	// medium | high | xhigh | max, one vocabulary mapped per provider at
+	// request time (see internal/drivers/llm/thinking.go). Empty sends
+	// nothing and the provider uses its own default. Overridable per call
+	// via llm.chat opts.thinking.
+	Thinking string `yaml:"thinking,omitempty"`
 	// ServerTools names provider-native server-side tools to enable on every
 	// request for this model (e.g. "web_search", "x_search", "google_search").
 	// Unlike client-side function tools (opts.Tools), these are executed by the
@@ -1024,6 +1030,13 @@ func validate(path string, c *Config) error {
 		case "anthropic", "openai", "openai-responses", "gemini", "rerank":
 		default:
 			return fmt.Errorf("%s: model %q has unsupported provider %q", path, name, m.Provider)
+		}
+		// Thinking is the one enum the llm layer also validates per call (hot
+		// runtime edits bypass this boot check); both keep the same vocabulary.
+		switch strings.ToLower(strings.TrimSpace(m.Thinking)) {
+		case "", "off", "low", "medium", "high", "xhigh", "max":
+		default:
+			return fmt.Errorf("%s: model %q has unsupported thinking level %q (want off|low|medium|high|xhigh|max)", path, name, m.Thinking)
 		}
 	}
 

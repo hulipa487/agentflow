@@ -299,8 +299,9 @@ curl -X POST localhost:8080/webhook/ -d '{"from":"alice","text":"hello"}'   # no
     model: gpt-4o
     base_url: http://127.0.0.1:11434/v1   # Ollama / vLLM / LiteLLM / OpenRouter
     api_key: ${OPENAI_API_KEY}
+    thinking: medium        # off | low | medium | high | xhigh | max; empty = provider default
     server_tools: []          # provider-native tools (gemini: google_search; openai-responses: web_search)</code></pre>
-  <p><code>provider</code> selects the request/response format. <code>base_url</code> selects the host. <code>api_key</code> may be empty for keyless local endpoints (Ollama). <code>server_tools</code> names provider-native server-side tools that run inside the provider's completion — the runtime injects only the native tool entry, no client-side schema.</p>
+  <p><code>provider</code> selects the request/response format. <code>base_url</code> selects the host. <code>api_key</code> may be empty for keyless local endpoints (Ollama). <code>thinking</code> sets the model's default thinking level — one provider-neutral vocabulary (<code>off</code> | <code>low</code> | <code>medium</code> | <code>high</code> | <code>xhigh</code> | <code>max</code>) that the runtime maps to each provider's native knob: an Anthropic <code>budget_tokens</code>, an OpenAI <code>reasoning_effort</code>, or a Gemini <code>thinking_budget</code>. Empty sends nothing and the provider uses its own default; overridable per call via <code>llm.chat</code> <code>opts.thinking</code>. <code>server_tools</code> names provider-native server-side tools that run inside the provider's completion — the runtime injects only the native tool entry, no client-side schema.</p>
 </section>
 
 <section id="config" class="section">
@@ -408,6 +409,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
     timeout: 30s
     retry: 2
     max_tokens: 4096
+    thinking: medium         # off | low | medium | high | xhigh | max; empty = provider default
     server_tools: []           # provider-native server-side tools</code></pre>
   <p><code>provider</code> selects the request/response shape. <code>base_url</code> selects the host. For OpenAI-compatible endpoints (Ollama, vLLM, LiteLLM), include <code>/v1</code> in <code>base_url</code>; <code>openai</code> appends <code>/chat/completions</code> and <code>openai-responses</code> appends <code>/responses</code>. For Anthropic-compatible endpoints, set <code>base_url</code> to the host root; the runtime appends <code>/v1/messages</code>. For <code>gemini</code>, point <code>base_url</code> at the version prefix (default <code>https://generativelanguage.googleapis.com/v1beta</code>); the runtime appends <code>/interactions</code> and sends the key in the <code>x-goog-api-key</code> header. The Gemini Interactions API is non-streaming and does not accept a token cap, so <code>llm.stream</code> yields one buffered delta and <code>max_tokens</code> is not sent. <code>provider: rerank</code> is a cross-encoder endpoint speaking <code>POST {base_url}/rerank</code> (TEI, vLLM, Jina, Cohere) and is used via <code>llm.rerank</code> / memory <code>rerank_model</code>, not as a chat model.</p>
   <p><code>server_tools</code> lists provider-native server-side tools to enable on every request (e.g. <code>google_search</code> on gemini, <code>web_search</code>/<code>x_search</code> on openai-responses). Unlike client-side function tools passed per-call via <code>opts.tools</code>, these execute inside the provider; the runtime only injects the native <code>{type: &lt;name&gt;}</code> entry. Values are provider-specific strings, keeping the runtime generic.</p>
@@ -825,6 +827,7 @@ llm.embed(inputs, opts?) -> { vectors, usage }   -- strings and/or part tables
 llm.rerank(query, documents, opts?) -> { results } -- results: [{ index, score }], 0-based
 
 -- opts: { model = "default", temperature = 0.7, max_tokens = 4096,
+--         thinking = "low"|"medium"|"high"|"xhigh"|"max"|"off",
 --         tools = [...], tool_choice = "auto" | "none" }</code></pre>
   <p>Messages are arrays of <code>{ role, content, tool_calls?, tool_call_id?, tool_result? }</code>. <strong>Multimodal turns</strong> use <code>{ role, parts = {...} }</code>; each part is a table:</p>
   <pre><code>{ type = "text",  text = "..." }

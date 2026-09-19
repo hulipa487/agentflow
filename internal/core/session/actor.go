@@ -105,6 +105,7 @@ type Op struct {
 	Stream      string        `json:"stream,omitempty"`
 	Tools       []ToolSpec    `json:"tools,omitempty"`
 	ToolChoice  string        `json:"tool_choice,omitempty"`
+	Thinking    string        `json:"thinking,omitempty"` // off|low|medium|high|xhigh|max
 
 	// Embedding / rerank ops (llm.embed, llm.rerank).
 	// Embed inputs are parts: plain texts ride as {type:"text"}; media

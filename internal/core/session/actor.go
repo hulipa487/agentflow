@@ -147,6 +147,18 @@ type Op struct {
 	// overrides targeting them and report ones no loop declares.
 	ToolNames []string `json:"tool_names,omitempty"`
 
+	// Files ops (files.*): user-scoped project trees, snapshots, scratch.
+	Project   string `json:"project,omitempty"`
+	Data      string `json:"data,omitempty"` // base64 file content (binary puts)
+	Mime      string `json:"mime,omitempty"`
+	Ref       string `json:"ref,omitempty"` // snapshot ref name or commit id
+	CommitMsg string `json:"commit_msg,omitempty"`
+
+	// Owner is the owning session key, stamped by the actor at dispatch (never
+	// Lua-settable). It scopes scratch space and tags engine-side saves so a
+	// session's temp files cannot collide with or leak into another's.
+	Owner string `json:"-"`
+
 	// HTTP op (http.request).
 	Method  string            `json:"method,omitempty"`
 	URL     string            `json:"url,omitempty"`
@@ -378,36 +390,45 @@ func (r *PromptRegistry) Get(key string) (string, bool) {
 
 // blockingOps run on the worker pool; everything else is inline.
 var blockingOps = map[string]bool{
-	"send":              true,
-	"session.push":      true,
-	"session.push_user": true,
-	"llm.chat":          true,
-	"llm.embed":         true,
-	"llm.rerank":        true,
-	"llm.stream.open":   true,
-	"llm.stream.next":   true,
-	"tools.run":         true,
-	"store.put":         true,
-	"store.get":         true,
-	"store.query":       true,
-	"store.delete":      true,
-	"shell.spawn":       true,
-	"shell.exec":        true,
-	"shell.write":       true,
-	"shell.destroy":     true,
-	"http.request":      true,
-	"mail.imap.fetch":   true,
-	"mail.smtp.send":    true,
-	"credential.get":    true,
-	"agent.send":        true,
-	"agent.request":     true,
-	"agent.reply":       true,
-	"agent.spawn":       true,
-	"agent.list":        true,
-	"scheduler.every":   true,
-	"scheduler.after":   true,
-	"scheduler.cron":    true,
-	"scheduler.cancel":  true,
+	"send":               true,
+	"session.push":       true,
+	"session.push_user":  true,
+	"llm.chat":           true,
+	"llm.embed":          true,
+	"llm.rerank":         true,
+	"llm.stream.open":    true,
+	"llm.stream.next":    true,
+	"tools.run":          true,
+	"store.put":          true,
+	"store.get":          true,
+	"store.query":        true,
+	"store.delete":       true,
+	"shell.spawn":        true,
+	"shell.exec":         true,
+	"shell.write":        true,
+	"shell.destroy":      true,
+	"http.request":       true,
+	"mail.imap.fetch":    true,
+	"mail.smtp.send":     true,
+	"credential.get":     true,
+	"agent.send":         true,
+	"agent.request":      true,
+	"agent.reply":        true,
+	"agent.spawn":        true,
+	"agent.list":         true,
+	"scheduler.every":    true,
+	"scheduler.after":    true,
+	"scheduler.cron":     true,
+	"scheduler.cancel":   true,
+	"files.put":          true,
+	"files.read":         true,
+	"files.list":         true,
+	"files.delete":       true,
+	"files.commit":       true,
+	"files.checkout":     true,
+	"files.scratch.put":  true,
+	"files.scratch.read": true,
+	"files.scratch.list": true,
 }
 
 // EndReason identifies why an actor left the supervisor.
@@ -661,6 +682,7 @@ func (a *Actor) dispatchInline(ctx context.Context, op Op, current *Message) (re
 	default:
 		// Stamp the tenant user UUID for inline handlers, mirroring execBlocking.
 		ctx = WithUserUUID(ctx, userFromMessage(current))
+		op.Owner = a.Identity.SessionID
 		if h, found := a.handlers[op.Type]; found {
 			r, ok := h(ctx, op)
 			return r, ok, true
@@ -695,6 +717,7 @@ func (a *Actor) dispatchBlocking(ctx context.Context, op Op, current *Message) (
 func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (string, bool) {
 	ctx = WithOwner(ctx, a.Name)
 	ctx = WithUserUUID(ctx, userFromMessage(current))
+	op.Owner = a.Identity.SessionID
 	if a.Info != nil {
 		ctx = WithShell(ctx, a.Info.Shell)
 	}
@@ -1059,6 +1082,7 @@ func UserUUIDFromCtx(ctx context.Context) string {
 	s, _ := v.(string)
 	return s
 }
+
 
 // userFromMessage recovers the user UUID from an inbound message: prefer the
 // identity-stashed payload field, else strip "user:" from From.

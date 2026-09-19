@@ -295,6 +295,64 @@ func TestValidateMediaAudit(t *testing.T) {
 	}
 }
 
+// TestValidateFiles exercises the file-store backend and scratch rules.
+func TestValidateFiles(t *testing.T) {
+	neg := int64(-1)
+	tests := []struct {
+		name    string
+		files   FilesConfig
+		wantErr string
+	}{
+		{name: "defaults ok", files: FilesConfig{}},
+		{name: "fs explicit ok", files: FilesConfig{Backend: "fs", Dir: "./data/files"}},
+		{
+			name:    "s3 missing fields",
+			files:   FilesConfig{Backend: "s3"},
+			wantErr: "requires s3.bucket and s3.region",
+		},
+		{
+			name:  "s3 without keys boots (store skipped at boot)",
+			files: FilesConfig{Backend: "s3", S3: MediaS3{Bucket: "b", Region: "r"}},
+		},
+		{
+			name:    "unknown backend",
+			files:   FilesConfig{Backend: "gcs"},
+			wantErr: "unsupported files backend",
+		},
+		{
+			name:    "negative max bytes",
+			files:   FilesConfig{MaxFileBytes: neg},
+			wantErr: "files.max_file_bytes must be >= 0",
+		},
+		{
+			name:    "malformed scratch ttl",
+			files:   FilesConfig{ScratchTTL: "tomorrow"},
+			wantErr: "files.scratch_ttl",
+		},
+		{name: "scratch ttl ok", files: FilesConfig{ScratchTTL: "24h"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Config{Files: tt.files, Agents: map[string]Agent{"bot": {Loop: "./loop.lua"}}}
+			err := validate("cfg.yaml", c)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("expected error containing %q, got: %v", tt.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected no error, got: %v", err)
+			}
+		})
+	}
+	// Defaults: 32 MiB ceiling, 24h scratch TTL.
+	f := FilesConfig{}
+	if f.FilesMaxBytes() != 32<<20 || f.FilesScratchTTL() != 24*time.Hour {
+		t.Fatalf("files defaults: max=%d ttl=%v", f.FilesMaxBytes(), f.FilesScratchTTL())
+	}
+}
+
 // TestValidateLegalSearch exercises the legal-search engine rules: only hklii
 // is supported (no key), and default resolution.
 func TestValidateLegalSearch(t *testing.T) {

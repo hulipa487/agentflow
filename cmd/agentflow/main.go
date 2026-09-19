@@ -29,6 +29,7 @@ import (
 	"agentflow/internal/core/budget"
 	"agentflow/internal/core/caps"
 	"agentflow/internal/core/credentials"
+	"agentflow/internal/core/files"
 	"agentflow/internal/core/gateway"
 	"agentflow/internal/core/identity"
 	"agentflow/internal/core/media"
@@ -248,6 +249,42 @@ func main() {
 		os.Exit(1)
 	}
 
+	// User-scoped file store: same blob-store family as media (fs or S3),
+	// snapshot metadata in the runtime store's files_meta table. An
+	// unresolvable S3 credential pair disables the store with a warning (the
+	// media rule), never a boot failure; agents without the files capability
+	// never touch it.
+	var filesMgr *files.Manager
+	if cfg.Files.Backend == "s3" {
+		s3cfg, ok := resolveMediaS3(ctx, credResolver, cfg.Files.S3, log)
+		if ok {
+			blobStore, err := s3media.New(s3cfg)
+			if err != nil {
+				log.Error("files store failed", "err", err)
+				os.Exit(1)
+			}
+			filesMgr = files.New(blobStore, rtStore, cfg.Files.FilesScratchTTL(), cfg.Files.FilesMaxBytes(), log)
+		}
+	} else {
+		filesDir := cfg.Files.Dir
+		if filesDir == "" {
+			filesDir = filepath.Join(filepath.Dir(cfg.PersistencePath()), "files")
+		}
+		blobStore, err := media.Open(filesDir)
+		if err != nil {
+			log.Error("files store failed", "err", err)
+			os.Exit(1)
+		}
+		filesMgr = files.New(blobStore, rtStore, cfg.Files.FilesScratchTTL(), cfg.Files.FilesMaxBytes(), log)
+	}
+	if filesMgr != nil {
+		if n, err := filesMgr.SweepScratch(ctx); err != nil {
+			log.Warn("files scratch sweep failed", "err", err)
+		} else if n > 0 {
+			log.Info("files scratch swept", "expired", n)
+		}
+	}
+
 	// Tool registry: builtins + shell builtins + MCP discovery. The web_search
 	// tool is backed by the configured search engines (config.Search); with no
 	// engines it reports honest-unavailable.
@@ -436,6 +473,9 @@ func main() {
 		for k, h := range gateOps(enforce, name, effectiveCaps, "net.mail", caps.MailHandlers(log, credStore), &withheld) {
 			handlers[k] = h
 		}
+		for k, h := range gateOps(enforce, name, effectiveCaps, "files", caps.FileHandlers(filesMgr, name), &withheld) {
+			handlers[k] = h
+		}
 		// runtime.* and credential.get stay ungated: the first is loop
 		// machinery every agent needs, the second is already scoped by the
 		// agent's own credential list.
@@ -565,6 +605,9 @@ func main() {
 			handlers[k] = h
 		}
 		for k, h := range gateOps(enforce, pname, profileCaps, "net.mail", caps.MailHandlers(log, credStore), &withheld) {
+			handlers[k] = h
+		}
+		for k, h := range gateOps(enforce, pname, profileCaps, "files", caps.FileHandlers(filesMgr, pname), &withheld) {
 			handlers[k] = h
 		}
 		for k, h := range runtimeHandlers {

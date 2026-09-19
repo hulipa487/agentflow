@@ -8,6 +8,12 @@
 //     reachable, otherwise deleteWebhook and long-poll. Falls back to polling
 //     without the webhook host dying silently.
 //
+// Webhook deliveries (webhook/auto) are authenticated: a secret_token is sent
+// at setWebhook (configured per channel, or generated per boot when absent)
+// and verified from X-Telegram-Bot-Api-Secret-Token on every delivery, before
+// the body is parsed. Polling paths clear any stale Telegram-side webhook
+// first — getUpdates 409s while one is registered.
+//
 // Access control (allow_users) is enforced in all modes before any Lua runs.
 //
 // Media (photos, documents, voice, audio, video) is ingested when the
@@ -20,6 +26,8 @@ package telegram
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -42,23 +50,24 @@ import (
 // replies (sendMessage / sendPhoto / ...) and either polls or serves a
 // webhook for inbound.
 type Driver struct {
-	name      string
-	token     string
-	agent     string
-	allow     map[int64]bool // empty = allow all
-	mode      string         // "polling" | "webhook" | "auto"
-	path      string         // webhook mode only
-	publicURL string         // webhook/auto: external base that routes to this process
-	apiBase   string         // override for the Telegram API host (tests); empty = api.telegram.org
-	store     media.Store   // nil = media policy disabled
-	pol       media.Policy
-	sink      router.Sink
-	log       *slog.Logger
-	client    *http.Client
-	seq       int64
+	name        string
+	token       string
+	agent       string
+	allow       map[int64]bool // empty = allow all
+	mode        string         // "polling" | "webhook" | "auto"
+	path        string         // webhook mode only
+	publicURL   string         // webhook/auto: external base that routes to this process
+	secretToken string         // webhook/auto: Telegram webhook secret (verified per delivery); empty = unauthenticated
+	apiBase     string         // override for the Telegram API host (tests); empty = api.telegram.org
+	store       media.Store    // nil = media policy disabled
+	pol         media.Policy
+	sink        router.Sink
+	log         *slog.Logger
+	client      *http.Client
+	seq         int64
 }
 
-func New(name, token, agent, mode string, allowUsers []int64, path, publicURL string, sink router.Sink, srv *httpd.Server, store media.Store, pol media.Policy, log *slog.Logger) *Driver {
+func New(name, token, agent, mode string, allowUsers []int64, path, publicURL, secretToken string, sink router.Sink, srv *httpd.Server, store media.Store, pol media.Policy, log *slog.Logger) *Driver {
 	allow := map[int64]bool{}
 	for _, id := range allowUsers {
 		allow[id] = true
@@ -66,19 +75,33 @@ func New(name, token, agent, mode string, allowUsers []int64, path, publicURL st
 	if mode == "" {
 		mode = "polling"
 	}
+	if (mode == "webhook" || mode == "auto") && secretToken == "" {
+		// Secure by default: a webhook that verifies nothing invites update
+		// injection by anyone who finds the path. Random-per-boot is safe
+		// because Start re-registers the webhook (with the new secret) every
+		// boot — Telegram only presents the secret it was last given.
+		generated, err := generateWebhookSecret()
+		if err != nil {
+			log.Warn("telegram webhook secret_token generation failed; webhook unauthenticated", "channel", name, "err", err)
+		} else {
+			secretToken = generated
+			log.Info("telegram webhook secret_token generated (none configured)", "channel", name)
+		}
+	}
 	d := &Driver{
-		name:      name,
-		token:     token,
-		agent:     agent,
-		allow:     allow,
-		mode:      mode,
-		path:      path,
-		publicURL: publicURL,
-		store:     store,
-		pol:       pol,
-		sink:      sink,
-		log:       log.With("driver", "telegram", "channel", name, "mode", mode),
-		client:    &http.Client{Timeout: 40 * time.Second},
+		name:        name,
+		token:       token,
+		agent:       agent,
+		allow:       allow,
+		mode:        mode,
+		path:        path,
+		publicURL:   publicURL,
+		secretToken: secretToken,
+		store:       store,
+		pol:         pol,
+		sink:        sink,
+		log:         log.With("driver", "telegram", "channel", name, "mode", mode),
+		client:      &http.Client{Timeout: 40 * time.Second},
 	}
 	// webhook and auto both serve the webhook path, so both attach their handler
 	// up front. auto may later fall back to polling, but the mounted path is
@@ -102,6 +125,7 @@ func (d *Driver) Name() string { return d.name }
 func (d *Driver) Start(ctx context.Context) error {
 	switch d.mode {
 	case "polling":
+		d.ensureNoWebhook("polling mode")
 		go d.poll(ctx)
 		return nil
 	case "webhook":
@@ -124,6 +148,7 @@ func (d *Driver) Start(ctx context.Context) error {
 func (d *Driver) startAuto(ctx context.Context) error {
 	if d.publicURL == "" {
 		d.log.Info("auto: no public_url, polling")
+		d.ensureNoWebhook("auto: no public_url")
 		go d.poll(ctx)
 		return nil
 	}
@@ -145,6 +170,10 @@ func (d *Driver) startAuto(ctx context.Context) error {
 	hookURL := d.publicURL + strings.TrimRight(d.path, "/") + "/"
 	if err := d.setWebhook(hookURL); err != nil {
 		d.log.Warn("auto: setWebhook failed, polling instead", "err", err)
+		// The webhook may have registered on a previous boot (or partially
+		// applied just now): getUpdates 409s against a stale webhook, so clear
+		// it before falling back to polling.
+		d.ensureNoWebhook("auto: setWebhook failed")
 		go d.poll(ctx)
 		return nil
 	}
@@ -164,15 +193,45 @@ func (d *Driver) apiURL(method string) string {
 	return base + "/bot" + d.token + "/" + method
 }
 
+// ensureNoWebhook clears any Telegram-side webhook before polling begins. A
+// stale webhook — left over from a webhook-mode deployment or an auto
+// setWebhook that failed after applying — makes every getUpdates fail with a
+// 409 "Conflict: can't use getUpdates method while webhook is active", so
+// polling must not start while one is registered. Best-effort: a network
+// blip here shouldn't block polling, but the 409 then persists until the
+// next boot, so a failure is a loud WARN rather than a swallowed error.
+func (d *Driver) ensureNoWebhook(why string) {
+	if err := d.deleteWebhook(); err != nil {
+		d.log.Warn("deleteWebhook before polling failed; getUpdates may 409 against a stale webhook", "why", why, "err", err)
+	}
+}
+
+// generateWebhookSecret makes a per-instance webhook secret. 32 random bytes
+// in base64url give 43 chars from [A-Za-z0-9_-] — inside Telegram's 1-256
+// char secret alphabet.
+func generateWebhookSecret() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
 // setWebhook registers hookURL with Telegram so updates are pushed there.
 // An empty URL clears the webhook (see deleteWebhook). drain is false so we
-// don't drop in-flight updates on the switch.
+// don't drop in-flight updates on the switch. When a secretToken is set it
+// is registered too, and Telegram then presents it on every delivery as the
+// X-Telegram-Bot-Api-Secret-Token header (verified in handleWebhook).
 func (d *Driver) setWebhook(hookURL string) error {
-	body, _ := json.Marshal(map[string]any{
+	body := map[string]any{
 		"url":             hookURL,
 		"allowed_updates": []string{"message"},
-	})
-	return d.postAPI("setWebhook", body)
+	}
+	if d.secretToken != "" {
+		body["secret_token"] = d.secretToken
+	}
+	b, _ := json.Marshal(body)
+	return d.postAPI("setWebhook", b)
 }
 
 // deleteWebhook clears any registered webhook URL so Telegram stops pushing.
@@ -314,10 +373,28 @@ func (d *Driver) getUpdates(ctx context.Context, offset int64) ([]update, error)
 
 // --- webhook mode ---
 
+// secretTokenHeader is the header Telegram presents the registered webhook
+// secret in on every delivery.
+const secretTokenHeader = "X-Telegram-Bot-Api-Secret-Token"
+
 func (d *Driver) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
+	}
+	// Authenticate before parsing: an unauthenticated POST must never reach
+	// update handling. Missing is 401, mismatched is 403; both are checked
+	// in constant time.
+	if d.secretToken != "" {
+		got := r.Header.Get(secretTokenHeader)
+		if got == "" {
+			http.Error(w, "missing secret token", http.StatusUnauthorized)
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(got), []byte(d.secretToken)) != 1 {
+			http.Error(w, "secret token mismatch", http.StatusForbidden)
+			return
+		}
 	}
 	var u update
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&u); err != nil {

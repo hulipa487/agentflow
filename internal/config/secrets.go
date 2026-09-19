@@ -30,6 +30,7 @@ var secretPathPatterns = []string{
 	"search.engines.*.api_key",
 	"gateway.channels.[].token",
 	"gateway.channels.[].secret",
+	"gateway.channels.[].secret_token",
 	"memory.backends.*.config.url",
 	"memory.backends.*.config.password",
 	"memory.backends.*.config.api_key",

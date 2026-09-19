@@ -538,12 +538,12 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
     <tbody>
       <tr><td><code>webhook</code></td><td>POST → router → session → reply. <strong>Sync</strong> (default): the response parks until the agent replies or <code>timeout</code> (default <code>55s</code>) → 504. <strong>Async</strong> (<code>async: true</code>): 202 + a job id immediately; the reply is collected via <code>GET &lt;path&gt;result/&lt;id&gt;</code> (202 while pending) or POSTed to a caller-supplied <code>callback_url</code> — async jobs are never cut off by the sync timeout and expire after 15 minutes. Default path <code>/webhook/</code></td></tr>
       <tr><td><code>ghhook</code></td><td>GitHub webhook intake: verifies the <code>X-Hub-Signature-256</code> HMAC with <code>secret</code>, acks 200 immediately, and forwards the event as an agent-typed message (payload <code>{type: project_event, source: github, event, data}</code>). No reply path. Default path <code>/hooks/github/</code></td></tr>
-      <tr><td><code>telegram</code> (<code>mode: polling</code>)</td><td>Default. Long-poll <code>getUpdates</code>, <code>allow_users</code> enforced</td></tr>
-      <tr><td><code>telegram</code> (<code>mode: webhook</code>)</td><td>Receives POST updates at <code>path</code> (default <code>/webhook/telegram/</code>); requires <code>gateway.public_url</code></td></tr>
-      <tr><td><code>telegram</code> (<code>mode: auto</code>)</td><td>Probes <code>&lt;public_url&gt;/health</code> at startup: registers <code>setWebhook</code> when reachable, else <code>deleteWebhook</code> + long-poll. Needs <code>gateway.public_url</code></td></tr>
+      <tr><td><code>telegram</code> (<code>mode: polling</code>)</td><td>Default. Long-poll <code>getUpdates</code>, <code>allow_users</code> enforced. Clears any stale Telegram-side webhook first — getUpdates 409s while one is registered (e.g. reverting from webhook mode)</td></tr>
+      <tr><td><code>telegram</code> (<code>mode: webhook</code>)</td><td>Receives POST updates at <code>path</code> (default <code>/webhook/telegram/</code>); requires <code>gateway.public_url</code>. Every delivery must carry the <code>secret_token</code> header (401/403 otherwise, checked before parsing); configured per channel, generated per boot when absent</td></tr>
+      <tr><td><code>telegram</code> (<code>mode: auto</code>)</td><td>Probes <code>&lt;public_url&gt;/health</code> at startup: registers <code>setWebhook</code> when reachable, else <code>deleteWebhook</code> + long-poll. A <code>setWebhook</code> failure also clears the webhook before polling. Needs <code>gateway.public_url</code></td></tr>
     </tbody>
   </table>
-  <p>Every HTTP channel <code>path</code> must end in <code>/</code> (a subtree mount). A UUID-style path segment is a recommended unguessable secret prefix. Two channels mounting the same path are a boot error. Telegram's <code>token</code> and ghhook's <code>secret</code> are secrets (see the registry): env-interpolated on the single-file path, lazy references on the configdir path — and an unresolvable one skips the channel with a warning, never a boot failure.</p>
+  <p>Every HTTP channel <code>path</code> must end in <code>/</code> (a subtree mount). A UUID-style path segment is a recommended unguessable secret prefix. Two channels mounting the same path are a boot error. Telegram's <code>token</code> and <code>secret_token</code> and ghhook's <code>secret</code> are secrets (see the registry): env-interpolated on the single-file path, lazy references on the configdir path — and an unresolvable one skips the channel with a warning, never a boot failure.</p>
   <p><strong>Inbound media</strong> is opt-in per channel via a <code>media:</code> block — an allow-list of MIME patterns (<code>image/*</code>, <code>application/pdf</code>, <code>audio/*</code>, …) plus <code>max_bytes</code> (default 8 MiB). Telegram downloads the file (getFile), webhook accepts base64 <code>attachments</code>; bytes land in the content-addressed blob store (local filesystem by default, or S3/MinIO via the top-level <code>media:</code> config) and the message carries tiny part descriptors. With no media block, attachments are dropped and only the text/caption flows.</p>
   <pre><code>gateway:
   listen: ":8080"               # the single shared listener (default :8080)
@@ -564,6 +564,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
       agent: bot
     - type: telegram
       token: ${TG_TOKEN}
+#     secret_token: ${TG_WEBHOOK_SECRET}  # webhook auth; empty = generated per boot
       mode: auto                 # polling (default) | webhook | auto
       allow_users: [123456789]
       agent: bot

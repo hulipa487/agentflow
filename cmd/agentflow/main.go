@@ -834,7 +834,13 @@ func main() {
 					"channel", name, "field", "token", "credential", config.CredentialName(ch.Token))
 				continue
 			}
-			d := telegram.New(name, token, ch.Agent, ch.Mode, ch.AllowUsers, ch.Path, cfg.Gateway.PublicURL, sink, httpSrv, mstore, mpol, log)
+			secretToken, ok := credResolver.Resolve(ctx, ch.SecretToken)
+			if !ok {
+				log.Warn("channel skipped: unresolved credential",
+					"channel", name, "field", "secret_token", "credential", config.CredentialName(ch.SecretToken))
+				continue
+			}
+			d := telegram.New(name, token, ch.Agent, ch.Mode, ch.AllowUsers, ch.Path, cfg.Gateway.PublicURL, secretToken, sink, httpSrv, mstore, mpol, log)
 			gw.Register(d)
 			telegramDrivers = append(telegramDrivers, d)
 		case "ghhook":

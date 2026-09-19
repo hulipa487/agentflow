@@ -31,6 +31,7 @@ type Config struct {
 	Browser  Browser           `yaml:"browser"`
 	Net      NetConfig         `yaml:"net"`
 	Media    MediaConfig       `yaml:"media"`
+	Files    FilesConfig       `yaml:"files"`
 	Audit    AuditConfig       `yaml:"audit"`
 	Agents   map[string]Agent  `yaml:"agents"`
 	Triggers []Trigger         `yaml:"triggers"` // configdir layout; declarative task data for loops
@@ -94,10 +95,40 @@ type MediaConfig struct {
 type MediaS3 struct {
 	Bucket    string `yaml:"bucket"`
 	Region    string `yaml:"region"`
-	Endpoint  string `yaml:"endpoint"`   // optional custom S3-compatible host (MinIO, ...); empty = AWS
+	Endpoint  string `yaml:"endpoint"`   // optional custom S3-compatible host (MinIO, R2, ...); empty = AWS
 	Prefix    string `yaml:"prefix"`     // optional object key prefix
 	AccessKey string `yaml:"access_key"` // env-interpolated
 	SecretKey string `yaml:"secret_key"` // env-interpolated
+}
+
+// FilesConfig selects the backend for the user-scoped file store. File bytes
+// live in the same content-addressed blob store family as media (handles stay
+// "media:<sha256>", backend-agnostic); the snapshot metadata (working tree,
+// commits, refs, scratch) lives in the runtime store's files_meta table.
+type FilesConfig struct {
+	Backend      string  `yaml:"backend"`        // fs (default) | s3
+	Dir          string  `yaml:"dir"`            // fs root; default <runtime-persistence-dir>/files
+	S3           MediaS3 `yaml:"s3"`             // same fields/resolution as media.s3
+	MaxFileBytes int64   `yaml:"max_file_bytes"` // per-file ceiling; 0 = 32 MiB
+	ScratchTTL   string  `yaml:"scratch_ttl"`    // e.g. 24h; 0 = no expiry; default 24h
+}
+
+// FilesMaxBytes returns the per-file ceiling, applying the default.
+func (f FilesConfig) FilesMaxBytes() int64 {
+	if f.MaxFileBytes > 0 {
+		return f.MaxFileBytes
+	}
+	return 32 << 20
+}
+
+// FilesScratchTTL parses scratch_ttl. Empty defaults to 24h; "0" disables
+// expiry (records persist until deleted). Malformed values fail at validation.
+func (f FilesConfig) FilesScratchTTL() time.Duration {
+	if f.ScratchTTL == "" {
+		return 24 * time.Hour
+	}
+	d, _ := time.ParseDuration(f.ScratchTTL) // validated at boot; error impossible here
+	return d
 }
 
 // AuditConfig controls the core-owned message journal (every inbound and
@@ -827,6 +858,7 @@ func validate(path string, c *Config) error {
 		allowedCaps["agent.request"] = true
 		allowedCaps["channel.push"] = true
 		allowedCaps["net.mail"] = true
+		allowedCaps["files"] = true
 	}
 
 	for name, a := range c.Agents {
@@ -1131,6 +1163,28 @@ func validate(path string, c *Config) error {
 		}
 	default:
 		return fmt.Errorf("%s: unsupported media backend %q (want fs or s3)", path, c.Media.Backend)
+	}
+
+	// File store: same backend shape as media. S3 requires bucket and region;
+	// credentials may be lazy references and an unresolvable one skips the
+	// file store at boot with a warning, never a boot failure (agents without
+	// the files capability never touch it).
+	switch c.Files.Backend {
+	case "", "fs":
+	case "s3":
+		if c.Files.S3.Bucket == "" || c.Files.S3.Region == "" {
+			return fmt.Errorf("%s: files backend s3 requires s3.bucket and s3.region", path)
+		}
+	default:
+		return fmt.Errorf("%s: unsupported files backend %q (want fs or s3)", path, c.Files.Backend)
+	}
+	if c.Files.MaxFileBytes < 0 {
+		return fmt.Errorf("%s: files.max_file_bytes must be >= 0", path)
+	}
+	if c.Files.ScratchTTL != "" {
+		if _, err := time.ParseDuration(c.Files.ScratchTTL); err != nil {
+			return fmt.Errorf("%s: files.scratch_ttl: %v", path, err)
+		}
 	}
 
 	if c.Audit.RetentionDays != nil && *c.Audit.RetentionDays < 0 {

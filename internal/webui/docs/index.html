@@ -324,6 +324,7 @@ runtime:    { ... }   # core tuning: VM limits, workers, reload, persistence, ad
 models:     { ... }   # named LLM providers
 memory:     { ... }   # instance-wide backend instances
 media:      { ... }   # blob store backend: fs (default) | s3
+files:      { ... }   # user-scoped file store: fs (default) | s3, scratch TTL
 audit:      { ... }   # message journal: enabled, retention_days
 profiles:   { ... }   # reusable configs: memory/, safety/, shell/, agent/
 gateway:    { ... }   # channels
@@ -645,6 +646,20 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
     secret_key: ${S3_SECRET_KEY}</code></pre>
   <p>Selects where channel-ingested media bytes live. Objects are content-addressed (<code>media:&lt;sha256&gt;</code> handles) regardless of backend, so loops and the audit journal never change shape when you switch. The <code>s3</code> backend speaks plain SigV4 (no SDK): repeated writes of the same bytes are deduped by a HEAD before PUT, and the secret key never appears in any error. S3 credentials are secrets (see the registry): an unresolvable pair skips the store with a boot warning (channels then run with media disabled) instead of failing the boot. Only handles cross the Lua bridge — bytes stay in the store until a provider or channel resolves them.</p>
 
+  <h3><code>files</code> — user-scoped file store</h3>
+  <pre><code>files:
+  backend: fs                 # fs (default) | s3 (AWS S3, MinIO, Cloudflare R2)
+  dir: ./data/files           # fs root (default: beside the persistence db)
+  s3:                         # same fields and resolution as media.s3
+    bucket: my-files
+    region: auto
+    endpoint: https://&lt;accountid&gt;.r2.cloudflarestorage.com
+    access_key: ${R2_ACCESS_KEY_ID}
+    secret_key: ${R2_SECRET_ACCESS_KEY}
+  max_file_bytes: 33554432    # per-file ceiling (default 32 MiB)
+  scratch_ttl: 24h            # per-session scratch lifetime; 0 = no expiry</code></pre>
+  <p>Backs the <code>files.*</code> Lua ops (cap <code>files</code>): user-scoped project trees with engine-native snapshot versioning, plus per-session scratch. File bytes are content-addressed in the blob store exactly like media; snapshot metadata lives in the runtime store's <code>files_meta</code> table (plain sqlite, inspectable). S3-compatible endpoints need a real SigV4 key pair — a bearer token cannot speak S3. An unresolvable credential pair disables the store with a boot warning (the ops then fail honestly), never a boot failure.</p>
+
   <h3><code>audit</code> — message journal</h3>
   <pre><code>audit:
   enabled: true               # default on
@@ -691,7 +706,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
       goal: { type: autonomous, success_signal: "PR merged", max_turns: 40 }
       workflow: release-train</code></pre>
   <p><strong>Capability ceiling</strong>: <code>plugins.allow_capabilities</code> (global) ⊇ <code>agents.&lt;name&gt;.capabilities</code> (per-agent) ⊇ spawn-spec grants (child). You cannot delegate what you lack. If an agent omits <code>capabilities</code> it gets the defaults <code>[llm.chat, memory, tools, agent.send, net.http]</code> — note <code>net.mail</code> is <em>not</em> a default and must be declared explicitly.</p>
-  <p><strong>Capabilities are enforced at runtime</strong>, not merely validated at boot. Each capability gates the Lua ops behind it: <code>llm.chat</code> → <code>llm.*</code>, <code>memory</code> → <code>store.*</code>, <code>tools</code> → <code>tools.*</code>, <code>shell.exec</code> → <code>shell.*</code>, <code>net.http</code> → <code>http.request</code> and <code>os.env</code>, <code>net.mail</code> → <code>mail.*</code>. An agent that omits one is refused with a message naming the op, the agent and the missing capability — the op stays addressable and fails clearly rather than vanishing into <em>"attempt to call a nil value"</em>. <code>agent.send</code>, <code>agent.request</code> and <code>agent.spawn</code> were always enforced this way; the rest now match. <code>runtime.*</code> and <code>credential.get</code> are deliberately ungated — the first is loop machinery every agent needs, the second is already scoped by the agent's own credential list. A boot warning lists exactly what was withheld from each agent and profile. Set <code>plugins.enforce_capabilities: false</code> (default <code>true</code>) only to keep a configuration running that depended on every agent having every op.</p>
+  <p><strong>Capabilities are enforced at runtime</strong>, not merely validated at boot. Each capability gates the Lua ops behind it: <code>llm.chat</code> → <code>llm.*</code>, <code>memory</code> → <code>store.*</code>, <code>tools</code> → <code>tools.*</code>, <code>shell.exec</code> → <code>shell.*</code>, <code>net.http</code> → <code>http.request</code> and <code>os.env</code>, <code>net.mail</code> → <code>mail.*</code>, <code>files</code> → <code>files.*</code>. An agent that omits one is refused with a message naming the op, the agent and the missing capability — the op stays addressable and fails clearly rather than vanishing into <em>"attempt to call a nil value"</em>. <code>agent.send</code>, <code>agent.request</code> and <code>agent.spawn</code> were always enforced this way; the rest now match. <code>runtime.*</code> and <code>credential.get</code> are deliberately ungated — the first is loop machinery every agent needs, the second is already scoped by the agent's own credential list. A boot warning lists exactly what was withheld from each agent and profile. Set <code>plugins.enforce_capabilities: false</code> (default <code>true</code>) only to keep a configuration running that depended on every agent having every op.</p>
   <p><strong><code>builtin:</code> is the tool namespace.</strong> Four vocabularies used to spell it — loop/plugin names, tool names, memory provider names, and the built-in memory profile — and nothing in the string said which one a name belonged to. Each now has its own spelling, so the prefix means exactly one thing:</p>
   <ul>
     <li><strong>tools</strong> keep it: <code>builtin:web_search</code>, <code>builtin:fetch</code>, <code>builtin:browser</code>, <code>builtin:legal_read</code>;</li>
@@ -949,6 +964,18 @@ os.env(name) -> string | nil
 os.time() -> number                        -- Unix seconds (UTC)
 os.date([format,] time?) -> table | string -- UTC; table unless a format is given</code></pre>
   <p><strong>Wall clock.</strong> <code>os.time()</code> returns whole Unix seconds and takes no arguments (this is not Lua's <code>os.time(table)</code>). <code>os.date()</code> returns the date <em>table</em> — <code>{ year, month, day, hour, min, sec, wday, yday, isdst }</code> with <code>wday</code> 1 = Sunday … 7 = Saturday, <code>yday</code> 1–366, and <code>isdst</code> always <code>false</code> — and takes an optional Unix-seconds time (default: now). The table is JSON-encodable, so it can ride in a payload. Pass a strftime string to get text instead: <code>os.date("%Y-%m-%d %H:%M:%S", t)</code>. Supported directives are <code>%Y %y %m %d %e %H %I %M %S %p %A %a %B %b %j %w %u %Z %%</code>; an unknown one is left verbatim. <strong>Everything is UTC</strong> — the sandbox has no local timezone, so the fields are identical on every host, and a leading <code>!</code> (<code>os.date("!*t")</code>) is accepted as a no-op. Cron triggers, by contrast, are matched in <code>runtime.timezone_offset_hours</code>; converting between the two is your loop's business.</p>
+
+  <h4><code>files</code> — cap: <code>files</code></h4>
+  <pre><code>files.put(project, path, content|{data=base64, mime=...}, {mime}?) -> { ok, entry }
+files.read(project, path) -> { ok, entry }        -- entry: {path, handle, size, mime, ts, revision}
+files.list(project, prefix?) -> { ok, entries }
+files.delete(project, path) -> { ok = true }
+files.commit(project, {ref="main", message}?) -> { ok, commit }   -- snapshot; parent chain = history
+files.checkout(project, ref|commit_id) -> { ok, manifest }        -- manifest: {commit, files=[{path,handle,size}]}
+files.scratch.put(name, content|{data=base64, mime=...}) -> { ok, entry }
+files.scratch.read(name) -> { ok, entry }
+files.scratch.list() -> { ok, entries }</code></pre>
+  <p>A <strong>user-scoped file store</strong>: named project trees whose scope is resolved by the engine from the turn's identity (<code>user:&lt;uuid&gt;</code> for channel-originated turns, <code>agent:&lt;name&gt;</code> otherwise) — a loop can never name another scope. Bytes live in the content-addressed blob store (<code>files:</code> config; local filesystem or S3-compatible — unchanged files dedupe across snapshots for free); snapshot metadata (working tree, commits, refs, scratch) lives in the runtime store's <code>files_meta</code> table, engine-owned and inspectable with plain SQL. Versioning is <strong>engine-native snapshots, not a git server</strong>: a commit records the full tree (path → handle) with a parent pointer and message, and moves a named ref; checkout resolves a ref or a commit id. Raw bytes never cross the Lua bridge — <code>put</code> takes utf-8 content or base64 <code>data</code>, <code>read</code> returns the handle + metadata, and materialization is engine-side. Scratch is per-session (keyed by the calling session, not user), TTL'd by <code>files.scratch_ttl</code> (default 24h, lazy expiry on read + boot sweep). One <code>files</code> capability gates the whole family; it is not in the default set — declare it explicitly. With the store disabled at boot (e.g. unresolvable S3 credentials) every op fails honestly.</p>
 
   <h4><code>mail</code> — cap: <code>net.mail</code></h4>
   <pre><code>mail.imap_fetch(opts) -> { ok, mailbox, count, messages }

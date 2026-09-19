@@ -79,6 +79,16 @@ func (s *Store) migrate() error {
 		CREATE INDEX IF NOT EXISTS message_journal_id ON message_journal (id);
 		CREATE INDEX IF NOT EXISTS message_journal_ts ON message_journal (ts);
 		CREATE INDEX IF NOT EXISTS message_journal_session ON message_journal (session_id);
+
+		-- Engine-owned key/value rows for the user-scoped file store (working
+		-- tree, commit, ref, scratch records). Same inspectability as the
+		-- journal: plain sqlite rows, no memory-provider layering.
+		CREATE TABLE IF NOT EXISTS files_meta (
+			key        TEXT PRIMARY KEY,
+			value      TEXT NOT NULL,
+			updated_at INTEGER NOT NULL,
+			expires_at INTEGER NOT NULL DEFAULT 0
+		);
 	`)
 	return err
 }

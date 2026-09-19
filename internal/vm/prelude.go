@@ -806,6 +806,70 @@ function llm.stream(messages, opts)
     return r.delta
   end
 end
+
+files = {}
+-- User-scoped file store (cap: files). Scope is engine-resolved from the
+-- turn's identity — a loop can never name another user's scope. Bytes never
+-- cross the bridge: put takes utf-8 content or {data=base64, mime=...};
+-- read returns the handle + metadata ({path, handle, size, mime, ts,
+-- revision}), materialization is engine-side.
+-- files.put(project, path, content|{data=...,mime=...}, {mime=...}?) -> {ok, entry}
+function files.put(project, path, content, opts)
+  opts = opts or {}
+  local req = { type = "files.put", project = project, path = path }
+  if type(content) == "table" then
+    req.data = content.data
+    req.mime = content.mime or opts.mime
+  else
+    req.content = content
+    req.mime = opts.mime
+  end
+  return op(req)
+end
+-- files.read(project, path) -> {ok, entry}
+function files.read(project, path)
+  return op({ type = "files.read", project = project, path = path })
+end
+-- files.list(project, prefix?) -> {ok, entries}
+function files.list(project, prefix)
+  return op({ type = "files.list", project = project, path = prefix or "" })
+end
+-- files.delete(project, path) -> {ok=true}
+function files.delete(project, path)
+  return op({ type = "files.delete", project = project, path = path })
+end
+-- files.commit(project, {ref="main", message=...}?) -> {ok, commit}. A commit
+-- snapshots the whole working tree (content-addressed: unchanged files are
+-- shared) and moves the named ref; the parent chain is the history.
+function files.commit(project, opts)
+  opts = opts or {}
+  return op({ type = "files.commit", project = project, ref = opts.ref, commit_msg = opts.message })
+end
+-- files.checkout(project, ref|commit_id) -> {ok, manifest={commit, files}}
+function files.checkout(project, ref)
+  return op({ type = "files.checkout", project = project, ref = ref })
+end
+-- Per-session scratch space, TTL'd (files.scratch_ttl). Keyed by the calling
+-- session — other sessions cannot see it.
+files.scratch = {}
+function files.scratch.put(name, content, opts)
+  opts = opts or {}
+  local req = { type = "files.scratch.put", path = name }
+  if type(content) == "table" then
+    req.data = content.data
+    req.mime = content.mime or opts.mime
+  else
+    req.content = content
+    req.mime = opts.mime
+  end
+  return op(req)
+end
+function files.scratch.read(name)
+  return op({ type = "files.scratch.read", path = name })
+end
+function files.scratch.list()
+  return op({ type = "files.scratch.list" })
+end
 `
 
 // LoadBase installs the json library and the prelude into the state.

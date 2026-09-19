@@ -264,6 +264,34 @@ func TestModelUpsertValidation(t *testing.T) {
 	}); rec.Code != http.StatusBadRequest {
 		t.Fatalf("bad timeout: got %d", rec.Code)
 	}
+	if rec := do(t, api, http.MethodPut, "/admin/api/models/x", map[string]any{
+		"provider": "openai", "model": "m", "thinking": "banana",
+	}); rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad thinking: got %d", rec.Code)
+	}
+}
+
+func TestModelUpsertThinkingApplies(t *testing.T) {
+	f := newFixture(t)
+	rec := do(t, f.ui.API(), http.MethodPut, "/admin/api/models/default", map[string]any{
+		"provider": "openai", "model": "gpt-5", "thinking": "xhigh",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upsert: got %d %s", rec.Code, rec.Body.String())
+	}
+	cfg, _ := f.models.Get("default")
+	if cfg.Thinking != "xhigh" {
+		t.Fatalf("thinking not applied: %+v", cfg)
+	}
+	// The list view exposes it so the editor can round-trip the field.
+	rec = do(t, f.ui.API(), http.MethodGet, "/admin/api/models", nil)
+	v := decode(t, rec)
+	for _, mAny := range v["models"].([]any) {
+		m := mAny.(map[string]any)
+		if m["name"] == "default" && m["thinking"] != "xhigh" {
+			t.Fatalf("list view dropped thinking: %v", m)
+		}
+	}
 }
 
 func TestModelRemove(t *testing.T) {

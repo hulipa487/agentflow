@@ -223,6 +223,7 @@ function openEditor(m) {
   document.getElementById("mTimeout").value = m ? m.timeout : "";
   document.getElementById("mRetry").value = m ? m.retry : 0;
   document.getElementById("mMaxTokens").value = m ? m.max_tokens : 0;
+  document.getElementById("mThinking").value = m ? (m.thinking || "") : "";
   document.getElementById("mServerTools").value = m ? (m.server_tools || []).join(", ") : "";
 }
 document.getElementById("newModelBtn").onclick = () => openEditor(null);
@@ -236,6 +237,7 @@ function editorBody() {
     timeout: document.getElementById("mTimeout").value.trim(),
     retry: +document.getElementById("mRetry").value || 0,
     max_tokens: +document.getElementById("mMaxTokens").value || 0,
+    thinking: document.getElementById("mThinking").value,
     server_tools: document.getElementById("mServerTools").value.split(",").map(s => s.trim()).filter(Boolean),
   };
 }

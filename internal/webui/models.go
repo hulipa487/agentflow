@@ -32,6 +32,7 @@ type modelBody struct {
 	Timeout     string   `json:"timeout"`
 	Retry       int      `json:"retry"`
 	MaxTokens   int      `json:"max_tokens"`
+	Thinking    string   `json:"thinking"`
 	ServerTools []string `json:"server_tools"`
 }
 
@@ -44,6 +45,7 @@ func (b modelBody) toConfig() config.Model {
 		Timeout:     b.Timeout,
 		Retry:       b.Retry,
 		MaxTokens:   b.MaxTokens,
+		Thinking:    b.Thinking,
 		ServerTools: b.ServerTools,
 	}
 }
@@ -66,6 +68,7 @@ type modelView struct {
 	Timeout        string   `json:"timeout"`
 	Retry          int      `json:"retry"`
 	MaxTokens      int      `json:"max_tokens"`
+	Thinking       string   `json:"thinking"`
 	ServerTools    []string `json:"server_tools"`
 	HasKey         bool     `json:"has_key"`
 	KeyFingerprint string   `json:"key_fingerprint,omitempty"`
@@ -85,6 +88,7 @@ func viewOf(name string, m config.Model) modelView {
 		Timeout:     m.Timeout,
 		Retry:       m.Retry,
 		MaxTokens:   m.MaxTokens,
+		Thinking:    m.Thinking,
 		ServerTools: m.ServerTools,
 		HasKey:      m.APIKey != "",
 	}
@@ -184,6 +188,10 @@ func (u *UI) handleModelUpsert(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "timeout must be a Go duration (e.g. 60s)")
 			return
 		}
+	}
+	if _, err := llm.ParseThinking(b.Thinking); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	m := b.toConfig()
 	// The UI never round-trips secrets: an empty api_key on an existing model

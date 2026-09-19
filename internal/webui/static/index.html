@@ -102,6 +102,12 @@
         <label>Timeout <input id="mTimeout" placeholder="60s"></label>
         <label>Retry <input id="mRetry" type="number" min="0" value="0"></label>
         <label>Max tokens <input id="mMaxTokens" type="number" min="0" value="0"></label>
+        <label>Thinking
+          <select id="mThinking">
+            <option value="">default (provider)</option>
+            <option>off</option><option>low</option><option>medium</option>
+            <option>high</option><option>xhigh</option><option>max</option>
+          </select></label>
         <label>Server tools <input id="mServerTools" placeholder="comma-separated, e.g. google_search"></label>
       </div>
       <p class="muted small">Use <code>${ENV_VAR}</code> in the key field to keep the secret out of the file. Saving applies to the live runtime immediately; use “Persist to config” to keep it across restarts.</p>

@@ -26,6 +26,10 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 	if err != nil {
 		return nil, false, err
 	}
+	thinking, err := thinkingOf(cfg, opts)
+	if err != nil {
+		return nil, false, err
+	}
 
 	body := map[string]any{
 		"model":    cfg.Model,
@@ -46,6 +50,11 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 	}
 	if mt := maxTokensOf(cfg, opts); mt > 0 {
 		body["max_tokens"] = mt
+	}
+	if thinking != "" {
+		if effort, ok := openaiEffort[thinking]; ok {
+			body["reasoning_effort"] = effort
+		}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(mustJSON(body)))

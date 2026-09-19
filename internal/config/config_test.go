@@ -553,6 +553,28 @@ func TestValidateMemoryBackendProviders(t *testing.T) {
 	}
 }
 
+// TestValidateModelThinking: the thinking level is a closed vocabulary, and a
+// config typo is a boot error — not a silently-dropped value at first call.
+func TestValidateModelThinking(t *testing.T) {
+	for _, level := range []string{"", "off", "low", "medium", "high", "xhigh", "max", "HIGH"} {
+		c := &Config{
+			Agents: map[string]Agent{"bot": {Loop: "./loop.lua"}},
+			Models: map[string]Model{"default": {Provider: "openai", Model: "m", Thinking: level}},
+		}
+		if err := validate("cfg.yaml", c); err != nil {
+			t.Fatalf("thinking %q must validate: %v", level, err)
+		}
+	}
+
+	c := &Config{
+		Agents: map[string]Agent{"bot": {Loop: "./loop.lua"}},
+		Models: map[string]Model{"default": {Provider: "openai", Model: "m", Thinking: "banana"}},
+	}
+	if err := validate("cfg.yaml", c); err == nil || !strings.Contains(err.Error(), "unsupported thinking level") {
+		t.Fatalf("an unknown level must fail the boot, got %v", err)
+	}
+}
+
 // TestValidateReservedMemoryProfileName: "conversational" is the one built-in
 // memory profile and is resolved before profiles.memory is consulted, so a
 // user profile of that name would never run. Refusing the name beats silently

@@ -73,6 +73,7 @@ type ToolDef struct {
 type Opts struct {
 	Temperature *float64
 	MaxTokens   int
+	Thinking    string // "" | off | low | medium | high | xhigh | max (see Thinking)
 	Tools       []ToolDef
 	ToolChoice  string // "" | "auto" | "none"
 }

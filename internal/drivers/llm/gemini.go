@@ -40,9 +40,18 @@ func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs
 	if err != nil {
 		return nil, false, err
 	}
+	thinking, err := thinkingOf(cfg, opts)
+	if err != nil {
+		return nil, false, err
+	}
 	body := map[string]any{
 		"model": cfg.Model,
 		"input": input,
+	}
+	if thinking != "" {
+		if budget, ok := geminiThinkingBudget[thinking]; ok {
+			body["thinking_config"] = map[string]any{"thinking_budget": budget}
+		}
 	}
 	if len(cfg.ServerTools) > 0 {
 		tools := make([]map[string]any, 0, len(cfg.ServerTools))

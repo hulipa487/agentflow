@@ -23,10 +23,15 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 	if err != nil {
 		return nil, false, err
 	}
+	thinking, err := thinkingOf(cfg, opts)
+	if err != nil {
+		return nil, false, err
+	}
 
+	maxTokens := maxTokensOf(cfg, opts)
 	body := map[string]any{
 		"model":      cfg.Model,
-		"max_tokens": maxTokensOf(cfg, opts),
+		"max_tokens": maxTokens,
 		"messages":   turns,
 		"stream":     true,
 	}
@@ -35,6 +40,14 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 	}
 	if opts.Temperature != nil {
 		body["temperature"] = *opts.Temperature
+	}
+	if thinking != "" && thinking != ThinkingOff {
+		// The Messages API has no explicit "off"; omitting the block is the
+		// only way to leave thinking at the provider default.
+		body["thinking"] = map[string]any{
+			"type":          "enabled",
+			"budget_tokens": anthropicBudgetFor(thinking, maxTokens),
+		}
 	}
 	if len(opts.Tools) > 0 {
 		tools := make([]map[string]any, 0, len(opts.Tools))

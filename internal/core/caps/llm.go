@@ -68,6 +68,7 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 		return llm.Opts{
 			Temperature: op.Temperature,
 			MaxTokens:   op.MaxTokens,
+			Thinking:    op.Thinking,
 			Tools:       toToolDefs(op.Tools),
 			ToolChoice:  op.ToolChoice,
 		}

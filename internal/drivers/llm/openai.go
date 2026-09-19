@@ -82,6 +82,12 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 		defer close(events)
 		defer resp.Body.Close()
 		var usage Usage
+		// Reasoning content (xAI/DeepSeek/OpenRouter-style) streams as
+		// reasoning_content fragments alongside the answer; OpenRouter names
+		// the same field "reasoning". No blocks exist on this shape —
+		// reasoning is a bare string, and sending it back is an error on
+		// DeepSeek-style APIs, so it is never serialized into requests.
+		var reason strings.Builder
 		// Tool-call accumulation: one entry per delta index. The first delta
 		// for an index carries function.name; subsequent deltas carry
 		// fragments of function.arguments that must be concatenated.
@@ -99,8 +105,10 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 			var ev struct {
 				Choices []struct {
 					Delta struct {
-						Content   string `json:"content"`
-						ToolCalls []struct {
+						Content          string `json:"content"`
+						ReasoningContent string `json:"reasoning_content"`
+						Reasoning        string `json:"reasoning"`
+						ToolCalls        []struct {
 							Index    int    `json:"index"`
 							ID       string `json:"id"`
 							Function struct {
@@ -111,8 +119,11 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 					} `json:"delta"`
 				} `json:"choices"`
 				Usage *struct {
-					PromptTokens     int `json:"prompt_tokens"`
-					CompletionTokens int `json:"completion_tokens"`
+					PromptTokens            int `json:"prompt_tokens"`
+					CompletionTokens        int `json:"completion_tokens"`
+					CompletionTokensDetails *struct {
+						ReasoningTokens int `json:"reasoning_tokens"`
+					} `json:"completion_tokens_details"`
 				} `json:"usage"`
 			}
 			if err := json.Unmarshal([]byte(data), &ev); err != nil {
@@ -121,6 +132,9 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 			if ev.Usage != nil {
 				usage.Input = ev.Usage.PromptTokens
 				usage.Output = ev.Usage.CompletionTokens
+				if ev.Usage.CompletionTokensDetails != nil {
+					usage.Reasoning = ev.Usage.CompletionTokensDetails.ReasoningTokens
+				}
 			}
 			if len(ev.Choices) > 0 {
 				d := ev.Choices[0].Delta
@@ -130,6 +144,12 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 					case <-ctx.Done():
 						return
 					}
+				}
+				if d.ReasoningContent != "" {
+					reason.WriteString(d.ReasoningContent)
+				}
+				if d.Reasoning != "" {
+					reason.WriteString(d.Reasoning)
 				}
 				for _, tc := range d.ToolCalls {
 					a, ok := accByIndex[tc.Index]
@@ -156,9 +176,9 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 				a := accByIndex[i]
 				calls = append(calls, ToolCall{ID: a.id, Name: a.name, Args: parseArgs(a.args.String())})
 			}
-			events <- event{toolCalls: calls}
+			events <- event{toolCalls: calls, thinking: reason.String()}
 		}
-		events <- event{usage: usage}
+		events <- event{usage: usage, thinking: reason.String()}
 	}()
 	return events, false, nil
 }

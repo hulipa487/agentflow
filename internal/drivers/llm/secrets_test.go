@@ -30,7 +30,7 @@ func TestChatUnresolvedAPIKey(t *testing.T) {
 		return (&config.Resolver{}).Resolve(context.Background(), raw)
 	})
 
-	_, _, _, err := m.Chat(context.Background(), "default", []Message{{Role: "user", Content: "hi"}}, Opts{})
+	_, err := m.Chat(context.Background(), "default", []Message{{Role: "user", Content: "hi"}}, Opts{})
 	if err == nil {
 		t.Fatal("chat with unresolvable api_key must fail")
 	}
@@ -41,7 +41,7 @@ func TestChatUnresolvedAPIKey(t *testing.T) {
 	// Once the credential resolves (env set), the call proceeds past
 	// resolution — failing later at the transport layer, not here.
 	t.Setenv("UNRESOLVED_MODEL_KEY", "sk-now-present")
-	_, _, _, err = m.Chat(context.Background(), "default", []Message{{Role: "user", Content: "hi"}}, Opts{})
+	_, err = m.Chat(context.Background(), "default", []Message{{Role: "user", Content: "hi"}}, Opts{})
 	if err != nil && strings.Contains(err.Error(), "cannot resolve api_key") {
 		t.Fatalf("resolution must succeed once the env var exists: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestChatLiteralKeyWithoutResolver(t *testing.T) {
 	m := NewManager(map[string]config.Model{
 		"default": {Provider: "openai", Model: "gpt-x", APIKey: "sk-literal", BaseURL: unroutableBaseURL},
 	}, testLogger())
-	_, _, _, err := m.Chat(context.Background(), "default", []Message{{Role: "user", Content: "hi"}}, Opts{})
+	_, err := m.Chat(context.Background(), "default", []Message{{Role: "user", Content: "hi"}}, Opts{})
 	if err != nil && strings.Contains(err.Error(), "cannot resolve api_key") {
 		t.Fatalf("no resolver must never raise resolution errors: %v", err)
 	}

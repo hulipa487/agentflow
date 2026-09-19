@@ -79,19 +79,56 @@ type Opts struct {
 }
 
 // Usage counts tokens as reported by the provider (0 when unknown).
+// Reasoning is the provider's separate count of thinking tokens where it
+// reports one (OpenAI-shaped completion/output token details); Anthropic and
+// Gemini fold thinking into Output, so it stays 0 there.
 type Usage struct {
-	Input  int `json:"input"`
-	Output int `json:"output"`
+	Input     int `json:"input"`
+	Output    int `json:"output"`
+	Reasoning int `json:"reasoning,omitempty"`
+}
+
+// Reply is one buffered completion: the assistant text plus everything the
+// provider reported alongside it. Thinking is the reasoning content joined
+// for reading ("" when the provider sent none); ThinkingBlocks are the raw
+// provider blocks — defined only where the provider defines them (Anthropic
+// thinking/redacted_thinking, Responses reasoning items, Gemini thought
+// parts), nil on Chat Completions, where reasoning is a bare string. The
+// blocks round-trip: passing them back as thinking_blocks on an assistant
+// message replays them (Anthropic requires this for multi-round tool use).
+type Reply struct {
+	Text           string
+	Thinking       string
+	ThinkingBlocks []map[string]any
+	ToolCalls      []ToolCall
+	Usage          Usage
+}
+
+// Frame is one llm.stream.next step. Delta is a text fragment; on Done the
+// terminal fields carry the full reply payload (Usage, ToolCalls, Thinking,
+// ThinkingBlocks — the same values Chat would have returned).
+type Frame struct {
+	Delta          string
+	Done           bool
+	Usage          Usage
+	ToolCalls      []ToolCall
+	Thinking       string
+	ThinkingBlocks []map[string]any
 }
 
 // event is one normalized provider event: a text delta, terminal usage, an
 // error, or the assembled tool_calls at stream end. Exactly one of the fields
 // is meaningful per event; a closed channel means the stream is over.
+// thinking/thinkingBlocks are terminal-only: providers assemble reasoning
+// internally and attach the full payload to their end-of-stream events, so
+// consumers see it exactly once, with toolCalls and/or usage.
 type event struct {
-	delta     string
-	usage     Usage
-	err       error
-	toolCalls []ToolCall
+	delta          string
+	usage          Usage
+	err            error
+	toolCalls      []ToolCall
+	thinking       string
+	thinkingBlocks []map[string]any
 }
 
 // Manager resolves model names to provider clients and owns live streams.
@@ -206,37 +243,51 @@ func (m *Manager) List() map[string]config.Model {
 // Get returns the live config for a named model ("" resolves to "default").
 func (m *Manager) Get(name string) (config.Model, error) { return m.resolve(name) }
 
-// Chat performs a full completion and returns the buffered text plus any
-// tool_calls the model requested at stream end.
-func (m *Manager) Chat(ctx context.Context, model string, msgs []Message, opts Opts) (string, []ToolCall, Usage, error) {
+// Chat performs a full completion and returns the buffered reply: text,
+// tool_calls requested at stream end, reported usage, and whatever thinking
+// content the provider sent (passive capture — surfaced, never requested
+// beyond what the thinking level already asks for).
+func (m *Manager) Chat(ctx context.Context, model string, msgs []Message, opts Opts) (*Reply, error) {
 	cfg, err := m.resolveModel(model)
 	if err != nil {
-		return "", nil, Usage{}, err
+		return nil, err
 	}
 	events, err := m.openWithRetry(ctx, cfg, msgs, opts)
 	if err != nil {
-		return "", nil, Usage{}, err
+		return nil, err
 	}
-	var text string
-	var usage Usage
-	var toolCalls []ToolCall
+	r := &Reply{}
 	for ev := range events {
 		if ev.err != nil {
-			return "", nil, usage, ev.err
+			return nil, ev.err
 		}
-		text += ev.delta
-		usage = ev.usage
+		r.Text += ev.delta
+		r.Usage = ev.usage
+		if ev.thinking != "" {
+			r.Thinking = ev.thinking
+		}
+		if ev.thinkingBlocks != nil {
+			r.ThinkingBlocks = ev.thinkingBlocks
+		}
 		if len(ev.toolCalls) > 0 {
-			toolCalls = ev.toolCalls
+			r.ToolCalls = ev.toolCalls
 		}
 	}
-	return text, toolCalls, usage, nil
+	return r, nil
 }
 
 // Stream is a live completion; Next blocks for the next delta.
 type Stream struct {
 	ch     chan event
 	cancel context.CancelFunc
+
+	// Terminal payload captured from events as they pass through (usage and
+	// tool calls may arrive on separate events before the close). Only
+	// StreamNext touches these, and one loop calls it sequentially.
+	usage    Usage
+	calls    []ToolCall
+	thinking string
+	blocks   []map[string]any
 }
 
 // StreamOpen starts a completion and returns a stream id for StreamNext.
@@ -265,33 +316,46 @@ func (m *Manager) StreamOpen(ctx context.Context, model string, msgs []Message, 
 	return id, nil
 }
 
-// StreamNext returns the next delta; done=true means the stream finished
-// (usage and toolCalls are valid then). A finished stream unregisters itself.
-func (m *Manager) StreamNext(ctx context.Context, id string) (delta string, done bool, usage Usage, toolCalls []ToolCall, err error) {
+// StreamNext returns the next frame; done=true means the stream finished
+// (usage, toolCalls, and the terminal thinking payload are valid then). A
+// finished stream unregisters itself.
+func (m *Manager) StreamNext(ctx context.Context, id string) (Frame, error) {
 	m.mu.Lock()
 	st, ok := m.streams[id]
 	m.mu.Unlock()
 	if !ok {
-		return "", false, Usage{}, nil, fmt.Errorf("unknown stream %q", id)
+		return Frame{}, fmt.Errorf("unknown stream %q", id)
 	}
 	select {
 	case ev, open := <-st.ch:
 		if !open {
 			m.StreamClose(id)
-			return "", true, Usage{}, nil, nil
+			return Frame{Done: true, Usage: st.usage, ToolCalls: st.calls, Thinking: st.thinking, ThinkingBlocks: st.blocks}, nil
+		}
+		if ev.usage.Input != 0 || ev.usage.Output != 0 {
+			st.usage = ev.usage
+		}
+		if len(ev.toolCalls) > 0 {
+			st.calls = ev.toolCalls
+		}
+		if ev.thinking != "" {
+			st.thinking = ev.thinking
+		}
+		if ev.thinkingBlocks != nil {
+			st.blocks = ev.thinkingBlocks
 		}
 		if ev.err != nil {
 			m.StreamClose(id)
-			return "", true, ev.usage, nil, ev.err
+			return Frame{Done: true, Usage: st.usage, ToolCalls: st.calls, Thinking: st.thinking, ThinkingBlocks: st.blocks}, ev.err
 		}
 		if len(ev.toolCalls) > 0 {
 			// Tool calls arrive once at stream end; treat as done so the
 			// loop picks them up without waiting for the channel close.
-			return "", true, ev.usage, ev.toolCalls, nil
+			return Frame{Done: true, Usage: st.usage, ToolCalls: st.calls, Thinking: st.thinking, ThinkingBlocks: st.blocks}, nil
 		}
-		return ev.delta, false, ev.usage, nil, nil
+		return Frame{Delta: ev.delta, Usage: st.usage}, nil
 	case <-ctx.Done():
-		return "", false, Usage{}, nil, ctx.Err()
+		return Frame{}, ctx.Err()
 	}
 }
 

@@ -1,6 +1,6 @@
-// Package budget meters LLM token usage with parent/child pool allocation.
-// Reservation happens before a provider call; the reported usage is committed
-// after the call returns. Unused reservation is released.
+// Package budget meters LLM token usage with pre-call reservation and
+// post-call commit. Each agent gets a root pool; unused reservation is
+// released after the provider call returns.
 package budget
 
 import (
@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// Pool is a token budget. A parent pool may have child pools carved from it.
+// Pool is a token budget.
 //
 // Accounting has two modes:
 //   - Daily reset (default): `used` accumulates until ResetDaily zeroes it at
@@ -23,7 +23,6 @@ type Pool struct {
 	limit    int64
 	used     int64
 	reserved int64
-	parent   *Pool
 	window   time.Duration // 0 = daily-reset mode
 	commits  []commit      // windowed-mode commit log, oldest first
 	now      func() time.Time
@@ -68,24 +67,6 @@ func (p *Pool) windowedUsed() int64 {
 	return sum
 }
 
-// Carve creates a child pool with its own limit, drawing from the parent's
-// remaining capacity. The child's limit cannot exceed the parent's remaining
-// unreserved budget.
-func (p *Pool) Carve(limit int64) (*Pool, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	available := p.limit - p.windowedUsed() - p.reserved
-	if limit > available {
-		return nil, fmt.Errorf("budget: cannot carve %d from parent with %d available", limit, available)
-	}
-	if limit <= 0 {
-		return nil, fmt.Errorf("budget: child limit must be positive")
-	}
-	p.reserved += limit
-	child := &Pool{limit: limit, parent: p, window: p.window, now: p.now}
-	return child, nil
-}
-
 // Lease represents a reservation that must be settled.
 type Lease struct {
 	pool     *Pool
@@ -94,7 +75,7 @@ type Lease struct {
 }
 
 // Reserve attempts to reserve tokens before an LLM call. Returns an error if
-// the pool (or any ancestor) cannot accommodate the reservation.
+// the pool cannot accommodate the reservation.
 func (p *Pool) Reserve(amount int64) (*Lease, error) {
 	if amount <= 0 {
 		return nil, fmt.Errorf("budget: reserve amount must be positive")
@@ -106,24 +87,6 @@ func (p *Pool) Reserve(amount int64) (*Lease, error) {
 }
 
 func (p *Pool) tryReserve(amount int64) bool {
-	// Walk from the leaf to the root, checking capacity at every level.
-	// This is a simple two-level hierarchy; deeper nesting is not supported.
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.windowedUsed()+p.reserved+amount > p.limit {
-		return false
-	}
-	// Also check the parent has room for this child's reservation.
-	if p.parent != nil {
-		if !p.parent.reserveFromChild(amount) {
-			return false
-		}
-	}
-	p.reserved += amount
-	return true
-}
-
-func (p *Pool) reserveFromChild(amount int64) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.windowedUsed()+p.reserved+amount > p.limit {
@@ -140,16 +103,12 @@ func (p *Pool) Commit(lease *Lease, actual int64) error {
 	}
 	lease.released = true
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.reserved -= lease.amount
 	if actual < 0 {
 		actual = 0
 	}
 	p.recordLocked(actual)
-	p.mu.Unlock()
-	if p.parent != nil {
-		p.parent.releaseFromChild(lease.amount)
-		p.parent.commitFromChild(actual)
-	}
 	return nil
 }
 
@@ -169,21 +128,6 @@ func (p *Pool) Release(lease *Lease) {
 	lease.released = true
 	p.mu.Lock()
 	p.reserved -= lease.amount
-	p.mu.Unlock()
-	if p.parent != nil {
-		p.parent.releaseFromChild(lease.amount)
-	}
-}
-
-func (p *Pool) releaseFromChild(amount int64) {
-	p.mu.Lock()
-	p.reserved -= amount
-	p.mu.Unlock()
-}
-
-func (p *Pool) commitFromChild(actual int64) {
-	p.mu.Lock()
-	p.recordLocked(actual)
 	p.mu.Unlock()
 }
 

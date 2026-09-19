@@ -264,12 +264,6 @@ type AgentMemory struct {
 	Oversample  int
 }
 
-// ResolveStore resolves a profile's store names into backend handles.
-// Equivalent to ResolveStoresFor with no agent (no table isolation).
-func (r *Registry) ResolveStores(profile map[string]Store) (AgentMemory, error) {
-	return r.ResolveStoresFor("", profile)
-}
-
 // ResolveStoresFor resolves a profile for one agent, isolating physical
 // tables: unless a store opts into sharing (Shared), its physical table is
 // prefixed with the agent name ("writer.dialogue"), so two agents on the same

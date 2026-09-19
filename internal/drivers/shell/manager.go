@@ -14,10 +14,11 @@ import (
 type HandleState int
 
 const (
-	HandlePending   HandleState = iota // spawn initiated but not yet confirmed
-	HandleRunning                      // container/connection is live
-	HandleStopped                      // graceful stop
-	HandleDestroyed                    // reclaimed
+	// HandleState values are pinned: Handle carries State as a numeric JSON
+	// field, so the numbers are a wire contract even for values Go no longer
+	// names. 0 (pending) and 2 (stopped) are reserved.
+	HandleRunning   HandleState = 1 // container/connection is live
+	HandleDestroyed HandleState = 3 // reclaimed
 )
 
 // SpawnOpts are the parameters for creating a new shell handle.
@@ -51,13 +52,13 @@ type ExecResult struct {
 
 // Handle is a managed shell handle (Docker container, SSH session).
 type Handle struct {
-	ID       string      `json:"id"`
-	Provider string      `json:"provider"`   // "docker" | "ssh"
-	Image    string      `json:"image"`      // empty for SSH
-	State    HandleState `json:"state"`
+	ID       string         `json:"id"`
+	Provider string         `json:"provider"` // "docker" | "ssh"
+	Image    string         `json:"image"`    // empty for SSH
+	State    HandleState    `json:"state"`
 	Meta     map[string]any `json:"meta,omitempty"`
 
-	internal any          // provider-specific state (e.g. container ID, *ssh.Client)
+	internal any // provider-specific state (e.g. container ID, *ssh.Client)
 	mu       sync.RWMutex
 }
 
@@ -75,11 +76,11 @@ type ShellProvider interface {
 // Manager owns all shell handles across the runtime and provides per-session
 // reaping when a session dies.
 type Manager struct {
-	mu      sync.Mutex
-	handles map[string]*Handle    // handle ID → handle
-	byOwner map[string][]string   // session key → handle IDs
+	mu        sync.Mutex
+	handles   map[string]*Handle  // handle ID → handle
+	byOwner   map[string][]string // session key → handle IDs
 	providers map[string]ShellProvider
-	log     *slog.Logger
+	log       *slog.Logger
 }
 
 // NewManager creates the shell manager with the registered providers.

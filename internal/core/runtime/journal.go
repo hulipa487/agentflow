@@ -62,69 +62,6 @@ func (s *Store) RecordMessage(ctx context.Context, e JournalEntry) error {
 	return err
 }
 
-// JournalFilter narrows ListMessages. Zero fields match everything.
-type JournalFilter struct {
-	Channel   string
-	SessionID string
-	Sender    string
-	Since     int64 // unix seconds; 0 = no lower bound
-	Limit     int   // default 100, capped at 1000
-}
-
-// ListMessages returns journal rows newest-first matching the filter.
-func (s *Store) ListMessages(ctx context.Context, f JournalFilter) ([]JournalEntry, error) {
-	limit := f.Limit
-	if limit <= 0 {
-		limit = 100
-	}
-	if limit > 1000 {
-		limit = 1000
-	}
-	q := `SELECT id, ts, direction, status, channel, chat, sender, agent, session_id,
-	             type, text, attachments_json, provenance_json, err
-	      FROM message_journal WHERE 1=1`
-	args := []any{}
-	if f.Channel != "" {
-		q += ` AND channel = ?`
-		args = append(args, f.Channel)
-	}
-	if f.SessionID != "" {
-		q += ` AND session_id = ?`
-		args = append(args, f.SessionID)
-	}
-	if f.Sender != "" {
-		q += ` AND sender = ?`
-		args = append(args, f.Sender)
-	}
-	if f.Since > 0 {
-		q += ` AND ts >= ?`
-		args = append(args, f.Since)
-	}
-	q += ` ORDER BY ts DESC, rowid DESC LIMIT ?`
-	args = append(args, limit)
-
-	rows, err := s.db.QueryContext(ctx, q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var out []JournalEntry
-	for rows.Next() {
-		var e JournalEntry
-		var atts, prov string
-		if err := rows.Scan(&e.ID, &e.Ts, &e.Direction, &e.Status, &e.Channel,
-			&e.Chat, &e.Sender, &e.Agent, &e.SessionID, &e.Type, &e.Text,
-			&atts, &prov, &e.Err); err != nil {
-			return nil, err
-		}
-		_ = json.Unmarshal([]byte(atts), &e.Attachments)
-		_ = json.Unmarshal([]byte(prov), &e.Provenance)
-		out = append(out, e)
-	}
-	return out, rows.Err()
-}
-
 // PruneMessages deletes journal rows older than cutoff, returning the count.
 func (s *Store) PruneMessages(ctx context.Context, cutoff time.Time) (int64, error) {
 	res, err := s.db.ExecContext(ctx,

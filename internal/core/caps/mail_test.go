@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"os"
-	"path/filepath"
 	"testing"
 
 	"agentflow/internal/core/credentials"
@@ -29,23 +28,11 @@ func runMail(t *testing.T, creds *credentials.Store, name string, op session.Op)
 	return out, true
 }
 
-func seededMailStore(t *testing.T, user, service, secret string) *credentials.Store {
-	s, err := credentials.Open(filepath.Join(t.TempDir(), "creds.db"), "test-master-key", discardLogger())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { s.Close() })
-	if err := s.Put(context.Background(), user, service, "password", secret, "", ""); err != nil {
-		t.Fatal(err)
-	}
-	return s
-}
-
 // TestMailIMAPFetchMissingHost confirms the cap validates its args before
 // touching the network — a misconfigured fetch returns a clear error, not a
 // dial timeout.
 func TestMailIMAPFetchMissingHost(t *testing.T) {
-	creds := seededMailStore(t, "u1", "imap", "pw")
+	creds := seededStore(t, "u1", "imap", "password", "pw")
 	_, ok := runMail(t, creds, "mail.imap.fetch", session.Op{
 		Type:     "mail.imap.fetch",
 		MailUser: "user@example.com",
@@ -58,7 +45,7 @@ func TestMailIMAPFetchMissingHost(t *testing.T) {
 
 // TestMailIMAPFetchMissingUser confirms username is required.
 func TestMailIMAPFetchMissingUser(t *testing.T) {
-	creds := seededMailStore(t, "u1", "imap", "pw")
+	creds := seededStore(t, "u1", "imap", "password", "pw")
 	_, ok := runMail(t, creds, "mail.imap.fetch", session.Op{
 		Type:     "mail.imap.fetch",
 		MailHost: "imap.example.com",
@@ -85,7 +72,7 @@ func TestMailIMAPFetchNoAuthRef(t *testing.T) {
 // TestMailSMTPSendValidation confirms the smtp validation order: each required
 // field is rejected with a clear error before any dial.
 func TestMailSMTPSendValidation(t *testing.T) {
-	creds := seededMailStore(t, "u1", "smtp", "pw")
+	creds := seededStore(t, "u1", "smtp", "password", "pw")
 	cases := []struct {
 		name string
 		op   session.Op
@@ -121,7 +108,7 @@ func TestMailAuthNotEnabled(t *testing.T) {
 // TestMailAuthNoUser confirms an auth reference without a user in context fails
 // clearly (mirrors net.http's behavior).
 func TestMailAuthNoUser(t *testing.T) {
-	creds := seededMailStore(t, "u1", "imap", "pw")
+	creds := seededStore(t, "u1", "imap", "password", "pw")
 	h := MailHandlers(discardLogger(), creds)
 	// No WithUserUUID on the context.
 	_, ok := h["mail.imap.fetch"](context.Background(), session.Op{
@@ -141,7 +128,7 @@ func TestMailAuthUnknownService(t *testing.T) {
 	if os.Getenv("AGENTFLOW_SKIP_NETWORK") != "" {
 		t.Skip("skipping; needs credential lookup")
 	}
-	creds := seededMailStore(t, "u1", "imap", "pw")
+	creds := seededStore(t, "u1", "imap", "password", "pw")
 	// Service "smtp" isn't seeded for u1; the cap should fail before dialing
 	// because resolvePassword runs first.
 	_, ok := runMail(t, creds, "mail.imap.fetch", session.Op{

@@ -13,8 +13,11 @@ import (
 	"agentflow/internal/drivers/shell"
 )
 
-// recordingShellProvider is a fake docker provider that records calls.
-type recordingShellProvider struct {
+// fakeShellProvider is the package's one shell fake: it records spawns,
+// execs, writes, and destroys, and answers reads with deterministic content.
+type fakeShellProvider struct {
+	name string
+
 	mu       sync.Mutex
 	spawns   int
 	execs    []string
@@ -23,41 +26,41 @@ type recordingShellProvider struct {
 	lastOpts shell.SpawnOpts
 }
 
-func (p *recordingShellProvider) Name() string { return "docker" }
-func (p *recordingShellProvider) Spawn(ctx context.Context, opts shell.SpawnOpts) (*shell.Handle, error) {
+func (p *fakeShellProvider) Name() string { return p.name }
+func (p *fakeShellProvider) Spawn(ctx context.Context, opts shell.SpawnOpts) (*shell.Handle, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.spawns++
 	p.lastOpts = opts
 	return &shell.Handle{ID: fmt.Sprintf("h-%d", p.spawns), State: shell.HandleRunning, Image: opts.Image}, nil
 }
-func (p *recordingShellProvider) Exec(ctx context.Context, h *shell.Handle, cmd string) (*shell.ExecResult, error) {
+func (p *fakeShellProvider) Exec(ctx context.Context, h *shell.Handle, cmd string) (*shell.ExecResult, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.execs = append(p.execs, cmd)
 	return &shell.ExecResult{Stdout: "ran: " + cmd, ExitCode: 0, Duration: 7}, nil
 }
-func (p *recordingShellProvider) Read(ctx context.Context, h *shell.Handle, path string) ([]byte, error) {
-	return nil, nil
+func (p *fakeShellProvider) Read(ctx context.Context, h *shell.Handle, path string) ([]byte, error) {
+	return []byte("content:" + path), nil
 }
-func (p *recordingShellProvider) Write(ctx context.Context, h *shell.Handle, path string, content []byte) error {
+func (p *fakeShellProvider) Write(ctx context.Context, h *shell.Handle, path string, content []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.writes = append(p.writes, path+"="+string(content))
 	return nil
 }
-func (p *recordingShellProvider) Destroy(ctx context.Context, h *shell.Handle) error {
+func (p *fakeShellProvider) Destroy(ctx context.Context, h *shell.Handle) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.destroys++
 	h.State = shell.HandleDestroyed
 	return nil
 }
-func (p *recordingShellProvider) Alive(h *shell.Handle) bool { return true }
+func (p *fakeShellProvider) Alive(h *shell.Handle) bool { return true }
 
-func shellToolSetup(t *testing.T) (*Registry, *recordingShellProvider) {
+func shellToolSetup(t *testing.T) (*Registry, *fakeShellProvider) {
 	t.Helper()
-	p := &recordingShellProvider{}
+	p := &fakeShellProvider{name: "docker"}
 	mgr := shell.NewManager([]shell.ShellProvider{p}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	r := NewRegistry()
 	RegisterShellBuiltins(r, mgr)

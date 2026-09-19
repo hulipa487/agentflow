@@ -537,8 +537,8 @@ func main() {
 		// Budget metering for spawn profiles: a profile that declares
 		// budget.tokens_per_day gets a metered LLM pool shared by every child
 		// spawned from it — e.g. a manager variant or worker pool gets its
-		// own budget. (Static agents carve per-agent pools above; profile-
-		// level carve-down from the parent's pool is a follow-up.)
+		// own budget. (Static agents each get their own pool above; drawing a
+		// profile's pool from the parent's budget is a follow-up.)
 		llmHandlers := caps.LLMHandlers(llmMgr, mediaStore)
 		if p.Budget.TokensPerDay > 0 {
 			pool := budget.NewPool(p.Budget.TokensPerDay)

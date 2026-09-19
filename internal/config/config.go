@@ -297,15 +297,8 @@ type SpawnProfile struct {
 	// Extras is the spawn profile's deployment-specific data (a pm options
 	// block, a workflow name, a goal{...}), surfaced read-only to a spawned
 	// child's loop by agent.config() with secret references rendered opaque.
-	Extras    map[string]any     `yaml:"extras"`
-	Ephemeral EphemeralLifecycle `yaml:"ephemeral"`
-	Budget    BudgetConfig       `yaml:"budget"`
-}
-
-type EphemeralLifecycle struct {
-	MaxLifetime string `yaml:"max_lifetime"`
-	IdleTTL     string `yaml:"idle_ttl"`
-	MaxTurns    int    `yaml:"max_turns"`
+	Extras map[string]any `yaml:"extras"`
+	Budget BudgetConfig   `yaml:"budget"`
 }
 
 type BudgetConfig struct {
@@ -617,8 +610,7 @@ type Channel struct {
 	Type   string `yaml:"type"` // webhook | telegram | ghhook
 	Mode   string `yaml:"mode"` // telegram: polling (default) | webhook | auto
 	Agent  string `yaml:"agent"`
-	Path   string `yaml:"path"`   // route mounted on the shared server, e.g. /webhook/<chan>/<uuid>/
-	Prefix string `yaml:"prefix"` // reserved for future per-channel secret-prefix use
+	Path   string `yaml:"path"` // route mounted on the shared server, e.g. /webhook/<chan>/<uuid>/
 	Token  string `yaml:"token"`
 	Secret string `yaml:"secret"` // ghhook: webhook secret for HMAC verification (env-interpolated)
 	// SecretToken is the telegram webhook secret (env-interpolated or cred:

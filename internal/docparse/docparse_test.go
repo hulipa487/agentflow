@@ -22,8 +22,8 @@ func TestSniff(t *testing.T) {
 		{[]byte("just plain text"), TXT},
 	}
 	for _, c := range cases {
-		if got := Sniff(c.data); got != c.want {
-			t.Errorf("Sniff = %v, want %v", got, c.want)
+		if got := sniff(c.data); got != c.want {
+			t.Errorf("sniff = %v, want %v", got, c.want)
 		}
 	}
 }

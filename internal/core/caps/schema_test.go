@@ -4,8 +4,6 @@ import (
 	"context"
 	"io"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -23,14 +21,8 @@ import (
 // as an empty table decodes back as an object — invalid JSON Schema that
 // strict providers (xAI) 400 on. The llm.chat boundary must drop it.
 func TestLLMChatDropsMangledRequired(t *testing.T) {
-	var body []byte
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ = io.ReadAll(r.Body)
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
-	}))
-	defer srv.Close()
+	var bodies [][]byte
+	srv := recordBodyServer(t, &bodies)
 
 	mgr := llm.NewManager(map[string]config.Model{
 		"default": {Provider: "openai", Model: "m", BaseURL: srv.URL},
@@ -50,6 +42,7 @@ func TestLLMChatDropsMangledRequired(t *testing.T) {
 	if !ok {
 		t.Fatalf("llm.chat failed: %s", resp)
 	}
+	body := bodies[0]
 	if strings.Contains(string(body), `"required":{}`) || strings.Contains(string(body), `"required": {}`) {
 		t.Fatalf("request emitted object-form required\n%s", body)
 	}
@@ -76,14 +69,8 @@ func (g *schemaGW) Send(channel, replyTo, text string, attachments []media.Part)
 // feed the defs into llm.chat, and assert the provider request never carries
 // `"required": {}` — the round trip that 400'd strict providers.
 func TestToolSchemaVMRoundTrip(t *testing.T) {
-	var body []byte
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ = io.ReadAll(r.Body)
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
-	}))
-	defer srv.Close()
+	var bodies [][]byte
+	srv := recordBodyServer(t, &bodies)
 
 	reg := tools.NewRegistry()
 	reg.Register(tools.ToolSpec{
@@ -154,6 +141,7 @@ end
 	if sends[0] != "done" {
 		t.Fatalf("loop failed: %s", sends[0])
 	}
+	body := bodies[0]
 	if !strings.Contains(string(body), "legal_read") {
 		t.Fatalf("provider request missing the tool\n%s", body)
 	}

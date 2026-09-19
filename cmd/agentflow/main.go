@@ -256,7 +256,7 @@ func main() {
 	// never touch it.
 	var filesMgr *files.Manager
 	if cfg.Files.Backend == "s3" {
-		s3cfg, ok := resolveMediaS3(ctx, credResolver, cfg.Files.S3, log)
+		s3cfg, ok := resolveMediaS3(ctx, credResolver, cfg.Files.S3, "files", log)
 		if ok {
 			blobStore, err := s3media.New(s3cfg)
 			if err != nil {
@@ -354,7 +354,7 @@ func main() {
 	// warning (channels then run with media disabled), never a boot failure.
 	var mediaStore media.Store
 	if cfg.Media.Backend == "s3" {
-		s3cfg, ok := resolveMediaS3(ctx, credResolver, cfg.Media.S3, log)
+		s3cfg, ok := resolveMediaS3(ctx, credResolver, cfg.Media.S3, "media", log)
 		if ok {
 			mediaStore, err = s3media.New(s3cfg)
 		}
@@ -1292,9 +1292,10 @@ func resolveBackendSecrets(ctx context.Context, res *config.Resolver, name strin
 	return out, true
 }
 
-// resolveMediaS3 resolves the S3 credential pair. Unresolvable logs a warning
+// resolveMediaS3 resolves the S3 credential pair for a blob-store backend
+// (media or files — `what` labels the warning). Unresolvable logs a warning
 // naming the credential and reports ok=false — the store is skipped.
-func resolveMediaS3(ctx context.Context, res *config.Resolver, s3 config.MediaS3, log *slog.Logger) (config.MediaS3, bool) {
+func resolveMediaS3(ctx context.Context, res *config.Resolver, s3 config.MediaS3, what string, log *slog.Logger) (config.MediaS3, bool) {
 	out := s3
 	for _, key := range []struct {
 		field string
@@ -1308,7 +1309,7 @@ func resolveMediaS3(ctx context.Context, res *config.Resolver, s3 config.MediaS3
 		}
 		v, ok := res.Resolve(ctx, *key.dst)
 		if !ok {
-			log.Warn("media store skipped: unresolved credential",
+			log.Warn(what + " store skipped: unresolved credential",
 				"field", key.field, "credential", config.CredentialName(*key.dst))
 			return config.MediaS3{}, false
 		}

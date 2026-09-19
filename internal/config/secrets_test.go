@@ -145,6 +145,9 @@ browser:
 media:
   backend: s3
   s3: { bucket: b, region: r, access_key: "${S3_AK}", secret_key: literal-secret }
+files:
+  backend: s3
+  s3: { bucket: f, region: r, access_key: "${FILES_AK}", secret_key: "${FILES_SK}" }
 memory:
   backends:
     vec:
@@ -194,6 +197,16 @@ triggers:
 	}
 	if got := cfg.Media.S3.SecretKey; got != "literal-secret" {
 		t.Fatalf("literal s3 secret_key must pass through, got %q", got)
+	}
+	// files.s3 must be registered exactly like media.s3: were these not in the
+	// registry, an unset ${VAR} would expand to "" at load, the consumer's
+	// skip-empty branch would pass the pair through, and s3media would fail
+	// with "access_key and secret_key are required" instead of degrading.
+	if got := cfg.Files.S3.AccessKey; got != "${FILES_AK}" {
+		t.Fatalf("files s3 access_key must stay raw, got %q", got)
+	}
+	if got := cfg.Files.S3.SecretKey; got != "${FILES_SK}" {
+		t.Fatalf("files s3 secret_key must stay raw, got %q", got)
 	}
 	if got := cfg.Profiles.Shell["box"].Password; got != "${BOX_PW}" {
 		t.Fatalf("shell password must stay raw, got %q", got)

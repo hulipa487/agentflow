@@ -7,7 +7,7 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 ## Features
 
 - **Actor-model sessions** — per-session Luau state, message-passing only, hot reload of loops and instructions.
-- **Multi-agent** — `agent.send` / `agent.request` / `agent.reply` / `agent.spawn`, address authority with `can_contact` ACLs, ephemeral children with budget/lifetime limits. Spawn profiles carry their own `extras` and credential allow-list through to each child.
+- **Multi-agent** — `agent.send` / `agent.request` / `agent.reply` / `agent.spawn`, address authority with `can_contact` ACLs, per-child budgets. Spawn profiles carry their own `extras` and credential allow-list through to each child.
 - **Memory** — provider → backend → store layering; `conversational` preset; retention/window GC. Stores are isolated per agent by default (`<agent>.<table>`); `shared: true` opts a store into deliberate cross-agent sharing. A backend whose credential is unresolvable is skipped with a warning, and its stores rebind to a surviving backend (vector → full-text search) or drop — never a boot failure.
 - **Embeddings & reranking** — `llm.embed` (OpenAI-compatible `/embeddings`) and `llm.rerank` (Jina/Cohere/TEI/vLLM `/rerank`); pgvector ingest on write and a `plugin:semantic` recall pipeline (embed → vector k-NN → rerank). Multimodal embeddings follow the Jina convention (`jina-embeddings-v5-omni-small`: text + image/video/audio/pdf in one vector space); `memory.write` embeds attachment-carrying records as one merged vector.
 - **Tools** — filesystem ops inside shell handles, a multi-engine `web_search` tool (Doubao / Ollama / StackOverflow / GitHub / YouTube, selected per call via `engine`; honest-degradation when unconfigured), a `legal_search` / `legal_read` pair over HKLII (Hong Kong case law + legislation) and the NPC China national laws database, and MCP stdio servers discovered at boot. Deployments retitle/re-document any tool via `tools.policy.overrides` (description + per-param descriptions; a `{prompt: key}` description resolves from the prompt registry), and loops declare their own model-visible tools in Lua with `tool.def` (merged into `tools.list`, dispatched by `tools.run`). `skills:` filters declared tools under the same rule as registered ones, so one shared loop directory can carry tools only some agents see. An override reaches a declared tool too — its description and param descriptions are resolved when the list is built, so a reloaded prompt applies on the next call; the name is reported if no loop ever declares it. Two tool surfaces stay distinct: **ops** (`http.request`, `llm.chat`, `store.*`, `shell.*`, `mail.*`) are reachable from Lua only — `tools.run` resolves names through the exposed tool set, so a model can never dispatch one — while **tools** (`builtin:*`, plus loop-declared `tool.def` entries) are what the model sees. Capabilities gate both now: `agents.<name>.capabilities` was validated at boot and then ignored, so every agent held every op; each capability now gates its ops at runtime with a refusal naming what is missing, and `plugins.enforce_capabilities: false` restores the old behavior. `builtin:` is now the tool namespace alone: loops are `plugin:per_chat`, memory providers are bare (`sqlite`), and the built-in memory profile is `conversational`. Four vocabularies used to spell the same prefix, so a name in the wrong field either failed obscurely or — for `skills:` — was dropped in silence; both are now reported, and the retired spellings are answered with the current one.
@@ -53,12 +53,12 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
   - **Linux**: system gcc (`cc`/`c++`/`ar`)
   - **macOS**: Xcode/clang (`clang`/`clang++`/`ar`)
 
-Luau is vendored under `third_party/luau/` (currently **0.731**, MIT license — see `third_party/luau/LICENSE.txt`) and is committed to the repo, so a fresh clone builds without fetching anything.
+Luau is a git submodule at `third_party/luau`, pinned to upstream release **0.731** (MIT license — see `third_party/luau/LICENSE.txt`). Clone with `git clone --recurse-submodules`, or run `git submodule update --init` in an existing checkout — `make` builds the pinned commit's sources into `internal/vm/lib/libluau.a`.
 
 ## Build
 
 ```bash
-make            # compile vendored Luau -> internal/vm/lib/libluau.a, then the agentflow binary
+make            # compile the pinned Luau submodule -> internal/vm/lib/libluau.a, then the binary
 make test       # go test with the host C/C++ toolchain
 make vet        # go vet
 make run        # build, then run (CONFIG=config.yaml by default)
@@ -142,7 +142,7 @@ No separate server or build step — the site is `go:embed`ded from `internal/we
 
 ```
 agentflow/
-├── Makefile            # build: vendored Luau -> libluau.a -> agentflow binary
+├── Makefile            # build: Luau submodule -> libluau.a -> agentflow binary
 ├── cmd/agentflow/      # main entrypoint
 ├── internal/           # core runtime + drivers (not importable — internal module)
 │   ├── core/           # actor, supervisor, router, scheduler, safety, memory, budget, metrics, credentials, ...
@@ -236,7 +236,7 @@ Migration checklist:
 ## Notes
 
 - **Log levels** — five additive levels, selected with `-log-level` (default `info`): `error` (runtime cannot continue), `warn` (degraded: upstream 429/502, retries), `info` (lifecycle: launch, channels, webhooks), `debug` (every interaction: LLM API request, memory put/query, telegram update, op dispatch), `dev` (temporary development logs). Setting a level prints it and everything above.
-- **Vendored Luau** (0.731) is committed under `third_party/luau/`, so the repo builds from a clean clone. Only the five components the build compiles are vendored (`VM`, `Common`, `Ast`, `Bytecode`, `Compiler`, plus their includes and the license files) — the upstream tests/bench/CLI/CodeGen/etc. are not. To upgrade, replace those components with a newer release and re-run `make`.
+- **Luau is a git submodule**, not vendored code: `third_party/luau` pins upstream `luau-lang/luau` at release **0.731** (the full upstream tree; only `VM`, `Common`, `Ast`, `Bytecode` and `Compiler` are compiled). A fresh clone needs `git clone --recurse-submodules` (or `git submodule update --init`) before `make`. To upgrade: `git -C third_party/luau fetch --tags && git -C third_party/luau checkout <new-tag> && git add third_party/luau`, then `make` and run the test suite.
 - **`config.yaml`** is gitignored — it's the local instance config and may contain credentials. Keep secrets in it or in environment variables, never in tracked files.
 - Runtime state (sqlite stores) lives under `data/` and is gitignored.
 

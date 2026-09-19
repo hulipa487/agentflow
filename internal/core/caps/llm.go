@@ -82,11 +82,17 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 		if err != nil {
 			return fail(err)
 		}
-		text, toolCalls, usage, err := m.Chat(ctx, op.Model, msgs, optsOf(op))
+		reply, err := m.Chat(ctx, op.Model, msgs, optsOf(op))
 		if err != nil {
 			return fail(err)
 		}
-		b, _ := json.Marshal(map[string]any{"text": text, "usage": usage, "tool_calls": toolCalls})
+		b, _ := json.Marshal(map[string]any{
+			"text":            reply.Text,
+			"thinking":        reply.Thinking,
+			"thinking_blocks": reply.ThinkingBlocks,
+			"usage":           reply.Usage,
+			"tool_calls":      reply.ToolCalls,
+		})
 		return string(b), true
 	}
 	streamOf := func(ctx context.Context, op session.Op) (string, bool) {
@@ -139,16 +145,18 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 		"llm.stream.open": streamOf,
 
 		"llm.stream.next": func(ctx context.Context, op session.Op) (string, bool) {
-			delta, done, usage, toolCalls, err := m.StreamNext(ctx, op.Stream)
-			if err != nil && !done {
+			frame, err := m.StreamNext(ctx, op.Stream)
+			if err != nil && !frame.Done {
 				return fail(err)
 			}
 			b, _ := json.Marshal(map[string]any{
-				"delta":      delta,
-				"done":       done,
-				"usage":      usage,
-				"tool_calls": toolCalls,
-				"error":      errString(err),
+				"delta":           frame.Delta,
+				"done":            frame.Done,
+				"usage":           frame.Usage,
+				"tool_calls":      frame.ToolCalls,
+				"thinking":        frame.Thinking,
+				"thinking_blocks": frame.ThinkingBlocks,
+				"error":           errString(err),
 			})
 			return string(b), true
 		},

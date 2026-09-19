@@ -90,12 +90,18 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 		defer close(events)
 		defer resp.Body.Close()
 		var usage Usage
-		// Anthropic emits content blocks indexed by position. A tool_use block
-		// starts with id+name, then receives input_delta.partial_json fragments.
+		// Anthropic emits content blocks indexed by position. tool_use blocks
+		// start with id+name, then receive input_delta.partial_json fragments;
+		// thinking blocks receive thinking_delta / signature_delta; a
+		// redacted_thinking block arrives complete on content_block_start.
+		// Thinking blocks (with their signatures) are captured verbatim: the
+		// Messages API requires them replayed on the next request when a
+		// multi-round tool loop continues with thinking enabled.
 		type blk struct {
-			id   string
-			name string
-			args strings.Builder
+			id, name, kind string // kind: "tool_use" | "thinking" | "redacted_thinking"
+			data           string // redacted_thinking payload (opaque, replayed verbatim)
+			args           strings.Builder
+			text, sig      strings.Builder
 		}
 		blocks := map[int]*blk{}
 		var order []int
@@ -108,10 +114,13 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 					ID   string `json:"id"`
 					Name string `json:"name"`
 					Text string `json:"text"`
+					Data string `json:"data"`
 				} `json:"content_block"`
 				Delta struct {
 					Type        string `json:"type"`
 					Text        string `json:"text"`
+					Thinking    string `json:"thinking"`
+					Signature   string `json:"signature"`
 					PartialJSON string `json:"partial_json"`
 				} `json:"delta"`
 				Usage struct {
@@ -131,8 +140,15 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 			case "message_start":
 				usage.Input = ev.Message.Usage.InputTokens
 			case "content_block_start":
-				if ev.ContentBlock != nil && ev.ContentBlock.Type == "tool_use" {
-					blocks[ev.Index] = &blk{id: ev.ContentBlock.ID, name: ev.ContentBlock.Name}
+				if ev.ContentBlock == nil {
+					continue
+				}
+				switch ev.ContentBlock.Type {
+				case "tool_use":
+					blocks[ev.Index] = &blk{kind: "tool_use", id: ev.ContentBlock.ID, name: ev.ContentBlock.Name}
+					order = append(order, ev.Index)
+				case "thinking", "redacted_thinking":
+					blocks[ev.Index] = &blk{kind: ev.ContentBlock.Type, data: ev.ContentBlock.Data}
 					order = append(order, ev.Index)
 				}
 			case "content_block_delta":
@@ -149,6 +165,14 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 					if b, ok := blocks[ev.Index]; ok {
 						b.args.WriteString(ev.Delta.PartialJSON)
 					}
+				case "thinking_delta":
+					if b, ok := blocks[ev.Index]; ok {
+						b.text.WriteString(ev.Delta.Thinking)
+					}
+				case "signature_delta":
+					if b, ok := blocks[ev.Index]; ok {
+						b.sig.WriteString(ev.Delta.Signature)
+					}
 				}
 			case "message_delta":
 				usage.Output = ev.Usage.OutputTokens
@@ -157,15 +181,35 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 				return
 			}
 		}
+		// Assemble the terminal thinking payload in block order: raw blocks
+		// verbatim for replay, joined texts for reading.
+		var thinkingBlocks []map[string]any
+		var texts []string
+		for _, i := range order {
+			b := blocks[i]
+			switch b.kind {
+			case "thinking":
+				thinkingBlocks = append(thinkingBlocks, map[string]any{
+					"type": "thinking", "thinking": b.text.String(), "signature": b.sig.String(),
+				})
+				texts = append(texts, b.text.String())
+			case "redacted_thinking":
+				thinkingBlocks = append(thinkingBlocks, map[string]any{"type": "redacted_thinking", "data": b.data})
+			}
+		}
+		thinking := strings.Join(texts, "\n\n")
 		if len(order) > 0 {
 			calls := make([]ToolCall, 0, len(order))
 			for _, i := range order {
-				b := blocks[i]
-				calls = append(calls, ToolCall{ID: b.id, Name: b.name, Args: parseArgs(b.args.String())})
+				if b := blocks[i]; b.kind == "tool_use" {
+					calls = append(calls, ToolCall{ID: b.id, Name: b.name, Args: parseArgs(b.args.String())})
+				}
 			}
-			events <- event{toolCalls: calls}
+			if len(calls) > 0 {
+				events <- event{toolCalls: calls, thinking: thinking, thinkingBlocks: thinkingBlocks}
+			}
 		}
-		events <- event{usage: usage}
+		events <- event{usage: usage, thinking: thinking, thinkingBlocks: thinkingBlocks}
 	}()
 	return events, false, nil
 }

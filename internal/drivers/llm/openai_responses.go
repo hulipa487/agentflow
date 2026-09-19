@@ -99,6 +99,12 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 		defer close(events)
 		defer resp.Body.Close()
 		var usage Usage
+		// Reasoning items (type:"reasoning") arrive whole on
+		// response.output_item.done and are captured verbatim for reply
+		// transparency; reasoning summary deltas stream the same text and
+		// serve as the fallback for proxies that skip the item events.
+		var reasoningItems []map[string]any
+		var summary strings.Builder
 		// Function-call accumulation keyed by output_index: arguments arrive as
 		// fragments to concatenate; id/name come from the first delta that has
 		// them (or from response.output_item.done).
@@ -125,33 +131,50 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 			var ev struct {
 				Type        string `json:"type"`
 				OutputIndex int    `json:"output_index"`
-				// response.output_text.delta / response.function_call_arguments.delta
+				// response.output_text.delta /
+				// response.reasoning_summary_text.delta /
+				// response.reasoning_text.delta
 				Delta string `json:"delta"`
 				// id/name arrive on response.output_item.added and
 				// response.output_item.done
 				CallID string `json:"call_id"`
 				Name   string `json:"name"`
-				Item   *struct {
-					Type      string `json:"type"`
-					CallID    string `json:"call_id"`
-					Name      string `json:"name"`
-					Arguments string `json:"arguments"`
-				} `json:"item"`
+				// item payloads: decoded as a whole for reasoning blocks and
+				// field-by-field for function calls
+				Item json.RawMessage `json:"item"`
 				// response.completed carries usage
 				Response struct {
 					Usage struct {
-						InputTokens  int `json:"input_tokens"`
-						OutputTokens int `json:"output_tokens"`
+						InputTokens         int `json:"input_tokens"`
+						OutputTokens        int `json:"output_tokens"`
+						OutputTokensDetails struct {
+							ReasoningTokens int `json:"reasoning_tokens"`
+						} `json:"output_tokens_details"`
 					} `json:"usage"`
 				} `json:"response"`
 				// some compatible proxies nest usage at the top level
 				Usage struct {
-					InputTokens  int `json:"input_tokens"`
-					OutputTokens int `json:"output_tokens"`
+					InputTokens         int `json:"input_tokens"`
+					OutputTokens        int `json:"output_tokens"`
+					OutputTokensDetails struct {
+						ReasoningTokens int `json:"reasoning_tokens"`
+					} `json:"output_tokens_details"`
 				} `json:"usage"`
 			}
 			if err := json.Unmarshal([]byte(data), &ev); err != nil {
 				continue
+			}
+			// item payloads: typed fields for function-call accumulation;
+			// reasoning blocks decode whole from the raw bytes instead, so
+			// their shape passes through verbatim.
+			var item struct {
+				Type      string `json:"type"`
+				CallID    string `json:"call_id"`
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			}
+			if len(ev.Item) > 0 {
+				_ = json.Unmarshal(ev.Item, &item) // partial fields are fine; blocks decode from the raw bytes below
 			}
 			switch ev.Type {
 			case "response.output_text.delta":
@@ -162,11 +185,13 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 						return
 					}
 				}
+			case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+				summary.WriteString(ev.Delta)
 			case "response.output_item.added":
-				if ev.Item != nil && ev.Item.Type == "function_call" {
+				if item.Type == "function_call" {
 					a := getAcc(ev.OutputIndex)
-					a.id = ev.Item.CallID
-					a.name = ev.Item.Name
+					a.id = item.CallID
+					a.name = item.Name
 				}
 			case "response.function_call_arguments.delta":
 				a := getAcc(ev.OutputIndex)
@@ -178,14 +203,22 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 				}
 				a.args.WriteString(ev.Delta)
 			case "response.output_item.done":
-				if ev.Item != nil && ev.Item.Type == "function_call" {
+				switch item.Type {
+				case "function_call":
 					a := getAcc(ev.OutputIndex)
-					a.id = ev.Item.CallID
-					a.name = ev.Item.Name
+					a.id = item.CallID
+					a.name = item.Name
 					// done carries the full arguments string; if no deltas were
 					// seen (some proxies skip them), use it directly.
 					if a.args.Len() == 0 {
-						a.args.WriteString(ev.Item.Arguments)
+						a.args.WriteString(item.Arguments)
+					}
+				case "reasoning":
+					// Verbatim capture: the item round-trips as a thinking
+					// block (replay needs the provider's own shape).
+					var raw map[string]any
+					if err := json.Unmarshal(ev.Item, &raw); err == nil {
+						reasoningItems = append(reasoningItems, raw)
 					}
 				}
 			case "response.completed":
@@ -195,16 +228,45 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 				if ev.Response.Usage.OutputTokens > 0 {
 					usage.Output = ev.Response.Usage.OutputTokens
 				}
+				if ev.Response.Usage.OutputTokensDetails.ReasoningTokens > 0 {
+					usage.Reasoning = ev.Response.Usage.OutputTokensDetails.ReasoningTokens
+				}
 				if ev.Usage.InputTokens > 0 {
 					usage.Input = ev.Usage.InputTokens
 				}
 				if ev.Usage.OutputTokens > 0 {
 					usage.Output = ev.Usage.OutputTokens
 				}
+				if ev.Usage.OutputTokensDetails.ReasoningTokens > 0 {
+					usage.Reasoning = ev.Usage.OutputTokensDetails.ReasoningTokens
+				}
 			case "error":
 				events <- event{err: fmt.Errorf("openai-responses stream error: %s", data)}
 				return
 			}
+		}
+		// Prefer the text assembled from whole reasoning items (the
+		// provider's own grouping); fall back to the delta accumulation.
+		thinking := ""
+		if len(reasoningItems) > 0 {
+			var parts []string
+			for _, it := range reasoningItems {
+				for _, sec := range []string{"summary", "content"} {
+					if arr, ok := it[sec].([]any); ok {
+						for _, p := range arr {
+							if pm, ok := p.(map[string]any); ok {
+								if t, ok := pm["text"].(string); ok && t != "" {
+									parts = append(parts, t)
+								}
+							}
+						}
+					}
+				}
+			}
+			thinking = strings.Join(parts, "\n\n")
+		}
+		if thinking == "" {
+			thinking = summary.String()
 		}
 		if len(order) > 0 {
 			calls := make([]ToolCall, 0, len(order))
@@ -212,9 +274,9 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 				a := accByIndex[i]
 				calls = append(calls, ToolCall{ID: a.id, Name: a.name, Args: parseArgs(a.args.String())})
 			}
-			events <- event{toolCalls: calls}
+			events <- event{toolCalls: calls, thinking: thinking, thinkingBlocks: reasoningItems}
 		}
-		events <- event{usage: usage}
+		events <- event{usage: usage, thinking: thinking, thinkingBlocks: reasoningItems}
 	}()
 	return events, false, nil
 }

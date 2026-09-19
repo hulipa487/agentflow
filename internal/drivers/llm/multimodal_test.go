@@ -33,7 +33,7 @@ func multimodalChat(t *testing.T, provider string, msgs []Message, wantErr strin
 	m := NewManager(map[string]config.Model{
 		"default": {Provider: provider, Model: "m", BaseURL: srv.URL},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	_, _, _, err := m.Chat(context.Background(), "default", msgs, Opts{})
+	_, err := m.Chat(context.Background(), "default", msgs, Opts{})
 	if wantErr == "" {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -309,12 +309,12 @@ func TestGeminiMediaParts(t *testing.T) {
 	m := NewManager(map[string]config.Model{
 		"default": {Provider: "gemini", Model: "m", BaseURL: srv.URL},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	text, _, _, err := m.Chat(context.Background(), "default", []Message{imageTurn(pngB64)}, Opts{})
+	reply, err := m.Chat(context.Background(), "default", []Message{imageTurn(pngB64)}, Opts{})
 	if err != nil {
 		t.Fatalf("Chat: %v", err)
 	}
-	if text != "a cat" {
-		t.Fatalf("text %q", text)
+	if reply.Text != "a cat" {
+		t.Fatalf("text %q", reply.Text)
 	}
 	// The media part was uploaded to the Files API and referenced by URI —
 	// never inline base64.
@@ -347,7 +347,7 @@ func TestGeminiUploadDeduped(t *testing.T) {
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	// Two chats carrying the same bytes upload once (48h cache window).
 	for i := 0; i < 2; i++ {
-		if _, _, _, err := m.Chat(context.Background(), "default", []Message{imageTurn(pngB64)}, Opts{}); err != nil {
+		if _, err := m.Chat(context.Background(), "default", []Message{imageTurn(pngB64)}, Opts{}); err != nil {
 			t.Fatalf("Chat %d: %v", i, err)
 		}
 	}
@@ -365,7 +365,7 @@ func TestGeminiURLPartDownloaded(t *testing.T) {
 		"default": {Provider: "gemini", Model: "m", BaseURL: srv.URL},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	// A url part is downloaded then uploaded to the Files API.
-	_, _, _, err := m.Chat(context.Background(), "default", []Message{{
+	_, err := m.Chat(context.Background(), "default", []Message{{
 		Role:  "user",
 		Parts: []media.Part{{Type: "image", MIME: "image/png", URL: srv.URL + "/img.png"}},
 	}}, Opts{})
@@ -395,7 +395,7 @@ func TestGeminiTextOnlyStaysString(t *testing.T) {
 	m := NewManager(map[string]config.Model{
 		"default": {Provider: "gemini", Model: "m", BaseURL: srv.URL},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if _, _, _, err := m.Chat(context.Background(), "default", []Message{{Role: "user", Content: "hi"}}, Opts{}); err != nil {
+	if _, err := m.Chat(context.Background(), "default", []Message{{Role: "user", Content: "hi"}}, Opts{}); err != nil {
 		t.Fatalf("Chat: %v", err)
 	}
 	if !strings.Contains(gotBody, `"input":"user: hi"`) {
@@ -410,7 +410,7 @@ func multimodalChatOn(t *testing.T, provider string, srv *httptest.Server, msgs 
 	m := NewManager(map[string]config.Model{
 		"default": {Provider: provider, Model: "m", BaseURL: srv.URL},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if _, _, _, err := m.Chat(context.Background(), "default", msgs, Opts{}); err != nil {
+	if _, err := m.Chat(context.Background(), "default", msgs, Opts{}); err != nil {
 		t.Fatalf("Chat: %v", err)
 	}
 }

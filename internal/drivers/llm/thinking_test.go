@@ -40,7 +40,7 @@ func chatThinking(t *testing.T, srv *httptest.Server, provider, modelCfg string,
 	m := NewManager(map[string]config.Model{
 		"default": {Provider: provider, Model: "m", BaseURL: srv.URL, Thinking: modelCfg},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	_, _, _, err := m.Chat(context.Background(), "default",
+	_, err := m.Chat(context.Background(), "default",
 		[]Message{{Role: "user", Content: "hi"}}, opts)
 	return err
 }

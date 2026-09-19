@@ -50,7 +50,15 @@ func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs
 	}
 	if thinking != "" {
 		if budget, ok := geminiThinkingBudget[thinking]; ok {
-			body["thinking_config"] = map[string]any{"thinking_budget": budget}
+			tc := map[string]any{"thinking_budget": budget}
+			if thinking != ThinkingOff {
+				// Thought summaries are returned only when asked for; ask
+				// whenever thinking is actually on. With off (budget 0) or
+				// unset there is nothing to summarize, so the request stays
+				// byte-identical to before.
+				tc["include_thoughts"] = true
+			}
+			body["thinking_config"] = tc
 		}
 	}
 	if len(cfg.ServerTools) > 0 {
@@ -88,13 +96,13 @@ func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs
 		return nil, false, err
 	}
 
+	// Content parts stay generic: a part flagged thought:true carries
+	// reasoning (returned only when include_thoughts was requested) and is
+	// captured verbatim as a thinking block; plain text parts are the answer.
 	var out struct {
 		Steps []struct {
-			Type    string `json:"type"`
-			Content []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"content"`
+			Type    string           `json:"type"`
+			Content []map[string]any `json:"content"`
 		} `json:"steps"`
 		Usage struct {
 			InputTokens       int `json:"input_tokens"`
@@ -107,18 +115,28 @@ func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs
 		return nil, false, fmt.Errorf("gemini: decode response: %w", err)
 	}
 
-	// The answer is the concatenation of text blocks in model_output steps.
+	// The answer is the concatenation of non-thought text blocks in
+	// model_output steps; thought-flagged parts (any step) are the reasoning.
 	var text string
+	var thoughtBlocks []map[string]any
+	var thoughts []string
 	for _, st := range out.Steps {
-		if st.Type != "model_output" {
-			continue
-		}
 		for _, c := range st.Content {
-			if c.Type == "text" {
-				text += c.Text
+			if thought, _ := c["thought"].(bool); thought {
+				if t, ok := c["text"].(string); ok && t != "" {
+					thoughts = append(thoughts, t)
+				}
+				thoughtBlocks = append(thoughtBlocks, c)
+				continue
+			}
+			if st.Type == "model_output" {
+				if t, ok := c["text"].(string); ok && c["type"] == "text" {
+					text += t
+				}
 			}
 		}
 	}
+	thoughtText := strings.Join(thoughts, "\n\n")
 
 	// Usage fields differ across interactions responses: prefer the explicit
 	// input/output pair, falling back to the total_* pair.
@@ -137,7 +155,7 @@ func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs
 		if text != "" {
 			events <- event{delta: text}
 		}
-		events <- event{usage: Usage{Input: inTok, Output: outTok}}
+		events <- event{usage: Usage{Input: inTok, Output: outTok}, thinking: thoughtText, thinkingBlocks: thoughtBlocks}
 	}()
 	return events, false, nil
 }

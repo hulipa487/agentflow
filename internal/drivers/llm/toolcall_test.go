@@ -39,11 +39,11 @@ func chatOnce(t *testing.T, srv *httptest.Server, provider string, msgs []Messag
 	m := NewManager(map[string]config.Model{
 		"default": {Provider: provider, Model: "m", BaseURL: srv.URL},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	text, calls, _, err := m.Chat(context.Background(), "default", msgs, Opts{Tools: tools, ToolChoice: "auto"})
+	reply, err := m.Chat(context.Background(), "default", msgs, Opts{Tools: tools, ToolChoice: "auto"})
 	if err != nil {
 		t.Fatalf("Chat: %v", err)
 	}
-	return text, calls
+	return reply.Text, reply.ToolCalls
 }
 
 var testTools = []ToolDef{{

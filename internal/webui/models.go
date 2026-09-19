@@ -229,7 +229,7 @@ func (u *UI) handleModelTest(w http.ResponseWriter, r *http.Request) {
 	if cfg.Provider == "rerank" {
 		_, callErr = u.deps.Models.Rerank(ctx, name, "ping", []string{"pong"}, 1)
 	} else {
-		_, _, _, callErr = u.deps.Models.Chat(ctx, name, []llm.Message{{Role: "user", Content: "ping"}}, llm.Opts{MaxTokens: 1})
+		_, callErr = u.deps.Models.Chat(ctx, name, []llm.Message{{Role: "user", Content: "ping"}}, llm.Opts{MaxTokens: 1})
 	}
 	latency := time.Since(start).Milliseconds()
 	if callErr != nil {

@@ -109,7 +109,14 @@ $(LIB): $(OBJS)
 luau: $(LIB)
 
 # ---- Go binary -------------------------------------------------------------
-$(BIN): $(LIB)
+# Prerequisites beyond the static lib: every Go source (the prelude is one),
+# the module files, and the cgo shim. Without these a Go-only change reports
+# nothing-to-do and hands out the stale binary.
+GOSRC := $(shell find cmd internal -name '*.go' 2>/dev/null) \
+	internal/vm/shim.cpp internal/vm/shim.h \
+	go.mod go.sum
+
+$(BIN): $(LIB) $(GOSRC)
 	$(GOENV) go build -o $(BIN) ./cmd/agentflow
 
 all: $(BIN)

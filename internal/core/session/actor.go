@@ -149,7 +149,7 @@ type Op struct {
 
 	// Files ops (files.*): user-scoped project trees, snapshots, scratch.
 	Project   string `json:"project,omitempty"`
-	Data      string `json:"data,omitempty"` // base64 file content (binary puts)
+	Data      string `json:"data,omitempty"`   // base64 file content (binary puts)
 	Mime      string `json:"mime,omitempty"`
 	Ref       string `json:"ref,omitempty"` // snapshot ref name or commit id
 	CommitMsg string `json:"commit_msg,omitempty"`
@@ -694,6 +694,7 @@ func (a *Actor) dispatchInline(ctx context.Context, op Op, current *Message) (re
 		// Stamp the tenant user UUID for inline handlers, mirroring execBlocking.
 		ctx = WithUserUUID(ctx, userFromMessage(current))
 		ctx = WithSessionKey(ctx, a.Identity.SessionID)
+		ctx = WithProvenanceKind(ctx, provenanceKindOf(current))
 		op.Owner = a.Identity.SessionID
 		if h, found := a.handlers[op.Type]; found {
 			r, ok := h(ctx, op)
@@ -730,6 +731,7 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 	ctx = WithOwner(ctx, a.Name)
 	ctx = WithUserUUID(ctx, userFromMessage(current))
 	ctx = WithSessionKey(ctx, a.Identity.SessionID)
+	ctx = WithProvenanceKind(ctx, provenanceKindOf(current))
 	op.Owner = a.Identity.SessionID
 	if a.Info != nil {
 		ctx = WithShell(ctx, a.Info.Shell)
@@ -1115,6 +1117,37 @@ func SessionKeyFromCtx(ctx context.Context) string {
 	}
 	s, _ := ctx.Value(sessionKey).(string)
 	return s
+}
+
+// ProvenanceKindFromCtx extracts the provenance kind injected by
+// WithProvenanceKind. It is core-assigned (never Lua-settable) — the memory
+// scope layer trusts it to admit maintenance reads for engine-fired contexts.
+func ProvenanceKindFromCtx(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	s, _ := ctx.Value(provenanceKey).(string)
+	return s
+}
+
+type provenanceKeyType struct{}
+
+var provenanceKey provenanceKeyType
+
+// WithProvenanceKind returns a context carrying the inbound message's
+// provenance kind ("system", "scheduler", "agent", or "" for channel turns
+// that carry none). Stamped by the actor at dispatch.
+func WithProvenanceKind(ctx context.Context, kind string) context.Context {
+	return context.WithValue(ctx, provenanceKey, kind)
+}
+
+// provenanceKindOf reads the core-assigned provenance kind of the current
+// inbound message; channel-originated messages carry none ("").
+func provenanceKindOf(m *Message) string {
+	if m == nil || m.Provenance == nil {
+		return ""
+	}
+	return m.Provenance.Kind
 }
 
 // userFromMessage recovers the user UUID from an inbound message: prefer the

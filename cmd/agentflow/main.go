@@ -1254,6 +1254,7 @@ func memoryFromConfig(s config.Store) memory.Store {
 		Window:     s.Window,
 		Requires:   s.Requires,
 		Shared:     s.Shared,
+		Scope:      s.Scope,
 	}
 	if s.Retention != "" {
 		d, err := time.ParseDuration(s.Retention)

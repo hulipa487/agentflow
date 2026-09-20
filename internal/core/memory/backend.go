@@ -235,6 +235,9 @@ type Store struct {
 	// used as-is. Private stores (the default) are isolated per agent at bind
 	// time — see ResolveStoresFor.
 	Shared bool
+	// Scope selects the isolation granularity of a private store ("user"
+	// default | "agent"); ignored on shared stores. See scope.go.
+	Scope string
 }
 
 // StoreBinding is a resolved (backend, table) pair.
@@ -243,6 +246,10 @@ type StoreBinding struct {
 	Table     string
 	Window    int
 	Retention time.Duration
+	// Scoping is the store's configured scope granularity: "user" (default for
+	// private stores), "agent" (one pool across users), or "" for shared
+	// stores (not wrapped — see WrapScoped).
+	Scoping string
 	// Features are the backend provider's capabilities ("kv", "vector",
 	// ...), resolved at bind time so loops can adapt (e.g. only embed for
 	// vector-capable stores).
@@ -287,7 +294,14 @@ func (r *Registry) ResolveStoresFor(agent string, profile map[string]Store) (Age
 		if !s.Shared && agent != "" {
 			table = agent + "." + s.Table
 		}
-		b := StoreBinding{Backend: s.Backend, Table: table, Window: s.Window, Retention: s.Retention, Features: r.Features(s.Backend)}
+		scoping := ""
+		if !s.Shared {
+			scoping = s.Scope
+			if scoping == "" {
+				scoping = "user"
+			}
+		}
+		b := StoreBinding{Backend: s.Backend, Table: table, Window: s.Window, Retention: s.Retention, Features: r.Features(s.Backend), Scoping: scoping}
 		out.Stores[sname] = b
 		out.Tables[s.Table] = b
 	}

@@ -24,16 +24,25 @@ func StoreHandlers(am *memory.AgentMemory, mgr *memory.Manager) map[string]sessi
 		}
 		return string(b), true
 	}
-	resolve := func(table string) (memory.BackendHandle, memory.StoreBinding, error) {
+	// resolve binds the table and wraps it with scope enforcement for private
+	// stores: the mode comes from the ctx provenance kind + user stamp (see
+	// memory.ModeOf), so a channel session can only ever read its own scope,
+	// service rows, and pre-upgrade legacy rows.
+	resolve := func(ctx context.Context, table string) (memory.BackendHandle, memory.StoreBinding, error) {
 		if am == nil {
 			return nil, memory.StoreBinding{}, fmt.Errorf("agent has no memory profile")
 		}
-		return mgr.BindForTable(*am, table)
+		h, bind, err := mgr.BindForTable(*am, table)
+		if err != nil {
+			return nil, memory.StoreBinding{}, err
+		}
+		h = memory.WrapScoped(h, bind.Scoping, memory.ModeOf(session.ProvenanceKindFromCtx(ctx), session.UserUUIDFromCtx(ctx)), session.UserUUIDFromCtx(ctx))
+		return h, bind, nil
 	}
 
 	return map[string]session.OpHandler{
 		"store.put": func(ctx context.Context, op session.Op) (string, bool) {
-			h, bind, err := resolve(op.Table)
+			h, bind, err := resolve(ctx, op.Table)
 			if err != nil {
 				return fail(err)
 			}
@@ -63,7 +72,7 @@ func StoreHandlers(am *memory.AgentMemory, mgr *memory.Manager) map[string]sessi
 		},
 
 		"store.get": func(ctx context.Context, op session.Op) (string, bool) {
-			h, bind, err := resolve(op.Table)
+			h, bind, err := resolve(ctx, op.Table)
 			if err != nil {
 				return fail(err)
 			}
@@ -75,7 +84,7 @@ func StoreHandlers(am *memory.AgentMemory, mgr *memory.Manager) map[string]sessi
 		},
 
 		"store.delete": func(ctx context.Context, op session.Op) (string, bool) {
-			h, bind, err := resolve(op.Table)
+			h, bind, err := resolve(ctx, op.Table)
 			if err != nil {
 				return fail(err)
 			}
@@ -96,7 +105,7 @@ func StoreHandlers(am *memory.AgentMemory, mgr *memory.Manager) map[string]sessi
 					table = k
 				}
 			}
-			h, bind, err := resolve(table)
+			h, bind, err := resolve(ctx, table)
 			if err != nil {
 				return fail(err)
 			}

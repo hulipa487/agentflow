@@ -295,6 +295,12 @@ type Store struct {
 	// physical table is prefixed with the agent name at bind time. Existing
 	// deployments that rely on implicit cross-agent sharing must set this.
 	Shared bool `yaml:"shared"`
+	// Scope selects the isolation granularity of a private store: "user"
+	// (default) scopes rows per user at the key level — channel-originated
+	// turns read and write only their own scope, service contexts, and
+	// pre-upgrade rows; "agent" keeps one pool for the whole agent across
+	// users (pre-isolation behavior). Ignored on shared stores.
+	Scope string `yaml:"scope"`
 }
 
 // ShellProfile defines defaults for shell.spawn.
@@ -917,6 +923,11 @@ func validate(path string, c *Config) error {
 			for sname, store := range stores {
 				if _, ok := c.Memory.Backends[store.Backend]; !ok {
 					return fmt.Errorf("%s: agent %q store %q references unknown backend %q", path, name, sname, store.Backend)
+				}
+				switch store.Scope {
+				case "", "user", "agent":
+				default:
+					return fmt.Errorf("%s: agent %q store %q: unsupported scope %q (want user or agent)", path, name, sname, store.Scope)
 				}
 			}
 		}

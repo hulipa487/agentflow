@@ -295,6 +295,29 @@ func TestValidateMediaAudit(t *testing.T) {
 	}
 }
 
+// TestValidateMemoryScope exercises the store scope vocabulary: user (default)
+// or agent on private stores; anything else fails at boot.
+func TestValidateMemoryScope(t *testing.T) {
+	mk := func(scope string) *Config {
+		return &Config{
+			Agents: map[string]Agent{"bot": {Loop: "./loop.lua", Memory: MemoryAgentConfig{IsInline: true, Inline: MemoryProfile{Stores: map[string]Store{"d": {Backend: "b", Table: "d", Scope: scope}}}}}},
+			Memory: Memory{Backends: map[string]Backend{"b": {Provider: "sqlite"}}},
+		}
+	}
+	if err := validate("cfg.yaml", mk("")); err != nil {
+		t.Fatalf("empty scope must pass: %v", err)
+	}
+	if err := validate("cfg.yaml", mk("user")); err != nil {
+		t.Fatalf("user scope must pass: %v", err)
+	}
+	if err := validate("cfg.yaml", mk("agent")); err != nil {
+		t.Fatalf("agent scope must pass: %v", err)
+	}
+	if err := validate("cfg.yaml", mk("fleet")); err == nil {
+		t.Fatal("unknown scope must fail at boot")
+	}
+}
+
 // TestValidateFiles exercises the file-store backend and scratch rules.
 func TestValidateFiles(t *testing.T) {
 	neg := int64(-1)

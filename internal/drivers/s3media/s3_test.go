@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -219,5 +220,63 @@ func TestListDelete(t *testing.T) {
 	blobs, _ = st.List()
 	if len(blobs) != 1 || blobs[0].Handle == r1.Handle {
 		t.Fatalf("after delete: %v", blobs)
+	}
+}
+
+// TestCanonicalURIAndQuery: the exact canonicalization R2's strict SigV4
+// validates. The bug class this guards: normalizing the URI (path.Clean
+// strips the bucket-root trailing slash — LIST 403'd against real R2 while
+// every object-path call passed) and '+'-for-space query escaping. The httptest
+// mock cannot catch these because it never verifies signatures.
+func TestCanonicalURIAndQuery(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want string
+	}{
+		{"https://example.com/media-bucket/", "/media-bucket/"}, // bucket-root LIST: slash preserved
+		{"https://example.com/media-bucket/agentflow/abc", "/media-bucket/agentflow/abc"},
+		{"https://example.com", "/"},
+	}
+	for _, c := range cases {
+		u, err := url.Parse(c.raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := canonicalURI(u); got != c.want {
+			t.Errorf("canonicalURI(%q) = %q, want %q", c.raw, got, c.want)
+		}
+	}
+
+	q := url.Values{}
+	q.Set("prefix", "agent flow/x+y~z") // space, slash, plus, tilde
+	q.Add("tag", "b")
+	q.Add("tag", "a") // multi-value: sorted by encoded value
+	q.Set("list-type", "2")
+	want := "list-type=2&prefix=agent%20flow%2Fx%2By~z&tag=a&tag=b"
+	if got := canonicalQuery(q); got != want {
+		t.Errorf("canonicalQuery = %q, want %q", got, want)
+	}
+}
+
+// TestCanonicalRequestMatchesAWSVector: the canonical URI and query halves of
+// the AWS-documented SigV4 example (GET iam.amazonaws.com Action=ListUsers,
+// 2015-08-30) must match the published canonical request exactly. This is the
+// local stand-in for signature validation the canned mock cannot do.
+func TestCanonicalRequestMatchesAWSVector(t *testing.T) {
+	u, err := url.Parse("https://iam.amazonaws.com/?Action=ListUsers&Version=2010-05-08")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// From the AWS SigV4 signing documentation, canonical request lines 1-2:
+	if got := canonicalURI(u); got != "/" {
+		t.Errorf("canonicalURI = %q, want %q", got, "/")
+	}
+	if got := canonicalQuery(u.Query()); got != "Action=ListUsers&Version=2010-05-08" {
+		t.Errorf("canonicalQuery = %q, want %q", got, "Action=ListUsers&Version=2010-05-08")
+	}
+	// RFC 3986 check the vector's shape implies: a space encodes as %20.
+	q := url.Values{"prefix": {"a b"}}
+	if got := canonicalQuery(q); got != "prefix=a%20b" {
+		t.Errorf("space encoding = %q, want %q", got, "prefix=a%20b")
 	}
 }

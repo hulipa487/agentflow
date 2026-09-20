@@ -19,7 +19,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path"
 	"sort"
 	"strings"
 	"time"
@@ -355,14 +354,22 @@ func canonicalHeaders(req *http.Request) (signed, block string) {
 	return strings.Join(keys, ";"), b.String()
 }
 
+// canonicalURI is the path exactly as it goes on the wire (Go has already
+// escaped it). It must NOT be normalized: the bucket-root listing path ends
+// in a trailing slash ("/bucket/"), and path.Clean would strip it, signing a
+// different URI than R2 receives — 403 SignatureDoesNotMatch on LIST while
+// every object-path call passes. R2 is strict where permissive fakes are not.
 func canonicalURI(u *url.URL) string {
 	p := u.EscapedPath()
 	if p == "" {
 		return "/"
 	}
-	return path.Clean(p)
+	return p
 }
 
+// canonicalQuery is the SigV4 canonical query string: URI-encoded
+// (RFC 3986 — a space is %20, never "+"), sorted by encoded key. Params with
+// empty values keep the trailing "="; multi-value keys sort by encoded value.
 func canonicalQuery(v url.Values) string {
 	keys := make([]string, 0, len(v))
 	for k := range v {
@@ -371,11 +378,19 @@ func canonicalQuery(v url.Values) string {
 	sort.Strings(keys)
 	var parts []string
 	for _, k := range keys {
-		for _, val := range v[k] {
-			parts = append(parts, url.QueryEscape(k)+"="+url.QueryEscape(val))
+		vals := append([]string(nil), v[k]...)
+		sort.Strings(vals)
+		for _, val := range vals {
+			parts = append(parts, awsQueryEscape(k)+"="+awsQueryEscape(val))
 		}
 	}
 	return strings.Join(parts, "&")
+}
+
+// awsQueryEscape is url.QueryEscape with the RFC 3986 space encoding SigV4
+// requires (QueryEscape emits "+" for space, which breaks the signature).
+func awsQueryEscape(s string) string {
+	return strings.ReplaceAll(url.QueryEscape(s), "+", "%20")
 }
 
 func hexSHA256(s string) string {

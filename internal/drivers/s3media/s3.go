@@ -150,7 +150,7 @@ func (s *Store) ReadAll(handle string, limit int64) ([]byte, error) {
 		return nil, fmt.Errorf("s3media: read %s: %w", handle, err)
 	}
 	if int64(len(b)) > limit {
-		return nil, fmt.Errorf("s3media: blob %s exceeds read limit", handle)
+		return nil, fmt.Errorf("%w: %s", media.ErrExceedsLimit, handle)
 	}
 	return b, nil
 }

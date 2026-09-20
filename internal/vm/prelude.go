@@ -819,6 +819,7 @@ function files.put(project, path, content, opts)
   local req = { type = "files.put", project = project, path = path }
   if type(content) == "table" then
     req.data = content.data
+    req.handle = content.handle
     req.mime = content.mime or opts.mime
   else
     req.content = content
@@ -857,6 +858,7 @@ function files.scratch.put(name, content, opts)
   local req = { type = "files.scratch.put", path = name }
   if type(content) == "table" then
     req.data = content.data
+    req.handle = content.handle
     req.mime = content.mime or opts.mime
   else
     req.content = content

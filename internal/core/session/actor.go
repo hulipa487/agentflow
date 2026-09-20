@@ -150,6 +150,7 @@ type Op struct {
 	// Files ops (files.*): user-scoped project trees, snapshots, scratch.
 	Project   string `json:"project,omitempty"`
 	Data      string `json:"data,omitempty"`   // base64 file content (binary puts)
+	Handle    string `json:"handle,omitempty"` // existing blob handle (put by handle)
 	Mime      string `json:"mime,omitempty"`
 	Ref       string `json:"ref,omitempty"` // snapshot ref name or commit id
 	CommitMsg string `json:"commit_msg,omitempty"`

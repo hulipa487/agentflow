@@ -283,3 +283,63 @@ func mustJSON(t *testing.T, v any) string {
 	}
 	return string(b)
 }
+
+// TestPutHandle: tree records can point at an existing blob without bytes
+// moving — the rollback primitive (checkout last-good, re-put by handle,
+// commit).
+func TestPutHandle(t *testing.T) {
+	m, _ := testManager(t, time.Hour)
+	ctx := context.Background()
+
+	e1 := putString(t, m, "user:u1", "proj", "src/app.go", "package app")
+	e2, err := m.PutHandle(ctx, "user:u1", "proj", "src/app.go", e1.Handle, "text/plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e2.Handle != e1.Handle || e2.Revision != 2 {
+		t.Fatalf("PutHandle must re-point the path and bump revision: %+v", e2)
+	}
+	// Materialization still yields the original bytes.
+	b, err := m.ReadBlob(ctx, e2.Handle, 1<<20)
+	if err != nil || string(b) != "package app" {
+		t.Fatalf("checkout-by-handle bytes %q err %v", b, err)
+	}
+	// A commit over the re-pointed tree carries the handle.
+	c, err := m.Commit(ctx, "user:u1", "proj", "main", "pin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Tree["src/app.go"] != e1.Handle {
+		t.Fatalf("commit tree must hold the re-pointed handle: %v", c.Tree)
+	}
+}
+
+// TestPutHandleRejectsBadHandles: malformed and dangling handles fail at put
+// time, not at checkout materialization.
+func TestPutHandleRejectsBadHandles(t *testing.T) {
+	m, _ := testManager(t, time.Hour)
+	ctx := context.Background()
+
+	if _, err := m.PutHandle(ctx, "s", "p", "x", "not-a-handle", ""); err == nil {
+		t.Fatal("malformed handle must fail")
+	}
+	fake := "media:" + strings.Repeat("f", 64)
+	if _, err := m.PutHandle(ctx, "s", "p", "x", fake, ""); err == nil {
+		t.Fatal("dangling handle must fail (existence probe)")
+	}
+}
+
+// TestScratchPutHandle: scratch records accept handles too.
+func TestScratchPutHandle(t *testing.T) {
+	m, _ := testManager(t, time.Hour)
+	ctx := context.Background()
+
+	e := putString(t, m, "user:u1", "proj", "blob.txt", "body")
+	if _, err := m.ScratchPutHandle(ctx, "sess:X", "copy.txt", e.Handle, "text/plain"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.ScratchGet(ctx, "sess:X", "copy.txt")
+	if err != nil || got.Handle != e.Handle {
+		t.Fatalf("scratch by handle %+v err %v", got, err)
+	}
+}

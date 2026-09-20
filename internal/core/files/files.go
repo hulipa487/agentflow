@@ -150,6 +150,69 @@ func (m *Manager) Put(ctx context.Context, scope, project, p string, r io.Reader
 	return e, nil
 }
 
+// PutHandle records a working-tree entry pointing at an existing blob
+// handle — no bytes move (the tree IS handles: rollback restores a commit's
+// tree by re-recording its handles). The handle format is validated and its
+// existence probed so a typo fails here instead of at checkout
+// materialization. Size is unknown without reading bytes and stays 0 —
+// manifests treat size as informational and consumers read by handle.
+func (m *Manager) PutHandle(ctx context.Context, scope, project, p, handle, mime string) (*Entry, error) {
+	if err := validPath(p); err != nil {
+		return nil, err
+	}
+	if err := m.checkHandle(ctx, handle); err != nil {
+		return nil, err
+	}
+	var rev int64 = 1
+	if prev, ok, err := m.getTree(ctx, scope, project, p); err != nil {
+		return nil, err
+	} else if ok {
+		rev = prev.Revision + 1
+	}
+	e := &Entry{Path: p, Handle: handle, MIME: mime, Ts: m.now().Unix(), Revision: rev}
+	if err := m.putJSON(ctx, treeKey(scope, project, p), e, time.Time{}); err != nil {
+		return nil, err
+	}
+	return e, nil
+}
+
+// ScratchPutHandle is PutHandle for the per-session scratch space.
+func (m *Manager) ScratchPutHandle(ctx context.Context, owner, name, handle, mime string) (*Entry, error) {
+	if err := validPath(name); err != nil {
+		return nil, err
+	}
+	if err := m.checkHandle(ctx, handle); err != nil {
+		return nil, err
+	}
+	var rev int64 = 1
+	if prev, err := m.ScratchGet(ctx, owner, name); err == nil {
+		rev = prev.Revision + 1
+	}
+	var exp time.Time
+	if m.ttl > 0 {
+		exp = m.now().Add(m.ttl)
+	}
+	e := &Entry{Path: name, Handle: handle, MIME: mime, Ts: m.now().Unix(), Revision: rev}
+	if err := m.putJSON(ctx, scratchKey(owner, name), e, exp); err != nil {
+		return nil, err
+	}
+	return e, nil
+}
+
+// checkHandle validates the handle format and probes that the blob exists.
+func (m *Manager) checkHandle(ctx context.Context, handle string) error {
+	if !media.ValidHandle(handle) {
+		return fmt.Errorf("%w: malformed handle %q", ErrBadPath, handle)
+	}
+	// Probe with a small read: nil means the blob exists; ErrExceedsLimit
+	// means it exists and is larger than the probe. Anything else (not
+	// found, backend failure) fails the put.
+	if _, err := m.blobs.ReadAll(handle, 512); err != nil && !errors.Is(err, media.ErrExceedsLimit) {
+		return fmt.Errorf("files: handle %s not found in blob store: %w", handle, err)
+	}
+	return nil
+}
+
 // Get returns the working-tree entry for one path (handle + metadata; never
 // bytes).
 func (m *Manager) Get(ctx context.Context, scope, project, p string) (*Entry, error) {

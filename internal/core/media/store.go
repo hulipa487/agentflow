@@ -57,6 +57,11 @@ func Classify(mime string) string {
 // ErrTooLarge is returned when media exceeds the configured ceiling.
 var ErrTooLarge = errors.New("media exceeds size limit")
 
+// ErrExceedsLimit is returned by ReadAll when the blob is larger than the
+// read limit — i.e. the blob EXISTS but did not fit the caller's ceiling.
+// Callers probing for existence (files put-by-handle) treat it as success.
+var ErrExceedsLimit = errors.New("blob exceeds read limit")
+
 // handleRe pins the handle format: media:<64 lowercase hex>. Anything else is
 // rejected before it ever reaches the filesystem, so a forged handle cannot
 // traverse paths.
@@ -195,7 +200,7 @@ func (s *FS) ReadAll(handle string, limit int64) ([]byte, error) {
 		return nil, fmt.Errorf("media store: %w", err)
 	}
 	if int64(len(b)) > limit {
-		return nil, fmt.Errorf("media store: blob %s exceeds read limit", handle)
+		return nil, fmt.Errorf("%w: %s", ErrExceedsLimit, handle)
 	}
 	return b, nil
 }

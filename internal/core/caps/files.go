@@ -65,9 +65,19 @@ func FileHandlers(m *files.Manager, agent string) map[string]session.OpHandler {
 	}
 
 	return map[string]session.OpHandler{
+		// files.put accepts content (utf-8), {data=base64}, or {handle=...} —
+		// a put-by-handle records the tree entry pointing at an existing blob
+		// (rollback restores a commit's tree without bytes crossing Lua).
 		"files.put": func(ctx context.Context, op session.Op) (string, bool) {
 			if err := guard(); err != nil {
 				return fail(err)
+			}
+			if op.Handle != "" {
+				e, err := m.PutHandle(ctx, scope(ctx), op.Project, op.Path, op.Handle, op.Mime)
+				if err != nil {
+					return fail(err)
+				}
+				return okJSON(map[string]any{"ok": true, "entry": e})
 			}
 			b, mime, err := contentOf(op)
 			if err != nil {
@@ -146,6 +156,13 @@ func FileHandlers(m *files.Manager, agent string) map[string]session.OpHandler {
 		"files.scratch.put": func(ctx context.Context, op session.Op) (string, bool) {
 			if err := guard(); err != nil {
 				return fail(err)
+			}
+			if op.Handle != "" {
+				e, err := m.ScratchPutHandle(ctx, op.Owner, op.Path, op.Handle, op.Mime)
+				if err != nil {
+					return fail(err)
+				}
+				return okJSON(map[string]any{"ok": true, "entry": e})
 			}
 			b, mime, err := contentOf(op)
 			if err != nil {

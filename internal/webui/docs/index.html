@@ -971,7 +971,7 @@ os.date([format,] time?) -> table | string -- UTC; table unless a format is give
   <p><strong>Wall clock.</strong> <code>os.time()</code> returns whole Unix seconds and takes no arguments (this is not Lua's <code>os.time(table)</code>). <code>os.date()</code> returns the date <em>table</em> — <code>{ year, month, day, hour, min, sec, wday, yday, isdst }</code> with <code>wday</code> 1 = Sunday … 7 = Saturday, <code>yday</code> 1–366, and <code>isdst</code> always <code>false</code> — and takes an optional Unix-seconds time (default: now). The table is JSON-encodable, so it can ride in a payload. Pass a strftime string to get text instead: <code>os.date("%Y-%m-%d %H:%M:%S", t)</code>. Supported directives are <code>%Y %y %m %d %e %H %I %M %S %p %A %a %B %b %j %w %u %Z %%</code>; an unknown one is left verbatim. <strong>Everything is UTC</strong> — the sandbox has no local timezone, so the fields are identical on every host, and a leading <code>!</code> (<code>os.date("!*t")</code>) is accepted as a no-op. Cron triggers, by contrast, are matched in <code>runtime.timezone_offset_hours</code>; converting between the two is your loop's business.</p>
 
   <h4><code>files</code> — cap: <code>files</code></h4>
-  <pre><code>files.put(project, path, content|{data=base64, mime=...}, {mime}?) -> { ok, entry }
+  <pre><code>files.put(project, path, content|{data=base64, handle=..., mime=...}, {mime}?) -> { ok, entry }
 files.read(project, path) -> { ok, entry }        -- entry: {path, handle, size, mime, ts, revision}
 files.list(project, prefix?) -> { ok, entries }
 files.delete(project, path) -> { ok = true }

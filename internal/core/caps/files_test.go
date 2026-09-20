@@ -209,3 +209,34 @@ end
 		t.Fatalf("bridge write must land in the user scope: %+v err %v", entries, err)
 	}
 }
+
+// TestFileHandlersPutByHandle: the rollback primitive — a tree entry can be
+// recorded from an existing handle; dangling/malformed handles fail the op.
+func TestFileHandlersPutByHandle(t *testing.T) {
+	m := testFileManager(t)
+	h := FileHandlers(m, "main")
+	ctx := session.WithUserUUID(context.Background(), "u1")
+
+	// Seed a blob via a normal put, then re-point another path at its handle.
+	resp, ok := h["files.put"](ctx, session.Op{Type: "files.put", Project: "p", Path: "orig.txt", Content: "v1"})
+	decodeOK(t, resp, ok)
+	var seed map[string]any
+	if err := json.Unmarshal([]byte(resp), &seed); err != nil {
+		t.Fatal(err)
+	}
+	handle := seed["entry"].(map[string]any)["handle"].(string)
+
+	resp, ok = h["files.put"](ctx, session.Op{Type: "files.put", Project: "p", Path: "rollback.txt", Handle: handle})
+	got := decodeOK(t, resp, ok)["entry"].(map[string]any)
+	if got["handle"] != handle {
+		t.Fatalf("put by handle must record the same handle: %v", got)
+	}
+
+	// Dangling and malformed handles fail loudly at put time.
+	for _, bad := range []string{"media:" + strings.Repeat("0", 64), "garbage"} {
+		resp, ok = h["files.put"](ctx, session.Op{Type: "files.put", Project: "p", Path: "x", Handle: bad})
+		if ok {
+			t.Fatalf("put with handle %q must fail, got %s", bad, resp)
+		}
+	}
+}

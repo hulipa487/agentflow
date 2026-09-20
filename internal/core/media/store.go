@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // Part is one content part of a message turn or attachment. Exactly one of
@@ -110,9 +111,10 @@ func (p Policy) Allows(mime string) bool {
 	return false
 }
 
-// Store is the blob-store contract: write under policy, read by handle.
-// Implementations: FS (content-addressed local directory, in this file) and
-// the S3 driver (internal/drivers/s3media). Handles are backend-agnostic
+// Store is the blob-store contract: write under policy, read by handle,
+// list and delete for mark-sweep GC. Implementations: FS (content-addressed
+// local directory, in this file) and the S3 driver
+// (internal/drivers/s3media). Handles are backend-agnostic
 // ("media:<sha256>"), so a Part never reveals where its bytes live.
 type Store interface {
 	// Put streams r into the store under the policy ceiling, returning the
@@ -120,6 +122,19 @@ type Store interface {
 	Put(r io.Reader, mime string, pol Policy) (*Ref, error)
 	// ReadAll reads the whole blob, enforcing limit as a sanity ceiling.
 	ReadAll(handle string, limit int64) ([]byte, error)
+	// List returns every blob in the store (for GC marking). Conversation
+	// and file-store scale make a full listing acceptable.
+	List() ([]Blob, error)
+	// Delete removes one blob. Deleting a missing blob is not an error.
+	Delete(handle string) error
+}
+
+// Blob is one stored object reported by List: its handle, size, and last
+// modification time (the GC grace window compares against ModTime).
+type Blob struct {
+	Handle  string
+	Size    int64
+	ModTime time.Time
 }
 
 // FS is a content-addressed blob store rooted at a directory (typically
@@ -178,6 +193,37 @@ func (s *FS) Put(r io.Reader, mime string, pol Policy) (*Ref, error) {
 		}
 	}
 	return &Ref{Handle: "media:" + sum, MIME: mime, Size: size}, nil
+}
+
+// List returns every blob in the directory with its size and mtime.
+func (s *FS) List() ([]Blob, error) {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return nil, fmt.Errorf("media store: %w", err)
+	}
+	out := make([]Blob, 0, len(entries))
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil {
+			return nil, fmt.Errorf("media store: stat %s: %w", e.Name(), err)
+		}
+		if info.IsDir() {
+			continue
+		}
+		out = append(out, Blob{Handle: "media:" + e.Name(), Size: info.Size(), ModTime: info.ModTime()})
+	}
+	return out, nil
+}
+
+// Delete removes one blob. A missing blob is not an error (idempotent GC).
+func (s *FS) Delete(handle string) error {
+	if !ValidHandle(handle) {
+		return fmt.Errorf("media store: malformed handle %q", handle)
+	}
+	if err := os.Remove(filepath.Join(s.dir, strings.TrimPrefix(handle, "media:"))); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("media store: delete %s: %w", handle, err)
+	}
+	return nil
 }
 
 // OpenFile returns a reader over the blob named by handle.

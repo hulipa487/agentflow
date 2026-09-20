@@ -1,6 +1,7 @@
 package s3media
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -42,11 +43,33 @@ func newMockS3(t *testing.T) (*httptest.Server, *mockS3) {
 				w.WriteHeader(http.StatusNotFound)
 			}
 		case http.MethodGet:
+			if r.URL.Query().Get("list-type") == "2" {
+				// ListObjectsV2: report every object under the prefix.
+				// Object keys in this mock include the bucket segment
+				// ("media-bucket/agentflow/<sha>"), so qualify the prefix.
+				pfx := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/"), "/") + "/" + r.URL.Query().Get("prefix")
+				var contents []string
+				for k := range m.objects {
+					if strings.HasPrefix(k, pfx) {
+						// Real S3 reports keys without the bucket segment.
+						contents = append(contents, fmt.Sprintf(
+							"<Contents><Key>%s</Key><Size>%d</Size><LastModified>2026-09-21T00:00:00.000Z</LastModified></Contents>",
+							strings.TrimPrefix(k, pfx[:len(pfx)-len(r.URL.Query().Get("prefix"))]), len(m.objects[k])))
+					}
+				}
+				w.Header().Set("Content-Type", "application/xml")
+				_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">` +
+					strings.Join(contents, "") + `</ListBucketResult>`))
+				return
+			}
 			if b, ok := m.objects[key]; ok {
 				w.Write(b)
 			} else {
 				w.WriteHeader(http.StatusNotFound)
 			}
+		case http.MethodDelete:
+			delete(m.objects, key)
+			w.WriteHeader(http.StatusNoContent)
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
@@ -155,5 +178,46 @@ func TestReadAllRejectsBadHandle(t *testing.T) {
 	s := newStore(t, srv.URL)
 	if _, err := s.ReadAll("../etc/passwd", 1<<20); err == nil {
 		t.Fatal("malformed handle should be rejected before any request")
+	}
+}
+
+// TestListDelete: List enumerates blobs (handle, size, modtime) under the
+// prefix and Delete removes them — the GC primitives.
+func TestListDelete(t *testing.T) {
+	srv, _ := newMockS3(t)
+	st := newStore(t, srv.URL)
+
+	r1, err := st.Put(strings.NewReader("alpha"), "text/plain", media.Policy{Allow: []string{"*"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Put(strings.NewReader("beta"), "text/plain", media.Policy{Allow: []string{"*"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	blobs, err := st.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blobs) != 2 {
+		t.Fatalf("List() = %d blobs, want 2", len(blobs))
+	}
+	seen := map[string]media.Blob{}
+	for _, b := range blobs {
+		seen[b.Handle] = b
+		if b.ModTime.IsZero() {
+			t.Fatalf("blob %s must carry LastModified", b.Handle)
+		}
+	}
+	if seen[r1.Handle].Size != 5 {
+		t.Fatalf("sizes wrong: %+v", seen)
+	}
+
+	if err := st.Delete(r1.Handle); err != nil {
+		t.Fatal(err)
+	}
+	blobs, _ = st.List()
+	if len(blobs) != 1 || blobs[0].Handle == r1.Handle {
+		t.Fatalf("after delete: %v", blobs)
 	}
 }

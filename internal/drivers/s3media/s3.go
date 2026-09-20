@@ -13,6 +13,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
@@ -153,6 +154,90 @@ func (s *Store) ReadAll(handle string, limit int64) ([]byte, error) {
 		return nil, fmt.Errorf("%w: %s", media.ErrExceedsLimit, handle)
 	}
 	return b, nil
+}
+
+// List returns every blob in the bucket under the configured prefix
+// (paginated ListObjectsV2), for mark-sweep GC.
+func (s *Store) List() ([]media.Blob, error) {
+	var out []media.Blob
+	var token string
+	for {
+		listURL := s.objectURL("") // bucket listing base
+		q := url.Values{
+			"list-type":          {"2"},
+			"prefix":             {s.prefixWithSlash()},
+			"continuation-token": {token},
+			"max-keys":           {"1000"},
+		}
+		// A zero token must not be sent.
+		if token == "" {
+			delete(q, "continuation-token")
+		}
+		req, err := http.NewRequest(http.MethodGet, listURL+"?"+q.Encode(), nil)
+		if err != nil {
+			return nil, fmt.Errorf("s3media: build list: %w", err)
+		}
+		resp, err := s.doRaw(req)
+		if err != nil {
+			return nil, fmt.Errorf("s3media: list: %w", err)
+		}
+		var page struct {
+			Contents []struct {
+				Key          string    `xml:"Key"`
+				Size         int64     `xml:"Size"`
+				LastModified time.Time `xml:"LastModified"`
+			} `xml:"Contents"`
+			Next string `xml:"NextContinuationToken"`
+		}
+		if err := xml.NewDecoder(resp.Body).Decode(&page); err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("s3media: decode list: %w", err)
+		}
+		resp.Body.Close()
+		for _, c := range page.Contents {
+			sum := strings.TrimPrefix(c.Key, s.prefixWithSlash())
+			if h := "media:" + sum; media.ValidHandle(h) {
+				out = append(out, media.Blob{Handle: h, Size: c.Size, ModTime: c.LastModified})
+			}
+		}
+		if page.Next == "" {
+			return out, nil
+		}
+		token = page.Next
+	}
+}
+
+// prefixWithSlash is the object key prefix with exactly one trailing slash
+// (or "" when unconfigured) — the namespace every blob key lives under.
+func (s *Store) prefixWithSlash() string {
+	if s.prefix == "" {
+		return ""
+	}
+	return s.prefix + "/"
+}
+
+// Delete removes one blob. A missing object is not an error (idempotent GC).
+func (s *Store) Delete(handle string) error {
+	if !media.ValidHandle(handle) {
+		return fmt.Errorf("s3media: malformed handle %q", handle)
+	}
+	req, err := http.NewRequest(http.MethodDelete, s.objectURL(s.objectKey(handle)), nil)
+	if err != nil {
+		return fmt.Errorf("s3media: build delete: %w", err)
+	}
+	s.sign(req, "UNSIGNED-PAYLOAD")
+	resp, err := s.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("s3media: delete %s: %w", handle, err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("s3media: delete %s: status %d", handle, resp.StatusCode)
+	}
+	return nil
 }
 
 // head reports whether key already exists (404 = no).

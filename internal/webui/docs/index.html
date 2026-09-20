@@ -657,8 +657,10 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
     access_key: ${R2_ACCESS_KEY_ID}
     secret_key: ${R2_SECRET_ACCESS_KEY}
   max_file_bytes: 33554432    # per-file ceiling (default 32 MiB)
-  scratch_ttl: 24h            # per-session scratch lifetime; 0 = no expiry</code></pre>
-  <p>Backs the <code>files.*</code> Lua ops (cap <code>files</code>): user-scoped project trees with engine-native snapshot versioning, plus per-session scratch. File bytes are content-addressed in the blob store exactly like media; snapshot metadata lives in the runtime store's <code>files_meta</code> table (plain sqlite, inspectable). S3-compatible endpoints need a real SigV4 key pair — a bearer token cannot speak S3. An unresolvable credential pair disables the store with a boot warning (the ops then fail honestly), never a boot failure.</p>
+  scratch_ttl: 24h            # per-session scratch lifetime; 0 = no expiry
+  gc_grace: 24h               # blob GC grace window; 0 = GC disabled</code></pre>
+  <p>Backs the <code>files.*</code> Lua ops (cap <code>files</code>): user-scoped project trees with engine-native snapshot versioning, plus per-session scratch. A boot-time mark-sweep reclaims orphaned blobs (deleted files, superseded contents) past <code>gc_grace</code>: the live set is every handle referenced by tree records, commit trees (rollback stays possible), and scratch — dedupe is untouched, and the grace window (vs the put blob-then-metadata write order) makes sweeping safe without locking.</p>
+  <p> File bytes are content-addressed in the blob store exactly like media; snapshot metadata lives in the runtime store's <code>files_meta</code> table (plain sqlite, inspectable). S3-compatible endpoints need a real SigV4 key pair — a bearer token cannot speak S3. An unresolvable credential pair disables the store with a boot warning (the ops then fail honestly), never a boot failure.</p>
 
   <h3><code>audit</code> — message journal</h3>
   <pre><code>audit:

@@ -283,6 +283,15 @@ func main() {
 		} else if n > 0 {
 			log.Info("files scratch swept", "expired", n)
 		}
+		// Blob GC: mark-and-sweep unreferenced blobs past the grace window.
+		// Disabled with files.gc_grace: "0".
+		if grace := cfg.Files.FilesGCGrace(); grace > 0 {
+			if live, swept, err := filesMgr.GC(ctx, grace); err != nil {
+				log.Warn("files blob gc failed", "err", err)
+			} else if swept > 0 {
+				log.Info("files blob gc swept", "live", live, "swept", swept)
+			}
+		}
 	}
 
 	// Tool registry: builtins + shell builtins + MCP discovery. The web_search
@@ -1310,7 +1319,7 @@ func resolveMediaS3(ctx context.Context, res *config.Resolver, s3 config.MediaS3
 		}
 		v, ok := res.Resolve(ctx, *key.dst)
 		if !ok {
-			log.Warn(what + " store skipped: unresolved credential",
+			log.Warn(what+" store skipped: unresolved credential",
 				"field", key.field, "credential", config.CredentialName(*key.dst))
 			return config.MediaS3{}, false
 		}

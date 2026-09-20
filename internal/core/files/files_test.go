@@ -2,10 +2,13 @@ package files
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -341,5 +344,83 @@ func TestScratchPutHandle(t *testing.T) {
 	got, err := m.ScratchGet(ctx, "sess:X", "copy.txt")
 	if err != nil || got.Handle != e.Handle {
 		t.Fatalf("scratch by handle %+v err %v", got, err)
+	}
+}
+
+// TestGCMarkSweep: unreferenced blobs are swept past the grace window;
+// referenced ones (working tree, commit trees, scratch) and young orphans
+// survive. Blob mtimes are aged with os.Chtimes — exactly what production
+// GC reads on the fs backend.
+func TestGCMarkSweep(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "blobs")
+	blobs, err := media.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt, err := runtime.Open(filepath.Join(t.TempDir(), "rt.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { rt.Close() })
+	m := New(blobs, rt, time.Hour, 1<<20, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx := context.Background()
+
+	liveTree := putString(t, m, "user:u1", "proj", "keep.txt", "keep-me")
+	putString(t, m, "user:u1", "proj", "pin.txt", "commit-pinned")
+	if _, err := m.Commit(ctx, "user:u1", "proj", "main", "pin"); err != nil {
+		t.Fatal(err)
+	}
+	scratchLive, err := m.ScratchPut(ctx, "sess:X", "scratch.txt", strings.NewReader("scratch"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	orphanDel := putString(t, m, "user:u1", "proj", "goner.txt", "delete me")
+	if err := m.Delete(ctx, "user:u1", "proj", "goner.txt"); err != nil {
+		t.Fatal(err)
+	}
+	putString(t, m, "user:u1", "proj", "rev.txt", "v1") // v1's blob orphaned by v2
+	putString(t, m, "user:u1", "proj", "rev.txt", "v2")
+	young := putString(t, m, "user:u1", "proj", "young.txt", "fresh")
+	if err := m.Delete(ctx, "user:u1", "proj", "young.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Age the old orphans two hours back on disk; the young one stays fresh.
+	old := time.Now().Add(-2 * time.Hour)
+	age := func(handle string) {
+		p := filepath.Join(dir, strings.TrimPrefix(handle, "media:"))
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatalf("age %s: %v", handle, err)
+		}
+	}
+	age(orphanDel.Handle)
+	sum1 := sha256.Sum256([]byte("v1"))
+	age("media:" + hex.EncodeToString(sum1[:]))
+
+	// A far-future grace sweeps nothing.
+	if _, swept, err := m.GC(ctx, 100*time.Hour); err != nil || swept != 0 {
+		t.Fatalf("huge grace must sweep nothing: swept=%d err=%v", swept, err)
+	}
+	// The 1h grace sweep takes the two old orphans, keeps the young one.
+	if _, swept, err := m.GC(ctx, time.Hour); err != nil || swept != 2 {
+		t.Fatalf("grace sweep swept=%d, want 2 err=%v", swept, err)
+	}
+	if _, err := m.blobs.ReadAll(young.Handle, 1<<20); err != nil {
+		t.Fatalf("young orphan must survive the graced sweep: %v", err)
+	}
+	// Referenced blobs survive everything.
+	pinned, err := m.Get(ctx, "user:u1", "proj", "pin.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range []string{liveTree.Handle, scratchLive.Handle, pinned.Handle} {
+		if _, err := m.blobs.ReadAll(h, 1<<20); err != nil {
+			t.Fatalf("live handle %s must survive GC: %v", h, err)
+		}
+	}
+	// The zero-grace pass takes the young orphan too.
+	if _, swept, err := m.GC(ctx, 0); err != nil || swept != 1 {
+		t.Fatalf("zero-grace sweep swept=%d, want 1 err=%v", swept, err)
 	}
 }

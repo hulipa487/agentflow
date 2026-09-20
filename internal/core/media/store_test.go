@@ -112,3 +112,50 @@ func TestClassify(t *testing.T) {
 		}
 	}
 }
+
+// TestFSListDelete: List reports every blob with size and mtime; Delete
+// removes a blob and treats a missing one as success (idempotent GC).
+func TestFSListDelete(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	r1, err := s.Put(strings.NewReader("alpha"), "text/plain", Policy{Allow: []string{"*"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, err := s.Put(strings.NewReader("beta"), "text/plain", Policy{Allow: []string{"*"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobs, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blobs) != 2 {
+		t.Fatalf("List() = %d blobs, want 2", len(blobs))
+	}
+	byHandle := map[string]Blob{}
+	for _, b := range blobs {
+		byHandle[b.Handle] = b
+		if b.ModTime.IsZero() {
+			t.Fatalf("blob %s must report an mtime", b.Handle)
+		}
+	}
+	if byHandle[r1.Handle].Size != 5 || byHandle[r2.Handle].Size != 4 {
+		t.Fatalf("sizes wrong: %+v", byHandle)
+	}
+	if err := s.Delete(r1.Handle); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Delete(r1.Handle); err != nil {
+		t.Fatalf("deleting a missing blob must be a no-op: %v", err)
+	}
+	blobs, _ = s.List()
+	if len(blobs) != 1 || blobs[0].Handle != r2.Handle {
+		t.Fatalf("after delete: %v", blobs)
+	}
+	if err := s.Delete("bogus"); err == nil {
+		t.Fatal("malformed handle must fail delete")
+	}
+}

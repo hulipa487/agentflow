@@ -111,6 +111,7 @@ type FilesConfig struct {
 	S3           MediaS3 `yaml:"s3"`             // same fields/resolution as media.s3
 	MaxFileBytes int64   `yaml:"max_file_bytes"` // per-file ceiling; 0 = 32 MiB
 	ScratchTTL   string  `yaml:"scratch_ttl"`    // e.g. 24h; 0 = no expiry; default 24h
+	GCGrace      string  `yaml:"gc_grace"`       // blob GC grace window; 0/empty = disabled; default 24h
 }
 
 // FilesMaxBytes returns the per-file ceiling, applying the default.
@@ -128,6 +129,17 @@ func (f FilesConfig) FilesScratchTTL() time.Duration {
 		return 24 * time.Hour
 	}
 	d, _ := time.ParseDuration(f.ScratchTTL) // validated at boot; error impossible here
+	return d
+}
+
+// FilesGCGrace parses gc_grace, the blob-GC minimum blob age. Empty defaults
+// to 24h; "0" disables GC entirely (the boot sweep skips it). Malformed
+// values fail at validation.
+func (f FilesConfig) FilesGCGrace() time.Duration {
+	if f.GCGrace == "" {
+		return 24 * time.Hour
+	}
+	d, _ := time.ParseDuration(f.GCGrace) // validated at boot; error impossible here
 	return d
 }
 
@@ -1195,6 +1207,11 @@ func validate(path string, c *Config) error {
 	if c.Files.ScratchTTL != "" {
 		if _, err := time.ParseDuration(c.Files.ScratchTTL); err != nil {
 			return fmt.Errorf("%s: files.scratch_ttl: %v", path, err)
+		}
+	}
+	if c.Files.GCGrace != "" {
+		if _, err := time.ParseDuration(c.Files.GCGrace); err != nil {
+			return fmt.Errorf("%s: files.gc_grace: %v", path, err)
 		}
 	}
 

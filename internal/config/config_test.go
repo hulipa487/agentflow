@@ -353,6 +353,12 @@ func TestValidateFiles(t *testing.T) {
 			wantErr: "files.scratch_ttl",
 		},
 		{name: "scratch ttl ok", files: FilesConfig{ScratchTTL: "24h"}},
+		{
+			name:    "malformed gc grace",
+			files:   FilesConfig{GCGrace: "eventually"},
+			wantErr: "files.gc_grace",
+		},
+		{name: "gc grace ok", files: FilesConfig{GCGrace: "24h"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -369,10 +375,10 @@ func TestValidateFiles(t *testing.T) {
 			}
 		})
 	}
-	// Defaults: 32 MiB ceiling, 24h scratch TTL.
+	// Defaults: 32 MiB ceiling, 24h scratch TTL, 24h GC grace.
 	f := FilesConfig{}
-	if f.FilesMaxBytes() != 32<<20 || f.FilesScratchTTL() != 24*time.Hour {
-		t.Fatalf("files defaults: max=%d ttl=%v", f.FilesMaxBytes(), f.FilesScratchTTL())
+	if f.FilesMaxBytes() != 32<<20 || f.FilesScratchTTL() != 24*time.Hour || f.FilesGCGrace() != 24*time.Hour {
+		t.Fatalf("files defaults: max=%d ttl=%v gc=%v", f.FilesMaxBytes(), f.FilesScratchTTL(), f.FilesGCGrace())
 	}
 }
 

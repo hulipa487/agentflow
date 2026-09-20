@@ -402,6 +402,72 @@ func (m *Manager) SweepScratch(ctx context.Context) (int, error) {
 // materialization, scratch mounts) apply when reading blobs back.
 func (m *Manager) MaxFileBytes() int64 { return m.maxBytes }
 
+// GC is a mark-sweep over the blob store. The live set is every handle
+// referenced by files_meta: working-tree records, every commit's tree
+// (rollback must keep old commits' blobs alive — sweeping them would defeat
+// checkout), and scratch records. Unreferenced blobs older than grace are
+// deleted; a grace of zero sweeps regardless of age (the boot wiring only
+// ever passes positive values; zero/negative is for tests and forced
+// operator sweeps). The put write order is blob-then-metadata, so anything
+// younger than the grace is referenced or mid-transaction — the grace window
+// is what makes marking safe without locking. Returns (live, swept).
+func (m *Manager) GC(ctx context.Context, grace time.Duration) (int, int, error) {
+	live, err := m.liveHandles(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	blobs, err := m.blobs.List()
+	if err != nil {
+		return 0, 0, err
+	}
+	swept := 0
+	cutoff := m.now().Add(-grace)
+	for _, b := range blobs {
+		if live[b.Handle] {
+			continue
+		}
+		if grace > 0 && b.ModTime.After(cutoff) {
+			continue // too young: referenced or mid-transaction
+		}
+		if err := m.blobs.Delete(b.Handle); err != nil {
+			return len(live), swept, err
+		}
+		swept++
+	}
+	return len(live), swept, nil
+}
+
+// liveHandles collects every blob handle referenced by files_meta: tree
+// records (t|), commit trees (c|), and scratch records (s|).
+func (m *Manager) liveHandles(ctx context.Context) (map[string]bool, error) {
+	live := map[string]bool{}
+	for _, prefix := range []string{"t|", "c|", "s|"} {
+		rows, err := m.meta.ListRows(ctx, prefix)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range rows {
+			switch r.Key[0] {
+			case 't', 's':
+				var e Entry
+				if err := json.Unmarshal([]byte(r.Value), &e); err != nil {
+					return nil, fmt.Errorf("files: corrupt record %q: %w", r.Key, err)
+				}
+				live[e.Handle] = true
+			case 'c':
+				var c Commit
+				if err := json.Unmarshal([]byte(r.Value), &c); err != nil {
+					return nil, fmt.Errorf("files: corrupt commit %q: %w", r.Key, err)
+				}
+				for _, h := range c.Tree {
+					live[h] = true
+				}
+			}
+		}
+	}
+	return live, nil
+}
+
 // ReadBlob materializes blob bytes engine-side (checkout, shell mounts,
 // fetch save_to). Loops never see this — it exists for engine consumers.
 func (m *Manager) ReadBlob(ctx context.Context, handle string, limit int64) ([]byte, error) {

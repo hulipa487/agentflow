@@ -756,7 +756,10 @@ type ChannelMedia struct {
 }
 
 // DefaultCapabilities is what an agent gets if capabilities are omitted.
-var DefaultCapabilities = []string{"llm.chat", "memory", "tools", "agent.send", "net.http"}
+// "users" is in the default set because the surface is read-only and scoped to
+// the caller's own turn; the profile directory behind it is gated on
+// maintenance provenance in the handler, not on the capability.
+var DefaultCapabilities = []string{"llm.chat", "memory", "tools", "agent.send", "net.http", "users"}
 
 // memoryProviderKnown reports whether name is a supported memory backend
 // provider, for the hint that catches the retired "builtin:" spelling.
@@ -946,6 +949,7 @@ func validate(path string, c *Config) error {
 		allowedCaps["channel.push"] = true
 		allowedCaps["net.mail"] = true
 		allowedCaps["files"] = true
+		allowedCaps["users"] = true
 	}
 
 	for name, a := range c.Agents {

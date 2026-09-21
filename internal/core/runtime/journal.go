@@ -23,21 +23,21 @@ import (
 // JournalEntry is one journaled message. Direction is "in" (router ingress)
 // or "out" (session egress); Status records what happened to it.
 type JournalEntry struct {
-	ID          string         // message id (stamped at ingress if absent)
-	Ts          int64          // unix seconds
-	Direction   string         // in | out
-	Status      string         // in: routed | dropped_queue; out: delivered | failed | blocked_safety
-	Channel     string         //
-	Chat        string         // channel chat id, when known
-	Sender      string         // msg.from (in) or recipient (out)
-	UserUUID    string         // profile behind the message ("" when the sender is unregistered)
-	Agent       string         //
-	SessionID   string         // out only
-	Type        string         // message type (user|timer|agent|...)
-	Text        string         //
-	Attachments []media.Part   // descriptors only (handles, never bytes)
-	Provenance  map[string]any // in only
-	Err         string         // delivery error detail (out, failed)
+	ID          string         `json:"id"`        // message id (stamped at ingress if absent)
+	Ts          int64          `json:"ts"`        // unix seconds
+	Direction   string         `json:"direction"` // in | out
+	Status      string         `json:"status"`    // in: routed | dropped_queue; out: delivered | failed | blocked_safety
+	Channel     string         `json:"channel,omitempty"`
+	Chat        string         `json:"chat,omitempty"`        // channel chat id, when known
+	Sender      string         `json:"sender"`                // msg.from (in) or recipient (out)
+	UserUUID    string         `json:"user_uuid"`             // profile behind the message ("" when the sender is unregistered)
+	Agent       string         `json:"agent,omitempty"`       //
+	SessionID   string         `json:"session_id,omitempty"`  // out only
+	Type        string         `json:"type,omitempty"`        // message type (user|timer|agent|...)
+	Text        string         `json:"text,omitempty"`        //
+	Attachments []media.Part   `json:"attachments,omitempty"` // descriptors only (handles, never bytes)
+	Provenance  map[string]any `json:"provenance,omitempty"`  // in only
+	Err         string         `json:"err,omitempty"`         // delivery error detail (out, failed)
 }
 
 // RecordMessage appends one entry to the journal.

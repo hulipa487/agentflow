@@ -43,6 +43,11 @@ type Deps struct {
 	Snapshot   func() ([]supervisor.SessionStatus, int, int)
 	Version    string
 	StartedAt  time.Time
+
+	// Users is the per-user surface: profiles, the usage ledger and the message
+	// journal (both live in the runtime store), the quota, and the file store.
+	// Each nil handle degrades with a named reason rather than a blank answer.
+	Users UserDeps
 }
 
 // UI is the console. Static serves the SPA (unauthenticated — it is inert
@@ -142,6 +147,13 @@ func (u *UI) API() http.Handler {
 	mux.HandleFunc("GET /admin/api/metrics", u.handleMetrics)
 	mux.HandleFunc("GET /admin/api/logs", u.handleLogs)
 	mux.HandleFunc("GET /admin/api/credentials/users", u.handleCredentialUsers)
+	// Per-user profiles: who they are, what they spent, what they own, and what
+	// they did.
+	mux.HandleFunc("GET /admin/api/users", u.handleUsers)
+	mux.HandleFunc("GET /admin/api/users/{id}", u.handleUser)
+	mux.HandleFunc("POST /admin/api/users/{id}/limit", u.handleUserLimit)
+	mux.HandleFunc("POST /admin/api/users/{id}/unlink", u.handleUserUnlink)
+	mux.HandleFunc("POST /admin/api/users/invites", u.handleInviteIssue)
 	return mux
 }
 
@@ -199,16 +211,16 @@ func (u *UI) handleState(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":          true,
-		"version":     d.Version,
-		"started_at":  d.StartedAt.Unix(),
-		"uptime_s":    int64(time.Since(d.StartedAt).Seconds()),
-		"config_path": d.ConfigPath,
-		"agents":      agents,
-		"channels":    channels,
-		"sessions":    sessions,
-		"sessions_active": active,
-		"sessions_idle":   idle,
+		"ok":                  true,
+		"version":             d.Version,
+		"started_at":          d.StartedAt.Unix(),
+		"uptime_s":            int64(time.Since(d.StartedAt).Seconds()),
+		"config_path":         d.ConfigPath,
+		"agents":              agents,
+		"channels":            channels,
+		"sessions":            sessions,
+		"sessions_active":     active,
+		"sessions_idle":       idle,
 		"credentials_enabled": d.Creds != nil,
 	})
 }

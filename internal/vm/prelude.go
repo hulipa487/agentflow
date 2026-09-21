@@ -298,6 +298,38 @@ function store.scopes(table)
   return op({ type = "store.scopes", table = table })
 end
 
+-- The user surface: read-only facts about the person this turn belongs to.
+-- A loop learns a name and a channel, never an email or a secret — credential
+-- values are only ever reached as the opaque auth={service=...} reference the
+-- engine resolves.
+user = {}
+-- user.current() -> {ok, registered, id, display_name, identities}. A turn with
+-- no registered user (engine work, or a handle nobody has linked) reports
+-- registered=false, so a loop can greet a guest differently.
+function user.current()
+  return op({ type = "user.current" })
+end
+-- user.usage() -> {ok, input, output, cached, reasoning, calls, failed,
+-- billable, used, limit, remaining, unlimited, in_flight} for the current user,
+-- so a loop can warn before the quota bites.
+function user.usage()
+  return op({ type = "user.usage" })
+end
+-- user.has_credential(service) -> {ok, service, present}: whether the user holds
+-- a credential. The value is never exposed; only the engine can use it.
+function user.has_credential(service)
+  return op({ type = "user.has_credential", service = service })
+end
+-- user.get(id) -> one profile, and user.list() -> every profile. Maintenance
+-- provenance only (system/scheduler): a user's own turn cannot read another
+-- account.
+function user.get(id)
+  return op({ type = "user.get", user_id = id })
+end
+function user.list()
+  return op({ type = "user.list" })
+end
+
 memory = {}
 function memory.write(record)
   local targets = memory_routing_table(record)
@@ -841,6 +873,12 @@ end
 -- files.list(project, prefix?) -> {ok, entries}
 function files.list(project, prefix)
   return op({ type = "files.list", project = project, path = prefix or "" })
+end
+-- files.projects() -> {ok, projects}: the project names in the caller's own
+-- scope. Scope is engine-resolved, so a loop can only ever see its own; there
+-- is no way to name someone else's.
+function files.projects()
+  return op({ type = "files.projects" })
 end
 -- files.delete(project, path) -> {ok=true}
 function files.delete(project, path)

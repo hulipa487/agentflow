@@ -229,6 +229,37 @@ func (m *Manager) Get(ctx context.Context, scope, project, p string) (*Entry, er
 	return e, nil
 }
 
+// Projects lists the project names present in a scope. A project is not a
+// registry entity — it comes into existence when something is written under its
+// name — so enumerating is a key scan with the project segment extracted. The
+// scope is the caller's ("user:<uuid>" or "agent:<name>"); a caller can never
+// discover another scope's projects.
+func (m *Manager) Projects(ctx context.Context, scope string) ([]string, error) {
+	if scope == "" {
+		return nil, errors.New("files: scope is required")
+	}
+	prefix := allTreePrefix + scope + "|"
+	rows, err := m.meta.ListRows(ctx, prefix)
+	if err != nil {
+		return nil, fmt.Errorf("files: list projects: %w", err)
+	}
+	seen := map[string]bool{}
+	for _, r := range rows {
+		rest := strings.TrimPrefix(r.Key, prefix)
+		// A tree key is "<project>|<path>": everything up to the first
+		// separator is the project.
+		if i := strings.Index(rest, "|"); i > 0 {
+			seen[rest[:i]] = true
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for p := range seen {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 // List returns working-tree entries under a path prefix ("" = the whole
 // tree), sorted by path. A prefix is a path fragment, not a stored path:
 // trailing slashes are tolerated ("src/" ≡ "src").

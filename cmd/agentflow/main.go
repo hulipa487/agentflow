@@ -148,6 +148,25 @@ func main() {
 	// load, so its values are literals and pass straight through.
 	credResolver := &config.Resolver{Store: credStore}
 
+	// hasCred answers credential existence for the user surface without ever
+	// touching a value: a loop may ask whether its user holds a key, never what
+	// the key is.
+	hasCred := func(userID, service string) bool {
+		if credStore == nil {
+			return false
+		}
+		refs, err := credStore.List(context.Background(), userID)
+		if err != nil {
+			return false
+		}
+		for _, r := range refs {
+			if r.Service == service {
+				return true
+			}
+		}
+		return false
+	}
+
 	// Outbound HTTP policy, shared by the Lua http.request op and the
 	// builtin:fetch tool so the two cannot disagree. The guard lives in the
 	// dialer — see internal/core/netguard — which is what makes it cover
@@ -278,6 +297,35 @@ func main() {
 	var userQuota *accounting.Quota
 	if identReg != nil {
 		userQuota = accounting.New(rtStore, identReg.LimitFor, cfg.Usage.DefaultTokensPerDay)
+	}
+
+	// The loop-visible projection of a profile: a display name and the handles,
+	// never an email or a secret. The conversion lives here because caps cannot
+	// import identity — the router's tests import caps, and identity imports
+	// router, so that edge would close a cycle.
+	profileFor := func(userID string) (caps.LoopProfile, bool, error) {
+		if identReg == nil {
+			return caps.LoopProfile{}, false, nil
+		}
+		p, ok, err := identReg.Get(userID)
+		if err != nil || !ok {
+			return caps.LoopProfile{}, false, err
+		}
+		return loopViewOf(p), true, nil
+	}
+	profilesFor := func() ([]caps.LoopProfile, error) {
+		if identReg == nil {
+			return nil, nil
+		}
+		ps, err := identReg.List()
+		if err != nil {
+			return nil, err
+		}
+		out := make([]caps.LoopProfile, 0, len(ps))
+		for _, p := range ps {
+			out = append(out, loopViewOf(p))
+		}
+		return out, nil
 	}
 
 	// User-scoped file store: same blob-store family as media (fs or S3),
@@ -526,6 +574,18 @@ func main() {
 		for k, h := range gateOps(enforce, name, effectiveCaps, "files", caps.FileHandlers(filesMgr, name), &withheld) {
 			handlers[k] = h
 		}
+		// The user surface: read-only facts about the sender, plus
+		// maintenance-only profile lookup for the agent's own loops.
+		userHandlers := caps.UserHandlers{
+			Profile:       profileFor,
+			Profiles:      profilesFor,
+			Ledger:        rtStore,
+			Quota:         userQuota,
+			HasCredential: hasCred,
+		}.Handlers()
+		for k, h := range gateOps(enforce, name, effectiveCaps, "user.current", userHandlers, &withheld) {
+			handlers[k] = h
+		}
 		// runtime.* and credential.get stay ungated: the first is loop
 		// machinery every agent needs, the second is already scoped by the
 		// agent's own credential list.
@@ -665,6 +725,16 @@ func main() {
 			handlers[k] = h
 		}
 		for k, h := range gateOps(enforce, pname, profileCaps, "files", caps.FileHandlers(filesMgr, pname), &withheld) {
+			handlers[k] = h
+		}
+		userHandlers := caps.UserHandlers{
+			Profile:       profileFor,
+			Profiles:      profilesFor,
+			Ledger:        rtStore,
+			Quota:         userQuota,
+			HasCredential: hasCred,
+		}.Handlers()
+		for k, h := range gateOps(enforce, pname, profileCaps, "user.current", userHandlers, &withheld) {
 			handlers[k] = h
 		}
 		for k, h := range runtimeHandlers {
@@ -1074,6 +1144,12 @@ func main() {
 			Snapshot: func() ([]supervisor.SessionStatus, int, int) {
 				return sup.Snapshot()
 			},
+			Users: webui.UserDeps{
+				Identities: identReg,
+				Store:      rtStore,
+				Quota:      userQuota,
+				Files:      filesMgr,
+			},
 		})
 		admin.Mount("/admin/api/", console.API(), true)
 		// Docs site (embedded, unauthenticated). Redirect bare /docs so the
@@ -1172,6 +1248,19 @@ func capabilitySet(caps []string) map[string]bool {
 // enforce is plugins.enforce_capabilities; setting it false returns the map
 // untouched, which is the migration escape for a configuration that relied on
 // every agent having every op.
+// loopViewOf projects a profile into what a loop may see: a display name and
+// the handles, never an email address or a credential.
+func loopViewOf(p identity.Profile) caps.LoopProfile {
+	v := caps.LoopProfile{UserID: p.UserID, DisplayName: p.DisplayName}
+	v.Identities = make([]caps.LoopIdentity, 0, len(p.Identities))
+	for _, id := range p.Identities {
+		v.Identities = append(v.Identities, caps.LoopIdentity{
+			Channel: id.Channel, Username: id.Username, Name: id.Name,
+		})
+	}
+	return v
+}
+
 func gateOps(enforce bool, agent string, granted map[string]bool, capability string,
 	hs map[string]session.OpHandler, withheld *[]string) map[string]session.OpHandler {
 	if !enforce || granted[capability] {

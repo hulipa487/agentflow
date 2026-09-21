@@ -2,6 +2,7 @@ package sessionhub
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -294,6 +295,128 @@ func TestClaimGivesTheSessionToOneInstance(t *testing.T) {
 	a.drainOnce(ctx)
 	if got := aDelivered.got(); len(got) != 1 || got[0] != "m1" {
 		t.Fatalf("the owner did not drain the session it claimed: %v", got)
+	}
+}
+
+// leaseDeadline reads the store's view of a session claim's deadline. The
+// renewal cadence is only visible there: the hub's own state says it renewed,
+// while the store says when the claim actually lapses.
+func leaseDeadline(t *testing.T, path, sessKey string) int64 {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+	var exp int64
+	if err := db.QueryRow(`SELECT expires_at FROM leases WHERE name = ?`, "session:"+sessKey).Scan(&exp); err != nil {
+		t.Fatalf("read the claim on %s: %v", sessKey, err)
+	}
+	return exp
+}
+
+// expireClaim backdates a session claim, standing in for the case the throttle
+// makes possible: this instance was unable to renew, and the claim lapsed.
+func expireClaim(t *testing.T, path, sessKey string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE leases SET expires_at = ? WHERE name = ?`,
+		time.Now().Add(-time.Minute).UnixNano(), "session:"+sessKey); err != nil {
+		t.Fatalf("expire the claim on %s: %v", sessKey, err)
+	}
+}
+
+// An idle session is not worth a store write on every poll — a deployment whose
+// lease store is in another region pays each one as a round trip — so its claim
+// is renewed at a fraction of the TTL, while a session with something waiting
+// is renewed on the spot, because delivering on a claim that has lapsed is the
+// one thing the renewal exists to prevent.
+func TestIdleClaimsAreRenewedAtAFractionOfTheTTL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hub.db")
+	a, da := oneInstance(t, path, "instance-a")
+	b, _ := oneInstance(t, path, "instance-b")
+	ctx := context.Background()
+	// A third of this is 100ms: short enough to observe, long enough that the
+	// steps below are not racing the clock.
+	const ttl = 300 * time.Millisecond
+	a.SetSessionTTL(ttl)
+	b.SetSessionTTL(ttl)
+
+	if ok, err := a.Claim(ctx, "bot|idle"); err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+	first := leaseDeadline(t, path, "bot|idle")
+
+	// The next pass is not a renewal: nothing is waiting for the session and
+	// nothing is due.
+	a.drainOnce(ctx)
+	if got := leaseDeadline(t, path, "bot|idle"); got != first {
+		t.Fatal("an idle session's claim was renewed on every poll")
+	}
+
+	// Work changes that: the claim is renewed before the delivery, whatever the
+	// clock says.
+	if err := b.Route(ctx, "bot", "idle", msg("m1")); err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	a.drainOnce(ctx)
+	if da.count() != 1 {
+		t.Fatalf("the owner did not deliver: %v", da.got())
+	}
+	withWork := leaseDeadline(t, path, "bot|idle")
+	if withWork <= first {
+		t.Fatal("a session with work must renew its claim before delivering")
+	}
+
+	// And once a third of the TTL has passed, the idle path renews too.
+	time.Sleep(ttl / 2)
+	a.drainOnce(ctx)
+	if got := leaseDeadline(t, path, "bot|idle"); got <= withWork {
+		t.Fatalf("an idle claim was not renewed after a third of its %v TTL", ttl)
+	}
+	if a.Held() != 1 {
+		t.Fatalf("held = %d, want the one session", a.Held())
+	}
+}
+
+// A claim that lapsed while this instance was idle means the session is another
+// instance's now. The messages waiting for it are that instance's to deliver,
+// and this one must not deliver them on a claim it no longer holds.
+func TestASessionTakenByAPeerIsNotDeliveredFor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hub.db")
+	a, da := oneInstance(t, path, "instance-a")
+	b, db := oneInstance(t, path, "instance-b")
+	ctx := context.Background()
+
+	if ok, err := a.Claim(ctx, "bot|moved"); err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+	if err := b.Route(ctx, "bot", "moved", msg("m1")); err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	expireClaim(t, path, "bot|moved")
+	if ok, err := b.Claim(ctx, "bot|moved"); err != nil || !ok {
+		t.Fatalf("a peer must be able to take a lapsed claim: ok=%v err=%v", ok, err)
+	}
+
+	// The pending check names the session, but the renewal before delivery
+	// fails — so nothing is delivered and the session is dropped.
+	a.drainOnce(ctx)
+	if da.count() != 0 {
+		t.Fatalf("delivered for a session this instance no longer owns: %v", da.got())
+	}
+	if a.Held() != 0 {
+		t.Fatalf("still holds the session: held=%d", a.Held())
+	}
+	// And the message was never claimed by the wrong instance, so the owner
+	// gets it on its next pass.
+	b.drainOnce(ctx)
+	if db.count() != 1 {
+		t.Fatalf("the owner did not deliver: %v", db.got())
 	}
 }
 

@@ -51,7 +51,7 @@ type Router struct {
 	// state is where route state lives. Nil — a deployment with no runtime
 	// store — leaves route.state.* unavailable, which the ops report rather
 	// than answering "null" for everything.
-	state runtime.Store
+	state runtime.Rows
 
 	// triggers is the prebuilt runtime.triggers response (the same JSON the
 	// agent-facing op returns). Route Lua calls runtime.triggers() to read the
@@ -84,7 +84,7 @@ func New(src, triggersResp string, sup *supervisor.Supervisor, log *slog.Logger)
 // SetStateStore installs the store route state lives in. main calls it once the
 // runtime store is open; without one the route.state.* ops fail with a clear
 // message instead of answering "null" for everything.
-func (r *Router) SetStateStore(st runtime.Store) { r.state = st }
+func (r *Router) SetStateStore(st runtime.Rows) { r.state = st }
 
 // Submit queues an inbound event. The message id is stamped here (the single
 // ingress choke point) so the journal, the session, and Lua all see the same
@@ -380,7 +380,7 @@ func (r *Router) stateList(ctx context.Context, prefix string) (string, bool) {
 // routeState resolves a handler key to its store row, and checks that route
 // state is available at all: a deployment with no runtime store has none, and
 // says so rather than answering "null" for every key.
-func (r *Router) routeState(key string) (runtime.Store, string, error) {
+func (r *Router) routeState(key string) (runtime.Rows, string, error) {
 	if r.state == nil {
 		return nil, "", errNoRouteState
 	}

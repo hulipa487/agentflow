@@ -43,7 +43,7 @@ const (
 // unavailable, so a deployment with no runtime store degrades rather than
 // panicking.
 type SessionStateHandlers struct {
-	Store runtime.Store
+	Store runtime.Rows
 }
 
 // Handlers returns the session.state.* op handlers.

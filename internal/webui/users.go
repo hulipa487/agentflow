@@ -12,13 +12,21 @@ import (
 	"agentflow/internal/core/runtime"
 )
 
-// UserDeps is the per-user console surface: the profile store, the runtime
-// store (usage ledger and message journal), the quota, and the file store. Any
-// of them may be nil when the corresponding subsystem is disabled, and each
-// handler degrades with a named reason rather than an empty answer.
+// UserDeps is the per-user console surface: the profile store, the ledger
+// rollups, the per-call detail and the audit journal behind a profile's page,
+// the quota, and the file store. Any of them may be nil when the corresponding
+// subsystem is disabled, and each handler degrades with a named reason rather
+// than an empty answer.
+//
+// The three read planes are separate fields because a deployment can keep them
+// in different places: the rollups have to stay where a quota check can read
+// them, while the detail and the journal are append-only and can live on a log
+// plane.
 type UserDeps struct {
 	Identities *identity.Registry
-	Store      runtime.Store
+	Store      runtime.Ledger
+	Events     runtime.EventLog
+	Journal    runtime.Journal
 	Quota      *accounting.Quota
 	Files      *files.Manager
 }
@@ -94,12 +102,17 @@ func (u *UI) handleUser(w http.ResponseWriter, r *http.Request) {
 		if totals, err := u.deps.Users.Store.UsageForDay(id, day); err == nil {
 			out["usage_today"] = totals
 		}
-		// The per-call detail exists only when usage.events is enabled; an
-		// empty list is the honest answer otherwise.
-		if events, err := u.deps.Users.Store.UsageEvents(id, time.Now().AddDate(0, 0, -7), 50); err == nil {
+	}
+	// The per-call detail exists only when usage.events is enabled, and it may
+	// live on a log plane of its own; an empty answer is the honest one
+	// otherwise.
+	if u.deps.Users.Events != nil {
+		if events, err := u.deps.Users.Events.UsageEvents(id, time.Now().AddDate(0, 0, -7), 50); err == nil {
 			out["recent_calls"] = events
 		}
-		if audit, err := u.deps.Users.Store.ListMessages(r.Context(), runtime.JournalFilter{
+	}
+	if u.deps.Users.Journal != nil {
+		if audit, err := u.deps.Users.Journal.ListMessages(r.Context(), runtime.JournalFilter{
 			UserUUID: id, Limit: 50,
 		}); err == nil {
 			out["audit"] = audit

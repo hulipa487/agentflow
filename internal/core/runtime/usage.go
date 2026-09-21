@@ -127,19 +127,9 @@ func (s *sqliteStore) RecordUsage(rec UsageRecord, withEvent bool) error {
 	if !withEvent {
 		return nil
 	}
-	ok := 0
-	if rec.OK {
-		ok = 1
-	}
-	if _, err := s.db.ExecContext(ctx, `
-		INSERT INTO usage_events
-			(ts, user_id, agent, model, kind, input, output, cached, cache_write, reasoning, ok)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		rec.At.Unix(), rec.UserID, rec.Agent, rec.Model, rec.Kind,
-		rec.Input, rec.Output, rec.Cached, rec.CacheWrite, rec.Reasoning, ok); err != nil {
-		return fmt.Errorf("record usage event: %w", err)
-	}
-	return nil
+	// The detail row goes through the same normalisation the rollup just did, so
+	// the two agree about what a failed call cost.
+	return s.AppendEvent(rec.UserID, EventFrom(rec))
 }
 
 // UsageForDay returns one user's totals for a UTC day.
@@ -291,7 +281,40 @@ func (s *sqliteStore) PruneUsage(before time.Time) error {
 		`DELETE FROM usage_daily WHERE day < ?`, DayKey(before)); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx,
-		`DELETE FROM usage_events WHERE ts < ?`, before.Unix())
+	_, err := s.PruneEvents(before)
 	return err
+}
+
+// AppendEvent writes one per-call detail row. RecordUsage writes the rollup and
+// the event together; this is the event on its own, which is what a deployment
+// whose detail lives on a log plane calls instead.
+func (s *sqliteStore) AppendEvent(userID string, ev UsageEvent) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ok := 0
+	if ev.OK {
+		ok = 1
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO usage_events
+			(ts, user_id, agent, model, kind, input, output, cached, cache_write, reasoning, ok)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		ev.Ts, userID, ev.Agent, ev.Model, ev.Kind,
+		ev.Input, ev.Output, ev.Cached, ev.CacheWrite, ev.Reasoning, ok); err != nil {
+		return fmt.Errorf("record usage event: %w", err)
+	}
+	return nil
+}
+
+// PruneEvents drops per-call detail rows older than cutoff, reporting how many
+// went — retention that deletes data says how much.
+func (s *sqliteStore) PruneEvents(before time.Time) (int64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := s.db.ExecContext(ctx, `DELETE FROM usage_events WHERE ts < ?`, before.Unix())
+	if err != nil {
+		return 0, fmt.Errorf("prune usage events: %w", err)
+	}
+	n, err := res.RowsAffected()
+	return n, err
 }

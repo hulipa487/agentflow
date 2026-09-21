@@ -73,7 +73,7 @@ type Manifest struct {
 // Manager owns the file store: blobs + metadata + scratch policy.
 type Manager struct {
 	blobs    media.Store
-	meta     runtime.Store
+	meta     runtime.Rows
 	ttl      time.Duration // 0 = scratch never expires
 	maxBytes int64
 	now      func() time.Time // test hook
@@ -82,7 +82,7 @@ type Manager struct {
 
 // New builds a Manager over the given blob store and runtime store. ttl is
 // the scratch TTL (0 disables expiry); maxBytes caps one file's size.
-func New(blobs media.Store, meta runtime.Store, ttl time.Duration, maxBytes int64, log *slog.Logger) *Manager {
+func New(blobs media.Store, meta runtime.Rows, ttl time.Duration, maxBytes int64, log *slog.Logger) *Manager {
 	if maxBytes <= 0 {
 		maxBytes = media.Policy{}.MaxOrDefault()
 	}

@@ -658,6 +658,9 @@ func main() {
 		for k, h := range gateOps(enforce, name, effectiveCaps, "files", caps.FileHandlers(filesMgr, name), &withheld) {
 			handlers[k] = h
 		}
+		for k, h := range gateOps(enforce, name, effectiveCaps, "session.state", caps.SessionStateHandlers{Store: rtStore}.Handlers(), &withheld) {
+			handlers[k] = h
+		}
 		// The user surface: read-only facts about the sender, plus
 		// maintenance-only profile lookup for the agent's own loops.
 		userHandlers := caps.UserHandlers{
@@ -813,6 +816,9 @@ func main() {
 			handlers[k] = h
 		}
 		for k, h := range gateOps(enforce, pname, profileCaps, "files", caps.FileHandlers(filesMgr, pname), &withheld) {
+			handlers[k] = h
+		}
+		for k, h := range gateOps(enforce, pname, profileCaps, "session.state", caps.SessionStateHandlers{Store: rtStore}.Handlers(), &withheld) {
 			handlers[k] = h
 		}
 		userHandlers := caps.UserHandlers{

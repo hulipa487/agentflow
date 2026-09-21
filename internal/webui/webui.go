@@ -44,6 +44,10 @@ type Deps struct {
 	Version    string
 	StartedAt  time.Time
 
+	// Instance identifies this process in a fleet: the lease owner id, which is
+	// how the console (and the lease table) tell one instance from another.
+	Instance string
+
 	// Users is the per-user surface: profiles, the usage ledger and the message
 	// journal (both live in the runtime store), the quota, and the file store.
 	// Each nil handle degrades with a named reason rather than a blank answer.
@@ -219,6 +223,7 @@ func (u *UI) handleState(w http.ResponseWriter, r *http.Request) {
 		"uptime_s":            int64(time.Since(d.StartedAt).Seconds()),
 		"config_path":         d.ConfigPath,
 		"config_epoch":        d.Cfg.Epoch,
+		"instance":            d.Instance,
 		"agents":              agents,
 		"channels":            channels,
 		"sessions":            sessions,

@@ -295,6 +295,14 @@ func main() {
 	defer leaseMgr.Close()
 	log.Info("instance identity", "owner", leaseMgr.Owner())
 
+	// Every metric this instance exposes says which instance it came from. A
+	// scrape of N instances is otherwise N indistinguishable series, and the
+	// instance id here is the one the logs and the lease table use, so a
+	// dashboard label leads back to the process that produced it.
+	if err := metricReg.SetLabels(map[string]string{"instance": leaseMgr.Owner()}); err != nil {
+		log.Warn("metric labels not set", "err", err)
+	}
+
 	// Shell handle registry. A handle is a resource out on a host — a container
 	// the session can reach from any instance — not a structure in this process,
 	// so it is recorded where the fleet can see it: that is what lets the

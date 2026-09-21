@@ -36,6 +36,74 @@ func TestRegistryPrometheusFormat(t *testing.T) {
 	}
 }
 
+// A fleet scrapes N instances, and the only thing that tells their series apart
+// is a label. With none set the exposition is exactly what it always was, so a
+// single-instance deployment's scrape does not change shape.
+func TestRegistryConstantLabels(t *testing.T) {
+	r := NewRegistry()
+	c := NewCounter("foo_total", "foo help")
+	c.Add(42)
+	r.Register(c)
+
+	if got := r.Labels(); len(got) != 0 {
+		t.Fatalf("a fresh registry has labels: %v", got)
+	}
+	if out := r.PrometheusFormat(); !strings.Contains(out, "\nfoo_total 42\n") {
+		t.Fatalf("an unlabelled registry must render the bare form:\n%s", out)
+	}
+
+	if err := r.SetLabels(map[string]string{"instance": "host-1-42"}); err != nil {
+		t.Fatal(err)
+	}
+	out := r.PrometheusFormat()
+	if !strings.Contains(out, `foo_total{instance="host-1-42"} 42`) {
+		t.Fatalf("labels missing from the series:\n%s", out)
+	}
+	if !strings.HasSuffix(out, "\n") {
+		t.Fatal("the exposition must end with a newline")
+	}
+
+	// Names are sorted, so the line is stable across scrapes however the map
+	// is iterated.
+	if err := r.SetLabels(map[string]string{"zone": "eu", "instance": "host-1-42"}); err != nil {
+		t.Fatal(err)
+	}
+	if out := r.PrometheusFormat(); !strings.Contains(out, `foo_total{instance="host-1-42",zone="eu"} 42`) {
+		t.Fatalf("labels are not sorted:\n%s", out)
+	}
+	if got := r.Labels(); got["zone"] != "eu" {
+		t.Fatalf("Labels() = %v", got)
+	}
+}
+
+// A value that would otherwise change what the line means is escaped; a name
+// Prometheus would reject is refused before anything is applied, because a
+// series with a bad name is dropped at scrape time.
+func TestRegistryLabelValidationAndEscaping(t *testing.T) {
+	r := NewRegistry()
+	if err := r.SetLabels(map[string]string{"bad-name": "x"}); err == nil {
+		t.Fatal("a label name with a dash must be refused")
+	}
+	if err := r.SetLabels(map[string]string{"1st": "x"}); err == nil {
+		t.Fatal("a label name starting with a digit must be refused")
+	}
+	if err := r.SetLabels(map[string]string{"": "x"}); err == nil {
+		t.Fatal("an empty label name must be refused")
+	}
+	if got := r.Labels(); len(got) != 0 {
+		t.Fatalf("a refused SetLabels must apply nothing: %v", got)
+	}
+
+	if err := r.SetLabels(map[string]string{"note": "a\"b\\c\nd"}); err != nil {
+		t.Fatal(err)
+	}
+	c := NewCounter("foo_total", "foo help")
+	r.Register(c)
+	if out := r.PrometheusFormat(); !strings.Contains(out, `note="a\"b\\c\nd"`) {
+		t.Fatalf("label value not escaped:\n%s", out)
+	}
+}
+
 func TestDefaultCounters(t *testing.T) {
 	counters := DefaultCounters()
 	if len(counters) == 0 {

@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -42,10 +43,116 @@ func (c *Counter) Help() string { return c.help }
 type Registry struct {
 	mu       sync.RWMutex
 	counters map[string]*Counter
+	// labels are constant labels rendered on every metric this registry
+	// exposes. See SetLabels.
+	labels map[string]string
 }
 
 func NewRegistry() *Registry {
 	return &Registry{counters: map[string]*Counter{}}
+}
+
+// SetLabels installs constant labels, rendered on every series the registry
+// exposes. They are what makes a fleet's /metrics endpoints tellable apart: an
+// operator scraping N instances has to know which one a value came from, and
+// nothing else in the exposition says so.
+//
+// A name Prometheus would not accept is refused rather than emitted — a series
+// with an invalid label name is rejected at scrape time, which is a worse
+// failure than a warning at boot — and nothing is applied in that case.
+func (r *Registry) SetLabels(labels map[string]string) error {
+	for name := range labels {
+		if !validLabelName(name) {
+			return fmt.Errorf("metrics: %q is not a valid label name", name)
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.labels = make(map[string]string, len(labels))
+	for name, value := range labels {
+		r.labels[name] = value
+	}
+	return nil
+}
+
+// Labels returns the constant labels this registry renders.
+func (r *Registry) Labels() map[string]string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string]string, len(r.labels))
+	for name, value := range r.labels {
+		out[name] = value
+	}
+	return out
+}
+
+// validLabelName reports whether Prometheus accepts the name: a letter or
+// underscore, then letters, digits and underscores.
+func validLabelName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '_':
+		case c >= '0' && c <= '9' && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// labelStringLocked renders the constant labels as a Prometheus label set, or
+// "" when there are none: a deployment that sets none keeps the bare exposition
+// it always had. Names are sorted so the output is stable across scrapes.
+func labelStringLocked(labels map[string]string) string {
+	if len(labels) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(labels))
+	for name := range labels {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, name := range names {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(name)
+		b.WriteString(`="`)
+		b.WriteString(escapeLabelValue(labels[name]))
+		b.WriteByte('"')
+	}
+	b.WriteByte('}')
+	return b.String()
+}
+
+// escapeLabelValue escapes a label value for the exposition format: backslash,
+// double quote and newline, the three characters that would otherwise change
+// what the line means.
+func escapeLabelValue(s string) string {
+	if !strings.ContainsAny(s, "\\\"\n") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 4)
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		default:
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
 }
 
 func (r *Registry) Register(c *Counter) {
@@ -89,14 +196,24 @@ func Add(name string, n int64) {
 }
 
 // PrometheusFormat renders counters in Prometheus text exposition format.
+// Names are sorted: a scrape that reorders itself between requests is noise in
+// a diff, and nothing about the format requires map order.
 func (r *Registry) PrometheusFormat() string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	labels := labelStringLocked(r.labels)
+	names := make([]string, 0, len(r.counters))
+	for name := range r.counters {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
 	var b strings.Builder
-	for _, c := range r.counters {
+	for _, name := range names {
+		c := r.counters[name]
 		b.WriteString(fmt.Sprintf("# HELP %s %s\n", c.Name(), c.Help()))
 		b.WriteString(fmt.Sprintf("# TYPE %s counter\n", c.Name()))
-		b.WriteString(fmt.Sprintf("%s %d\n", c.Name(), c.Value()))
+		b.WriteString(fmt.Sprintf("%s%s %d\n", c.Name(), labels, c.Value()))
 	}
 	return b.String()
 }

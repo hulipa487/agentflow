@@ -272,6 +272,18 @@ type UserResolver interface {
 	LookupUser(uuid string) (channel, replyTo string, ok bool)
 }
 
+// ProfileSettings resolves a user's per-user overrides — a model and a layer of
+// instructions — for the agent they are talking to. Nil, the default, means
+// every user gets exactly what the agent is configured with.
+//
+// It is deliberately a two-string signature rather than a struct: the identity
+// package implements it without importing this one, and a lookup that fails
+// returns an error the actor ignores, because a profile read must never fail a
+// person's turn.
+type ProfileSettings interface {
+	Settings(ctx context.Context, userID string) (model, instructionsAppend string, err error)
+}
+
 // AgentSummary is safe runtime metadata returned by agent.list.
 type AgentSummary struct {
 	SessionID string `json:"session_id"`
@@ -407,51 +419,55 @@ func (r *PromptRegistry) Get(key string) (string, bool) {
 
 // blockingOps run on the worker pool; everything else is inline.
 var blockingOps = map[string]bool{
-	"send":                true,
-	"session.push":        true,
-	"session.push_user":   true,
-	"llm.chat":            true,
-	"llm.embed":           true,
-	"llm.rerank":          true,
-	"llm.stream.open":     true,
-	"llm.stream.next":     true,
-	"tools.run":           true,
-	"store.put":           true,
-	"store.get":           true,
-	"store.query":         true,
-	"store.delete":        true,
-	"store.scopes":        true,
-	"user.current":        true,
-	"user.usage":          true,
-	"user.has_credential": true,
-	"user.get":            true,
-	"user.list":           true,
-	"shell.spawn":         true,
-	"shell.exec":          true,
-	"shell.write":         true,
-	"shell.destroy":       true,
-	"http.request":        true,
-	"mail.imap.fetch":     true,
-	"mail.smtp.send":      true,
-	"credential.get":      true,
-	"agent.send":          true,
-	"agent.request":       true,
-	"agent.reply":         true,
-	"agent.spawn":         true,
-	"agent.list":          true,
-	"scheduler.every":     true,
-	"scheduler.after":     true,
-	"scheduler.cron":      true,
-	"scheduler.cancel":    true,
-	"files.put":           true,
-	"files.read":          true,
-	"files.list":          true,
-	"files.delete":        true,
-	"files.commit":        true,
-	"files.checkout":      true,
-	"files.scratch.put":   true,
-	"files.scratch.read":  true,
-	"files.scratch.list":  true,
+	"send":                 true,
+	"session.push":         true,
+	"session.push_user":    true,
+	"llm.chat":             true,
+	"llm.embed":            true,
+	"llm.rerank":           true,
+	"llm.stream.open":      true,
+	"llm.stream.next":      true,
+	"tools.run":            true,
+	"store.put":            true,
+	"store.get":            true,
+	"store.query":          true,
+	"store.delete":         true,
+	"store.scopes":         true,
+	"session.state.set":    true,
+	"session.state.get":    true,
+	"session.state.delete": true,
+	"session.state.list":   true,
+	"user.current":         true,
+	"user.usage":           true,
+	"user.has_credential":  true,
+	"user.get":             true,
+	"user.list":            true,
+	"shell.spawn":          true,
+	"shell.exec":           true,
+	"shell.write":          true,
+	"shell.destroy":        true,
+	"http.request":         true,
+	"mail.imap.fetch":      true,
+	"mail.smtp.send":       true,
+	"credential.get":       true,
+	"agent.send":           true,
+	"agent.request":        true,
+	"agent.reply":          true,
+	"agent.spawn":          true,
+	"agent.list":           true,
+	"scheduler.every":      true,
+	"scheduler.after":      true,
+	"scheduler.cron":       true,
+	"scheduler.cancel":     true,
+	"files.put":            true,
+	"files.read":           true,
+	"files.list":           true,
+	"files.delete":         true,
+	"files.commit":         true,
+	"files.checkout":       true,
+	"files.scratch.put":    true,
+	"files.scratch.read":   true,
+	"files.scratch.list":   true,
 }
 
 // EndReason identifies why an actor left the supervisor.
@@ -482,13 +498,16 @@ type Actor struct {
 	// journal an audit trail.
 	Journal EgressJournalFunc
 
-	gw       Gateway
-	agents   AgentService
-	sched    SchedulerService
-	users    UserResolver
-	safety   *safety.Dispatcher
-	handlers map[string]OpHandler
-	pool     *pool.Pool
+	gw     Gateway
+	agents AgentService
+	sched  SchedulerService
+	users  UserResolver
+	// profileSettings, when set, is where a per-user model and instruction layer
+	// come from. See ProfileSettings.
+	profileSettings ProfileSettings
+	safety          *safety.Dispatcher
+	handlers        map[string]OpHandler
+	pool            *pool.Pool
 
 	reload chan struct{}
 	log    *slog.Logger
@@ -697,16 +716,18 @@ func (a *Actor) dispatchInline(ctx context.Context, op Op, current *Message) (re
 		return "true", true, false
 
 	case "agent.info":
-		return a.infoJSON(), true, true
+		// Stamped here rather than once before the switch: the inbox case sets
+		// `current`, so a hoisted stamp would describe the previous message.
+		// agent.info is the case that needs the person, because a profile may
+		// override the model and add a layer of instructions.
+		return a.infoJSON(a.opContext(ctx, current)), true, true
 
 	case "agent.config":
 		return a.configJSON(), true, true
 
 	default:
 		// Stamp the tenant user UUID for inline handlers, mirroring execBlocking.
-		ctx = WithUserUUID(ctx, userFromMessage(current))
-		ctx = WithSessionKey(ctx, a.Identity.SessionID)
-		ctx = WithProvenanceKind(ctx, provenanceKindOf(current))
+		ctx = a.opContext(ctx, current)
 		op.Owner = a.Identity.SessionID
 		if h, found := a.handlers[op.Type]; found {
 			r, ok := h(ctx, op)
@@ -967,7 +988,10 @@ func (a *Actor) configJSON() string {
 	return r
 }
 
-func (a *Actor) infoJSON() string {
+// infoJSON is what a loop reads for its own identity: agent.info(). It is
+// built per call rather than once, because two of its fields depend on *who* is
+// being served — see the per-user overrides below.
+func (a *Actor) infoJSON(ctx context.Context) string {
 	instructions := ""
 	if a.Info.Instructions != nil {
 		instructions = a.Info.Instructions.Load()
@@ -976,6 +1000,7 @@ func (a *Actor) infoJSON() string {
 	if budget <= 0 {
 		budget = 6000
 	}
+	model := a.Info.Model
 	mem := map[string]any{}
 	if a.Info.Memory != nil {
 		stores := map[string]any{}
@@ -989,20 +1014,74 @@ func (a *Actor) infoJSON() string {
 		mem["rerank_model"] = a.Info.Memory.RerankModel
 		mem["oversample"] = a.Info.Memory.Oversample
 	}
-	r, _ := jsonString(map[string]any{
+
+	// Per-user overrides. A profile may name a model and may add a layer of
+	// instructions to the agent's own. Merging them *here* is what makes them
+	// engine-enforced for every loop that follows the documented idiom — this is
+	// the model and the system prompt a loop reads — without a line of Lua
+	// changing. It is a default for this person, not a veto: a loop that names a
+	// model explicitly on a single call still gets the model it asked for, and
+	// the agent's own model stays visible as agent_model.
+	var overrideModel, overrideInstructions string
+	if u := UserUUIDFromCtx(ctx); u != "" && a.profileSettings != nil {
+		if m, added, err := a.profileSettings.Settings(ctx, u); err == nil {
+			overrideModel, overrideInstructions = m, added
+		}
+	}
+
+	out := map[string]any{
 		"name":           a.Info.Name,
 		"session_id":     a.Identity.SessionID,
 		"address":        "session:" + a.Identity.SessionID,
-		"model":          a.Info.Model,
+		"model":          model,
 		"instructions":   instructions,
 		"history_budget": budget,
 		"memory":         mem,
 		"shell":          a.Info.Shell,
 		"skills":         a.Info.Skills,
 		"capabilities":   a.Info.Capabilities,
-	})
+	}
+	if overrideModel != "" {
+		out["agent_model"] = model
+		out["model"] = overrideModel
+	}
+	if overrideInstructions != "" {
+		out["instructions_append"] = overrideInstructions
+		out["instructions"] = layerInstructions(instructions, overrideInstructions)
+	}
+	r, _ := jsonString(out)
 	return r
 }
+
+// layerInstructions appends a profile's instructions to the agent's as their own
+// paragraph, so the agent's operating rules stay first and authoritative and the
+// person's layer reads as what it is.
+func layerInstructions(base, added string) string {
+	switch {
+	case added == "":
+		return base
+	case base == "":
+		return added
+	default:
+		return base + "\n\n" + added
+	}
+}
+
+// opContext stamps the per-turn facts an op handler reads: the tenant user the
+// turn belongs to, the session key, and the provenance kind. The registered
+// handlers get it through the default branch, and the few ops the actor serves
+// itself — agent.info — call it directly, so both paths agree on what a handler
+// can see.
+func (a *Actor) opContext(ctx context.Context, current *Message) context.Context {
+	ctx = WithUserUUID(ctx, userFromMessage(current))
+	ctx = WithSessionKey(ctx, a.Identity.SessionID)
+	return WithProvenanceKind(ctx, provenanceKindOf(current))
+}
+
+// SetProfileSettings installs the per-user override lookup. Called by the
+// supervisor right after the actor is built, alongside the other late-bound
+// dependencies; nil leaves every user on the agent's own model and prompts.
+func (a *Actor) SetProfileSettings(p ProfileSettings) { a.profileSettings = p }
 
 // waitInbox blocks for the next message, a reload signal, or shutdown.
 func (a *Actor) waitInbox(ctx context.Context) (Message, bool) {

@@ -1098,6 +1098,12 @@ func main() {
 		})
 		sink = sc
 		sup.SetUserResolver(identReg)
+		// Per-user overrides: a profile's model and instruction layer reach every
+		// session through agent.info(), so a loop written against the documented
+		// idiom honours them without a line of Lua changing. Cached for a short
+		// window, which is also how fast a change made on one instance reaches
+		// the others.
+		sup.SetProfileSettings(identity.NewSettingsSource(identReg, 0))
 		// storedb.Display, not the raw target: in a fleet this is a DSN, and a
 		// DSN carries a password.
 		log.Info("identity layer enabled", "store", storedb.Display(cfg.IdentityStore()),

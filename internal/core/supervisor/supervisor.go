@@ -65,7 +65,10 @@ type Supervisor struct {
 	shellMgr *shell.Manager
 	sched    *schedulerAdapter
 	users    session.UserResolver
-	log      *slog.Logger
+	// profileSettings, when set, supplies each session with the per-user model
+	// and instruction overrides its person has. See session.ProfileSettings.
+	profileSettings session.ProfileSettings
+	log             *slog.Logger
 
 	// EgressJournal, when set, is attached to every spawned actor so all
 	// session egress lands in the core-owned message journal.
@@ -120,6 +123,11 @@ func (s *Supervisor) SetScheduler(svc *scheduler.Service) {
 // Called by main; nil (the default) leaves push_user returning "identity not
 // enabled" — the runtime works unchanged without the identity layer.
 func (s *Supervisor) SetUserResolver(r session.UserResolver) { s.users = r }
+
+// SetProfileSettings installs the per-user override lookup every session gets.
+// Called by main; nil (the default) leaves every user on the agent's own model
+// and prompts.
+func (s *Supervisor) SetProfileSettings(p session.ProfileSettings) { s.profileSettings = p }
 
 // Start fixes the context used for lazily spawned actors.
 func (s *Supervisor) Start(ctx context.Context) { s.ctx = ctx }
@@ -203,6 +211,7 @@ func (s *Supervisor) DeliverLocal(agent, key string, msg session.Message) error 
 		a.LoopSrc = def.LoopSrc
 		a.SupportSrcs = builtins.SupportChunks()
 		a.OnExit = s.onActorExit
+		a.SetProfileSettings(s.profileSettings)
 		a.Journal = s.EgressJournal
 		actorCtx, cancel := context.WithCancel(s.ctx)
 		s.sessions[skey] = a

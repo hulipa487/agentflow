@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/router"
 	"agentflow/internal/core/session"
 )
@@ -52,6 +53,32 @@ func TestResolveDistinctNativesDistinctUUIDs(t *testing.T) {
 	b, _ := r.Resolve("telegram", "user:telegram:2", "2", nil)
 	if a == b {
 		t.Fatal("different native_from must yield different uuids")
+	}
+}
+
+// A first contact is counted as a mint; resolving a known handle again is not.
+// The TUI's Identity row reads this counter, so a silent regression here would
+// show as a permanently flat line rather than a failure.
+func TestResolveCountsMints(t *testing.T) {
+	r := newTestRegistry(t)
+	c, ok := metrics.Global().Get("agentflow_identity_mints")
+	if !ok {
+		t.Fatal("agentflow_identity_mints is not registered")
+	}
+	before := c.Value()
+
+	if _, err := r.Resolve("telegram", "user:telegram:777", "777", nil); err != nil {
+		t.Fatalf("first resolve: %v", err)
+	}
+	if got := c.Value(); got != before+1 {
+		t.Errorf("first contact should count one mint: before=%d after=%d", before, got)
+	}
+
+	if _, err := r.Resolve("telegram", "user:telegram:777", "777", nil); err != nil {
+		t.Fatalf("second resolve: %v", err)
+	}
+	if got := c.Value(); got != before+1 {
+		t.Errorf("resolving a known handle must not count a mint: %d", got)
 	}
 }
 

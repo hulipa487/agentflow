@@ -386,6 +386,9 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
   </ul>
   <p><b>Auth:</b> every console API route (and <code>/metrics</code>, <code>/v1/sessions</code>, <code>/admin/credentials</code>) requires a bearer token — even on loopback. Set <code>ADMIN_TOKEN</code> to pin it; otherwise a random per-boot token is generated and printed once to the console. The static SPA files are served open but are inert without the token. Secrets are write-only throughout: list endpoints return metadata and fingerprints, never values, and the config view masks sensitive keys while preserving <code>${VAR}</code> placeholders.</p>
 
+  <h3>Terminal dashboard</h3>
+  <p>When stdout is a TTY the runtime also attaches a <b>Bubbletea terminal dashboard</b> in the alternate screen (<code>-no-tui</code> to disable). It is the console's Metrics tab in the terminal: the same counters, grouped by subsystem, with in-process sparklines and the live session counts in the header. It is a <b>read-only metrics display</b> — no operator actions, so nothing it shows can change the runtime; <code>q</code>/<code>esc</code> quits and restores the screen. The metrics pane flows into one to three columns by width and the log footer scales with the terminal (3–8 lines); on a terminal too short for both the pane is clipped with a visible marker rather than dropping rows silently, and below a minimum height it is dropped entirely so the frame always fits. Piped output (systemd, <code>| tee</code>) keeps the plain stderr logger instead.</p>
+
   <h3>Logging</h3>
   <p>Logs use five <b>additive</b> levels — selecting one prints it and everything above. Choose with <code>-log-level</code> (default <code>info</code>):</p>
   <table>

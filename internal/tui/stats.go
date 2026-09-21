@@ -4,9 +4,12 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 )
 
-// statDef describes one row of the stats panel: which registry counter to
+// statDef describes one row of the metrics pane: which registry counter to
 // show, a short label, and whether the value is a gauge (sessions, pending
 // requests — sparkline of raw samples) or a monotonic counter (totals —
 // sparkline of per-sample deltas, since the raw value only ever climbs).
@@ -16,19 +19,99 @@ type statDef struct {
 	Gauge bool
 }
 
-// statDefs is the curated set of operationally relevant counters, in display
-// order. The full set stays available via /metrics and the web console.
-var statDefs = []statDef{
-	{"agentflow_sessions_active", "sessions", true},
-	{"agentflow_requests_pending", "pending", true},
-	{"agentflow_ingress_total", "ingress", false},
-	{"agentflow_egress_total", "egress", false},
-	{"agentflow_egress_failed", "egress fail", false},
-	{"agentflow_llm_calls", "llm calls", false},
-	{"agentflow_llm_tokens", "llm tokens", false},
-	{"agentflow_budget_denied", "budget denied", false},
-	{"agentflow_safety_drops", "safety drops", false},
-	{"agentflow_media_ingested", "media in", false},
+// statSection groups rows under a title. Sections are the pane's reading
+// order; renderMetrics packs them into columns by terminal width, keeping
+// each section's rows contiguous so a section is never split across columns.
+type statSection struct {
+	Title string
+	Rows  []statDef
+}
+
+// statSections is the curated display set, grouped by subsystem. Every
+// registry counter stays available via /metrics and the web console; this is
+// the operator's at-a-glance cut. A new engine subsystem earns a row here —
+// the TUI is a metrics display, so new surfaces become rows, not panes.
+//
+// Order is operational priority: what an operator checks first sits first. A
+// short terminal clips the tail and marks the clip, so the last sections are
+// the ones it is cheapest to lose.
+var statSections = []statSection{
+	{"Sessions", []statDef{
+		{"agentflow_sessions_active", "active", true},
+		{"agentflow_children_spawned", "spawned", false},
+		{"agentflow_children_died", "died", false},
+		{"agentflow_requests_pending", "pending", true},
+		{"agentflow_timers_pending", "timers", true},
+		{"agentflow_tool_confirmations", "confirmations", false},
+	}},
+	{"LLM", []statDef{
+		{"agentflow_llm_calls", "calls", false},
+		{"agentflow_llm_tokens", "tokens", false},
+		{"agentflow_budget_denied", "budget denied", false},
+	}},
+	{"Traffic", []statDef{
+		{"agentflow_ingress_total", "ingress", false},
+		{"agentflow_ingress_dropped", "dropped", false},
+		{"agentflow_egress_total", "egress", false},
+		{"agentflow_egress_failed", "egress fail", false},
+		{"agentflow_channel_errors", "chan errors", false},
+		{"agentflow_trigger_fires", "triggers", false},
+	}},
+	{"Safety", []statDef{
+		{"agentflow_safety_drops", "drops", false},
+		{"agentflow_http_private_blocked", "private blk", false},
+		{"agentflow_http_insecure_tls", "insecure tls", false},
+	}},
+	{"Files", []statDef{
+		{"agentflow_files_gc_swept", "gc swept", false},
+		{"agentflow_files_scratch_swept", "scratch swept", false},
+	}},
+	{"Media", []statDef{
+		{"agentflow_media_ingested", "ingested", false},
+		{"agentflow_media_bytes", "bytes", false},
+		{"agentflow_media_unsupported", "unsupported", false},
+	}},
+	{"Credentials", []statDef{
+		{"agentflow_credential_gets", "gets", false},
+		{"agentflow_credential_gets_denied", "denied", false},
+	}},
+	{"Identity", []statDef{
+		{"agentflow_identity_mints", "minted", false},
+	}},
+}
+
+// statDefs flattens the curated sections in display order.
+func statDefs() []statDef {
+	var out []statDef
+	for _, s := range statSections {
+		out = append(out, s.Rows...)
+	}
+	return out
+}
+
+// Pane geometry: a row is "  " + label + " " + value + "  " + sparkline.
+const (
+	labelW    = 14
+	valueW    = 8
+	rowChrome = 2 + labelW + 1 + valueW + 2 // fixed columns before the spark
+	minSparkW = 10
+	maxSparkW = 40
+	gutter    = 2 // blank columns between metric columns
+	maxCols   = 3
+)
+
+// layoutCols picks the metric column count and width for a content width.
+// Another column is added while one can still hold the label, value and a
+// legible sparkline; past maxCols extra width becomes longer sparklines.
+func layoutCols(usable int) (cols, colW int) {
+	cols = usable / (rowChrome + minSparkW)
+	if cols < 1 {
+		cols = 1
+	}
+	if cols > maxCols {
+		cols = maxCols
+	}
+	return cols, (usable - gutter*(cols-1)) / cols
 }
 
 // sparkBlocks are the 8-level unicode bar chars used for sparklines.
@@ -91,30 +174,133 @@ func humanize(v int64) string {
 	}
 }
 
-// sparkWidth budgets the sparkline column from the terminal width.
-func (m *Model) sparkWidth() int {
-	w := m.width - 26
-	if w < 10 {
-		w = 10
-	}
-	if w > 40 {
-		w = 40
-	}
-	return w
+// truncate clips s to w terminal cells, ellipsizing when it cuts. It measures
+// rune widths rather than bytes, so a wide glyph is never split in half.
+func truncate(s string, w int) string {
+	return runewidth.Truncate(s, w, "…")
 }
 
-// renderStats draws the stats panel: one row per statDef with the latest
-// value and a sparkline (deltas for counters, raw for gauges).
-func (m *Model) renderStats() string {
-	var b strings.Builder
-	sw := m.sparkWidth()
-	for _, d := range statDefs {
-		series := m.sparks[d.Name]
-		if !d.Gauge {
-			series = deltas(series)
-		}
-		line := fmt.Sprintf("  %-14s %8s  %s", d.Label, humanize(m.latest[d.Name]), sparkline(series, sw))
-		b.WriteString(logStyle.Render(line) + "\n")
+// row renders one stat row: label, humanized value, and a sparkline sized to
+// the column. A counter with no samples yet renders as 0 with an empty
+// sparkline.
+func (m *Model) row(d statDef, sparkW int) string {
+	series := m.sparks[d.Name]
+	if !d.Gauge {
+		series = deltas(series)
 	}
-	return b.String()
+	return fmt.Sprintf("  %-*s %*s  %s",
+		labelW, d.Label, valueW, humanize(m.latest[d.Name]), sparkline(series, sparkW))
+}
+
+// sectionLines renders a section: its title, then its rows. Rows stay
+// contiguous so the column packer never splits a section.
+func (m *Model) sectionLines(sec statSection, sparkW, colW int) []string {
+	lines := make([]string, 0, len(sec.Rows)+1)
+	lines = append(lines, titleStyle.Render(runewidth.Truncate(sec.Title, colW, "…")))
+	for _, d := range sec.Rows {
+		lines = append(lines, logStyle.Render(runewidth.Truncate(m.row(d, sparkW), colW, "…")))
+	}
+	return lines
+}
+
+// renderMetrics draws the sectioned metrics pane, packed into one to three
+// columns and clipped to the height the layout budgeted for it.
+func (m *Model) renderMetrics(height int) string {
+	cols, colW := layoutCols(m.width - 2)
+	sparkW := colW - rowChrome
+	if sparkW > maxSparkW {
+		sparkW = maxSparkW
+	}
+	if sparkW < 3 {
+		sparkW = 3
+	}
+
+	blocks := make([][]string, 0, len(statSections))
+	for _, sec := range statSections {
+		blocks = append(blocks, m.sectionLines(sec, sparkW, colW))
+	}
+	lines := joinColumns(packBlocks(blocks, cols), colW)
+
+	// Clip to the available height. The marker states the clip rather than
+	// dropping rows silently — a truncated pane that lies is worse than one
+	// that admits it.
+	if len(lines) > height {
+		if height < 1 {
+			return ""
+		}
+		lines = lines[:height]
+		lines[height-1] = idleStyle.Render(runewidth.Truncate("… more rows (resize taller)", colW, "…"))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// packBlocks distributes ordered blocks into at most cols columns, keeping
+// each block whole and balancing height: a column takes blocks until it
+// reaches its share of the total, then the next column starts.
+func packBlocks(blocks [][]string, cols int) [][]string {
+	if cols < 2 || len(blocks) == 0 {
+		var all []string
+		for i, b := range blocks {
+			if i > 0 {
+				all = append(all, "")
+			}
+			all = append(all, b...)
+		}
+		return [][]string{all}
+	}
+
+	total := 0
+	for _, b := range blocks {
+		total += len(b) + 1 // + blank separator between sections
+	}
+	target := (total + cols - 1) / cols
+
+	out := make([][]string, 0, cols)
+	var cur []string
+	for _, b := range blocks {
+		if len(cur) > 0 && len(cur)+len(b) > target && len(out) < cols-1 {
+			out = append(out, cur)
+			cur = nil
+		}
+		if len(cur) > 0 {
+			cur = append(cur, "")
+		}
+		cur = append(cur, b...)
+	}
+	if len(cur) > 0 || len(out) == 0 {
+		out = append(out, cur)
+	}
+	return out
+}
+
+// joinColumns lays packed columns side by side, each padded to colW visible
+// columns and separated by a gutter.
+func joinColumns(cols [][]string, colW int) []string {
+	height := 0
+	for _, c := range cols {
+		if len(c) > height {
+			height = len(c)
+		}
+	}
+	out := make([]string, 0, height)
+	for i := 0; i < height; i++ {
+		var b strings.Builder
+		for ci, c := range cols {
+			if ci > 0 {
+				b.WriteString(strings.Repeat(" ", gutter))
+			}
+			cell := ""
+			if i < len(c) {
+				cell = c[i]
+			}
+			b.WriteString(cell)
+			if pad := colW - lipgloss.Width(cell); pad > 0 {
+				b.WriteString(strings.Repeat(" ", pad))
+			}
+		}
+		// Trailing padding is cosmetic; it sits after each cell's style reset,
+		// so trimming spaces can never cut an escape sequence.
+		out = append(out, strings.TrimRight(b.String(), " "))
+	}
+	return out
 }

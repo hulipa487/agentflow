@@ -218,6 +218,7 @@ func (u *UI) handleState(w http.ResponseWriter, r *http.Request) {
 		"started_at":          d.StartedAt.Unix(),
 		"uptime_s":            int64(time.Since(d.StartedAt).Seconds()),
 		"config_path":         d.ConfigPath,
+		"config_epoch":        d.Cfg.Epoch,
 		"agents":              agents,
 		"channels":            channels,
 		"sessions":            sessions,

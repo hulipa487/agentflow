@@ -355,7 +355,7 @@ func TestFetchSaveToScratch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rt, err := runtime.Open(filepath.Join(t.TempDir(), "rt.db"))
+	rt, err := runtime.OpenSQLite(filepath.Join(t.TempDir(), "rt.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

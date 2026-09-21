@@ -149,7 +149,7 @@ func MailHandlers(log *slog.Logger, creds *credentials.Store) map[string]session
 			seqSet := imap.SeqSet{}
 			seqSet.AddNum(seqs...)
 			fetchOpts := &imap.FetchOptions{
-				Envelope: true,
+				Envelope:    true,
 				BodySection: []*imap.FetchItemBodySection{{Peek: true}},
 			}
 			messages, err := c.Fetch(&seqSet, fetchOpts).Collect()

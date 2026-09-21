@@ -18,10 +18,10 @@ import (
 
 // userFixture wires the user surface with fakes for everything that lives
 // outside caps: the projection comes from a map, credentials from a set.
-func userFixture(t *testing.T, limit int64) (map[string]session.OpHandler, *runtime.Store, string) {
+func userFixture(t *testing.T, limit int64) (map[string]session.OpHandler, runtime.Store, string) {
 	t.Helper()
 	dir := t.TempDir()
-	ledger, err := runtime.Open(filepath.Join(dir, "runtime.db"))
+	ledger, err := runtime.OpenSQLite(filepath.Join(dir, "runtime.db"))
 	if err != nil {
 		t.Fatalf("open ledger: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestUserDirectoryRequiresMaintenanceProvenance(t *testing.T) {
 // The surface stays honest when the identity layer is off: no projection means
 // no directory and no profile, but usage still reports a guest.
 func TestUserSurfaceWithoutIdentityLayer(t *testing.T) {
-	ledger, err := runtime.Open(filepath.Join(t.TempDir(), "runtime.db"))
+	ledger, err := runtime.OpenSQLite(filepath.Join(t.TempDir(), "runtime.db"))
 	if err != nil {
 		t.Fatalf("open ledger: %v", err)
 	}

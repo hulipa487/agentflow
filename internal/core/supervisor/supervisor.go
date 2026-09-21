@@ -71,9 +71,14 @@ type Supervisor struct {
 	// session egress lands in the core-owned message journal.
 	EgressJournal session.EgressJournalFunc
 
-	mu        sync.Mutex
-	sessions  map[string]*session.Actor
-	cancels   map[string]context.CancelFunc
+	// hub, when set, decides whether a delivered message is this instance's to
+	// handle or belongs to the instance that owns the session. Nil — the
+	// default, and every single-instance deployment — delivers everything here.
+	hub SessionRouter
+
+	mu       sync.Mutex
+	sessions map[string]*session.Actor
+	cancels  map[string]context.CancelFunc
 	// retired tracks session ids that ran and exited. A send to a retired
 	// session address must fail (the recipient is gone); find-or-create is only
 	// for session addresses that have never existed (e.g. a PM session that has
@@ -139,7 +144,7 @@ func (s *Supervisor) BootPersistent() {
 				Principal: "system:supervisor",
 			},
 		}
-		if err := s.Deliver(name, "boot", msg); err != nil {
+		if err := s.DeliverLocal(name, "boot", msg); err != nil {
 			s.log.Warn("persistent agent boot failed", "agent", name, "err", err)
 			continue
 		}
@@ -150,9 +155,34 @@ func (s *Supervisor) BootPersistent() {
 // Agents returns the agent definitions (the reload watcher reads these).
 func (s *Supervisor) Agents() map[string]*AgentDef { return s.defs }
 
+// SessionRouter decides where a session's messages are delivered. In a
+// single-instance deployment there is none and every message is delivered here.
+// In a fleet the hub implements it: a session runs on one instance, and a
+// message that arrives on another is queued for the owner rather than starting
+// a second copy of the conversation.
+type SessionRouter interface {
+	Route(ctx context.Context, agent, key string, msg session.Message) error
+}
+
+// SetHub installs the router that decides whether a delivered message is this
+// instance's to handle. Nil — the default — delivers everything locally.
+func (s *Supervisor) SetHub(h SessionRouter) { s.hub = h }
+
 // Deliver routes a message to the session for (agent, key), spawning it on
-// first contact.
+// first contact. With a hub installed the message may instead be queued for
+// the instance that owns the session; see SetHub.
 func (s *Supervisor) Deliver(agent, key string, msg session.Message) error {
+	if h := s.hub; h != nil {
+		return h.Route(context.Background(), agent, key, msg)
+	}
+	return s.DeliverLocal(agent, key, msg)
+}
+
+// DeliverLocal delivers to this instance's session unconditionally, bypassing
+// the hub. It is what the hub itself calls once it has established that this
+// instance owns the session, and what a boot push uses: "spawn my daemons" is a
+// local instruction, not a message to be routed.
+func (s *Supervisor) DeliverLocal(agent, key string, msg session.Message) error {
 	def, ok := s.defs[agent]
 	if !ok {
 		return &UnknownAgentError{Agent: agent}

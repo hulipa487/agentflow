@@ -21,12 +21,13 @@ import (
 	"log/slog"
 	"time"
 
-	_ "modernc.org/sqlite" // pure-Go sqlite driver, matching the repo's choice
+	"agentflow/internal/core/storedb"
 )
 
-// Store is an encrypted credential store backed by a sqlite file.
+// Store is an encrypted credential store on the engine's SQL store: a local
+// file on one machine, or the shared server a fleet agrees on.
 type Store struct {
-	db     *sql.DB
+	st     *storedb.DB
 	aesgcm cipher.AEAD
 	path   string
 	log    *slog.Logger
@@ -51,69 +52,71 @@ type ServiceRef struct {
 	UpdatedAt   int64  `json:"updated_at"`
 }
 
-// Open opens (creating if needed) the credential store at path. masterKey is
-// any non-empty string; it is hashed to a 32-byte AES key. A wrong key
+// Open opens (creating if needed) the credential store at target: a SQLite file
+// path, or a PostgreSQL DSN. A fleet points every instance at the same server,
+// so a key an operator adds on one instance resolves on all of them. masterKey
+// is any non-empty string; it is hashed to a 32-byte AES key. A wrong key
 // produces a hard decrypt error on first read, not silent data.
-func Open(path string, masterKey string, log *slog.Logger) (*Store, error) {
+func Open(target string, masterKey string, log *slog.Logger) (*Store, error) {
 	if masterKey == "" {
 		return nil, fmt.Errorf("credentials: master key is empty")
 	}
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	db, err := sql.Open("sqlite", path)
+	st, err := storedb.Open(target)
 	if err != nil {
-		return nil, fmt.Errorf("credentials: open %s: %w", path, err)
-	}
-	if _, err := db.Exec(`
-		PRAGMA journal_mode = WAL;
-		PRAGMA busy_timeout = 5000;
-		PRAGMA foreign_keys = ON;
-	`); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("credentials: pragma: %w", err)
+		return nil, fmt.Errorf("credentials: %w", err)
 	}
 	key := sha256.Sum256([]byte(masterKey))
 	block, err := aes.NewCipher(key[:])
 	if err != nil {
-		_ = db.Close()
+		_ = st.Close()
 		return nil, fmt.Errorf("credentials: cipher: %w", err)
 	}
 	aesgcm, err := cipher.NewGCM(block)
 	if err != nil {
-		_ = db.Close()
+		_ = st.Close()
 		return nil, fmt.Errorf("credentials: gcm: %w", err)
 	}
-	s := &Store{db: db, aesgcm: aesgcm, path: path, log: log.With("module", "credentials")}
+	s := &Store{st: st, aesgcm: aesgcm, path: st.Target(), log: log.With("module", "credentials")}
 	if err := s.migrate(); err != nil {
-		_ = db.Close()
+		_ = st.Close()
 		return nil, err
 	}
 	return s, nil
 }
 
-func (s *Store) migrate() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_, err := s.db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS credentials (
-			user_uuid  TEXT NOT NULL,
-			service    TEXT NOT NULL,
-			kind       TEXT NOT NULL,
-			secret     BLOB NOT NULL,        -- AES-GCM ciphertext (nonce||ct)
-			header     TEXT NOT NULL DEFAULT 'Authorization',
-			scheme     TEXT NOT NULL DEFAULT 'Bearer',
-			created_at INTEGER NOT NULL,
-			updated_at INTEGER NOT NULL,
-			revoked    INTEGER NOT NULL DEFAULT 0,
-			PRIMARY KEY (user_uuid, service)
-		);
-	`)
-	return err
+// schema is the credential table, written once for both backends.
+//
+// The ciphertext column is TEXT, not a binary type: the stored value is
+// base64 of nonce||ciphertext, which is what makes it the same bytes in a
+// SQLite file and in a server, and legible to whoever is looking at the
+// database. (A BLOB column in an existing file keeps working — a declared type
+// only sets SQLite's affinity, and TEXT is the affinity these bytes want.)
+var schema = []string{
+	`CREATE TABLE IF NOT EXISTS credentials (
+		user_uuid  TEXT NOT NULL,
+		service    TEXT NOT NULL,
+		kind       TEXT NOT NULL,
+		secret     TEXT NOT NULL,
+		header     TEXT NOT NULL DEFAULT 'Authorization',
+		scheme     TEXT NOT NULL DEFAULT 'Bearer',
+		created_at BIGINT NOT NULL,
+		updated_at BIGINT NOT NULL,
+		revoked    INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (user_uuid, service)
+	);`,
 }
 
-// Close closes the underlying database.
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) migrate() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return s.st.ExecDDL(ctx, schema...)
+}
+
+// Close releases the store's hold on the connection pool.
+func (s *Store) Close() error { return s.st.Close() }
 
 // Put upserts a credential. header/scheme default to "Authorization"/"Bearer"
 // when empty. The secret is encrypted before it touches the database. An
@@ -134,7 +137,10 @@ func (s *Store) Put(ctx context.Context, userUUID, service, kind, secret, header
 		return err
 	}
 	now := time.Now().Unix()
-	_, err = s.db.ExecContext(ctx, `
+	// string(ct), not ct: the column is text, and a []byte handed to a text
+	// column is a bytea on a server — which PostgreSQL refuses rather than
+	// casting. The bytes are the same either way.
+	_, err = s.st.Exec(ctx, `
 		INSERT INTO credentials (user_uuid, service, kind, secret, header, scheme, created_at, updated_at, revoked)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
 		ON CONFLICT(user_uuid, service) DO UPDATE SET
@@ -144,7 +150,7 @@ func (s *Store) Put(ctx context.Context, userUUID, service, kind, secret, header
 			scheme = excluded.scheme,
 			updated_at = excluded.updated_at,
 			revoked = 0`,
-		userUUID, service, kind, ct, header, scheme, now, now)
+		userUUID, service, kind, string(ct), header, scheme, now, now)
 	if err != nil {
 		return fmt.Errorf("credentials: put %s/%s: %w", userUUID, service, err)
 	}
@@ -160,7 +166,7 @@ func (s *Store) Get(ctx context.Context, userUUID, service string) (Secret, bool
 		scheme string
 		rev    int
 	)
-	err := s.db.QueryRowContext(ctx,
+	err := s.st.QueryRow(ctx,
 		`SELECT secret, header, scheme, revoked FROM credentials WHERE user_uuid = ? AND service = ?`,
 		userUUID, service).Scan(&ctBlob, &header, &scheme, &rev)
 	if err == sql.ErrNoRows {
@@ -181,7 +187,7 @@ func (s *Store) Get(ctx context.Context, userUUID, service string) (Secret, bool
 
 // Delete removes a credential (revocation). Idempotent.
 func (s *Store) Delete(ctx context.Context, userUUID, service string) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.st.Exec(ctx,
 		`DELETE FROM credentials WHERE user_uuid = ? AND service = ?`, userUUID, service)
 	if err != nil {
 		return fmt.Errorf("credentials: delete %s/%s: %w", userUUID, service, err)
@@ -191,7 +197,7 @@ func (s *Store) Delete(ctx context.Context, userUUID, service string) error {
 
 // List returns service metadata (never values) for a user.
 func (s *Store) List(ctx context.Context, userUUID string) ([]ServiceRef, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.st.Query(ctx,
 		`SELECT service, kind, secret, created_at, updated_at FROM credentials WHERE user_uuid = ? AND revoked = 0 ORDER BY service`,
 		userUUID)
 	if err != nil {
@@ -218,7 +224,7 @@ func (s *Store) List(ctx context.Context, userUUID string) ([]ServiceRef, error)
 // ListUsers returns the distinct user UUIDs that hold at least one
 // non-revoked credential, for the admin UI's per-user browsing.
 func (s *Store) ListUsers(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.st.Query(ctx,
 		`SELECT DISTINCT user_uuid FROM credentials WHERE revoked = 0 ORDER BY user_uuid`)
 	if err != nil {
 		return nil, fmt.Errorf("credentials: list users: %w", err)

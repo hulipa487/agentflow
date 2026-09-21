@@ -35,8 +35,7 @@ import (
 	"time"
 
 	"agentflow/internal/core/metrics"
-
-	_ "modernc.org/sqlite"
+	"agentflow/internal/core/storedb"
 )
 
 // UserResolver resolves a user to a delivery target. The actor uses it to
@@ -132,13 +131,13 @@ type Resolution struct {
 // Registered reports whether this inbound carries a user scope.
 func (r Resolution) Registered() bool { return r.UserID != "" }
 
-// Registry mints and resolves user identities, and owns their profiles,
-// backed by a sqlite database.
+// Registry mints and resolves user identities, and owns their profiles. It is
+// backed by the engine's SQL store: a local file on one machine, or the shared
+// server a fleet agrees on.
 type Registry struct {
-	db    *sql.DB
-	log   *slog.Logger
-	mu    sync.Mutex
-	cache map[string]Resolution // native_from → resolution
+	st  *storedb.DB
+	log *slog.Logger
+	mu  sync.Mutex
 	// autoClaim restores pre-registration behavior: a first contact claims a
 	// profile, so the handle gets a personal scope immediately. Default false —
 	// unknown handles stay in the shared service stratum until linked.
@@ -151,24 +150,20 @@ type Registry struct {
 	traits atomic.Pointer[map[string]ChannelTraits]
 }
 
-// Open creates the registry, opening (or creating) the sqlite database at
-// path and running the schema migration.
-func Open(path string, log *slog.Logger) (*Registry, error) {
-	db, err := sql.Open("sqlite", path)
+// Open creates the registry over the store at target and runs the schema
+// migration. The target is a SQLite file path or a PostgreSQL DSN: point it at
+// a server and every instance resolves the same handles to the same profiles,
+// which is what makes a fleet's user scopes mean one thing.
+func Open(target string, log *slog.Logger) (*Registry, error) {
+	st, err := storedb.Open(target)
 	if err != nil {
-		return nil, fmt.Errorf("identity: open %s: %w", path, err)
+		return nil, fmt.Errorf("identity: %w", err)
 	}
-	if _, err := db.Exec(`
-		PRAGMA journal_mode = WAL;
-		PRAGMA busy_timeout = 5000;
-		PRAGMA foreign_keys = ON;
-	`); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("identity: pragma: %w", err)
-	}
-	r := &Registry{db: db, log: log.With("module", "identity"), cache: map[string]Resolution{}}
-	if err := r.migrate(); err != nil {
-		_ = db.Close()
+	r := &Registry{st: st, log: log.With("module", "identity")}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := r.migrate(ctx); err != nil {
+		_ = st.Close()
 		return nil, fmt.Errorf("identity: migrate: %w", err)
 	}
 	return r, nil
@@ -186,19 +181,16 @@ func (r *Registry) SetAutoClaim(v bool) {
 // SetChannelTraits installs this deployment's per-channel traits, keyed by the
 // channel name drivers report. Identities already stored are refreshed to
 // match — including rows written before the traits were known, which would
-// otherwise stay unverifiable for the life of the database — and the resolution
-// cache is dropped, since a cached answer carries the old traits.
+// otherwise stay unverifiable for the life of the database. Writing every row
+// is idempotent, so several instances doing it at boot is harmless.
 func (r *Registry) SetChannelTraits(m map[string]ChannelTraits) error {
 	cp := m
 	r.traits.Store(&cp)
-	r.mu.Lock()
-	r.cache = map[string]Resolution{}
-	r.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	for name, t := range m {
-		if _, err := r.db.ExecContext(ctx,
+		if _, err := r.st.Exec(ctx,
 			`UPDATE identities SET trust = ?, deliverable = ?, linkable = ? WHERE channel = ?`,
 			t.Trust, boolInt(t.Deliverable), boolInt(t.Linkable), name); err != nil {
 			return fmt.Errorf("identity: set traits for %q: %w", name, err)
@@ -236,179 +228,48 @@ func (r *Registry) LinkableChannels() []string {
 	return out
 }
 
-func (r *Registry) migrate() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	for _, stmt := range []string{
-		`CREATE TABLE IF NOT EXISTS profiles (
-			user_id        TEXT PRIMARY KEY,
-			display_name   TEXT NOT NULL DEFAULT '',
-			email          TEXT NOT NULL DEFAULT '',
-			tokens_per_day INTEGER NOT NULL DEFAULT 0,
-			created_at     INTEGER NOT NULL,
-			updated_at     INTEGER NOT NULL
-		);`,
-		`CREATE TABLE IF NOT EXISTS identities (
-			id          TEXT PRIMARY KEY,
-			user_id     TEXT NOT NULL DEFAULT '',
-			channel     TEXT NOT NULL,
-			native_from TEXT NOT NULL UNIQUE,
-			reply_to    TEXT NOT NULL DEFAULT '',
-			username    TEXT NOT NULL DEFAULT '',
-			name        TEXT NOT NULL DEFAULT '',
-			trust       TEXT NOT NULL DEFAULT 'asserted',
-			deliverable INTEGER NOT NULL DEFAULT 0,
-			linkable    INTEGER NOT NULL DEFAULT 0,
-			first_seen  INTEGER NOT NULL,
-			last_seen   INTEGER NOT NULL
-		);`,
-		`CREATE INDEX IF NOT EXISTS idx_identities_user ON identities(user_id);`,
-		`CREATE TABLE IF NOT EXISTS user_tokens (
-			token_hash TEXT PRIMARY KEY,
-			user_id    TEXT NOT NULL,
-			created_at INTEGER NOT NULL,
-			last_used  INTEGER NOT NULL DEFAULT 0,
-			revoked    INTEGER NOT NULL DEFAULT 0
-		);`,
-		`CREATE INDEX IF NOT EXISTS idx_user_tokens_user ON user_tokens(user_id);`,
-		`CREATE TABLE IF NOT EXISTS link_challenges (
-			code_hash  TEXT PRIMARY KEY,
-			user_id    TEXT NOT NULL,
-			channel    TEXT NOT NULL,
-			created_at INTEGER NOT NULL,
-			expires_at INTEGER NOT NULL,
-			consumed   INTEGER NOT NULL DEFAULT 0
-		);`,
-		`CREATE TABLE IF NOT EXISTS invites (
-			code_hash   TEXT PRIMARY KEY,
-			created_at  INTEGER NOT NULL,
-			expires_at  INTEGER NOT NULL,
-			redeemed_by TEXT NOT NULL DEFAULT '',
-			redeemed_at INTEGER NOT NULL DEFAULT 0
-		);`,
-	} {
-		if _, err := r.db.ExecContext(ctx, stmt); err != nil {
-			return err
-		}
-	}
-	// Expired challenges and unredeemed invites are dead weight; drop them at
-	// boot rather than carrying them for the life of the database.
-	now := time.Now().Unix()
-	for _, stmt := range []string{
-		`DELETE FROM link_challenges WHERE expires_at < ?`,
-		`DELETE FROM invites WHERE expires_at < ? AND redeemed_by = ''`,
-	} {
-		if _, err := r.db.ExecContext(ctx, stmt, now); err != nil {
-			return err
-		}
-	}
-	return r.migrateLegacyUsers(ctx)
-}
-
-// migrateLegacyUsers folds the pre-profile `users` table into profiles and
-// identities. Each legacy row becomes a profile whose id IS the old uuid — so
-// every scoped key minted before this release (memory, files, credentials)
-// stays valid without moving a byte — plus the identity that produced it.
-//
-// The copy is INSERT OR IGNORE per row and the drop happens only after every
-// row is copied, so a crash mid-migration is repaired by the next boot rather
-// than losing rows.
-func (r *Registry) migrateLegacyUsers(ctx context.Context) error {
-	var exists int
-	err := r.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'users'`).Scan(&exists)
-	if err != nil || exists == 0 {
-		return err
-	}
-	rows, err := r.db.QueryContext(ctx,
-		`SELECT uuid, native_from, channel, reply_to, username, name, first_seen, last_seen FROM users`)
-	if err != nil {
-		return err
-	}
-	type legacy struct {
-		uuid, nativeFrom, channel, replyTo, username, name string
-		firstSeen, lastSeen                                int64
-	}
-	var all []legacy
-	for rows.Next() {
-		var l legacy
-		if err := rows.Scan(&l.uuid, &l.nativeFrom, &l.channel, &l.replyTo,
-			&l.username, &l.name, &l.firstSeen, &l.lastSeen); err != nil {
-			rows.Close()
-			return err
-		}
-		all = append(all, l)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-
-	for _, l := range all {
-		if _, err := r.db.ExecContext(ctx,
-			`INSERT OR IGNORE INTO profiles (user_id, created_at, updated_at) VALUES (?, ?, ?)`,
-			l.uuid, l.firstSeen, l.lastSeen); err != nil {
-			return err
-		}
-		t := Traits(l.channel)
-		if _, err := r.db.ExecContext(ctx,
-			`INSERT OR IGNORE INTO identities
-			   (id, user_id, channel, native_from, reply_to, username, name,
-			    trust, deliverable, linkable, first_seen, last_seen)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			l.uuid, l.uuid, l.channel, l.nativeFrom, l.replyTo, l.username, l.name,
-			t.Trust, boolInt(t.Deliverable), boolInt(t.Linkable), l.firstSeen, l.lastSeen); err != nil {
-			return err
-		}
-	}
-	if _, err := r.db.ExecContext(ctx, `DROP TABLE users`); err != nil {
-		return err
-	}
-	if n := len(all); n > 0 {
-		r.log.Info("identity: migrated legacy users to profiles", "count", n)
-	}
-	return nil
-}
-
 // Close closes the underlying database.
-func (r *Registry) Close() error { return r.db.Close() }
+func (r *Registry) Close() error { return r.st.Close() }
 
 // Resolve returns the identity (and profile, when linked) behind an inbound,
 // creating the identity on first contact. It refreshes the stored delivery
 // target + profile fields on every call, since a user may move between chats.
 // Concurrent first-contacts for the same key are serialized so exactly one
 // identity is minted.
+//
+// Every call reads the store, and an in-process cache of resolutions used to
+// sit here. It was a liability rather than an optimization: this path already
+// writes the delivery target back on every inbound, so caching saved no round
+// trip, and in a fleet it served answers another instance had already
+// invalidated — a handle that had just been linked or unlinked kept its old
+// scope in this process for as long as the process lived.
 func (r *Registry) Resolve(channel, nativeFrom, replyTo string, profile map[string]any) (Resolution, error) {
-	// Fast path: cache hit. Refresh outside the lock (refresh does its own DB
-	// write and does not touch the cache).
-	r.mu.Lock()
-	if res, ok := r.cache[nativeFrom]; ok {
-		r.mu.Unlock()
-		r.refresh(res.IdentityID, replyTo, profile)
-		return res, nil
-	}
-	r.mu.Unlock()
-
-	// Slow path: serialize minting. The mutex is coarse (one mint at a time
-	// across all keys); minting is rare (first contact only) and a finer lock
-	// would buy nothing for the load profile.
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if res, ok := r.cache[nativeFrom]; ok {
-		r.refresh(res.IdentityID, replyTo, profile)
-		return res, nil
-	}
 	id, ok, err := r.lookupIdentity(nativeFrom)
 	if err != nil {
 		return Resolution{}, err
 	}
-	if !ok {
-		return r.mintIdentity(nativeFrom, channel, replyTo, profile)
+	if ok {
+		res := id.resolution()
+		r.refresh(id, replyTo, profile)
+		return res, nil
 	}
-	res := id.resolution()
-	r.cache[nativeFrom] = res
-	r.refresh(id.ID, replyTo, profile)
-	return res, nil
+
+	// Serialize minting. The mutex is coarse (one mint at a time across all
+	// keys), minting is rare (first contact only) and a finer lock would buy
+	// nothing for the load profile. It is deliberately not held on the path
+	// above, which is every message after the first.
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// Re-read under the lock: a concurrent inbound for the same key may have
+	// minted it between the read above and here.
+	if id, ok, err := r.lookupIdentity(nativeFrom); err != nil {
+		return Resolution{}, err
+	} else if ok {
+		res := id.resolution()
+		r.refresh(id, replyTo, profile)
+		return res, nil
+	}
+	return r.mintIdentity(nativeFrom, channel, replyTo, profile)
 }
 
 // resolution projects a stored identity into the per-inbound view.
@@ -429,7 +290,7 @@ const identityCols = `id, user_id, channel, native_from, reply_to, username, nam
 func (r *Registry) lookupIdentity(nativeFrom string) (Identity, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	row := r.db.QueryRowContext(ctx,
+	row := r.st.QueryRow(ctx,
 		`SELECT `+identityCols+` FROM identities WHERE native_from = ?`, nativeFrom)
 	id, err := scanIdentity(row)
 	if err == sql.ErrNoRows {
@@ -459,62 +320,99 @@ func scanIdentity(s rowScanner) (Identity, error) {
 	return id, nil
 }
 
+// mintGate is a test seam, nil in production (the branch is one load). A test
+// sets it to hold several instances inside the window between "no identity for
+// this handle" and the insert that mints one — the only moment at which a
+// shared store can end up with two rows for one handle, and otherwise a matter
+// of luck to reproduce.
+var mintGate func()
+
 // mintIdentity creates the identity row for a first contact. With autoClaim it
 // also claims a profile, so the handle gets a personal scope immediately;
 // otherwise the identity stays unregistered and carries no user scope.
+//
+// The insert is conflict-safe, because in a fleet two instances can see the
+// same handle's first message at the same moment. Without it the loser's INSERT
+// fails on the unique handle, and a first contact on that instance is an error
+// rather than a welcome. The loser adopts the row the winner wrote instead: one
+// handle resolves to one user scope, wherever it arrives.
 func (r *Registry) mintIdentity(nativeFrom, channel, replyTo string, profile map[string]any) (Resolution, error) {
 	now := time.Now().Unix()
 	username, name := profileStrings(profile)
 	t := r.traitsOf(channel)
-	userID := ""
-	if r.autoClaim {
-		userID = "u_" + randomID(12)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if _, err := r.db.ExecContext(ctx,
-			`INSERT INTO profiles (user_id, created_at, updated_at) VALUES (?, ?, ?)`,
-			userID, now, now); err != nil {
-			return Resolution{}, fmt.Errorf("claim profile: %w", err)
-		}
-	}
-
 	id := Identity{
-		ID: "i_" + randomID(12), UserID: userID, Channel: channel,
+		ID: "i_" + randomID(12), Channel: channel,
 		NativeFrom: nativeFrom, ReplyTo: replyTo, Username: username, Name: name,
 		Trust: t.Trust, Deliverable: t.Deliverable, Linkable: t.Linkable,
 		FirstSeen: now, LastSeen: now,
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if mintGate != nil {
+		mintGate()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if _, err := r.db.ExecContext(ctx,
-		`INSERT INTO identities (`+identityCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id.ID, id.UserID, id.Channel, id.NativeFrom, id.ReplyTo, id.Username, id.Name,
-		id.Trust, boolInt(id.Deliverable), boolInt(id.Linkable), id.FirstSeen, id.LastSeen); err != nil {
+	won, err := r.insertIdentity(ctx, id)
+	if err != nil {
 		return Resolution{}, fmt.Errorf("mint identity: %w", err)
 	}
-	res := id.resolution()
-	r.cache[nativeFrom] = res
+	if !won {
+		existing, ok, err := r.lookupIdentity(nativeFrom)
+		if err != nil {
+			return Resolution{}, err
+		}
+		if !ok {
+			return Resolution{}, fmt.Errorf("mint identity: the row that won the race for %q is gone", nativeFrom)
+		}
+		// The other instance's row is the identity now, but this inbound's
+		// delivery target is the newer one.
+		r.refresh(existing, replyTo, profile)
+		return existing.resolution(), nil
+	}
+
+	// Claiming a profile is a second step, and it runs only on the instance
+	// that won the insert — so a lost race leaves no orphan account behind.
+	if r.autoClaim {
+		if err := r.addProfile(ctx, &id, now, "", ""); err != nil {
+			return Resolution{}, fmt.Errorf("claim profile: %w", err)
+		}
+	}
+
 	metrics.Inc("agentflow_identity_mints")
-	r.log.Info("identity minted", "identity", id.ID, "user_id", userID,
-		"native_from", nativeFrom, "channel", channel, "registered", userID != "")
-	return res, nil
+	r.log.Info("identity minted", "identity", id.ID, "user_id", id.UserID,
+		"native_from", nativeFrom, "channel", channel, "registered", id.UserID != "")
+	return id.resolution(), nil
 }
+
+// lastSeenInterval bounds how often an identity's last_seen is written. It is
+// what push ordering uses to prefer where a person last spoke, so it has to
+// move — but writing it on every inbound makes one row the hot row of a busy
+// chat, and a minute of slack changes nothing about where someone last spoke.
+const lastSeenInterval = time.Minute
 
 // refresh updates the delivery target and profile fields for a known identity.
 // It is best-effort: a failure here only means the next push may use a stale
 // target, which the outbox layer handles. Errors are logged, not returned.
-func (r *Registry) refresh(identityID, replyTo string, profile map[string]any) {
-	if identityID == "" {
+//
+// A call that would change nothing writes nothing: the profile fields and reply
+// target are compared against the row this inbound was resolved from, so the
+// common case — the same person in the same chat — costs a read and no write.
+func (r *Registry) refresh(id Identity, replyTo string, profile map[string]any) {
+	if id.ID == "" {
 		return
 	}
+	now := time.Now().Unix()
 	username, name := profileStrings(profile)
+	changed := replyTo != id.ReplyTo || username != id.Username || name != id.Name
+	if !changed && now-id.LastSeen < int64(lastSeenInterval.Seconds()) {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := r.db.ExecContext(ctx,
+	if _, err := r.st.Exec(ctx,
 		`UPDATE identities SET reply_to = ?, username = ?, name = ?, last_seen = ?
 		 WHERE id = ?`,
-		replyTo, username, name, time.Now().Unix(), identityID); err != nil {
-		r.log.Warn("refresh identity failed", "identity", identityID, "err", err)
+		replyTo, username, name, now, id.ID); err != nil {
+		r.log.Warn("refresh identity failed", "identity", id.ID, "err", err)
 	}
 }
 
@@ -533,7 +431,7 @@ func (r *Registry) CreateProfile(displayName, email string) (Profile, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := r.db.ExecContext(ctx,
+	if _, err := r.st.Exec(ctx,
 		`INSERT INTO profiles (user_id, display_name, email, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?)`,
 		p.UserID, p.DisplayName, p.Email, p.CreatedAt, p.UpdatedAt); err != nil {
@@ -547,7 +445,7 @@ func (r *Registry) Get(userID string) (Profile, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var p Profile
-	err := r.db.QueryRowContext(ctx,
+	err := r.st.QueryRow(ctx,
 		`SELECT user_id, display_name, email, tokens_per_day, created_at, updated_at
 		 FROM profiles WHERE user_id = ?`, userID).
 		Scan(&p.UserID, &p.DisplayName, &p.Email, &p.TokensPerDay, &p.CreatedAt, &p.UpdatedAt)
@@ -569,7 +467,7 @@ func (r *Registry) Get(userID string) (Profile, bool, error) {
 func (r *Registry) List() ([]Profile, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	rows, err := r.db.QueryContext(ctx,
+	rows, err := r.st.Query(ctx,
 		`SELECT user_id, display_name, email, tokens_per_day, created_at, updated_at
 		 FROM profiles ORDER BY created_at, user_id`)
 	if err != nil {
@@ -622,7 +520,7 @@ func (r *Registry) Update(userID string, displayName, email *string, tokensPerDa
 	args = append(args, time.Now().Unix(), userID)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	res, err := r.db.ExecContext(ctx,
+	res, err := r.st.Exec(ctx,
 		`UPDATE profiles SET `+strings.Join(sets, ", ")+` WHERE user_id = ?`, args...)
 	if err != nil {
 		return err
@@ -637,7 +535,7 @@ func (r *Registry) Update(userID string, displayName, email *string, tokensPerDa
 func (r *Registry) Identities(userID string) ([]Identity, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	rows, err := r.db.QueryContext(ctx,
+	rows, err := r.st.Query(ctx,
 		`SELECT `+identityCols+` FROM identities WHERE user_id = ? ORDER BY first_seen, id`, userID)
 	if err != nil {
 		return nil, err
@@ -672,14 +570,46 @@ func (r *Registry) Link(userID, nativeFrom string) (Identity, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := r.db.ExecContext(ctx,
-		`UPDATE identities SET user_id = ? WHERE id = ?`, userID, id.ID); err != nil {
+	assigned, err := r.assignIdentity(ctx, userID, id.ID)
+	if err != nil {
 		return Identity{}, err
 	}
+	if !assigned {
+		return Identity{}, fmt.Errorf("handle %q already belongs to another profile", nativeFrom)
+	}
 	id.UserID = userID
-	r.evict(nativeFrom)
 	r.log.Info("identity linked", "identity", id.ID, "user_id", userID, "channel", id.Channel)
 	return id, nil
+}
+
+// assignIdentity points an identity at a profile, reporting whether it did.
+//
+// The WHERE clause is the gate, not a formality: the caller read the row before
+// calling, and in a fleet another instance may have linked this handle to a
+// different profile in the meantime. A false means someone else owns it now,
+// and the caller must refuse rather than overwrite a live link.
+func (r *Registry) assignIdentity(ctx context.Context, userID, identityID string) (bool, error) {
+	res, err := r.st.Exec(ctx,
+		`UPDATE identities SET user_id = ? WHERE id = ? AND (user_id = '' OR user_id = ?)`,
+		userID, identityID, userID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// releaseIdentity detaches an identity from the profile that holds it, reporting
+// whether it did. Like assignIdentity, the user_id predicate makes a stale read
+// harmless: only the profile that currently holds the handle can give it up.
+func (r *Registry) releaseIdentity(ctx context.Context, userID, identityID string) (bool, error) {
+	res, err := r.st.Exec(ctx,
+		`UPDATE identities SET user_id = '' WHERE id = ? AND user_id = ?`, identityID, userID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 // Unlink detaches a handle from its profile, returning it to the unregistered
@@ -704,25 +634,26 @@ func (r *Registry) Unlink(userID, identityID string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	var native string
-	if err := r.db.QueryRowContext(ctx,
-		`SELECT native_from FROM identities WHERE id = ?`, identityID).Scan(&native); err != nil {
+	released, err := r.releaseIdentity(ctx, userID, identityID)
+	if err != nil {
 		return err
 	}
-	if _, err := r.db.ExecContext(ctx,
-		`UPDATE identities SET user_id = '' WHERE id = ?`, identityID); err != nil {
-		return err
+	if !released {
+		return fmt.Errorf("no such identity %q on profile %q", identityID, userID)
 	}
-	r.evict(native)
+	// The "not the last handle" check above is a read; two concurrent unlinks of
+	// a two-handle profile would both pass it and leave the account
+	// unreachable. So the invariant is verified after the write and repaired if
+	// it broke, rather than assumed.
+	if remaining, err := r.Identities(userID); err == nil && len(remaining) == 0 {
+		if _, err := r.st.Exec(ctx,
+			`UPDATE identities SET user_id = ? WHERE id = ?`, userID, identityID); err != nil {
+			r.log.Error("identity unlink rollback failed", "identity", identityID, "user_id", userID, "err", err)
+		}
+		return fmt.Errorf("cannot unlink the last handle of profile %q", userID)
+	}
 	r.log.Info("identity unlinked", "identity", identityID, "user_id", userID)
 	return nil
-}
-
-// evict drops a cached resolution so the next inbound re-reads the link state.
-func (r *Registry) evict(nativeFrom string) {
-	r.mu.Lock()
-	delete(r.cache, nativeFrom)
-	r.mu.Unlock()
 }
 
 // --- delivery ---------------------------------------------------------------
@@ -764,7 +695,7 @@ func (r *Registry) LookupUser(id string) (channel, replyTo string, ok bool) {
 	// the id as a single identity.
 	var ch, rt string
 	var deliverable int
-	err := r.db.QueryRowContext(ctx,
+	err := r.st.QueryRow(ctx,
 		`SELECT channel, reply_to, deliverable FROM identities WHERE id = ?`, id).
 		Scan(&ch, &rt, &deliverable)
 	if err == sql.ErrNoRows {
@@ -793,7 +724,7 @@ func (r *Registry) IssueToken(userID string) (string, error) {
 	tok := tokenPrefix + randomID(24)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := r.db.ExecContext(ctx,
+	if _, err := r.st.Exec(ctx,
 		`INSERT INTO user_tokens (token_hash, user_id, created_at) VALUES (?, ?, ?)`,
 		hashSecret(tok), userID, time.Now().Unix()); err != nil {
 		return "", fmt.Errorf("issue token: %w", err)
@@ -811,7 +742,7 @@ func (r *Registry) TokenUser(token string) (string, bool) {
 	h := hashSecret(token)
 	var userID string
 	var revoked int
-	if err := r.db.QueryRowContext(ctx,
+	if err := r.st.QueryRow(ctx,
 		`SELECT user_id, revoked FROM user_tokens WHERE token_hash = ?`, h).Scan(&userID, &revoked); err != nil {
 		return "", false
 	}
@@ -820,7 +751,7 @@ func (r *Registry) TokenUser(token string) (string, bool) {
 	}
 	// Best effort: a failed touch only costs accuracy on the console's
 	// last-used column, never authority.
-	_, _ = r.db.ExecContext(ctx, `UPDATE user_tokens SET last_used = ? WHERE token_hash = ?`, time.Now().Unix(), h)
+	_, _ = r.st.Exec(ctx, `UPDATE user_tokens SET last_used = ? WHERE token_hash = ?`, time.Now().Unix(), h)
 	return userID, true
 }
 
@@ -832,7 +763,7 @@ func (r *Registry) RevokeToken(userID, token string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	res, err := r.db.ExecContext(ctx,
+	res, err := r.st.Exec(ctx,
 		`UPDATE user_tokens SET revoked = 1 WHERE token_hash = ? AND user_id = ?`,
 		hashSecret(token), userID)
 	if err != nil {
@@ -848,7 +779,7 @@ func (r *Registry) RevokeToken(userID, token string) error {
 func (r *Registry) Tokens(userID string) ([]TokenRef, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	rows, err := r.db.QueryContext(ctx,
+	rows, err := r.st.Query(ctx,
 		`SELECT substr(token_hash, 1, 8), created_at, last_used FROM user_tokens
 		 WHERE user_id = ? AND revoked = 0 ORDER BY created_at`, userID)
 	if err != nil {
@@ -899,7 +830,7 @@ func (r *Registry) StartLink(userID, channel string, ttl time.Duration) (string,
 	expires := now.Add(ttl).Unix()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := r.db.ExecContext(ctx,
+	if _, err := r.st.Exec(ctx,
 		`INSERT INTO link_challenges (code_hash, user_id, channel, created_at, expires_at)
 		 VALUES (?, ?, ?, ?, ?)`,
 		hashSecret(code), userID, channel, now.Unix(), expires); err != nil {
@@ -924,7 +855,7 @@ func (r *Registry) ConsumeLink(channel, nativeFrom, code string) (string, error)
 	var userID, ch string
 	var expires int64
 	var consumed int
-	err := r.db.QueryRowContext(ctx,
+	err := r.st.QueryRow(ctx,
 		`SELECT user_id, channel, expires_at, consumed FROM link_challenges WHERE code_hash = ?`, h).
 		Scan(&userID, &ch, &expires, &consumed)
 	if err == sql.ErrNoRows {
@@ -944,7 +875,7 @@ func (r *Registry) ConsumeLink(channel, nativeFrom, code string) (string, error)
 	}
 	// Compare-and-set: the update is the gate, so two concurrent attempts with
 	// the same code cannot both proceed.
-	res, err := r.db.ExecContext(ctx,
+	res, err := r.st.Exec(ctx,
 		`UPDATE link_challenges SET consumed = 1 WHERE code_hash = ? AND consumed = 0`, h)
 	if err != nil {
 		return "", err
@@ -969,7 +900,7 @@ func (r *Registry) IssueInvite(ttl time.Duration) (string, error) {
 	now := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := r.db.ExecContext(ctx,
+	if _, err := r.st.Exec(ctx,
 		`INSERT INTO invites (code_hash, created_at, expires_at) VALUES (?, ?, ?)`,
 		hashSecret(code), now.Unix(), now.Add(ttl).Unix()); err != nil {
 		return "", fmt.Errorf("issue invite: %w", err)
@@ -990,7 +921,7 @@ func (r *Registry) RedeemInvite(code string) error {
 	h := hashSecret(code)
 	var expires int64
 	var redeemedBy string
-	err := r.db.QueryRowContext(ctx,
+	err := r.st.QueryRow(ctx,
 		`SELECT expires_at, redeemed_by FROM invites WHERE code_hash = ?`, h).Scan(&expires, &redeemedBy)
 	if err == sql.ErrNoRows {
 		return fmt.Errorf("unknown invite code")
@@ -1004,7 +935,7 @@ func (r *Registry) RedeemInvite(code string) error {
 	if time.Now().Unix() > expires {
 		return fmt.Errorf("invite expired")
 	}
-	res, err := r.db.ExecContext(ctx,
+	res, err := r.st.Exec(ctx,
 		`UPDATE invites SET redeemed_by = 'pending', redeemed_at = ? WHERE code_hash = ? AND redeemed_by = ''`,
 		time.Now().Unix(), h)
 	if err != nil {
@@ -1038,12 +969,8 @@ func (r *Registry) ProvisionOIDC(identityKey, displayName, email string, jit boo
 	if strings.TrimSpace(identityKey) == "" {
 		return Identity{}, false, fmt.Errorf("identity: empty oidc identity key")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
-	// Under the lock: two concurrent first logins must not each mint a profile.
-	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	id, ok, err := r.lookupIdentity(identityKey)
 	if err != nil {
@@ -1051,7 +978,7 @@ func (r *Registry) ProvisionOIDC(identityKey, displayName, email string, jit boo
 	}
 	now := time.Now().Unix()
 	if ok {
-		if _, err := r.db.ExecContext(ctx,
+		if _, err := r.st.Exec(ctx,
 			`UPDATE identities SET last_seen = ? WHERE id = ?`, now, id.ID); err != nil {
 			r.log.Warn("oidc last_seen refresh failed", "err", err)
 		}
@@ -1062,15 +989,12 @@ func (r *Registry) ProvisionOIDC(identityKey, displayName, email string, jit boo
 		return Identity{}, false, fmt.Errorf("identity: no profile is provisioned for this login yet")
 	}
 
-	userID := "u_" + randomID(12)
-	if _, err := r.db.ExecContext(ctx,
-		`INSERT INTO profiles (user_id, display_name, email, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?)`, userID, displayName, email, now, now); err != nil {
-		return Identity{}, false, fmt.Errorf("identity: provision profile: %w", err)
-	}
+	// No lock is needed around the write: the insert is conflict-safe, so two
+	// simultaneous first logins — in this process or in another instance —
+	// produce one row, and the loser reads it rather than failing the login.
 	t := Traits(oidcChannel)
 	id = Identity{
-		ID: "i_" + randomID(12), UserID: userID, Channel: oidcChannel,
+		ID: "i_" + randomID(12), Channel: oidcChannel,
 		NativeFrom:  identityKey,
 		Username:    email,
 		Name:        displayName,
@@ -1080,17 +1004,62 @@ func (r *Registry) ProvisionOIDC(identityKey, displayName, email string, jit boo
 		FirstSeen:   now,
 		LastSeen:    now,
 	}
-	if _, err := r.db.ExecContext(ctx,
-		`INSERT INTO identities (`+identityCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id.ID, id.UserID, id.Channel, id.NativeFrom, id.ReplyTo, id.Username, id.Name,
-		id.Trust, boolInt(id.Deliverable), boolInt(id.Linkable), id.FirstSeen, id.LastSeen); err != nil {
+	won, err := r.insertIdentity(ctx, id)
+	if err != nil {
 		return Identity{}, false, fmt.Errorf("identity: provision identity: %w", err)
 	}
-	r.cache[identityKey] = id.resolution()
+	if !won {
+		existing, ok, err := r.lookupIdentity(identityKey)
+		if err != nil {
+			return Identity{}, false, err
+		}
+		if !ok {
+			return Identity{}, false, fmt.Errorf("identity: the row that won the race for this login is gone")
+		}
+		return existing, false, nil
+	}
+	if err := r.addProfile(ctx, &id, now, displayName, email); err != nil {
+		return Identity{}, false, fmt.Errorf("identity: provision profile: %w", err)
+	}
 	metrics.Inc("agentflow_user_provisions")
 	issuer, _, _ := strings.Cut(identityKey, "|")
-	r.log.Info("profile provisioned from an oidc login", "user_id", userID, "identity", id.ID, "issuer", issuer)
+	r.log.Info("profile provisioned from an oidc login", "user_id", id.UserID, "identity", id.ID, "issuer", issuer)
 	return id, true, nil
+}
+
+// insertIdentity writes an identity row, reporting whether this call created it.
+// False means another writer — a goroutine here, or another instance in a fleet
+// — got there first, and the caller must adopt the row that exists: one handle
+// is one identity, in every process, at every moment.
+func (r *Registry) insertIdentity(ctx context.Context, id Identity) (bool, error) {
+	res, err := r.st.Exec(ctx,
+		`INSERT INTO identities (`+identityCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT (native_from) DO NOTHING`,
+		id.ID, id.UserID, id.Channel, id.NativeFrom, id.ReplyTo, id.Username, id.Name,
+		id.Trust, boolInt(id.Deliverable), boolInt(id.Linkable), id.FirstSeen, id.LastSeen)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// addProfile creates a profile and links an identity to it. It runs only on the
+// instance that won the identity insert, so a lost race leaves no account
+// behind that nothing points at.
+func (r *Registry) addProfile(ctx context.Context, id *Identity, now int64, displayName, email string) error {
+	userID := "u_" + randomID(12)
+	if _, err := r.st.Exec(ctx,
+		`INSERT INTO profiles (user_id, display_name, email, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?)`, userID, displayName, email, now, now); err != nil {
+		return fmt.Errorf("create profile: %w", err)
+	}
+	if _, err := r.st.Exec(ctx,
+		`UPDATE identities SET user_id = ? WHERE id = ?`, userID, id.ID); err != nil {
+		return fmt.Errorf("link new profile: %w", err)
+	}
+	id.UserID = userID
+	return nil
 }
 
 // --- helpers ---

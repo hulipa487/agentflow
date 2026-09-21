@@ -55,7 +55,7 @@ type UserHandlers struct {
 	Profile  func(userID string) (LoopProfile, bool, error)
 	Profiles func() ([]LoopProfile, error)
 
-	Ledger *runtime.Store
+	Ledger runtime.Store
 	Quota  *accounting.Quota
 
 	// HasCredential reports whether a user holds a credential for a service.

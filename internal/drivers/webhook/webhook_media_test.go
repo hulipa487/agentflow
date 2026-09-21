@@ -150,4 +150,3 @@ func TestWebhookPlainTextOnly(t *testing.T) {
 		t.Fatalf("plain request changed shape: %+v", sink.inbs)
 	}
 }
-

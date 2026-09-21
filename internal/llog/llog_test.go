@@ -32,7 +32,7 @@ func TestNameAndShortName(t *testing.T) {
 		short string
 	}{
 		{LevelDev, "DEV", "DEV"},
-		{LevelDev - 4, "DEV", "DEV"},        // anything at/below -8 is DEV
+		{LevelDev - 4, "DEV", "DEV"}, // anything at/below -8 is DEV
 		{slog.LevelDebug, "DEBUG", "DBG"},
 		{slog.LevelDebug + 2, "DEBUG", "DBG"}, // between debug and info
 		{slog.LevelInfo, "INFO", "INF"},
@@ -66,9 +66,9 @@ func TestAdditiveFiltering(t *testing.T) {
 	}
 
 	tests := []struct {
-		level    slog.Level
-		present  []string
-		absent   []string
+		level   slog.Level
+		present []string
+		absent  []string
 	}{
 		{LevelDev, []string{"dev line", "debug line", "info line", "warn line", "error line"}, nil},
 		{slog.LevelDebug, []string{"debug line", "info line", "warn line", "error line"}, []string{"dev line"}},

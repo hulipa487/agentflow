@@ -54,7 +54,7 @@ func itoa(n int) string {
 // call is refused before it reaches the provider.
 func TestUserQuotaDeniesTheCallBeforeTheProvider(t *testing.T) {
 	dir := t.TempDir()
-	ledger, err := runtime.Open(filepath.Join(dir, "runtime.db"))
+	ledger, err := runtime.OpenSQLite(filepath.Join(dir, "runtime.db"))
 	if err != nil {
 		t.Fatalf("open ledger: %v", err)
 	}
@@ -140,7 +140,7 @@ data: [DONE]
 // somebody else's budget.
 func TestQuotaIgnoresTrafficWithoutAUser(t *testing.T) {
 	dir := t.TempDir()
-	ledger, err := runtime.Open(filepath.Join(dir, "runtime.db"))
+	ledger, err := runtime.OpenSQLite(filepath.Join(dir, "runtime.db"))
 	if err != nil {
 		t.Fatalf("open ledger: %v", err)
 	}

@@ -34,9 +34,9 @@ agents:
 // fixture builds a UI against a temp config file and returns the pieces the
 // tests poke at.
 type fixture struct {
-	ui     *UI
-	models *llm.Manager
-	cfgDir string
+	ui      *UI
+	models  *llm.Manager
+	cfgDir  string
 	cfgPath string
 }
 

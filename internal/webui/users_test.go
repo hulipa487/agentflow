@@ -20,7 +20,7 @@ func quiet() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)
 
 // userConsole builds a console over a real profile store and ledger, with the
 // file store left out (its absence must degrade, not fail).
-func userConsole(t *testing.T) (*httptest.Server, *identity.Registry, *runtime.Store, string) {
+func userConsole(t *testing.T) (*httptest.Server, *identity.Registry, runtime.Store, string) {
 	t.Helper()
 	dir := t.TempDir()
 	reg, err := identity.Open(filepath.Join(dir, "identity.db"), quiet())
@@ -28,7 +28,7 @@ func userConsole(t *testing.T) (*httptest.Server, *identity.Registry, *runtime.S
 		t.Fatalf("open identity: %v", err)
 	}
 	t.Cleanup(func() { _ = reg.Close() })
-	store, err := runtime.Open(filepath.Join(dir, "runtime.db"))
+	store, err := runtime.OpenSQLite(filepath.Join(dir, "runtime.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

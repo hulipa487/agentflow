@@ -12,9 +12,9 @@ import (
 // interface. Timer fires are delivered as core-stamped timer messages into the
 // owning session's mailbox.
 type schedulerAdapter struct {
-	svc    *scheduler.Service
-	sup    *Supervisor
-	log    *slog.Logger
+	svc *scheduler.Service
+	sup *Supervisor
+	log *slog.Logger
 }
 
 func newSchedulerAdapter(svc *scheduler.Service, sup *Supervisor, log *slog.Logger) *schedulerAdapter {

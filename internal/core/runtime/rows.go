@@ -18,7 +18,7 @@ type Row struct {
 
 // PutRow writes one row, replacing any existing row with the same key.
 // expiresAt zero means the row never expires.
-func (s *Store) PutRow(ctx context.Context, key, value string, expiresAt time.Time) error {
+func (s *sqliteStore) PutRow(ctx context.Context, key, value string, expiresAt time.Time) error {
 	var exp int64
 	if !expiresAt.IsZero() {
 		exp = expiresAt.UnixNano()
@@ -36,7 +36,7 @@ func (s *Store) PutRow(ctx context.Context, key, value string, expiresAt time.Ti
 
 // GetRow returns the row for key. A row past its expiry deadline is deleted
 // here (lazy expiry) and reported as not found.
-func (s *Store) GetRow(ctx context.Context, key string) (Row, bool, error) {
+func (s *sqliteStore) GetRow(ctx context.Context, key string) (Row, bool, error) {
 	var r Row
 	var updated, exp int64
 	err := s.db.QueryRowContext(ctx,
@@ -60,7 +60,7 @@ func (s *Store) GetRow(ctx context.Context, key string) (Row, bool, error) {
 }
 
 // DeleteRow removes one row (idempotent).
-func (s *Store) DeleteRow(ctx context.Context, key string) error {
+func (s *sqliteStore) DeleteRow(ctx context.Context, key string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM files_meta WHERE key = ?`, key)
 	return err
 }
@@ -68,7 +68,7 @@ func (s *Store) DeleteRow(ctx context.Context, key string) error {
 // ListRows returns rows whose key starts with prefix, in key order. The range
 // scan (>= prefix, < prefix||'\xff') uses the primary key — LIKE would not.
 // Expired rows are skipped and deleted as they are scanned.
-func (s *Store) ListRows(ctx context.Context, prefix string) ([]Row, error) {
+func (s *sqliteStore) ListRows(ctx context.Context, prefix string) ([]Row, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT key, value, updated_at, expires_at FROM files_meta
 		WHERE key >= ? AND key < ? ORDER BY key`, prefix, prefix+"\xff")
@@ -99,7 +99,7 @@ func (s *Store) ListRows(ctx context.Context, prefix string) ([]Row, error) {
 
 // SweepExpired deletes every expired row and returns how many were removed.
 // Runs at boot so scratch space does not accumulate across restarts.
-func (s *Store) SweepExpired(ctx context.Context) (int, error) {
+func (s *sqliteStore) SweepExpired(ctx context.Context) (int, error) {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM files_meta WHERE expires_at != 0 AND expires_at < ?`,
 		time.Now().UnixNano())
 	if err != nil {

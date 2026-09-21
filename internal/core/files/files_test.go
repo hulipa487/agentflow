@@ -26,7 +26,7 @@ func testManager(t *testing.T, ttl time.Duration) (*Manager, *time.Time) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rt, err := runtime.Open(filepath.Join(t.TempDir(), "rt.db"))
+	rt, err := runtime.OpenSQLite(filepath.Join(t.TempDir(), "rt.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,7 +357,7 @@ func TestGCMarkSweep(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rt, err := runtime.Open(filepath.Join(t.TempDir(), "rt.db"))
+	rt, err := runtime.OpenSQLite(filepath.Join(t.TempDir(), "rt.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

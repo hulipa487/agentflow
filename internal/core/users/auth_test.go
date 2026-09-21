@@ -381,7 +381,7 @@ func TestConfigEndpoint(t *testing.T) {
 
 func TestMeUsageAndProjects(t *testing.T) {
 	dir := t.TempDir()
-	store, err := runtime.Open(filepath.Join(dir, "runtime.db"))
+	store, err := runtime.OpenSQLite(filepath.Join(dir, "runtime.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

@@ -48,6 +48,8 @@ func userConsole(t *testing.T) (*httptest.Server, *identity.Registry, runtime.St
 	ui := New(Deps{Users: UserDeps{
 		Identities: reg,
 		Store:      store,
+		Events:     store,
+		Journal:    store,
 		Quota:      accounting.New(store, reg.LimitFor, 0),
 	}})
 	srv := httptest.NewServer(ui.API())

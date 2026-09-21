@@ -49,7 +49,7 @@ type Options struct {
 	// Files answers /me/projects. Nil means the file store is disabled.
 	Files *files.Manager
 	// Store answers /me/usage. Nil means accounting is disabled.
-	Store runtime.Store
+	Store runtime.Ledger
 	// Quota reports the caller's limit. Nil means no quota is configured.
 	Quota QuotaStatus
 	// Verifier checks access tokens minted by the deployment's identity
@@ -75,7 +75,7 @@ type API struct {
 	jit      bool
 	linkable []string
 	files    *files.Manager
-	store    runtime.Store
+	store    runtime.Ledger
 	quota    QuotaStatus
 	limiter  *ipLimiter
 }

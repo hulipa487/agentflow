@@ -10,45 +10,15 @@
 package runtime
 
 import (
-	"context"
 	"io"
 	"log/slog"
-	"time"
 
 	"agentflow/internal/core/storedb"
 )
 
-// Store is the runtime store's surface. Both implementations satisfy it, and
-// every consumer above takes this interface rather than a concrete type.
-type Store interface {
-	// --- message journal (the core-owned audit trail) ---
-	RecordMessage(ctx context.Context, e JournalEntry) error
-	ListMessages(ctx context.Context, f JournalFilter) ([]JournalEntry, error)
-	PruneMessages(ctx context.Context, cutoff time.Time) (int64, error)
-	JournalRowCount(ctx context.Context) (int64, error)
-
-	// --- key/value rows (file-store metadata: trees, commits, refs, scratch) ---
-	PutRow(ctx context.Context, key, value string, expiresAt time.Time) error
-	GetRow(ctx context.Context, key string) (Row, bool, error)
-	DeleteRow(ctx context.Context, key string) error
-	ListRows(ctx context.Context, prefix string) ([]Row, error)
-	SweepExpired(ctx context.Context) (int, error)
-
-	// --- per-user token ledger ---
-	RecordUsage(rec UsageRecord, withEvent bool) error
-	UsageForDay(userID, day string) (UsageTotals, error)
-	UsageForAgentDay(agent, day string) (UsageTotals, error)
-	UsageHistory(userID string, days int) ([]UsageRow, error)
-	UsageDaily(day string) ([]UsageRow, error)
-	UsageEvents(userID string, since time.Time, limit int) ([]UsageEvent, error)
-	PruneUsage(before time.Time) error
-
-	// Path identifies the store for logs. A PostgreSQL store reports a
-	// credential-free form of its DSN: a store's address may be logged, its
-	// password must not be.
-	Path() string
-	Close() error
-}
+// Store and its four narrow planes (Journal, Rows, Ledger, EventLog) are
+// declared in interfaces.go. Both implementations satisfy the whole of Store;
+// a consumer takes the part it needs.
 
 // Backend names the storage engine behind the runtime store.
 const (

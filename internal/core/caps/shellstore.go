@@ -21,7 +21,7 @@ import (
 // one record per shell — tens, not millions — and an index is one more thing
 // that can disagree with what it indexes.
 type ShellStore struct {
-	Store runtime.Store
+	Store runtime.Rows
 }
 
 // shellRowPrefix namespaces handle records in the shared row table.

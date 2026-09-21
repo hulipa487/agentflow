@@ -195,4 +195,41 @@ func TestPostgresProvisionedLoginIsShared(t *testing.T) {
 	}
 }
 
+// Per-user overrides on a server: the columns are added to an existing table by
+// the boot migration (a catalogue lookup on PostgreSQL, not a pragma), and the
+// read path a session hits every turn works there too.
+func TestPostgresProfileOverrides(t *testing.T) {
+	if postgresDSN == "" {
+		t.Skip("AGENTFLOW_TEST_POSTGRES is unset; skipping the postgres backend")
+	}
+	a := openAt(t, postgresDSN)
+	p, err := a.CreateProfile("Override "+pgTag(t), "")
+	if err != nil {
+		t.Fatalf("create profile: %v", err)
+	}
+	model, added := "pg-premium", "Answer briefly."
+	if err := a.SetOverrides(p.UserID, &model, &added); err != nil {
+		t.Fatalf("set overrides: %v", err)
+	}
+	// Another instance reads them: the columns are in the shared table.
+	b := openAt(t, postgresDSN)
+	gotModel, gotAdded, err := b.Overrides(p.UserID)
+	if err != nil || gotModel != model || gotAdded != added {
+		t.Fatalf("overrides on b = %q %q err=%v", gotModel, gotAdded, err)
+	}
+	// And they ride on the profile the console reads.
+	got, ok, err := b.Get(p.UserID)
+	if err != nil || !ok || got.Model != model || got.InstructionsAppend != added {
+		t.Fatalf("profile = %+v ok=%v err=%v", got, ok, err)
+	}
+	// Clearing puts them back on inherit.
+	empty := ""
+	if err := b.SetOverrides(p.UserID, &empty, &empty); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	if m, x, _ := a.Overrides(p.UserID); m != "" || x != "" {
+		t.Fatalf("clearing on one instance must hold on another: %q %q", m, x)
+	}
+}
+
 func ptr[T any](v T) *T { return &v }

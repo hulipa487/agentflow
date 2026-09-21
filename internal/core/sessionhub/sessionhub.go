@@ -59,6 +59,10 @@ type Hub struct {
 
 	mu   sync.Mutex
 	held map[string]bool // session keys this instance owns
+	// renewed is when each held session's claim was last written to the store.
+	// The drain renews an idle session at a fraction of the TTL rather than on
+	// every poll — see renewIfDue — so it has to know when it last did.
+	renewed map[string]time.Time
 }
 
 // New builds a hub. leases and queue must live on the same store — they do when
@@ -76,6 +80,7 @@ func New(leases *lease.Manager, queue *inbox.Queue, deliver Deliver, log *slog.L
 		poll:    DefaultPoll,
 		ttl:     DefaultSessionTTL,
 		held:    map[string]bool{},
+		renewed: map[string]time.Time{},
 	}
 }
 
@@ -162,11 +167,34 @@ func (h *Hub) claim(ctx context.Context, sessKey string) (bool, error) {
 	defer h.mu.Unlock()
 	if ok {
 		h.held[sessKey] = true
+		h.renewed[sessKey] = time.Now()
 		return true, nil
 	}
 	// Another instance owns it, and this one does not.
 	delete(h.held, sessKey)
+	delete(h.renewed, sessKey)
 	return false, nil
+}
+
+// renewIfDue renews a session's claim when the renewal is due — at a third of
+// the TTL, so two of them can fail before the claim lapses — and otherwise
+// reports that the session is still ours without touching the store.
+//
+// The throttling is what makes an idle session free. Renewing on every poll is
+// four store writes a second per session, which a local file absorbs and a
+// store in another region pays as round trips. What it costs is detection: an
+// instance whose claim a peer has taken notices within a third of the TTL
+// instead of within a poll. A session with messages waiting is renewed on the
+// spot instead (see drainOnce), so the delivery path never acts on a stale
+// claim.
+func (h *Hub) renewIfDue(ctx context.Context, sessKey string) (bool, error) {
+	h.mu.Lock()
+	due := time.Since(h.renewed[sessKey]) >= h.ttl/3
+	h.mu.Unlock()
+	if !due {
+		return true, nil
+	}
+	return h.claim(ctx, sessKey)
 }
 
 // Drain delivers everything waiting for the sessions this instance owns, and
@@ -186,7 +214,14 @@ func (h *Hub) Drain(ctx context.Context) {
 	}
 }
 
-// drainOnce is one pass: renew the claims, then deliver what is waiting.
+// drainOnce is one pass: find what is waiting for the sessions this instance
+// owns, renew those claims, deliver, and keep the idle ones alive.
+//
+// The pass is built around one question — which sessions have something waiting
+// — rather than around a claim per session. Claiming per session costs a query
+// each, so an instance holding many idle sessions would spend its pass on round
+// trips that find nothing; against a store in another region that is seconds of
+// latency each time round.
 func (h *Hub) drainOnce(ctx context.Context) {
 	h.mu.Lock()
 	keys := make([]string, 0, len(h.held))
@@ -194,17 +229,34 @@ func (h *Hub) drainOnce(ctx context.Context) {
 		keys = append(keys, k)
 	}
 	h.mu.Unlock()
+	if len(keys) == 0 {
+		return
+	}
 
-	for _, sessKey := range keys {
-		agent, key, ok := SplitSessionKey(sessKey)
-		if !ok {
+	busy, err := h.queue.Pending(ctx, h.leases.Owner(), keys)
+	if err != nil {
+		h.log.Warn("sessionhub: pending check failed", "err", err)
+		return
+	}
+	waiting := make(map[string]bool, len(busy))
+	for _, sessKey := range busy {
+		// Renew before delivering: a claim that lapsed while this instance was
+		// idle means the session is someone else's now, and its messages are
+		// theirs to deliver. Leaving them unclaimed lets the visibility window
+		// hand them over rather than stalling behind us.
+		ok, err := h.claim(ctx, sessKey)
+		if err != nil {
+			h.log.Warn("sessionhub: claim renewal failed", "session", sessKey, "err", err)
 			continue
 		}
-		// Renew first: a claim that lapsed while a peer was idle would hand the
-		// session over on the next poll, and the renewal is also what tells this
-		// instance to stop draining a session it no longer owns.
-		if _, err := h.claim(ctx, sessKey); err != nil {
-			h.log.Warn("sessionhub: claim renewal failed", "session", sessKey, "err", err)
+		if ok {
+			waiting[sessKey] = true
+		}
+	}
+
+	for sessKey := range waiting {
+		agent, key, ok := SplitSessionKey(sessKey)
+		if !ok {
 			continue
 		}
 		items, err := h.queue.Claim(ctx, h.leases.Owner(), sessKey, DefaultClaimBatchSize)
@@ -224,6 +276,17 @@ func (h *Hub) drainOnce(ctx context.Context) {
 		}
 		if err := h.queue.Ack(ctx, h.leases.Owner(), delivered); err != nil {
 			h.log.Warn("sessionhub: ack failed", "session", sessKey, "err", err)
+		}
+	}
+
+	// The sessions with nothing waiting still have to keep their claims alive,
+	// or a peer takes them while they sit idle — but at a fraction of the TTL.
+	for _, sessKey := range keys {
+		if waiting[sessKey] {
+			continue // renewed just above, before delivering
+		}
+		if _, err := h.renewIfDue(ctx, sessKey); err != nil {
+			h.log.Warn("sessionhub: claim renewal failed", "session", sessKey, "err", err)
 		}
 	}
 }
@@ -246,6 +309,7 @@ func (h *Hub) Release(ctx context.Context) {
 		keys = append(keys, k)
 	}
 	h.held = map[string]bool{}
+	h.renewed = map[string]time.Time{}
 	h.mu.Unlock()
 	for _, k := range keys {
 		if err := h.leases.Release(ctx, sessionLease+":"+k); err != nil {

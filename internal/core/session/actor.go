@@ -860,6 +860,7 @@ type EgressRecord struct {
 	Agent       string
 	Channel     string
 	ReplyTo     string
+	UserUUID    string // profile behind the reply ("" when the sender is unregistered)
 	Text        string
 	Attachments []media.Part
 	InReplyTo   string // inbound message id, when this is a reply
@@ -885,6 +886,7 @@ func (a *Actor) egress(ctx context.Context, channel, replyTo, text string, attac
 				Agent:       a.Identity.Agent,
 				Channel:     channel,
 				ReplyTo:     replyTo,
+				UserUUID:    UserUUIDFromCtx(ctx),
 				Text:        text,
 				Attachments: attachments,
 				InReplyTo:   inReplyTo,
@@ -1152,14 +1154,19 @@ func provenanceKindOf(m *Message) string {
 	return m.Provenance.Kind
 }
 
-// userFromMessage recovers the user UUID from an inbound message: prefer the
-// identity-stashed payload field, else strip "user:" from From.
+// userFromMessage recovers the user scope from an inbound message. An explicit
+// "user_uuid" payload key wins even when empty: the identity sink sets it to
+// "" for a handle that is not linked to a profile, and that must mean "no user
+// scope" rather than falling back to the sender string. Only when the key is
+// absent — an identity-disabled runtime, or the sink's fail-open path — does
+// the From address supply the scope.
 func userFromMessage(m *Message) string {
 	if m == nil {
 		return ""
 	}
-	if p, ok := m.Payload["user_uuid"].(string); ok && p != "" {
-		return p
+	if v, ok := m.Payload["user_uuid"]; ok {
+		s, _ := v.(string)
+		return s
 	}
 	if from := m.From; from != "" {
 		if u := strings.TrimPrefix(from, "user:"); u != from && u != "" {

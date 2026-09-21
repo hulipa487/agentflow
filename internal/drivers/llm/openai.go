@@ -119,8 +119,11 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 					} `json:"delta"`
 				} `json:"choices"`
 				Usage *struct {
-					PromptTokens            int `json:"prompt_tokens"`
-					CompletionTokens        int `json:"completion_tokens"`
+					PromptTokens        int `json:"prompt_tokens"`
+					CompletionTokens    int `json:"completion_tokens"`
+					PromptTokensDetails *struct {
+						CachedTokens int `json:"cached_tokens"`
+					} `json:"prompt_tokens_details"`
 					CompletionTokensDetails *struct {
 						ReasoningTokens int `json:"reasoning_tokens"`
 					} `json:"completion_tokens_details"`
@@ -132,6 +135,9 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 			if ev.Usage != nil {
 				usage.Input = ev.Usage.PromptTokens
 				usage.Output = ev.Usage.CompletionTokens
+				if ev.Usage.PromptTokensDetails != nil {
+					usage.Cached = ev.Usage.PromptTokensDetails.CachedTokens
+				}
 				if ev.Usage.CompletionTokensDetails != nil {
 					usage.Reasoning = ev.Usage.CompletionTokensDetails.ReasoningTokens
 				}

@@ -33,6 +33,7 @@ type Config struct {
 	Media    MediaConfig       `yaml:"media"`
 	Files    FilesConfig       `yaml:"files"`
 	Audit    AuditConfig       `yaml:"audit"`
+	Usage    UsageConfig       `yaml:"usage"`
 	Agents   map[string]Agent  `yaml:"agents"`
 	Triggers []Trigger         `yaml:"triggers"` // configdir layout; declarative task data for loops
 	Prompts  map[string]Prompt `yaml:"prompts"`
@@ -163,6 +164,32 @@ func (a AuditConfig) AuditRetention() int {
 	return *a.RetentionDays
 }
 
+// UsageConfig controls the per-user token ledger: the daily rollup every quota
+// check and accounting view reads, plus an optional per-call detail log.
+type UsageConfig struct {
+	// Events writes one row per metered call in addition to the daily rollup.
+	// Off by default: the rollup answers quota and dashboard questions, and the
+	// event log is the high-volume table.
+	Events *bool `yaml:"events"`
+	// RetentionDays prunes ledger rows older than this many days (default 30;
+	// 0 = keep forever).
+	RetentionDays *int `yaml:"retention_days"`
+	// DefaultTokensPerDay is the deployment-wide per-user daily token limit
+	// (0 = unlimited). A profile's own tokens_per_day overrides it.
+	DefaultTokensPerDay int64 `yaml:"default_tokens_per_day"`
+}
+
+// UsageEvents reports whether the per-call detail log is enabled (default off).
+func (u UsageConfig) UsageEvents() bool { return u.Events != nil && *u.Events }
+
+// UsageRetention returns ledger retention in days (default 30; 0 = forever).
+func (u UsageConfig) UsageRetention() int {
+	if u.RetentionDays == nil {
+		return 30
+	}
+	return *u.RetentionDays
+}
+
 // Runtime contains instance-wide tuning and persistence.
 type Runtime struct {
 	VM struct {
@@ -178,6 +205,7 @@ type Runtime struct {
 	Persistence string            `yaml:"persistence"` // e.g. sqlite://./data/agentflow.db
 	Admin       AdminConfig       `yaml:"admin"`
 	Identity    IdentityConfig    `yaml:"identity"`
+	Users       UsersConfig       `yaml:"users"`
 	Credentials CredentialsConfig `yaml:"credentials"`
 	// TimezoneOffsetHours is the instance-wide UTC offset applied to cron
 	// trigger matching (e.g. 8 for UTC+8, -5.5 for UTC-5:30). 0 = UTC, the
@@ -215,6 +243,47 @@ type AdminConfig struct {
 type IdentityConfig struct {
 	Enabled     bool   `yaml:"enabled"`
 	Persistence string `yaml:"persistence"` // sqlite path; "" = <runtime persistence dir>/identity.db
+}
+
+// UsersConfig configures the user-facing profile API (profile registration and
+// channel linking) and the policy applied to senders who have not registered.
+type UsersConfig struct {
+	// Enabled exposes the /v1/users API on the shared httpd listener. Off by
+	// default: the surface is public, so opening it is a deliberate act.
+	Enabled bool `yaml:"enabled"`
+	// Registration selects who may create a profile: "open" (default) or
+	// "invite", where an operator issues single-use codes first.
+	Registration string `yaml:"registration"`
+	// RequireRegistration (default true) keeps an unknown channel handle in the
+	// shared service stratum — no personal scope, no quota identity — until it
+	// is linked to a profile. Set false to restore auto-claiming a profile on
+	// first contact, which is the pre-registration behavior.
+	RequireRegistration *bool `yaml:"require_registration"`
+	// LinkTTL is how long a channel-link challenge stays valid (default 10m).
+	LinkTTL string `yaml:"link_ttl"`
+}
+
+// RegistrationRequired reports whether an unknown handle must be linked to a
+// profile before it gets any per-user state. Defaults to true.
+func (u UsersConfig) RegistrationRequired() bool {
+	return u.RequireRegistration == nil || *u.RequireRegistration
+}
+
+// RegistrationMode returns the normalized registration mode ("open" default).
+func (u UsersConfig) RegistrationMode() string {
+	if u.Registration == "" {
+		return "open"
+	}
+	return u.Registration
+}
+
+// LinkChallengeTTL returns the channel-link challenge lifetime (default 10m).
+func (u UsersConfig) LinkChallengeTTL() time.Duration {
+	if u.LinkTTL == "" {
+		return 10 * time.Minute
+	}
+	d, _ := time.ParseDuration(u.LinkTTL) // validated at boot; error impossible here
+	return d
 }
 
 // Model is a named LLM provider configuration. The omitempty tags keep the
@@ -1217,6 +1286,30 @@ func validate(path string, c *Config) error {
 
 	if c.Audit.RetentionDays != nil && *c.Audit.RetentionDays < 0 {
 		return fmt.Errorf("%s: audit.retention_days must be >= 0 (0 = keep forever)", path)
+	}
+	if c.Usage.RetentionDays != nil && *c.Usage.RetentionDays < 0 {
+		return fmt.Errorf("%s: usage.retention_days must be >= 0 (0 = keep forever)", path)
+	}
+	if c.Usage.DefaultTokensPerDay < 0 {
+		return fmt.Errorf("%s: usage.default_tokens_per_day must be >= 0 (0 = unlimited)", path)
+	}
+
+	// The users API needs the identity layer: profiles, channel links and
+	// unregistered-handle policy all live in the identity store, so enabling
+	// one without the other is a boot error with the corrective spelling
+	// rather than an endpoint that silently answers nothing.
+	if c.Runtime.Users.Enabled && !c.Runtime.Identity.Enabled {
+		return fmt.Errorf("%s: runtime.users.enabled requires runtime.identity.enabled (the profile store lives there)", path)
+	}
+	switch c.Runtime.Users.RegistrationMode() {
+	case "open", "invite":
+	default:
+		return fmt.Errorf("%s: runtime.users.registration must be open or invite (got %q)", path, c.Runtime.Users.Registration)
+	}
+	if c.Runtime.Users.LinkTTL != "" {
+		if _, err := time.ParseDuration(c.Runtime.Users.LinkTTL); err != nil {
+			return fmt.Errorf("%s: runtime.users.link_ttl: %v", path, err)
+		}
 	}
 
 	for sname, s := range c.MCP.Servers {

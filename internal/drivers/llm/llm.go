@@ -87,10 +87,17 @@ type Opts struct {
 // Reasoning is the provider's separate count of thinking tokens where it
 // reports one (OpenAI-shaped completion/output token details); Anthropic and
 // Gemini fold thinking into Output, so it stays 0 there.
+//
+// Cached is prompt tokens served from the provider's prompt cache, billed at a
+// discount; CacheWrite is tokens written into it. Only Anthropic bills cache
+// creation separately (and is the only provider reporting it here) — elsewhere
+// CacheWrite stays 0.
 type Usage struct {
-	Input     int `json:"input"`
-	Output    int `json:"output"`
-	Reasoning int `json:"reasoning,omitempty"`
+	Input      int `json:"input"`
+	Output     int `json:"output"`
+	Cached     int `json:"cached,omitempty"`
+	CacheWrite int `json:"cache_write,omitempty"`
+	Reasoning  int `json:"reasoning,omitempty"`
 }
 
 // Reply is one buffered completion: the assistant text plus everything the

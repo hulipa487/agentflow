@@ -105,10 +105,11 @@ func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs
 			Content []map[string]any `json:"content"`
 		} `json:"steps"`
 		Usage struct {
-			InputTokens       int `json:"input_tokens"`
-			OutputTokens      int `json:"output_tokens"`
-			TotalInputTokens  int `json:"total_input_tokens"`
-			TotalOutputTokens int `json:"total_output_tokens"`
+			InputTokens             int `json:"input_tokens"`
+			OutputTokens            int `json:"output_tokens"`
+			TotalInputTokens        int `json:"total_input_tokens"`
+			TotalOutputTokens       int `json:"total_output_tokens"`
+			CachedContentTokenCount int `json:"cachedContentTokenCount"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
@@ -155,7 +156,7 @@ func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs
 		if text != "" {
 			events <- event{delta: text}
 		}
-		events <- event{usage: Usage{Input: inTok, Output: outTok}, thinking: thoughtText, thinkingBlocks: thoughtBlocks}
+		events <- event{usage: Usage{Input: inTok, Output: outTok, Cached: out.Usage.CachedContentTokenCount}, thinking: thoughtText, thinkingBlocks: thoughtBlocks}
 	}()
 	return events, false, nil
 }

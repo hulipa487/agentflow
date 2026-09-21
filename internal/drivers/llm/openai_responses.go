@@ -145,8 +145,11 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 				// response.completed carries usage
 				Response struct {
 					Usage struct {
-						InputTokens         int `json:"input_tokens"`
-						OutputTokens        int `json:"output_tokens"`
+						InputTokens        int `json:"input_tokens"`
+						OutputTokens       int `json:"output_tokens"`
+						InputTokensDetails struct {
+							CachedTokens int `json:"cached_tokens"`
+						} `json:"input_tokens_details"`
 						OutputTokensDetails struct {
 							ReasoningTokens int `json:"reasoning_tokens"`
 						} `json:"output_tokens_details"`
@@ -154,8 +157,11 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 				} `json:"response"`
 				// some compatible proxies nest usage at the top level
 				Usage struct {
-					InputTokens         int `json:"input_tokens"`
-					OutputTokens        int `json:"output_tokens"`
+					InputTokens        int `json:"input_tokens"`
+					OutputTokens       int `json:"output_tokens"`
+					InputTokensDetails struct {
+						CachedTokens int `json:"cached_tokens"`
+					} `json:"input_tokens_details"`
 					OutputTokensDetails struct {
 						ReasoningTokens int `json:"reasoning_tokens"`
 					} `json:"output_tokens_details"`
@@ -228,6 +234,9 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 				if ev.Response.Usage.OutputTokens > 0 {
 					usage.Output = ev.Response.Usage.OutputTokens
 				}
+				if ev.Response.Usage.InputTokensDetails.CachedTokens > 0 {
+					usage.Cached = ev.Response.Usage.InputTokensDetails.CachedTokens
+				}
 				if ev.Response.Usage.OutputTokensDetails.ReasoningTokens > 0 {
 					usage.Reasoning = ev.Response.Usage.OutputTokensDetails.ReasoningTokens
 				}
@@ -236,6 +245,9 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 				}
 				if ev.Usage.OutputTokens > 0 {
 					usage.Output = ev.Usage.OutputTokens
+				}
+				if ev.Usage.InputTokensDetails.CachedTokens > 0 {
+					usage.Cached = ev.Usage.InputTokensDetails.CachedTokens
 				}
 				if ev.Usage.OutputTokensDetails.ReasoningTokens > 0 {
 					usage.Reasoning = ev.Usage.OutputTokensDetails.ReasoningTokens

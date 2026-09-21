@@ -278,10 +278,15 @@ func (mt Metering) releaseQuota(l *accounting.Lease) {
 
 // reserve takes a budget lease when the deployment configured one. A nil pool
 // means the call is accounted but unlimited.
-func (mt Metering) reserve(amount int64) (*budget.Lease, error) {
+//
+// A pool that shares the deployment's ledger refreshes here: the moment before
+// a reservation is the moment the figure has to be right, and the read is
+// throttled inside the pool.
+func (mt Metering) reserve(ctx context.Context, amount int64) (*budget.Lease, error) {
 	if mt.Pool == nil {
 		return nil, nil
 	}
+	mt.Pool.Refresh(ctx)
 	return mt.Pool.Reserve(amount)
 }
 
@@ -381,7 +386,7 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]
 		if qerr != nil {
 			return denyJSON("user_quota_exhausted", qerr), false
 		}
-		lease, err := mt.reserve(estimate)
+		lease, err := mt.reserve(ctx, estimate)
 		if err != nil {
 			mt.releaseQuota(ql)
 			metrics.Inc("agentflow_budget_denied")
@@ -432,7 +437,7 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]
 		if qerr != nil {
 			return denyJSON("user_quota_exhausted", qerr), false
 		}
-		lease, err := mt.reserve(estimate)
+		lease, err := mt.reserve(ctx, estimate)
 		if err != nil {
 			mt.releaseQuota(ql)
 			metrics.Inc("agentflow_budget_denied")
@@ -490,7 +495,7 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]
 		if qerr != nil {
 			return denyJSON("user_quota_exhausted", qerr), false
 		}
-		lease, err := mt.reserve(estimate)
+		lease, err := mt.reserve(ctx, estimate)
 		if err != nil {
 			mt.releaseQuota(ql)
 			metrics.Inc("agentflow_budget_denied")

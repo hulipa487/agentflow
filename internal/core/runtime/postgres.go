@@ -107,6 +107,8 @@ var postgresSchema = []string{
 		PRIMARY KEY (user_id, day, agent, model)
 	)`,
 	`CREATE INDEX IF NOT EXISTS usage_daily_day ON usage_daily (day)`,
+	// The per-agent rollup a deployment-wide agent budget reads.
+	`CREATE INDEX IF NOT EXISTS usage_daily_agent_day ON usage_daily (agent, day)`,
 	`CREATE TABLE IF NOT EXISTS usage_events (
 		id          BIGSERIAL PRIMARY KEY,
 		ts          BIGINT NOT NULL,
@@ -378,6 +380,24 @@ func (s *postgresStore) RecordUsage(rec UsageRecord, withEvent bool) error {
 		return fmt.Errorf("record usage event: %w", err)
 	}
 	return nil
+}
+
+// UsageForAgentDay returns one agent's totals for a UTC day, across every user
+// it served — the figure a deployment-wide agent budget is measured against.
+func (s *postgresStore) UsageForAgentDay(agent, day string) (UsageTotals, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var t UsageTotals
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(input),0), COALESCE(SUM(output),0), COALESCE(SUM(cached),0),
+		       COALESCE(SUM(cache_write),0), COALESCE(SUM(reasoning),0), COALESCE(SUM(calls),0),
+		       COALESCE(SUM(failed),0)
+		FROM usage_daily WHERE agent = $1 AND day = $2`, agent, day).
+		Scan(&t.Input, &t.Output, &t.Cached, &t.CacheWrite, &t.Reasoning, &t.Calls, &t.Failed)
+	if err != nil {
+		return UsageTotals{}, err
+	}
+	return t, nil
 }
 
 func (s *postgresStore) UsageForDay(userID, day string) (UsageTotals, error) {

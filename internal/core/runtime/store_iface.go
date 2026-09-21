@@ -37,6 +37,7 @@ type Store interface {
 	// --- per-user token ledger ---
 	RecordUsage(rec UsageRecord, withEvent bool) error
 	UsageForDay(userID, day string) (UsageTotals, error)
+	UsageForAgentDay(agent, day string) (UsageTotals, error)
 	UsageHistory(userID string, days int) ([]UsageRow, error)
 	UsageDaily(day string) ([]UsageRow, error)
 	UsageEvents(userID string, since time.Time, limit int) ([]UsageEvent, error)

@@ -30,6 +30,8 @@ const usageSchema = `
 		PRIMARY KEY (user_id, day, agent, model)
 	);
 	CREATE INDEX IF NOT EXISTS usage_daily_day ON usage_daily (day);
+	-- The per-agent rollup a deployment-wide agent budget reads.
+	CREATE INDEX IF NOT EXISTS usage_daily_agent_day ON usage_daily (agent, day);
 
 	CREATE TABLE IF NOT EXISTS usage_events (
 		id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -150,6 +152,26 @@ func (s *sqliteStore) UsageForDay(userID, day string) (UsageTotals, error) {
 		       COALESCE(SUM(cache_write),0), COALESCE(SUM(reasoning),0), COALESCE(SUM(calls),0),
 		       COALESCE(SUM(failed),0)
 		FROM usage_daily WHERE user_id = ? AND day = ?`, userID, day).
+		Scan(&t.Input, &t.Output, &t.Cached, &t.CacheWrite, &t.Reasoning, &t.Calls, &t.Failed)
+	if err != nil {
+		return UsageTotals{}, err
+	}
+	return t, nil
+}
+
+// UsageForAgentDay returns one agent's totals for a UTC day, across every user
+// it served. It is the figure a deployment-wide agent budget is measured
+// against: a pool that counted only its own process would grant the full budget
+// per instance, and forgive everything already spent on a restart.
+func (s *sqliteStore) UsageForAgentDay(agent, day string) (UsageTotals, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var t UsageTotals
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(input),0), COALESCE(SUM(output),0), COALESCE(SUM(cached),0),
+		       COALESCE(SUM(cache_write),0), COALESCE(SUM(reasoning),0), COALESCE(SUM(calls),0),
+		       COALESCE(SUM(failed),0)
+		FROM usage_daily WHERE agent = ? AND day = ?`, agent, day).
 		Scan(&t.Input, &t.Output, &t.Cached, &t.CacheWrite, &t.Reasoning, &t.Calls, &t.Failed)
 	if err != nil {
 		return UsageTotals{}, err

@@ -224,6 +224,20 @@ func TestStoreContract(t *testing.T) {
 		if !found {
 			t.Fatalf("daily view is missing this run's row")
 		}
+		// The per-agent rollup sums one agent's rows across every user — the
+		// figure a deployment-wide agent budget is measured against. On a shared
+		// server other runs may have contributed, so this is a lower bound.
+		agentTotals, err := s.UsageForAgentDay("bot", day)
+		if err != nil {
+			t.Fatalf("agent usage: %v", err)
+		}
+		if agentTotals.Input < 200 || agentTotals.Output < 40 {
+			t.Fatalf("the per-agent rollup is missing this run's rows: %+v", agentTotals)
+		}
+		// An agent nobody called has nothing.
+		if none, err := s.UsageForAgentDay(id+"nobody", day); err != nil || none.Calls != 0 {
+			t.Fatalf("an unknown agent should have no usage: %+v err=%v", none, err)
+		}
 		// Pruning by age leaves today alone.
 		if err := s.PruneUsage(time.Now().AddDate(0, 0, -30)); err != nil {
 			t.Fatalf("prune usage: %v", err)

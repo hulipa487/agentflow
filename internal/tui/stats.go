@@ -48,6 +48,7 @@ var statSections = []statSection{
 		{"agentflow_llm_calls", "calls", false},
 		{"agentflow_llm_tokens", "tokens", false},
 		{"agentflow_budget_denied", "budget denied", false},
+		{"agentflow_user_quota_denied", "quota denied", false},
 	}},
 	{"Traffic", []statDef{
 		{"agentflow_ingress_total", "ingress", false},
@@ -77,6 +78,8 @@ var statSections = []statSection{
 	}},
 	{"Identity", []statDef{
 		{"agentflow_identity_mints", "minted", false},
+		{"agentflow_user_registrations", "registered", false},
+		{"agentflow_user_links", "linked", false},
 	}},
 }
 

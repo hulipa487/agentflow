@@ -215,6 +215,8 @@ func DefaultCounters() map[string]*Counter {
 		"agentflow_user_link_challenges":   NewCounter("agentflow_user_link_challenges", "Channel-link challenges issued"),
 		"agentflow_user_links":             NewCounter("agentflow_user_links", "Channel handles linked to a profile"),
 		"agentflow_usage_record_failed":    NewCounter("agentflow_usage_record_failed", "Metered calls whose ledger write failed"),
+		"agentflow_user_quota_denied":      NewCounter("agentflow_user_quota_denied", "LLM calls refused by a per-user daily token quota"),
+		"agentflow_user_quota_unavailable": NewCounter("agentflow_user_quota_unavailable", "Quota checks that failed open because the ledger was unreadable"),
 		"agentflow_trigger_fires":          NewCounter("agentflow_trigger_fires", "Scheduled every:/cron: triggers fired by the engine"),
 		"agentflow_http_private_blocked":   NewCounter("agentflow_http_private_blocked", "Outbound HTTP connections refused by the private-address guard"),
 		"agentflow_http_insecure_tls":      NewCounter("agentflow_http_insecure_tls", "Outbound HTTP requests that skipped TLS verification"),

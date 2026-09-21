@@ -65,6 +65,18 @@ func FileHandlers(m *files.Manager, agent string) map[string]session.OpHandler {
 	}
 
 	return map[string]session.OpHandler{
+		// files.projects lists the project names in the caller's own scope.
+		// There is no way to name another scope: the engine resolves it.
+		"files.projects": func(ctx context.Context, op session.Op) (string, bool) {
+			if err := guard(); err != nil {
+				return fail(err)
+			}
+			projects, err := m.Projects(ctx, scope(ctx))
+			if err != nil {
+				return fail(err)
+			}
+			return okJSON(projects)
+		},
 		// files.put accepts content (utf-8), {data=base64}, or {handle=...} —
 		// a put-by-handle records the tree entry pointing at an existing blob
 		// (rollback restores a commit's tree without bytes crossing Lua).

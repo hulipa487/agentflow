@@ -82,18 +82,18 @@ func Traits(channel string) ChannelTraits {
 
 // Identity is one (channel, handle) pair a person arrives on.
 type Identity struct {
-	ID          string
-	UserID      string // "" until linked to a profile
-	Channel     string
-	NativeFrom  string
-	ReplyTo     string
-	Username    string
-	Name        string
-	Trust       string
-	Deliverable bool
-	Linkable    bool
-	FirstSeen   int64
-	LastSeen    int64
+	ID          string `json:"id"`
+	UserID      string `json:"user_id"` // "" until linked to a profile
+	Channel     string `json:"channel"`
+	NativeFrom  string `json:"native_from"`
+	ReplyTo     string `json:"reply_to,omitempty"`
+	Username    string `json:"username,omitempty"`
+	Name        string `json:"name,omitempty"`
+	Trust       string `json:"trust"`
+	Deliverable bool   `json:"deliverable"`
+	Linkable    bool   `json:"linkable"`
+	FirstSeen   int64  `json:"first_seen"`
+	LastSeen    int64  `json:"last_seen"`
 }
 
 // Linked reports whether this handle belongs to a profile.
@@ -101,13 +101,13 @@ func (i Identity) Linked() bool { return i.UserID != "" }
 
 // Profile is a person: the account their identities hang off.
 type Profile struct {
-	UserID       string
-	DisplayName  string
-	Email        string
-	TokensPerDay int64 // 0 = the deployment default
-	CreatedAt    int64
-	UpdatedAt    int64
-	Identities   []Identity
+	UserID       string     `json:"user_id"`
+	DisplayName  string     `json:"display_name,omitempty"`
+	Email        string     `json:"email,omitempty"`
+	TokensPerDay int64      `json:"tokens_per_day"` // 0 = the deployment default
+	CreatedAt    int64      `json:"created_at"`
+	UpdatedAt    int64      `json:"updated_at"`
+	Identities   []Identity `json:"identities"`
 }
 
 // Resolution is what one inbound resolves to: the handle it came from and the

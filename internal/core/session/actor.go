@@ -111,6 +111,11 @@ type Op struct {
 	ToolChoice  string        `json:"tool_choice,omitempty"`
 	Thinking    string        `json:"thinking,omitempty"` // off|low|medium|high|xhigh|max
 
+	// User surface (user.*): a credential service name, and the profile a
+	// maintenance loop asks about.
+	Service string `json:"service,omitempty"`
+	UserID  string `json:"user_id,omitempty"`
+
 	// Embedding / rerank ops (llm.embed, llm.rerank).
 	// Embed inputs are parts: plain texts ride as {type:"text"}; media
 	// parts (image/video/audio/pdf) ride as descriptors resolved at
@@ -402,46 +407,51 @@ func (r *PromptRegistry) Get(key string) (string, bool) {
 
 // blockingOps run on the worker pool; everything else is inline.
 var blockingOps = map[string]bool{
-	"send":               true,
-	"session.push":       true,
-	"session.push_user":  true,
-	"llm.chat":           true,
-	"llm.embed":          true,
-	"llm.rerank":         true,
-	"llm.stream.open":    true,
-	"llm.stream.next":    true,
-	"tools.run":          true,
-	"store.put":          true,
-	"store.get":          true,
-	"store.query":        true,
-	"store.delete":       true,
-	"store.scopes":       true,
-	"shell.spawn":        true,
-	"shell.exec":         true,
-	"shell.write":        true,
-	"shell.destroy":      true,
-	"http.request":       true,
-	"mail.imap.fetch":    true,
-	"mail.smtp.send":     true,
-	"credential.get":     true,
-	"agent.send":         true,
-	"agent.request":      true,
-	"agent.reply":        true,
-	"agent.spawn":        true,
-	"agent.list":         true,
-	"scheduler.every":    true,
-	"scheduler.after":    true,
-	"scheduler.cron":     true,
-	"scheduler.cancel":   true,
-	"files.put":          true,
-	"files.read":         true,
-	"files.list":         true,
-	"files.delete":       true,
-	"files.commit":       true,
-	"files.checkout":     true,
-	"files.scratch.put":  true,
-	"files.scratch.read": true,
-	"files.scratch.list": true,
+	"send":                true,
+	"session.push":        true,
+	"session.push_user":   true,
+	"llm.chat":            true,
+	"llm.embed":           true,
+	"llm.rerank":          true,
+	"llm.stream.open":     true,
+	"llm.stream.next":     true,
+	"tools.run":           true,
+	"store.put":           true,
+	"store.get":           true,
+	"store.query":         true,
+	"store.delete":        true,
+	"store.scopes":        true,
+	"user.current":        true,
+	"user.usage":          true,
+	"user.has_credential": true,
+	"user.get":            true,
+	"user.list":           true,
+	"shell.spawn":         true,
+	"shell.exec":          true,
+	"shell.write":         true,
+	"shell.destroy":       true,
+	"http.request":        true,
+	"mail.imap.fetch":     true,
+	"mail.smtp.send":      true,
+	"credential.get":      true,
+	"agent.send":          true,
+	"agent.request":       true,
+	"agent.reply":         true,
+	"agent.spawn":         true,
+	"agent.list":          true,
+	"scheduler.every":     true,
+	"scheduler.after":     true,
+	"scheduler.cron":      true,
+	"scheduler.cancel":    true,
+	"files.put":           true,
+	"files.read":          true,
+	"files.list":          true,
+	"files.delete":        true,
+	"files.commit":        true,
+	"files.checkout":      true,
+	"files.scratch.put":   true,
+	"files.scratch.read":  true,
+	"files.scratch.list":  true,
 }
 
 // EndReason identifies why an actor left the supervisor.
@@ -1132,6 +1142,18 @@ func ProvenanceKindFromCtx(ctx context.Context) string {
 	}
 	s, _ := ctx.Value(provenanceKey).(string)
 	return s
+}
+
+// MaintenanceFromCtx reports whether the current dispatch came from an
+// engine-fired context (system or scheduler provenance) — the agent's own
+// maintenance loops, as opposed to a user's turn or an agent hop. The kind is
+// core-assigned at dispatch, so a loop cannot forge it.
+func MaintenanceFromCtx(ctx context.Context) bool {
+	switch ProvenanceKindFromCtx(ctx) {
+	case "system", "scheduler":
+		return true
+	}
+	return false
 }
 
 type provenanceKeyType struct{}

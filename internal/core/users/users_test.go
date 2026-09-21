@@ -29,7 +29,7 @@ func newAPI(t *testing.T, cfg config.UsersConfig) (*httptest.Server, *identity.R
 		t.Fatalf("open identity: %v", err)
 	}
 	t.Cleanup(func() { _ = reg.Close() })
-	srv := httptest.NewServer(New(reg, cfg, discardLogger()).Handler())
+	srv := httptest.NewServer(New(reg, cfg, discardLogger(), Options{}).Handler())
 	t.Cleanup(srv.Close)
 	return srv, reg
 }

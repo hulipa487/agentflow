@@ -1,0 +1,296 @@
+openapi: 3.1.0
+info:
+  title: agentflow user API
+  version: "1"
+  description: |
+    The user-facing profile API: registration, channel linking, and self-service
+    views. It is JSON only — the engine ships no user interface — so a frontend
+    can live in its own repository and deploy on its own cadence.
+
+    Two proofs keep a profile honest. A caller proves *which profile* it is with
+    a bearer token; it proves a *channel handle* by echoing a one-time challenge
+    back from that handle (see `createLinkChallenge`). Neither half alone links
+    anything.
+
+    ## Authentication
+
+    Every request carries `Authorization: Bearer <token>`, and there are two
+    kinds of token:
+
+    - **An access token from the deployment's identity provider** (Better Auth,
+      Keycloak, Auth0, …). The engine verifies the signature against the
+      issuer's published JWKS and checks `iss`, `aud` and `exp`; the subject
+      claim identifies the profile, and the first verified login creates one
+      unless `runtime.users.jit_provisioning` is false. Login, passwords, MFA
+      and session lifetime all live in that provider — the engine has no login
+      of its own.
+    - **A per-profile API token** (`afu_…`) from `POST /register`, for scripts
+      and for deployments with no identity provider.
+
+    There is no cookie and no server-side session, so there is nothing ambient
+    for another site to replay — which is why no CSRF token appears anywhere in
+    this document.
+
+    `GET /config` reports whether a provider is configured, so a frontend can
+    choose its login flow before it has a token.
+
+    ## Cross-origin use
+
+    CORS is off until an operator lists the frontend's origin in
+    `runtime.users.cors_origins`. Only a listed origin is answered, deliberately
+    without `Access-Control-Allow-Credentials` — bearer tokens are sent
+    explicitly, never ambiently.
+
+    ## Rate limiting
+
+    `POST /register` is rate limited per client address (30/min, burst 10).
+    Behind a reverse proxy every caller shares one address, so a frontend
+    deployed that way must rate limit there as well.
+servers:
+  - url: /
+paths:
+  /config:
+    get:
+      summary: Public configuration a frontend needs to render a signup flow
+      security: []
+      responses:
+        "200":
+          description: The deployment's user-facing settings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  registration: { type: string, enum: [open, invite] }
+                  linkable_channels:
+                    type: array
+                    items: { type: string }
+                    description: Channel names whose sender identity the platform authenticates
+                  identity_provider:
+                    type: boolean
+                    description: True when an access token from the configured provider is accepted
+  /register:
+    post:
+      summary: Create a profile and receive its API token
+      description: The token is returned exactly once and is never readable again.
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                invite: { type: string, description: Required when registration is "invite" }
+                display_name: { type: string }
+                email: { type: string }
+      responses:
+        "201":
+          description: The new profile and its token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user_id: { type: string }
+                  token: { type: string }
+                  profile: { $ref: "#/components/schemas/Profile" }
+        "403": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+  /me:
+    get:
+      summary: The caller's profile
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: The profile with its linked handles and token metadata
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Profile" }
+        "401": { $ref: "#/components/responses/Error" }
+    patch:
+      summary: Update the caller's display name or email
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name: { type: string }
+                email: { type: string }
+      responses:
+        "200":
+          description: The updated profile
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Profile" }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+  /me/links:
+    post:
+      summary: Start linking a channel handle
+      description: |
+        Returns a single-use code. The caller sends `/link <code>` from the
+        handle being linked; the engine completes the link when that message
+        arrives and never routes it to a loop. Possession is the proof: only the
+        profile owner sees the code, and only the handle's owner can send from
+        the handle.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [channel]
+              properties:
+                channel: { type: string, description: A name from /config's linkable_channels }
+      responses:
+        "201":
+          description: Challenge issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  channel: { type: string }
+                  code: { type: string }
+                  expires_at: { type: integer }
+                  instructions: { type: string }
+        "400": { $ref: "#/components/responses/Error" }
+  /me/links/{identity_id}:
+    delete:
+      summary: Unlink a handle
+      description: The last handle cannot be unlinked — that would leave the account unreachable.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: identity_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: Handle detached }
+        "400": { $ref: "#/components/responses/Error" }
+  /me/token/rotate:
+    post:
+      summary: Issue a fresh API token and revoke the presented one
+      description: API tokens only — rotatable when the caller presented one.
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: The new token, returned once
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+        "400": { $ref: "#/components/responses/Error" }
+  /me/usage:
+    get:
+      summary: The caller's token usage and quota standing
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Today's totals, a seven-day window, and the quota
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  day: { type: string }
+                  today: { $ref: "#/components/schemas/Usage" }
+                  history:
+                    type: array
+                    items: { $ref: "#/components/schemas/UsageRow" }
+                  quota:
+                    type: object
+                    properties:
+                      used: { type: integer }
+                      limit: { type: integer, description: 0 means no limit is configured }
+                      in_flight: { type: integer }
+                      unlimited: { type: boolean }
+        "503": { $ref: "#/components/responses/Error" }
+  /me/projects:
+    get:
+      summary: The caller's file projects
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Project names in the caller's own scope
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  projects:
+                    type: array
+                    items: { type: string }
+        "503": { $ref: "#/components/responses/Error" }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Either an identity-provider access token (verified against the issuer's
+        JWKS) or an `afu_…` API token from /register
+  schemas:
+    Profile:
+      type: object
+      properties:
+        user_id: { type: string }
+        display_name: { type: string }
+        email: { type: string }
+        tokens_per_day: { type: integer, description: 0 means the deployment default applies }
+        created_at: { type: integer }
+        identities:
+          type: array
+          items: { $ref: "#/components/schemas/Identity" }
+        tokens:
+          type: array
+          description: Token metadata only — never a token
+          items:
+            type: object
+            properties:
+              fingerprint: { type: string }
+              created_at: { type: integer }
+              last_used: { type: integer }
+    Identity:
+      type: object
+      properties:
+        id: { type: string }
+        channel: { type: string }
+        native_from: { type: string }
+        username: { type: string }
+        name: { type: string }
+        trust: { type: string, enum: [verified, asserted, system] }
+        deliverable: { type: boolean }
+        linkable: { type: boolean }
+        first_seen: { type: integer }
+        last_seen: { type: integer }
+    Usage:
+      type: object
+      properties:
+        input: { type: integer }
+        output: { type: integer }
+        cached: { type: integer, description: Prompt tokens served from the provider's cache }
+        reasoning: { type: integer }
+        calls: { type: integer, description: Attempts, including failed ones }
+        failed: { type: integer }
+    UsageRow:
+      allOf:
+        - type: object
+          properties:
+            day: { type: string }
+            agent: { type: string }
+            model: { type: string }
+        - $ref: "#/components/schemas/Usage"
+  responses:
+    Error:
+      description: An error, always shaped `{"error": "..."}`
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error: { type: string }

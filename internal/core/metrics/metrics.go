@@ -212,6 +212,7 @@ func DefaultCounters() map[string]*Counter {
 		"agentflow_files_scratch_swept":    NewCounter("agentflow_files_scratch_swept", "Expired per-session scratch entries reclaimed"),
 		"agentflow_identity_mints":         NewCounter("agentflow_identity_mints", "User identities minted (first contact per channel handle)"),
 		"agentflow_user_registrations":     NewCounter("agentflow_user_registrations", "Profiles created through the users API"),
+		"agentflow_user_provisions":        NewCounter("agentflow_user_provisions", "Profiles provisioned by a first identity-provider login"),
 		"agentflow_user_link_challenges":   NewCounter("agentflow_user_link_challenges", "Channel-link challenges issued"),
 		"agentflow_user_links":             NewCounter("agentflow_user_links", "Channel handles linked to a profile"),
 		"agentflow_usage_record_failed":    NewCounter("agentflow_usage_record_failed", "Metered calls whose ledger write failed"),

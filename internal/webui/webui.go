@@ -108,7 +108,7 @@ func (u *UI) Docs() http.Handler {
 			path = "index.html"
 		}
 		switch path {
-		case "index.html", "css/styles.css", "js/nav.js":
+		case "index.html", "css/styles.css", "js/nav.js", "openapi/users.yaml":
 		default:
 			http.NotFound(w, r)
 			return
@@ -125,6 +125,8 @@ func (u *UI) Docs() http.Handler {
 			w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 		case strings.HasSuffix(path, ".css"):
 			w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		case strings.HasSuffix(path, ".yaml"):
+			w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
 		}
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = w.Write(b)

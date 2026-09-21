@@ -311,6 +311,20 @@ func main() {
 		fn()
 	}
 
+	// agentDayUsage reads an agent's deployment-wide spend for today from the
+	// token ledger. It is the figure a daily budget pool enforces against: a
+	// pool counting only its own process would hand the full budget to every
+	// instance, and forgive the day's spend whenever one restarted.
+	agentDayUsage := func(agent string) func(context.Context) (int64, error) {
+		return func(ctx context.Context) (int64, error) {
+			t, err := rtStore.UsageForAgentDay(agent, runtime.DayKey(time.Now()))
+			if err != nil {
+				return 0, err
+			}
+			return t.Billable(), nil
+		}
+	}
+
 	// Identity registry (opt-in). Opened here rather than with the rest of the
 	// identity wiring below, because the per-user quota the LLM handlers
 	// enforce resolves its limits from profiles.
@@ -606,9 +620,12 @@ func main() {
 			pool = budget.NewPool(tokensPerDay)
 			if w := budgetWindow(a); w > 0 {
 				// Rolling-window budget: usage drains continuously as commits age
-				// out, so there is no midnight cliff. Skip the daily reset.
+				// out, so there is no midnight cliff. Skip the daily reset — and
+				// the ledger, whose day-granular rows cannot express a window.
 				pool.SetWindow(w)
 			} else {
+				// A daily budget belongs to the agent, not to this process.
+				pool.SetUsageSource(agentDayUsage(name))
 				pool.StartDailyReset()
 			}
 		}
@@ -762,6 +779,10 @@ func main() {
 			if w, err := time.ParseDuration(p.Budget.Window); err == nil && w > 0 {
 				pool.SetWindow(w)
 			} else {
+				// The profile's budget, summed over every child every instance
+				// has spawned — the ledger attributes a child's calls to the
+				// profile it came from.
+				pool.SetUsageSource(agentDayUsage(pname))
 				pool.StartDailyReset()
 			}
 		}

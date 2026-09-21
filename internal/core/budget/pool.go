@@ -4,6 +4,7 @@
 package budget
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -26,7 +27,23 @@ type Pool struct {
 	window   time.Duration // 0 = daily-reset mode
 	commits  []commit      // windowed-mode commit log, oldest first
 	now      func() time.Time
+
+	// source, when set, is where the *deployment-wide* usage for the current
+	// day comes from: the token ledger. base is what it reported when last
+	// read, and used counts what this process has committed since. Without a
+	// source a pool counts only its own process — which in a fleet hands every
+	// instance the full budget, and forgives everything spent when one restarts.
+	source    func(context.Context) (int64, error)
+	base      int64
+	baseAt    time.Time
+	refreshIn time.Duration
 }
+
+// DefaultRefreshInterval is how stale a ledger reading may be before the next
+// reservation refreshes it. Every instance converges on the deployment's real
+// spend within this interval, so the overshoot a fleet can reach is bounded by
+// what its instances spend in one interval rather than by the instance count.
+const DefaultRefreshInterval = 15 * time.Second
 
 type commit struct {
 	ts     time.Time
@@ -74,12 +91,89 @@ type Lease struct {
 	released bool
 }
 
+// SetUsageSource installs where this pool's deployment-wide usage comes from:
+// the token ledger, summed over every instance and every user the agent served.
+// It is what makes an agent's budget an agent's budget rather than a
+// per-process one, and what stops a restart from forgiving the day's spend.
+//
+// The source is consulted by Refresh, at most once per refresh interval. It
+// applies to daily accounting only: a rolling window is this process's own
+// commits over the trailing period, which the ledger's day-granular rows cannot
+// express.
+func (p *Pool) SetUsageSource(src func(context.Context) (int64, error)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.source = src
+	p.baseAt = time.Time{} // read it on the next reservation
+}
+
+// SetRefreshInterval overrides how often the source is consulted.
+func (p *Pool) SetRefreshInterval(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if d > 0 {
+		p.refreshIn = d
+	}
+}
+
+// Refresh re-reads the shared usage figure when the cached one is stale. The
+// local count restarts from zero because what this process committed since the
+// last read is in the ledger by then — the ledger is the whole truth, and the
+// alternative double-counts this instance's own calls.
+//
+// It is best-effort: an unreadable ledger leaves the pool counting what it
+// knows, which is what a pool with no source does anyway. Accounting failing
+// must not stop the runtime.
+func (p *Pool) Refresh(ctx context.Context) { p.refreshIfStale(ctx) }
+
+func (p *Pool) refreshIfStale(ctx context.Context) {
+	p.mu.Lock()
+	src := p.source
+	interval := p.refreshIn
+	if interval <= 0 {
+		interval = DefaultRefreshInterval
+	}
+	stale := src != nil && p.window <= 0 &&
+		(p.baseAt.IsZero() || p.now().Sub(p.baseAt) >= interval)
+	p.mu.Unlock()
+	if !stale {
+		return
+	}
+
+	total, err := src(ctx)
+	if err != nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.base = total
+	p.used = 0
+	p.baseAt = p.now()
+}
+
+// usedLocked is the figure every check and every reading uses: the
+// deployment's total as of the last refresh, plus what this process has
+// committed since.
+func (p *Pool) usedLocked() int64 {
+	if p.window > 0 {
+		return p.windowedUsed()
+	}
+	return p.base + p.used
+}
+
 // Reserve attempts to reserve tokens before an LLM call. Returns an error if
 // the pool cannot accommodate the reservation.
+//
+// A pool with a ledger source refreshes here if it is stale, with a background
+// context: no caller can forget, and a call is never refused — or allowed — on
+// a figure that is only this process's. Callers on a request path pass their
+// own context to Refresh first, which is the same read with the caller's
+// deadline and cancellation.
 func (p *Pool) Reserve(amount int64) (*Lease, error) {
 	if amount <= 0 {
 		return nil, fmt.Errorf("budget: reserve amount must be positive")
 	}
+	p.refreshIfStale(context.Background())
 	if !p.tryReserve(amount) {
 		return nil, ErrExhausted
 	}
@@ -89,7 +183,7 @@ func (p *Pool) Reserve(amount int64) (*Lease, error) {
 func (p *Pool) tryReserve(amount int64) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.windowedUsed()+p.reserved+amount > p.limit {
+	if p.usedLocked()+p.reserved+amount > p.limit {
 		return false
 	}
 	p.reserved += amount
@@ -135,14 +229,15 @@ func (p *Pool) Release(lease *Lease) {
 func (p *Pool) Remaining() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.limit - p.windowedUsed() - p.reserved
+	return p.limit - p.usedLocked() - p.reserved
 }
 
-// Used returns the committed usage (the trailing-window sum in windowed mode).
+// Used returns the committed usage: this deployment's, when a ledger source is
+// installed, else this process's (the trailing-window sum in windowed mode).
 func (p *Pool) Used() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.windowedUsed()
+	return p.usedLocked()
 }
 
 // ResetDaily resets the used counter at day boundaries (UTC). In windowed mode
@@ -155,6 +250,10 @@ func (p *Pool) ResetDaily() {
 		return
 	}
 	p.used = 0
+	// The day rolled over, so the ledger's figure for "today" is zero too. A
+	// stale baseline would keep the pool exhausted into the new day.
+	p.base = 0
+	p.baseAt = time.Time{}
 }
 
 // StartDailyReset starts a goroutine that resets usage at the next UTC midnight

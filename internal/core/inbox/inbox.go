@@ -152,6 +152,50 @@ func (q *Queue) Post(ctx context.Context, sessionKey string, msg session.Message
 	return nil
 }
 
+// Pending reports which of these sessions have something waiting for them, in
+// one round trip.
+//
+// A drain pass uses it to decide what to look at, because claiming per session
+// costs a query each: an instance holding a hundred idle sessions would spend a
+// hundred round trips finding nothing to do. Against a local file that is
+// merely wasteful; against a store in another region it is seconds of latency
+// in every pass.
+//
+// A session counts as pending when it holds a message nobody has claimed, or
+// one whose claim has gone stale, or one this owner holds unacked — a delivery
+// that crashed before it was acknowledged, which is what makes it recoverable
+// rather than lost.
+func (q *Queue) Pending(ctx context.Context, owner string, sessions []string) ([]string, error) {
+	if len(sessions) == 0 {
+		return nil, nil
+	}
+	in := strings.TrimSuffix(strings.Repeat("?,", len(sessions)), ",")
+	args := make([]any, 0, len(sessions)+2)
+	for _, s := range sessions {
+		args = append(args, s)
+	}
+	args = append(args, time.Now().UnixNano()-q.visibility.Load(), owner)
+
+	rows, err := q.st.Query(ctx, `
+		SELECT DISTINCT session_key FROM session_inbox
+		WHERE done = 0 AND session_key IN (`+in+`)
+		  AND (claimed_by = '' OR claimed_at < ? OR claimed_by = ?)
+		ORDER BY session_key`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("inbox: pending: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, fmt.Errorf("inbox: scan pending: %w", err)
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
 // Claim takes up to limit messages for one session and returns everything this
 // owner now holds for it — including anything an earlier round delivered
 // without acking, which is what makes a crashed delivery recoverable rather

@@ -26,6 +26,58 @@ func msg(id string) session.Message {
 // Two instances write to one inbox. The ids they mint are their own — a channel
 // driver's counter restarts at one on every instance — so the same id on two of
 // them is two messages, and folding them together would silently drop a turn.
+// Pending answers "which of these sessions has something waiting" in one query,
+// and claims nothing: the answer decides what a drain pass looks at, while the
+// claim that follows is what hands a message to exactly one instance.
+func TestPendingNamesOnlySessionsWithWork(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inbox.db")
+	a := openInstance(t, path, "instance-a")
+	b := openInstance(t, path, "instance-b")
+	ctx := context.Background()
+
+	if err := a.Post(ctx, "bot|one", msg("m1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Post(ctx, "bot|three", msg("m3")); err != nil {
+		t.Fatal(err)
+	}
+	// A claim this owner holds unacked is still work: a delivery that crashed
+	// before its ack has to be found again, or the message is stuck.
+	if _, err := a.Claim(ctx, "instance-a", "bot|three", 10); err != nil {
+		t.Fatal(err)
+	}
+	// An acked message is not work.
+	if err := a.Post(ctx, "bot|done", msg("m4")); err != nil {
+		t.Fatal(err)
+	}
+	done, err := a.Claim(ctx, "instance-a", "bot|done", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Ack(ctx, "instance-a", done); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := a.Pending(ctx, "instance-a", []string{"bot|one", "bot|two", "bot|three", "bot|done"})
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	want := map[string]bool{"bot|one": true, "bot|three": true}
+	if len(got) != 2 || !want[got[0]] || !want[got[1]] {
+		t.Fatalf("pending = %v, want bot|one and bot|three", got)
+	}
+
+	// Nothing was claimed on the way: a peer can still take what is waiting.
+	items, err := b.Claim(ctx, "instance-b", "bot|one", 10)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("a peer could not claim what pending only reported: %d items, err=%v", len(items), err)
+	}
+	// And a session list that is empty is not a query.
+	if got, err := a.Pending(ctx, "instance-a", nil); err != nil || got != nil {
+		t.Fatalf("empty list = %v, err=%v", got, err)
+	}
+}
+
 func TestSameIDFromTwoInstancesIsTwoMessages(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "inbox.db")
 	a := openInstance(t, path, "instance-a")

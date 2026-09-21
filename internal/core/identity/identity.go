@@ -20,6 +20,8 @@ import (
 	"sync"
 	"time"
 
+	"agentflow/internal/core/metrics"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -43,9 +45,9 @@ type Contact struct {
 // e.g. "user:telegram:123"), which is already a stable per-(channel, human)
 // value — so identity is established without any driver change.
 type Registry struct {
-	db   *sql.DB
-	log  *slog.Logger
-	mu   sync.Mutex
+	db    *sql.DB
+	log   *slog.Logger
+	mu    sync.Mutex
 	cache map[string]string // native_from → uuid (hit path avoids a DB read)
 }
 
@@ -168,6 +170,7 @@ func (r *Registry) mint(nativeFrom, channel, replyTo string, profile map[string]
 		return "", fmt.Errorf("mint user: %w", err)
 	}
 	r.log.Info("user minted", "uuid", uuid, "native_from", nativeFrom, "channel", channel)
+	metrics.Inc("agentflow_identity_mints")
 	return uuid, nil
 }
 

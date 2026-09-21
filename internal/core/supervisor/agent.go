@@ -104,7 +104,8 @@ func (s *Supervisor) List(source session.Identity) []session.AgentSummary {
 	return out
 }
 
-// SessionStatus is one live session's row in the TUI snapshot.
+// SessionStatus is one live session's row in a supervisor snapshot, as the
+// web console's live-sessions view renders it.
 type SessionStatus struct {
 	SessionID string
 	Agent     string

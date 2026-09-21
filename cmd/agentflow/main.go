@@ -281,6 +281,7 @@ func main() {
 		if n, err := filesMgr.SweepScratch(ctx); err != nil {
 			log.Warn("files scratch sweep failed", "err", err)
 		} else if n > 0 {
+			metrics.Add("agentflow_files_scratch_swept", int64(n))
 			log.Info("files scratch swept", "expired", n)
 		}
 		// Blob GC: mark-and-sweep unreferenced blobs past the grace window.
@@ -289,6 +290,7 @@ func main() {
 			if live, swept, err := filesMgr.GC(ctx, grace); err != nil {
 				log.Warn("files blob gc failed", "err", err)
 			} else if swept > 0 {
+				metrics.Add("agentflow_files_gc_swept", int64(swept))
 				log.Info("files blob gc swept", "live", live, "swept", swept)
 			}
 		}
@@ -688,11 +690,14 @@ func main() {
 	var dash *tui.Dashboard
 	if !*noTUI && isatty.IsTerminal(os.Stdout.Fd()) {
 		dash = tui.Start(tui.Source{
-			Snapshot: func() ([]supervisor.SessionStatus, int, int) {
+			Snapshot: func() (int, int) {
 				if sup == nil {
-					return nil, 0, 0
+					return 0, 0
 				}
-				return sup.Snapshot()
+				// The dashboard shows the live counts only; per-session rows
+				// are the admin API's job.
+				_, active, idle := sup.Snapshot()
+				return active, idle
 			},
 			Metrics: metricReg.Snapshot,
 			Spark: func(name string) []int64 {

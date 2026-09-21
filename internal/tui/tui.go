@@ -1,25 +1,26 @@
 // Package ui renders the operator dashboard: a live Bubbletea TUI showing
-// per-agent status (active/idle/spawned), the PM→worker project tree, and a
-// scrolling log tail. It is fed by a supervisor Snapshot poller and a tee'd
-// slog handler; it owns the terminal only when attached to a TTY.
+// runtime metrics — the curated counters, sectioned, with sparklines — plus a
+// short log tail. It is fed by a supervisor snapshot poller, the counter
+// registry, and a tee'd slog handler; it owns the terminal only when attached
+// to a TTY.
+//
+// It is deliberately a read-only metrics display: no operator actions, no chat
+// surface, no identity of its own. Interaction and configuration are the web
+// console's job, and a new engine subsystem shows up here as a counter row.
 package tui
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-
-	"agentflow/internal/core/supervisor"
 )
 
-// snapshotMsg carries one supervisor snapshot into the model.
+// snapshotMsg carries one supervisor snapshot's session counts into the model.
 type snapshotMsg struct {
-	rows   []supervisor.SessionStatus
 	active int
 	idle   int
 }
@@ -38,9 +39,10 @@ type logMsg string
 type tickMsg time.Time
 
 // Source provides the data the TUI renders. Metrics and Spark are optional:
-// when Metrics is nil the stats panel is hidden (tests and minimal setups).
+// when Metrics is nil the metrics pane is hidden (tests and minimal setups).
 type Source struct {
-	Snapshot func() (rows []supervisor.SessionStatus, active, idle int)
+	// Snapshot reports live session counts (busy vs idle) for the header.
+	Snapshot func() (active, idle int)
 	// Metrics returns the latest value per counter.
 	Metrics func() map[string]int64
 	// Spark returns recent samples for one counter, oldest first.
@@ -53,7 +55,6 @@ type Model struct {
 	mu      sync.Mutex
 	pending []string // log lines buffered before/without a running program
 
-	rows   []supervisor.SessionStatus
 	active int
 	idle   int
 	latest map[string]int64
@@ -65,6 +66,12 @@ type Model struct {
 }
 
 const maxLogs = 200
+
+// Default terminal geometry used before the first WindowSizeMsg arrives.
+const (
+	defaultWidth  = 80
+	defaultHeight = 24
+)
 
 // New builds the model. prog is set later via SetProgram once the program
 // starts (the log tee needs it to push lines).
@@ -117,8 +124,8 @@ func tick() tea.Cmd {
 
 func poll(src Source) tea.Cmd {
 	return func() tea.Msg {
-		rows, active, idle := src.Snapshot()
-		return snapshotMsg{rows: rows, active: active, idle: idle}
+		active, idle := src.Snapshot()
+		return snapshotMsg{active: active, idle: idle}
 	}
 }
 
@@ -132,7 +139,7 @@ func pollMetrics(src Source) tea.Cmd {
 		msg := metricsMsg{latest: src.Metrics()}
 		if src.Spark != nil {
 			msg.sparks = map[string][]int64{}
-			for _, d := range statDefs {
+			for _, d := range statDefs() {
 				msg.sparks[d.Name] = src.Spark(d.Name)
 			}
 		}
@@ -153,7 +160,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		return m, tea.Batch(poll(m.src), pollMetrics(m.src), tick())
 	case snapshotMsg:
-		m.rows = msg.rows
 		m.active = msg.active
 		m.idle = msg.idle
 	case metricsMsg:
@@ -172,51 +178,42 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // tokens.css): accent blue for titles/borders, green for active/ok, grays for
 // muted/idle/log — so the terminal reads as the same product as the console.
 var (
-	borderStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("68"))  // muted accent blue
+	borderStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("68")) // muted accent blue
 	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("75"))                             // accent blue (#58a6ff-ish)
 	activeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))                                        // ok green
 	idleStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))                                       // muted gray
-	pmStyle     = lipgloss.NewStyle().Bold(true)
 	logStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))                                       // dim gray
 )
 
-func statusDot(busy bool) string {
-	if busy {
-		return activeStyle.Render("● active")
-	}
-	return idleStyle.Render("○ idle")
-}
-
 func (m *Model) View() string {
 	m.drainPending()
-	var b strings.Builder
-
-	// Header / status panel.
-	header := fmt.Sprintf("Agents  %s   %s   Σ spawned: %d",
-		activeStyle.Render(fmt.Sprintf("● active: %d", m.active)),
-		idleStyle.Render(fmt.Sprintf("○ idle: %d", m.idle)),
-		len(m.rows))
-	b.WriteString(titleStyle.Render("AgentFlow") + "\n")
-	b.WriteString(header + "\n\n")
-
-	// Project tree: PMs top-level, workers nested under their parent PM.
-	b.WriteString(titleStyle.Render("Projects") + "\n")
-	b.WriteString(m.renderTree())
-	b.WriteString("\n")
-
-	// Stats panel (only when a metrics source is wired).
-	if m.src.Metrics != nil {
-		b.WriteString(titleStyle.Render("Stats") + "\n")
-		b.WriteString(m.renderStats())
-		b.WriteString("\n")
+	// The first frame can render before the terminal size is known.
+	if m.width <= 0 {
+		m.width = defaultWidth
+	}
+	if m.height <= 0 {
+		m.height = defaultHeight
 	}
 
-	// Log tail.
-	logHeight := m.logHeight()
+	var b strings.Builder
+
+	// Header: the live session counts, the one signal the log tail cannot give.
+	b.WriteString(titleStyle.Render("AgentFlow") + "\n")
+	b.WriteString(fmt.Sprintf("%s   %s\n\n",
+		activeStyle.Render(fmt.Sprintf("● active: %d", m.active)),
+		idleStyle.Render(fmt.Sprintf("○ idle: %d", m.idle))))
+
+	metricsH, logH := m.layout()
+	if m.src.Metrics != nil && metricsH > 0 {
+		b.WriteString(titleStyle.Render("Metrics") + "\n")
+		b.WriteString(m.renderMetrics(metricsH) + "\n\n")
+	}
+
+	// Log footer, sized to the terminal (see layout).
 	b.WriteString(titleStyle.Render("Logs") + "\n")
 	start := 0
-	if len(m.logs) > logHeight {
-		start = len(m.logs) - logHeight
+	if len(m.logs) > logH {
+		start = len(m.logs) - logH
 	}
 	for _, line := range m.logs[start:] {
 		b.WriteString(logStyle.Render(truncate(line, m.width-2)) + "\n")
@@ -226,78 +223,62 @@ func (m *Model) View() string {
 	return borderStyle.Width(m.width - 2).Render(b.String())
 }
 
-// logHeight budgets rows for the log pane after the fixed panels.
-func (m *Model) logHeight() int {
-	// header(2) + blank + projects title + tree lines + blank + logs title + footer
-	used := 2 + 1 + 1 + len(m.rows) + 1 + 1 + 2
-	if m.src.Metrics != nil {
-		used += 1 + len(statDefs) + 1 // stats title + rows + blank
-	}
-	h := m.height - used - 2
-	if h < 3 {
-		h = 3
-	}
-	if h > 12 {
-		h = 12
-	}
-	return h
-}
+// Frame chrome in rendered lines, excluding pane content: title, header,
+// blank, pane titles, the blank after the metrics block, the footer line and
+// the two border rows.
+const (
+	chromeWithMetrics = 10
+	chromeLogsOnly    = 8
+)
 
-// renderTree builds the PM→worker tree from the flat snapshot. PMs are
-// sessions whose agent is the project-manager role (spawned "project_manager"
-// or a "pm"-style agent); workers are sessions whose ParentID points at a PM.
-// Anything with no parent and not a PM renders as a top-level root row.
-func (m *Model) renderTree() string {
-	if len(m.rows) == 0 {
-		return idleStyle.Render("  (no live sessions)") + "\n"
+// layout budgets the two panes' content lines for the current terminal size.
+// The log footer is sized first (a quarter of the terminal, 3–8 lines) and the
+// metrics pane takes the remainder. On a terminal too short for both the
+// footer shrinks, then the metrics pane is dropped to zero and View skips it —
+// so the frame always fits the terminal it was given.
+func (m *Model) layout() (metricsH, logH int) {
+	h := m.height
+	if h <= 0 {
+		h = defaultHeight
 	}
-	children := map[string][]supervisor.SessionStatus{}
-	var roots []supervisor.SessionStatus
-	for _, r := range m.rows {
-		if r.ParentID != "" {
-			children[r.ParentID] = append(children[r.ParentID], r)
-		} else {
-			roots = append(roots, r)
+
+	if m.src.Metrics == nil {
+		logH = h / 4
+		if logH < 3 {
+			logH = 3
 		}
-	}
-	sort.Slice(roots, func(i, j int) bool { return roots[i].SessionID < roots[j].SessionID })
-	for _, c := range children {
-		sort.Slice(c, func(i, j int) bool { return c[i].SessionID < c[j].SessionID })
-	}
-
-	var b strings.Builder
-	for _, root := range roots {
-		kids := children[root.SessionID]
-		label := pmStyle.Render(displayID(root.SessionID))
-		if len(kids) > 0 {
-			b.WriteString(fmt.Sprintf("▾ %s  %s\n", label, statusDot(root.Busy)))
-			for i, k := range kids {
-				branch := "├─"
-				if i == len(kids)-1 {
-					branch = "╰─"
-				}
-				b.WriteString(fmt.Sprintf("  %s %s  %s\n", branch, displayID(k.SessionID), statusDot(k.Busy)))
-			}
-		} else {
-			b.WriteString(fmt.Sprintf("• %s  %s\n", label, statusDot(root.Busy)))
+		if logH > 8 {
+			logH = 8
 		}
+		if max := h - chromeLogsOnly; logH > max {
+			logH = max
+		}
+		if logH < 0 {
+			logH = 0
+		}
+		return 0, logH
 	}
-	return b.String()
-}
 
-// displayID shortens a session key (agent|route|...) to its agent + tail for
-// readability.
-func displayID(sessionID string) string {
-	parts := strings.Split(sessionID, "|")
-	if len(parts) <= 1 {
-		return sessionID
+	// Room for the chrome, a three-line footer and at least one metric row.
+	if h >= chromeWithMetrics+4 {
+		logH = h / 4
+		if logH < 3 {
+			logH = 3
+		}
+		if logH > 8 {
+			logH = 8
+		}
+		if metricsH = h - chromeWithMetrics - logH; metricsH < 1 {
+			metricsH = 1
+			logH = h - chromeWithMetrics - metricsH
+		}
+		return metricsH, logH
 	}
-	return parts[0] + "|" + parts[len(parts)-1]
-}
 
-func truncate(s string, w int) string {
-	if w <= 0 || len(s) <= w {
-		return s
+	// No room for metrics: header and log footer only.
+	logH = h - chromeLogsOnly
+	if logH < 0 {
+		logH = 0
 	}
-	return s[:w-1] + "…"
+	return 0, logH
 }

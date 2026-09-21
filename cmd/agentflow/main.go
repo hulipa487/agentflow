@@ -991,6 +991,31 @@ func main() {
 		}
 	}()
 
+	// Expired key/value rows — a route handler's state, the file store's
+	// scratch — are reclaimed once a day. A row's deadline is a promise the
+	// store keeps on read; this is what keeps the space, including for rows
+	// nothing reads again.
+	sweepRows := func() {
+		if n, err := rtStore.SweepExpired(ctx); err != nil {
+			log.Warn("expired row sweep failed", "err", err)
+		} else if n > 0 {
+			log.Info("expired rows reclaimed", "rows", n)
+		}
+	}
+	singleton(ctx, "rows-sweep", sweepRows)
+	go func() {
+		tick := time.NewTicker(24 * time.Hour)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				singleton(ctx, "rows-sweep", sweepRows)
+			}
+		}
+	}()
+
 	// Token ledger retention: the daily rollup and (when enabled) the per-call
 	// detail log age out on a daily tick, like the journal. One instance does it:
 	// the delete is idempotent, but N instances deleting the same rows
@@ -1090,6 +1115,11 @@ func main() {
 		os.Exit(1)
 	}
 	rtr := router.New(routeSrc, caps.TriggersResponse(cfg.Triggers), sup, log)
+	// Route handlers get durable, deployment-wide state. A handler's Lua state
+	// is per process, so this is where remembering anything belongs: the
+	// routing decision a chat reads is the same on every instance, and it
+	// survives a restart.
+	rtr.SetStateStore(rtStore)
 	if cfg.Audit.AuditEnabled() {
 		rtr.Journal = func(in router.Inbound, status string) {
 			msg := in.Message

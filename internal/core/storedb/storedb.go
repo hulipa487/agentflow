@@ -230,6 +230,52 @@ func (d *DB) ExecDDL(ctx context.Context, statements ...string) error {
 	return nil
 }
 
+// EnsureColumn adds a column when an older database lacks it, and does nothing
+// when it is already there. CREATE TABLE IF NOT EXISTS silently does nothing on
+// an existing table, so a column introduced after a release needs this — and
+// unlike a bare ALTER it can run on every boot.
+//
+// definition is the column's SQL type and default, e.g. "TEXT NOT NULL DEFAULT ”".
+func (d *DB) EnsureColumn(ctx context.Context, table, column, definition string) error {
+	has, err := d.HasColumn(ctx, table, column)
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	// The identifiers are not parameters (no backend takes one for DDL) and
+	// come from this package's own callers, never from a request. The
+	// definition is a caller-supplied SQL fragment for the same reason.
+	if _, err := d.db.ExecContext(ctx,
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, definition)); err != nil {
+		return fmt.Errorf("storedb: add %s.%s: %w", table, column, err)
+	}
+	return nil
+}
+
+// HasColumn reports whether a table has a column. The two backends keep their
+// catalogues in different places — this is the one thing about a schema that
+// cannot be written once — but both statements still bind through the wrapper,
+// so nothing here depends on which placeholder syntax a driver wants.
+func (d *DB) HasColumn(ctx context.Context, table, column string) (bool, error) {
+	var n int
+	var err error
+	switch d.backend {
+	case BackendPostgres:
+		err = d.QueryRow(ctx, `
+			SELECT COUNT(*) FROM information_schema.columns
+			WHERE table_name = ? AND column_name = ?`, table, column).Scan(&n)
+	default:
+		err = d.QueryRow(ctx,
+			`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&n)
+	}
+	if err != nil {
+		return false, fmt.Errorf("storedb: look up %s.%s: %w", table, column, err)
+	}
+	return n > 0, nil
+}
+
 // bind rewrites placeholders for the backend. SQLite takes "?" as written.
 func (d *DB) bind(query string) string {
 	if d.backend != BackendPostgres {

@@ -23,6 +23,8 @@ var schema = []string{
 		display_name   TEXT NOT NULL DEFAULT '',
 		email          TEXT NOT NULL DEFAULT '',
 		tokens_per_day BIGINT NOT NULL DEFAULT 0,
+		model          TEXT NOT NULL DEFAULT '',
+		instructions_append TEXT NOT NULL DEFAULT '',
 		created_at     BIGINT NOT NULL,
 		updated_at     BIGINT NOT NULL
 	);`,
@@ -72,6 +74,18 @@ var schema = []string{
 func (r *Registry) migrate(ctx context.Context) error {
 	if err := r.st.ExecDDL(ctx, schema...); err != nil {
 		return err
+	}
+	// Columns added after a release: CREATE TABLE IF NOT EXISTS does nothing on
+	// a database that already has the table, so the per-user overrides need an
+	// explicit migration. Running it every boot is the point — the column is
+	// added once and the check is a catalogue lookup after that.
+	for _, col := range []struct{ name, definition string }{
+		{"model", "TEXT NOT NULL DEFAULT ''"},
+		{"instructions_append", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := r.st.EnsureColumn(ctx, "profiles", col.name, col.definition); err != nil {
+			return err
+		}
 	}
 	now := time.Now().Unix()
 	for _, stmt := range []string{

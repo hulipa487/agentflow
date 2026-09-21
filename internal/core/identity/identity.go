@@ -107,14 +107,25 @@ type Identity struct {
 func (i Identity) Linked() bool { return i.UserID != "" }
 
 // Profile is a person: the account their identities hang off.
+//
+// Model and InstructionsAppend are per-user overrides of what the agent they
+// are talking to would otherwise use. Empty means inherit, which is the normal
+// case: a deployment sets these for the few accounts that differ.
 type Profile struct {
-	UserID       string     `json:"user_id"`
-	DisplayName  string     `json:"display_name,omitempty"`
-	Email        string     `json:"email,omitempty"`
-	TokensPerDay int64      `json:"tokens_per_day"` // 0 = the deployment default
-	CreatedAt    int64      `json:"created_at"`
-	UpdatedAt    int64      `json:"updated_at"`
-	Identities   []Identity `json:"identities"`
+	UserID       string `json:"user_id"`
+	DisplayName  string `json:"display_name,omitempty"`
+	Email        string `json:"email,omitempty"`
+	TokensPerDay int64  `json:"tokens_per_day"` // 0 = the deployment default
+	// Model names an entry in the deployment's models: registry. It overrides
+	// the *agent's* default model for this person's turns; it does not override
+	// a model a loop names explicitly on a single call.
+	Model string `json:"model,omitempty"`
+	// InstructionsAppend is text appended to the agent's instructions for this
+	// person, as its own layer — the agent's instructions stay authoritative.
+	InstructionsAppend string     `json:"instructions_append,omitempty"`
+	CreatedAt          int64      `json:"created_at"`
+	UpdatedAt          int64      `json:"updated_at"`
+	Identities         []Identity `json:"identities"`
 }
 
 // Resolution is what one inbound resolves to: the handle it came from and the
@@ -456,9 +467,11 @@ func (r *Registry) Get(userID string) (Profile, bool, error) {
 	defer cancel()
 	var p Profile
 	err := r.st.QueryRow(ctx,
-		`SELECT user_id, display_name, email, tokens_per_day, created_at, updated_at
+		`SELECT user_id, display_name, email, tokens_per_day, model, instructions_append,
+		        created_at, updated_at
 		 FROM profiles WHERE user_id = ?`, userID).
-		Scan(&p.UserID, &p.DisplayName, &p.Email, &p.TokensPerDay, &p.CreatedAt, &p.UpdatedAt)
+		Scan(&p.UserID, &p.DisplayName, &p.Email, &p.TokensPerDay, &p.Model,
+			&p.InstructionsAppend, &p.CreatedAt, &p.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return Profile{}, false, nil
 	}
@@ -478,7 +491,8 @@ func (r *Registry) List() ([]Profile, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	rows, err := r.st.Query(ctx,
-		`SELECT user_id, display_name, email, tokens_per_day, created_at, updated_at
+		`SELECT user_id, display_name, email, tokens_per_day, model, instructions_append,
+		        created_at, updated_at
 		 FROM profiles ORDER BY created_at, user_id`)
 	if err != nil {
 		return nil, err
@@ -488,7 +502,7 @@ func (r *Registry) List() ([]Profile, error) {
 	for rows.Next() {
 		var p Profile
 		if err := rows.Scan(&p.UserID, &p.DisplayName, &p.Email, &p.TokensPerDay,
-			&p.CreatedAt, &p.UpdatedAt); err != nil {
+			&p.Model, &p.InstructionsAppend, &p.CreatedAt, &p.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -539,6 +553,62 @@ func (r *Registry) Update(userID string, displayName, email *string, tokensPerDa
 		return fmt.Errorf("no such profile %q", userID)
 	}
 	return nil
+}
+
+// SetOverrides sets a profile's per-user overrides. A nil argument leaves that
+// field alone; a pointer to "" clears it (which is how a person goes back to
+// inheriting the agent's model and instructions).
+//
+// It is a separate call from Update because it is a separate concern: Update
+// edits who someone is, this edits how the engine talks to them, and the
+// overrides are read on a hot path that must not pay for the rest of the row.
+func (r *Registry) SetOverrides(userID string, model, instructionsAppend *string) error {
+	if model == nil && instructionsAppend == nil {
+		return nil
+	}
+	sets := []string{}
+	args := []any{}
+	if model != nil {
+		sets = append(sets, "model = ?")
+		args = append(args, *model)
+	}
+	if instructionsAppend != nil {
+		sets = append(sets, "instructions_append = ?")
+		args = append(args, *instructionsAppend)
+	}
+	sets = append(sets, "updated_at = ?")
+	args = append(args, time.Now().Unix(), userID)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res, err := r.st.Exec(ctx,
+		`UPDATE profiles SET `+strings.Join(sets, ", ")+` WHERE user_id = ?`, args...)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("no such profile %q", userID)
+	}
+	return nil
+}
+
+// Overrides reads a profile's overrides alone — one indexed row, two columns —
+// for the turn path, which asks for them on every loop turn.
+func (r *Registry) Overrides(userID string) (model, instructionsAppend string, err error) {
+	if userID == "" {
+		return "", "", nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = r.st.QueryRow(ctx,
+		`SELECT model, instructions_append FROM profiles WHERE user_id = ?`, userID).
+		Scan(&model, &instructionsAppend)
+	if err == sql.ErrNoRows {
+		return "", "", nil
+	}
+	if err != nil {
+		return "", "", err
+	}
+	return model, instructionsAppend, nil
 }
 
 // Identities returns a profile's linked handles, oldest first.

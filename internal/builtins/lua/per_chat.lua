@@ -7,6 +7,9 @@
 -- Router op contract (service-state ops, distinct from session ops):
 --   inbox   -> { message = Message, agent = string }   (next inbound event)
 --   deliver { agent, key, message }                    (resolve/forward)
+--   router.state.get/set/delete/list                   (durable, fleet-wide;
+--     a handler's Lua state is per process, so anything it must remember goes
+--     there instead — see router.state in the docs)
 --
 -- Routing key: channel-qualified chat id; falls back to the sender when a
 -- channel has no chat concept (e.g. webhook).

@@ -91,7 +91,7 @@ func credMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "agentflow cred: master key env var %s is not set\n", envName)
 		return 1
 	}
-	store, err := credentials.Open(cfg.CredentialsPath(), masterKey, log)
+	store, err := credentials.Open(cfg.CredentialsStore(), masterKey, log)
 	if err != nil {
 		fmt.Fprintln(stderr, "agentflow cred:", err)
 		return 1

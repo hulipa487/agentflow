@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"agentflow/internal/config"
+	"agentflow/internal/core/lease"
 	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/session"
 )
@@ -50,9 +51,17 @@ type Service struct {
 	log     *slog.Logger
 	poll    time.Duration
 
+	// leases decides which instance fires an occurrence. Nil means nothing
+	// arbitrates — a deployment that runs alone, or one with no shared store —
+	// and every trigger fires here.
+	leases *lease.Manager
+
 	mu   sync.Mutex
 	ctx  context.Context
 	jobs map[string]*job
+	// held is the set of trigger claims this instance currently owns, so Stop
+	// hands back exactly what it took and nothing else.
+	held map[string]bool
 	// list is the declaration set the last Reload applied (event triggers
 	// included), used by the watcher to detect an unchanged file.
 	list []config.Trigger
@@ -82,6 +91,7 @@ func New(lookup Lookup, deliver Deliver, offset time.Duration, log *slog.Logger)
 		log:     log.With("module", "triggers"),
 		poll:    defaultPoll,
 		jobs:    map[string]*job{},
+		held:    map[string]bool{},
 	}
 }
 
@@ -167,14 +177,35 @@ func (s *Service) Pending() int {
 	return len(s.jobs)
 }
 
-// Stop cancels every scheduled trigger.
+// Stop cancels every scheduled trigger and gives up the claims this instance
+// holds. Releasing matters for the ordinary case of a restart — a deploy, a
+// config change, a move to another host: without it the fleet waits out the
+// lease before the trigger fires again, and a rolling deploy silently skips an
+// occurrence on every instance in turn.
 func (s *Service) Stop() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	for _, j := range s.jobs {
 		j.cancel()
 	}
 	s.jobs = map[string]*job{}
+	names := make([]string, 0, len(s.held))
+	for name := range s.held {
+		names = append(names, name)
+	}
+	s.held = map[string]bool{}
+	leases := s.leases
+	s.mu.Unlock()
+
+	if leases == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, name := range names {
+		if err := leases.Release(ctx, name); err != nil {
+			s.log.Warn("trigger claim release failed", "lease", name, "err", err)
+		}
+	}
 }
 
 // WatchConfigDir polls <dir>/triggers/*.yaml and reloads the scheduled set
@@ -328,11 +359,92 @@ func (s *Service) run(ctx context.Context, j *job) {
 	}
 }
 
+// SetLeases installs the lease manager that arbitrates which instance fires an
+// occurrence. Without one, every scheduled trigger fires on this instance —
+// correct for a deployment that runs alone, a duplicate for a fleet.
+func (s *Service) SetLeases(m *lease.Manager) {
+	s.mu.Lock()
+	s.leases = m
+	s.mu.Unlock()
+}
+
+// leaseSlack is the margin a claim leaves around the next occurrence, and
+// minLeaseTTL the shortest claim worth taking: shorter than this, a claim costs
+// more round trips than the work it guards.
+const (
+	leaseSlack  = 30 * time.Second
+	minLeaseTTL = 30 * time.Second
+)
+
+// leaseTTL is how long this trigger's claim should last, measured from now.
+//
+// It has to cover until the next occurrence, or the claim lapses in between and
+// the next instance whose timer happens to come up takes the trigger — which
+// for an `every:` schedule with a phase offset means it fires more often than
+// the deployment asked for. So an interval trigger claims its interval plus a
+// margin: whoever holds it keeps it.
+//
+// A cron schedule is absolute rather than a phase, so its claim can end a
+// margin *before* the next occurrence: every instance's timer comes up at the
+// same instant, the compare-and-set picks one, and a holder that died costs one
+// occurrence instead of a whole period.
+func (j *job) leaseTTL(now time.Time) time.Duration {
+	if j.kind == "every" {
+		return j.every + leaseSlack
+	}
+	if next := j.sched.Next(now); !next.IsZero() {
+		if d := next.Sub(now) - leaseSlack; d > minLeaseTTL {
+			return d
+		}
+	}
+	return minLeaseTTL
+}
+
+// claim takes or renews this trigger's lease, reporting whether this instance
+// should deliver the occurrence.
+//
+// Every instance runs the timers — they have to, because the instance holding
+// the lease can change at any time — so the lease is what makes an occurrence
+// produce one message rather than one per instance.
+func (s *Service) claim(j *job) bool {
+	if s.leases == nil {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	name := triggerLease + ":" + j.trigger.Name
+	ok, err := s.leases.AcquireFor(ctx, name, j.leaseTTL(time.Now()))
+	if err != nil {
+		// Fail closed. A store that cannot say who owns the trigger cannot
+		// arbitrate, and firing on every instance would deliver the same
+		// message once per instance — worse than a skipped occurrence, which
+		// the next interval repeats anyway.
+		s.log.Warn("trigger skipped: lease unavailable", "trigger", j.trigger.Name, "err", err)
+		return false
+	}
+	if !ok {
+		s.log.Debug("trigger not fired: another instance holds it", "trigger", j.trigger.Name)
+		return false
+	}
+	// Record what this instance owns, so a shutdown can hand it back.
+	s.mu.Lock()
+	s.held[name] = true
+	s.mu.Unlock()
+	return true
+}
+
+// triggerLease namespaces trigger leases in the shared lease table, so a
+// trigger and a sweep can never contend for the same name.
+const triggerLease = "trigger"
+
 // fire delivers one occurrence: a Message{type:"cron", payload:<trigger
 // payload>} into the target session. The trigger name travels in the message
 // id and provenance principal, never merged into the payload — a loop sees
 // exactly the payload the deployment declared.
 func (s *Service) fire(j *job) {
+	if !s.claim(j) {
+		return
+	}
 	now := time.Now()
 	msg := session.Message{
 		ID:      "cron:" + j.trigger.Name + ":" + strconv.FormatInt(now.Unix(), 10),

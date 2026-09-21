@@ -6,9 +6,9 @@ import (
 	"time"
 )
 
-func testStore(t *testing.T) *Store {
+func testStore(t *testing.T) Store {
 	t.Helper()
-	s, err := Open(filepath.Join(t.TempDir(), "runtime.db"))
+	s, err := OpenSQLite(filepath.Join(t.TempDir(), "runtime.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestPruneUsage(t *testing.T) {
 	}
 }
 
-func mustRecord(t *testing.T, s *Store, user string, input int, at time.Time) {
+func mustRecord(t *testing.T, s Store, user string, input int, at time.Time) {
 	t.Helper()
 	if err := s.RecordUsage(UsageRecord{
 		UserID: user, Agent: "bot", Model: "m", Kind: "chat",

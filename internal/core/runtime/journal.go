@@ -41,7 +41,7 @@ type JournalEntry struct {
 }
 
 // RecordMessage appends one entry to the journal.
-func (s *Store) RecordMessage(ctx context.Context, e JournalEntry) error {
+func (s *sqliteStore) RecordMessage(ctx context.Context, e JournalEntry) error {
 	atts, err := json.Marshal(e.Attachments)
 	if err != nil {
 		return err
@@ -78,7 +78,7 @@ type JournalFilter struct {
 // ListMessages returns journal rows matching the filter, newest first. It is
 // the read side of the audit trail: the per-user view the console and an
 // operator query build on.
-func (s *Store) ListMessages(ctx context.Context, f JournalFilter) ([]JournalEntry, error) {
+func (s *sqliteStore) ListMessages(ctx context.Context, f JournalFilter) ([]JournalEntry, error) {
 	limit := f.Limit
 	if limit <= 0 {
 		limit = 100
@@ -146,7 +146,7 @@ func (s *Store) ListMessages(ctx context.Context, f JournalFilter) ([]JournalEnt
 }
 
 // PruneMessages deletes journal rows older than cutoff, returning the count.
-func (s *Store) PruneMessages(ctx context.Context, cutoff time.Time) (int64, error) {
+func (s *sqliteStore) PruneMessages(ctx context.Context, cutoff time.Time) (int64, error) {
 	res, err := s.db.ExecContext(ctx,
 		`DELETE FROM message_journal WHERE ts < ?`, cutoff.Unix())
 	if err != nil {
@@ -155,8 +155,9 @@ func (s *Store) PruneMessages(ctx context.Context, cutoff time.Time) (int64, err
 	return res.RowsAffected()
 }
 
-// journalRowCount is a test/ops helper: total journaled rows.
-func (s *Store) journalRowCount(ctx context.Context) (int64, error) {
+// JournalRowCount reports how many rows the journal holds — the ops figure for
+// the audit trail's size.
+func (s *sqliteStore) JournalRowCount(ctx context.Context) (int64, error) {
 	var n int64
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM message_journal`).Scan(&n)
 	if err == sql.ErrNoRows {

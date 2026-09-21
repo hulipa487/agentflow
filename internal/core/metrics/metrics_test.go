@@ -76,7 +76,7 @@ type mockResponseWriter struct {
 	status int
 }
 
-func (m *mockResponseWriter) Header() http.Header        { return http.Header{} }
+func (m *mockResponseWriter) Header() http.Header         { return http.Header{} }
 func (m *mockResponseWriter) Write(b []byte) (int, error) { return len(b), nil }
 func (m *mockResponseWriter) WriteHeader(s int)           { m.status = s }
 

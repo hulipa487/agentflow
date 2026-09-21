@@ -91,7 +91,7 @@ func DayKey(t time.Time) string { return t.UTC().Format("2006-01-02") }
 
 // RecordUsage folds one call into the daily rollup and, when withEvent is set,
 // appends the per-call detail row.
-func (s *Store) RecordUsage(rec UsageRecord, withEvent bool) error {
+func (s *sqliteStore) RecordUsage(rec UsageRecord, withEvent bool) error {
 	if rec.At.IsZero() {
 		rec.At = time.Now()
 	}
@@ -141,7 +141,7 @@ func (s *Store) RecordUsage(rec UsageRecord, withEvent bool) error {
 }
 
 // UsageForDay returns one user's totals for a UTC day.
-func (s *Store) UsageForDay(userID, day string) (UsageTotals, error) {
+func (s *sqliteStore) UsageForDay(userID, day string) (UsageTotals, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var t UsageTotals
@@ -168,7 +168,7 @@ type UsageRow struct {
 
 // UsageDaily returns every slice for a UTC day, largest first — the console's
 // per-user accounting view.
-func (s *Store) UsageDaily(day string) ([]UsageRow, error) {
+func (s *sqliteStore) UsageDaily(day string) ([]UsageRow, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	rows, err := s.db.QueryContext(ctx, `
@@ -193,7 +193,7 @@ func (s *Store) UsageDaily(day string) ([]UsageRow, error) {
 
 // UsageHistory returns one user's daily rows for the window ending today,
 // newest first — the per-user trend a frontend renders.
-func (s *Store) UsageHistory(userID string, days int) ([]UsageRow, error) {
+func (s *sqliteStore) UsageHistory(userID string, days int) ([]UsageRow, error) {
 	if days <= 0 || days > 90 {
 		days = 7
 	}
@@ -232,7 +232,7 @@ type UsageEvent struct {
 
 // UsageEvents returns a user's recent per-call rows, newest first (the detail
 // view behind the rollup; only populated when usage.events is enabled).
-func (s *Store) UsageEvents(userID string, since time.Time, limit int) ([]UsageEvent, error) {
+func (s *sqliteStore) UsageEvents(userID string, since time.Time, limit int) ([]UsageEvent, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
@@ -262,7 +262,7 @@ func (s *Store) UsageEvents(userID string, since time.Time, limit int) ([]UsageE
 
 // PruneUsage drops ledger rows older than cutoff. The daily rollup is pruned by
 // day string, the event log by timestamp.
-func (s *Store) PruneUsage(before time.Time) error {
+func (s *sqliteStore) PruneUsage(before time.Time) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if _, err := s.db.ExecContext(ctx,

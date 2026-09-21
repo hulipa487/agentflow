@@ -17,10 +17,10 @@ import (
 func discard() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 // fixture builds a quota over a real ledger and a real profile store.
-func fixture(t *testing.T, defaultPerDay, profileLimit int64) (*Quota, *identity.Registry, *runtime.Store, string) {
+func fixture(t *testing.T, defaultPerDay, profileLimit int64) (*Quota, *identity.Registry, runtime.Store, string) {
 	t.Helper()
 	dir := t.TempDir()
-	ledger, err := runtime.Open(filepath.Join(dir, "runtime.db"))
+	ledger, err := runtime.OpenSQLite(filepath.Join(dir, "runtime.db"))
 	if err != nil {
 		t.Fatalf("open ledger: %v", err)
 	}
@@ -43,7 +43,7 @@ func fixture(t *testing.T, defaultPerDay, profileLimit int64) (*Quota, *identity
 	return New(ledger, reg.LimitFor, defaultPerDay), reg, ledger, p.UserID
 }
 
-func spend(t *testing.T, ledger *runtime.Store, userID string, input int) {
+func spend(t *testing.T, ledger runtime.Store, userID string, input int) {
 	t.Helper()
 	if err := ledger.RecordUsage(runtime.UsageRecord{
 		UserID: userID, Agent: "bot", Model: "m", Kind: "chat",

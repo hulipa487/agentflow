@@ -7,6 +7,8 @@ package config
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,7 +20,12 @@ import (
 )
 
 type Config struct {
-	Version  string            `yaml:"version"`
+	Version string `yaml:"version"`
+	// Epoch identifies the configuration this process loaded: a hash of the
+	// fragments as written, before ${VAR} expansion, so rotating a secret does
+	// not move it while any change of shape does. Two instances can compare it
+	// to tell whether they are running the same deployment.
+	Epoch    string            `yaml:"-"`
 	Runtime  Runtime           `yaml:"runtime"`
 	Models   map[string]Model  `yaml:"models"`
 	Memory   Memory            `yaml:"memory"`
@@ -226,7 +233,7 @@ func (r Runtime) TimezoneOffset() time.Duration {
 // environment variable at boot (never from the config file).
 type CredentialsConfig struct {
 	Enabled      bool   `yaml:"enabled"`
-	Path         string `yaml:"path"`           // sqlite path; "" = <runtime persistence dir>/credentials.db
+	Path         string `yaml:"path"`           // sqlite path or postgres DSN; "" = follow runtime.persistence
 	MasterKeyEnv string `yaml:"master_key_env"` // env var holding the master key; default "CREDENTIALS_MASTER_KEY"
 }
 
@@ -242,7 +249,7 @@ type AdminConfig struct {
 // to "user:<uuid>", making loops channel-agnostic and proactive push uniform.
 type IdentityConfig struct {
 	Enabled     bool   `yaml:"enabled"`
-	Persistence string `yaml:"persistence"` // sqlite path; "" = <runtime persistence dir>/identity.db
+	Persistence string `yaml:"persistence"` // sqlite path or postgres DSN; "" = follow runtime.persistence
 }
 
 // UsersConfig configures the user-facing profile API (profile registration and
@@ -881,7 +888,35 @@ func Load(path string) (*Config, error) {
 	if err := resolvePrompts(&c); err != nil {
 		return nil, err
 	}
+	c.Epoch = ComputeEpoch(path)
 	return &c, nil
+}
+
+// ComputeEpoch hashes the configuration fragments, in the order they are
+// applied, so a fleet can tell whether every instance loaded the same
+// deployment. The raw bytes are hashed — before ${VAR} expansion — so rotating
+// a secret leaves the epoch alone while any change to shape moves it. File
+// names are part of the hash because moving a setting between fragments is a
+// change even when the merged result is identical.
+func ComputeEpoch(files ...string) string {
+	h := sha256.New()
+	for _, f := range files {
+		if f == "" {
+			continue
+		}
+		b, err := os.ReadFile(f)
+		if err != nil {
+			continue // a fragment that is absent contributes nothing
+		}
+		// The name participates in the hash: moving a setting between fragments
+		// is a change even when the merged result is identical. NUL separates
+		// the fields so no concatenation can alias another.
+		h.Write([]byte(filepath.Base(f)))
+		h.Write([]byte{0})
+		h.Write(b)
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))[:12]
 }
 
 // rebasePromptFiles makes base the resolution base for relative prompt file:
@@ -1488,33 +1523,58 @@ func (c *Config) PersistencePath() string {
 	return p
 }
 
-// IdentityPath returns the sqlite path for the identity registry, resolved
-// beside the runtime persistence path unless explicitly overridden.
-func (c *Config) IdentityPath() string {
+// DataDir is the directory local blobs (media, files) default to. It is the
+// persistence directory when the runtime store is a SQLite file — the two live
+// together — and "./data" when persistence is a server DSN, where there is no
+// local directory to sit beside.
+func (c *Config) DataDir() string {
+	p := c.Runtime.Persistence
+	if p != "" && (strings.HasPrefix(p, "postgres://") || strings.HasPrefix(p, "postgresql://")) {
+		return "./data"
+	}
+	dir := filepath.Dir(c.PersistencePath())
+	if dir == "" || dir == "." {
+		return "./data"
+	}
+	return dir
+}
+
+// IdentityStore returns where the identity registry keeps its data: a SQLite
+// file path, or a PostgreSQL DSN. It follows runtime.persistence unless the
+// identity block names its own target, so a deployment that points the runtime
+// store at a server gets shared identities — and shared user scopes — without
+// saying so twice.
+func (c *Config) IdentityStore() string {
 	if c.Runtime.Identity.Persistence != "" {
 		return c.Runtime.Identity.Persistence
 	}
-	// Default to a sibling file in the runtime persistence directory.
-	p := c.PersistencePath()
-	dir := filepath.Dir(p)
-	if dir == "" || dir == "." {
-		return "identity.db"
-	}
-	return dir + "/identity.db"
+	return c.storeBesideRuntime("identity.db")
 }
 
-// CredentialsPath returns the sqlite path for the credential store, resolved
-// beside the runtime persistence path unless explicitly overridden.
-func (c *Config) CredentialsPath() string {
+// CredentialsStore returns where the credential store keeps its data, resolved
+// on the same rule as IdentityStore: an explicit target wins, otherwise it
+// follows the runtime store — one file per store on one machine, one server for
+// a fleet.
+func (c *Config) CredentialsStore() string {
 	if c.Runtime.Credentials.Path != "" {
 		return c.Runtime.Credentials.Path
 	}
+	return c.storeBesideRuntime("credentials.db")
+}
+
+// storeBesideRuntime resolves a per-store target from the runtime persistence
+// target: the same DSN when persistence is a server, else a sibling file in the
+// persistence directory.
+func (c *Config) storeBesideRuntime(name string) string {
 	p := c.PersistencePath()
+	if strings.HasPrefix(p, "postgres://") || strings.HasPrefix(p, "postgresql://") {
+		return p
+	}
 	dir := filepath.Dir(p)
 	if dir == "" || dir == "." {
-		return "credentials.db"
+		return name
 	}
-	return dir + "/credentials.db"
+	return filepath.Join(dir, name)
 }
 
 // CredentialsMasterKeyEnv returns the env var holding the credential master

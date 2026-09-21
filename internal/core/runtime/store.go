@@ -16,14 +16,15 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Store is the runtime-state SQLite database.
-type Store struct {
+// sqliteStore is the runtime state in one local SQLite file: the
+// single-instance default. It implements Store.
+type sqliteStore struct {
 	db   *sql.DB
 	path string
 }
 
-// Open creates or opens a runtime store at the given path.
-func Open(path string) (*Store, error) {
+// OpenSQLite creates or opens a runtime store in a local SQLite file.
+func OpenSQLite(path string) (Store, error) {
 	if path == "" {
 		path = "./data/agentflow-runtime.db"
 	}
@@ -37,18 +38,19 @@ func Open(path string) (*Store, error) {
 			return nil, err
 		}
 	}
-	db, err := sql.Open("sqlite", abs)
+	// Pragmas belong in the DSN rather than a one-off Exec: a pooled
+	// connection opened later would otherwise default to busy_timeout=0 and
+	// fail immediately on SQLITE_BUSY instead of waiting for the writer.
+	dsn := abs + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open runtime store %s: %w", abs, err)
 	}
-	if _, err := db.Exec(`
-		PRAGMA journal_mode = WAL;
-		PRAGMA busy_timeout = 5000;
-	`); err != nil {
+	if err := db.Ping(); err != nil {
 		_ = db.Close()
-		return nil, err
+		return nil, fmt.Errorf("open runtime store %s: %w", abs, err)
 	}
-	s := &Store{db: db, path: abs}
+	s := &sqliteStore{db: db, path: abs}
 	if err := s.migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -56,7 +58,7 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
-func (s *Store) migrate() error {
+func (s *sqliteStore) migrate() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	_, err := s.db.ExecContext(ctx, `
@@ -108,7 +110,7 @@ func (s *Store) migrate() error {
 // addColumnIfMissing adds a column to an existing table. It is the migration
 // path for columns introduced after a table shipped: CREATE TABLE IF NOT EXISTS
 // silently does nothing on an existing table, so a new column needs this.
-func (s *Store) addColumnIfMissing(ctx context.Context, table, column, typ string) error {
+func (s *sqliteStore) addColumnIfMissing(ctx context.Context, table, column, typ string) error {
 	rows, err := s.db.QueryContext(ctx, `SELECT name FROM pragma_table_info(?)`, table)
 	if err != nil {
 		return err
@@ -130,7 +132,7 @@ func (s *Store) addColumnIfMissing(ctx context.Context, table, column, typ strin
 	return err
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *sqliteStore) Close() error { return s.db.Close() }
 
 // Path returns the database path (for logging).
-func (s *Store) Path() string { return s.path }
+func (s *sqliteStore) Path() string { return s.path }

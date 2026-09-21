@@ -7,8 +7,8 @@ import (
 	"context"
 	"sync"
 
-	"github.com/google/uuid"
 	"agentflow/internal/core/session"
+	"github.com/google/uuid"
 )
 
 // Registry owns request/reply waiters.

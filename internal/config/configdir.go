@@ -70,9 +70,14 @@ func LoadDir(dir string, log *slog.Logger) (*Config, error) {
 	}
 	c := &Config{}
 
+	// The epoch covers every fragment this directory contributes, in the order
+	// they are applied, so a fleet can compare what each instance loaded.
+	var fragments []string
+
 	// system.yaml is the only required fragment; it carries everything except
 	// agents, channels, and triggers, which have their own homes.
 	sysPath := filepath.Join(dir, "system.yaml")
+	fragments = append(fragments, sysPath)
 	b, err := os.ReadFile(sysPath)
 	if err != nil {
 		return nil, fmt.Errorf("configdir %s: system.yaml: %w", dir, err)
@@ -89,6 +94,7 @@ func LoadDir(dir string, log *slog.Logger) (*Config, error) {
 
 	// channels.yaml -> gateway.channels.
 	chPath := filepath.Join(dir, "channels.yaml")
+	fragments = append(fragments, chPath)
 	if b, err := os.ReadFile(chPath); err == nil {
 		var frag struct {
 			Channels []Channel `yaml:"channels"`
@@ -108,6 +114,7 @@ func LoadDir(dir string, log *slog.Logger) (*Config, error) {
 		return nil, fmt.Errorf("configdir %s: profiles: %w", dir, err)
 	}
 	sort.Strings(profileFiles)
+	fragments = append(fragments, profileFiles...)
 	for _, pf := range profileFiles {
 		b, err := os.ReadFile(pf)
 		if err != nil {
@@ -162,6 +169,12 @@ func LoadDir(dir string, log *slog.Logger) (*Config, error) {
 	if err := resolvePrompts(c); err != nil {
 		return nil, err
 	}
+	// Triggers are fragments too. The glob order matches the one the trigger
+	// loader applies, so the epoch and the live set agree.
+	triggerFiles, _ := filepath.Glob(filepath.Join(dir, "triggers", "*.yaml"))
+	sort.Strings(triggerFiles)
+	fragments = append(fragments, triggerFiles...)
+	c.Epoch = ComputeEpoch(fragments...)
 	return c, nil
 }
 

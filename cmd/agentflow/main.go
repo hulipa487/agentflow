@@ -33,6 +33,8 @@ import (
 	"agentflow/internal/core/files"
 	"agentflow/internal/core/gateway"
 	"agentflow/internal/core/identity"
+	"agentflow/internal/core/inbox"
+	"agentflow/internal/core/lease"
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/memory"
 	"agentflow/internal/core/metrics"
@@ -45,6 +47,8 @@ import (
 	"agentflow/internal/core/safety"
 	"agentflow/internal/core/scheduler"
 	"agentflow/internal/core/session"
+	"agentflow/internal/core/sessionhub"
+	"agentflow/internal/core/storedb"
 	"agentflow/internal/core/supervisor"
 	"agentflow/internal/core/tools"
 	"agentflow/internal/core/triggers"
@@ -114,6 +118,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The configuration's epoch: a fleet compares these to tell a stale or
+	// divergent instance from a healthy one.
+	log.Info("config loaded", "epoch", cfg.Epoch, "version", cfg.Version)
+
 	// plugins.dir may shadow any builtin Lua (loops, routes, support chunks)
 	// by name — wire it before the first builtins.Resolve below.
 	builtins.SetPluginDir(cfg.Plugins.Dir)
@@ -134,7 +142,7 @@ func main() {
 			log.Error("runtime.credentials.enabled but env var unset", "env", envName)
 			os.Exit(1)
 		}
-		credStore, err = credentials.Open(cfg.CredentialsPath(), masterKey, log)
+		credStore, err = credentials.Open(cfg.CredentialsStore(), masterKey, log)
 		if err != nil {
 			log.Error("credential store open failed", "err", err)
 			os.Exit(1)
@@ -265,7 +273,7 @@ func main() {
 	schedSvc := scheduler.New(log)
 
 	// Runtime store: persists timer/budget/child metadata.
-	rtStore, err := runtime.Open(cfg.PersistencePath())
+	rtStore, err := runtime.OpenStore(cfg.PersistencePath(), log)
 	if err != nil {
 		log.Error("runtime store failed", "err", err)
 		os.Exit(1)
@@ -273,16 +281,42 @@ func main() {
 	// Per-call token detail in the ledger (the daily rollup is always written).
 	usageEvents := cfg.Usage.UsageEvents()
 
+	// Singleton arbitration. Scheduled work — every:/cron: triggers, the file
+	// GC, the retention prunes — has to run once per deployment, not once per
+	// instance, and the lease is what decides which instance runs each piece. It
+	// lives in the same store as everything else, so a deployment that shares a
+	// database shares the arbitration for free, and one that runs alone is
+	// uncontended.
+	leaseMgr, err := lease.Open(cfg.PersistencePath(), lease.OwnerID(), lease.DefaultTTL, log)
+	if err != nil {
+		log.Error("lease manager failed", "err", err)
+		os.Exit(1)
+	}
+	defer leaseMgr.Close()
+	log.Info("instance identity", "owner", leaseMgr.Owner())
+
+	// singleton runs fn only while this instance holds the named lease. A store
+	// that cannot answer is a store that cannot arbitrate: the work is skipped
+	// rather than run by everyone.
+	singleton := func(ctx context.Context, name string, fn func()) {
+		ok, err := leaseMgr.Acquire(ctx, name)
+		if err != nil {
+			log.Warn("scheduled work skipped: lease unavailable", "name", name, "err", err)
+			return
+		}
+		if !ok {
+			log.Debug("scheduled work skipped: another instance holds it", "name", name)
+			return
+		}
+		fn()
+	}
+
 	// Identity registry (opt-in). Opened here rather than with the rest of the
 	// identity wiring below, because the per-user quota the LLM handlers
 	// enforce resolves its limits from profiles.
 	var identReg *identity.Registry
 	if cfg.Runtime.Identity.Enabled {
-		idPath := cfg.IdentityPath()
-		if dir := filepath.Dir(idPath); dir != "" && dir != "." {
-			_ = os.MkdirAll(dir, 0750)
-		}
-		identReg, err = identity.Open(idPath, log)
+		identReg, err = identity.Open(cfg.IdentityStore(), log)
 		if err != nil {
 			log.Error("identity registry failed", "err", err)
 			os.Exit(1)
@@ -306,6 +340,15 @@ func main() {
 		if err := identReg.SetChannelTraits(channelTraits); err != nil {
 			log.Error("identity channel traits failed", "err", err)
 			os.Exit(1)
+		}
+
+		// Mixed backends are legal, and usually a mistake worth saying out loud:
+		// an instance whose identity store is shared but whose journal is local
+		// has a fleet-wide view of who people are and a single-instance view of
+		// what they said.
+		if got, want := storedb.BackendFor(cfg.IdentityStore()), storedb.BackendFor(cfg.PersistencePath()); got != want {
+			log.Warn("identity store and runtime store are on different backends",
+				"identity", got, "runtime", want)
 		}
 	}
 
@@ -365,7 +408,7 @@ func main() {
 	} else {
 		filesDir := cfg.Files.Dir
 		if filesDir == "" {
-			filesDir = filepath.Join(filepath.Dir(cfg.PersistencePath()), "files")
+			filesDir = filepath.Join(cfg.DataDir(), "files")
 		}
 		blobStore, err := media.Open(filesDir)
 		if err != nil {
@@ -375,21 +418,27 @@ func main() {
 		filesMgr = files.New(blobStore, rtStore, cfg.Files.FilesScratchTTL(), cfg.Files.FilesMaxBytes(), log)
 	}
 	if filesMgr != nil {
-		if n, err := filesMgr.SweepScratch(ctx); err != nil {
-			log.Warn("files scratch sweep failed", "err", err)
-		} else if n > 0 {
-			metrics.Add("agentflow_files_scratch_swept", int64(n))
-			log.Info("files scratch swept", "expired", n)
-		}
-		// Blob GC: mark-and-sweep unreferenced blobs past the grace window.
-		// Disabled with files.gc_grace: "0".
-		if grace := cfg.Files.FilesGCGrace(); grace > 0 {
-			if live, swept, err := filesMgr.GC(ctx, grace); err != nil {
-				log.Warn("files blob gc failed", "err", err)
-			} else if swept > 0 {
-				metrics.Add("agentflow_files_gc_swept", int64(swept))
-				log.Info("files blob gc swept", "live", live, "swept", swept)
+		singleton(ctx, "files-scratch", func() {
+			if n, err := filesMgr.SweepScratch(ctx); err != nil {
+				log.Warn("files scratch sweep failed", "err", err)
+			} else if n > 0 {
+				metrics.Add("agentflow_files_scratch_swept", int64(n))
+				log.Info("files scratch swept", "expired", n)
 			}
+		})
+		// Blob GC: mark-and-sweep unreferenced blobs past the grace window.
+		// Disabled with files.gc_grace: "0". One instance sweeps: two concurrent
+		// mark-and-sweeps over one blob store can delete what the other is still
+		// writing.
+		if grace := cfg.Files.FilesGCGrace(); grace > 0 {
+			singleton(ctx, "files-gc", func() {
+				if live, swept, err := filesMgr.GC(ctx, grace); err != nil {
+					log.Warn("files blob gc failed", "err", err)
+				} else if swept > 0 {
+					metrics.Add("agentflow_files_gc_swept", int64(swept))
+					log.Info("files blob gc swept", "live", live, "swept", swept)
+				}
+			})
 		}
 	}
 
@@ -469,7 +518,7 @@ func main() {
 	} else {
 		mediaDir := cfg.Media.Dir
 		if mediaDir == "" {
-			mediaDir = filepath.Join(filepath.Dir(cfg.PersistencePath()), "media")
+			mediaDir = filepath.Join(cfg.DataDir(), "media")
 		}
 		mediaStore, err = media.Open(mediaDir)
 	}
@@ -850,12 +899,35 @@ func main() {
 
 	sup = supervisor.New(defs, gw, opPool, shellMgr, log)
 
+	// Session hub. A conversation runs on one instance at a time, and in a
+	// fleet any instance may receive its traffic — a webhook load-balanced
+	// across the fleet, a trigger firing wherever its lease landed, a push from
+	// another node. The hub puts a per-session lease in front of delivery and
+	// the shared inbox behind it: an instance that owns the session (or can
+	// take it) delivers the message itself, and one that does not queues it for
+	// the owner. Without a shared store both are local, the lease is
+	// uncontended, and this behaves exactly as it did before.
+	hubQueue, err := inbox.Open(cfg.PersistencePath(), leaseMgr.Owner(), log)
+	if err != nil {
+		log.Error("session inbox failed", "err", err)
+		os.Exit(1)
+	}
+	defer hubQueue.Close()
+	hub := sessionhub.New(leaseMgr, hubQueue, sup.DeliverLocal, log)
+	sup.SetHub(hub)
+	go hub.Drain(ctx)
+
 	// Token ledger retention: the daily rollup and (when enabled) the per-call
-	// detail log age out on a daily tick, like the journal.
+	// detail log age out on a daily tick, like the journal. One instance does it:
+	// the delete is idempotent, but N instances deleting the same rows
+	// concurrently is N times the work for no benefit.
 	if days := cfg.Usage.UsageRetention(); days > 0 {
-		if err := rtStore.PruneUsage(time.Now().AddDate(0, 0, -days)); err != nil {
-			log.Warn("usage prune failed", "err", err)
+		prune := func() {
+			if err := rtStore.PruneUsage(time.Now().AddDate(0, 0, -days)); err != nil {
+				log.Warn("usage prune failed", "err", err)
+			}
 		}
+		singleton(ctx, "usage-prune", prune)
 		go func() {
 			tick := time.NewTicker(24 * time.Hour)
 			defer tick.Stop()
@@ -864,9 +936,7 @@ func main() {
 				case <-ctx.Done():
 					return
 				case <-tick.C:
-					if err := rtStore.PruneUsage(time.Now().AddDate(0, 0, -days)); err != nil {
-						log.Warn("usage prune failed", "err", err)
-					}
+					singleton(ctx, "usage-prune", prune)
 				}
 			}
 		}()
@@ -877,12 +947,15 @@ func main() {
 	// can neither skip nor forge it. Journal errors are logged, never fatal.
 	if cfg.Audit.AuditEnabled() {
 		if days := cfg.Audit.AuditRetention(); days > 0 {
-			cutoff := time.Now().AddDate(0, 0, -days)
-			if n, err := rtStore.PruneMessages(ctx, cutoff); err != nil {
-				log.Warn("journal prune failed", "err", err)
-			} else if n > 0 {
-				log.Info("journal pruned", "rows", n, "retention_days", days)
+			prune := func() {
+				cutoff := time.Now().AddDate(0, 0, -days)
+				if n, err := rtStore.PruneMessages(ctx, cutoff); err != nil {
+					log.Warn("journal prune failed", "err", err)
+				} else if n > 0 {
+					log.Info("journal pruned", "rows", n, "retention_days", days)
+				}
 			}
+			singleton(ctx, "journal-prune", prune)
 			go func() {
 				tick := time.NewTicker(24 * time.Hour)
 				defer tick.Stop()
@@ -891,9 +964,7 @@ func main() {
 					case <-ctx.Done():
 						return
 					case <-tick.C:
-						if _, err := rtStore.PruneMessages(ctx, time.Now().AddDate(0, 0, -days)); err != nil {
-							log.Warn("journal prune failed", "err", err)
-						}
+						singleton(ctx, "journal-prune", prune)
 					}
 				}
 			}()
@@ -1006,7 +1077,7 @@ func main() {
 		})
 		sink = sc
 		sup.SetUserResolver(identReg)
-		log.Info("identity layer enabled", "db", cfg.IdentityPath(),
+		log.Info("identity layer enabled", "store", cfg.IdentityStore(),
 			"require_registration", cfg.Runtime.Users.RegistrationRequired())
 	}
 
@@ -1165,6 +1236,7 @@ func main() {
 		}
 		adminToken = hex.EncodeToString(b)
 		log.Info("web console admin token (set ADMIN_TOKEN to pin it)", "token", adminToken)
+		log.Warn("admin token is per-boot and per-instance: a fleet must set ADMIN_TOKEN, or every console rejects the others' tokens")
 	}
 	admin := metrics.NewAdminServer(adminAddr, adminToken, metricReg, log)
 	admin.SetReady(true)
@@ -1228,6 +1300,9 @@ func main() {
 		log,
 	)
 	triggerSvc.Start(ctx)
+	// One instance fires each occurrence; without this the fleet would deliver
+	// every trigger once per instance.
+	triggerSvc.SetLeases(leaseMgr)
 	triggerSvc.Reload(cfg.Triggers)
 	// A configdir's triggers/*.yaml is re-read on a poll, so editing a schedule
 	// needs no restart (the rest of the directory still does).
@@ -1244,6 +1319,11 @@ func main() {
 	<-ctx.Done()
 
 	log.Info("shutting down")
+	// Before the stores close: stopping the triggers gives up their claims, and
+	// the hub gives up its sessions, so the rest of the fleet picks both up at
+	// once instead of waiting out the leases.
+	triggerSvc.Stop()
+	hub.Release(ctx)
 	watcher.Stop()
 	memMgr.Stop()
 	for _, c := range mcpClients {

@@ -17,7 +17,7 @@ import (
 // handler degrades with a named reason rather than an empty answer.
 type UserDeps struct {
 	Identities *identity.Registry
-	Store      *runtime.Store
+	Store      runtime.Store
 	Quota      *accounting.Quota
 	Files      *files.Manager
 }

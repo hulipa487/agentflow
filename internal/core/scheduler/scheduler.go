@@ -21,10 +21,10 @@ type TimerID string
 
 // Service manages all session-owned timers.
 type Service struct {
-	mu     sync.Mutex
-	timers map[TimerID]*timer
+	mu      sync.Mutex
+	timers  map[TimerID]*timer
 	byOwner map[string]map[TimerID]bool
-	log    *slog.Logger
+	log     *slog.Logger
 }
 
 type timer struct {

@@ -53,15 +53,15 @@ type Options struct {
 
 // Driver accepts webhooks and implements gateway.Driver for replies.
 type Driver struct {
-	name    string
-	path    string
-	agent   string
-	sink    router.Sink
-	store   media.Store // nil = media policy disabled
-	pol     media.Policy
-	opts    Options
-	log     *slog.Logger
-	http    *http.Client // callback delivery
+	name  string
+	path  string
+	agent string
+	sink  router.Sink
+	store media.Store // nil = media policy disabled
+	pol   media.Policy
+	opts  Options
+	log   *slog.Logger
+	http  *http.Client // callback delivery
 
 	seq     atomic.Uint64
 	mu      sync.Mutex

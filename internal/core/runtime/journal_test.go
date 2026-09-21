@@ -8,9 +8,9 @@ import (
 	"agentflow/internal/core/media"
 )
 
-func openTemp(t *testing.T) *Store {
+func openTemp(t *testing.T) Store {
 	t.Helper()
-	s, err := Open(t.TempDir() + "/rt.db")
+	s, err := OpenSQLite(t.TempDir() + "/rt.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestJournalRoundTrip(t *testing.T) {
 	}
 
 	// Count via the ops helper: both directions share msg-1.
-	if n, err := s.journalRowCount(ctx); err != nil || n != 2 {
+	if n, err := s.JournalRowCount(ctx); err != nil || n != 2 {
 		t.Fatalf("count: %d %v", n, err)
 	}
 }
@@ -82,7 +82,7 @@ func TestJournalPrune(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("pruned: %d", n)
 	}
-	if n, err := s.journalRowCount(ctx); err != nil || n != 1 {
+	if n, err := s.JournalRowCount(ctx); err != nil || n != 1 {
 		t.Fatalf("remaining: %d %v", n, err)
 	}
 }

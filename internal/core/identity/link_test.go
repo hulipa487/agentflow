@@ -1,6 +1,7 @@
 package identity
 
 import (
+	"context"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -58,7 +59,7 @@ func TestTokenIsStoredHashed(t *testing.T) {
 	tok, _ := r.IssueToken(p.UserID)
 
 	var n int
-	if err := r.db.QueryRow(`SELECT COUNT(*) FROM user_tokens WHERE token_hash = ?`, tok).Scan(&n); err != nil {
+	if err := r.st.QueryRow(context.Background(), `SELECT COUNT(*) FROM user_tokens WHERE token_hash = ?`, tok).Scan(&n); err != nil {
 		t.Fatalf("query: %v", err)
 	}
 	if n != 0 {
@@ -130,7 +131,7 @@ func TestLinkCodeExpiresAndNeedsAKnownHandle(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 	// Age the challenge past its expiry.
-	if _, err := r.db.Exec(`UPDATE link_challenges SET expires_at = ? WHERE code_hash = ?`,
+	if _, err := r.st.Exec(context.Background(), `UPDATE link_challenges SET expires_at = ? WHERE code_hash = ?`,
 		time.Now().Add(-time.Minute).Unix(), hashSecret(code)); err != nil {
 		t.Fatalf("age: %v", err)
 	}
@@ -196,7 +197,7 @@ func TestExpiredInviteIsRejectedAndPruned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
-	if _, err := r.db.Exec(`UPDATE invites SET expires_at = ? WHERE code_hash = ?`,
+	if _, err := r.st.Exec(context.Background(), `UPDATE invites SET expires_at = ? WHERE code_hash = ?`,
 		time.Now().Add(-time.Minute).Unix(), hashSecret(code)); err != nil {
 		t.Fatalf("age: %v", err)
 	}
@@ -211,7 +212,7 @@ func TestExpiredInviteIsRejectedAndPruned(t *testing.T) {
 	}
 	defer r2.Close()
 	var n int
-	if err := r2.db.QueryRow(`SELECT COUNT(*) FROM invites`).Scan(&n); err != nil {
+	if err := r2.st.QueryRow(context.Background(), `SELECT COUNT(*) FROM invites`).Scan(&n); err != nil {
 		t.Fatalf("count: %v", err)
 	}
 	if n != 0 {

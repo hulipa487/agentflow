@@ -7,9 +7,9 @@ import (
 	"testing"
 )
 
-func journalStore(t *testing.T) *Store {
+func journalStore(t *testing.T) Store {
 	t.Helper()
-	s, err := Open(filepath.Join(t.TempDir(), "runtime.db"))
+	s, err := OpenSQLite(filepath.Join(t.TempDir(), "runtime.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -17,7 +17,7 @@ func journalStore(t *testing.T) *Store {
 	return s
 }
 
-func record(t *testing.T, s *Store, e JournalEntry) {
+func record(t *testing.T, s Store, e JournalEntry) {
 	t.Helper()
 	if err := s.RecordMessage(context.Background(), e); err != nil {
 		t.Fatalf("record: %v", err)
@@ -115,7 +115,7 @@ func TestJournalMigratesAnExistingTable(t *testing.T) {
 		t.Fatalf("close raw: %v", err)
 	}
 
-	s, err := Open(path)
+	s, err := OpenSQLite(path)
 	if err != nil {
 		t.Fatalf("open after migration: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestJournalMigratesAnExistingTable(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	s2, err := Open(path)
+	s2, err := OpenSQLite(path)
 	if err != nil {
 		t.Fatalf("second open: %v", err)
 	}

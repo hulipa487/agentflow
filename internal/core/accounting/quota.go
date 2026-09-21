@@ -22,7 +22,7 @@ var ErrQuotaExhausted = errors.New("user quota exhausted")
 
 // Quota bounds how many billable tokens a user may spend per UTC day.
 type Quota struct {
-	ledger *runtime.Store
+	ledger runtime.Store
 	// limit resolves a profile's own daily limit (0 = no override). It is a
 	// function rather than a profile-store dependency so this package stays
 	// clear of the identity and router packages, which the caps package — its
@@ -38,7 +38,7 @@ type Quota struct {
 
 // New builds a quota check over the ledger. limitFn may be nil, in which case
 // every user falls back to defaultPerDay.
-func New(ledger *runtime.Store, limitFn func(userID string) (int64, error), defaultPerDay int64) *Quota {
+func New(ledger runtime.Store, limitFn func(userID string) (int64, error), defaultPerDay int64) *Quota {
 	return &Quota{
 		ledger:   ledger,
 		limit:    limitFn,

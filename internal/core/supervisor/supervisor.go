@@ -137,10 +137,34 @@ func (s *Supervisor) Start(ctx context.Context) { s.ctx = ctx }
 // spawn at boot without waiting for external traffic. Call after Start, once
 // channels are registered so a boot-turn reply has somewhere to go. Delivery
 // errors are logged, never fatal.
-func (s *Supervisor) BootPersistent() {
+//
+// In a fleet each daemon is booted by one instance. A daemon is one session,
+// and one conversation must not exist twice: the instance that claims the
+// session owns it — it renews the claim like any other session, receives its
+// traffic, and hands it over when it dies. The others skip it, which is why a
+// daemon's boot turn runs once per fleet boot rather than once per instance; a
+// takeover resumes the session without re-running it, because the boot turn is
+// a startup instruction and the conversation is in the memory backend.
+func (s *Supervisor) BootPersistent(ctx context.Context) {
 	for name, def := range s.defs {
 		if !def.Persistent || def.SpawnTemplate != nil {
 			continue
+		}
+		if s.hub != nil {
+			// The session key format is the one DeliverLocal builds below, and
+			// the one the hub keys its leases by: sessionhub.SessionKey.
+			claimed, err := s.hub.Claim(ctx, name+"|"+daemonKey)
+			if err != nil {
+				// A store that cannot answer is a store that cannot arbitrate.
+				// Starting the daemon anyway would risk a second copy of the
+				// conversation, so it is left to whoever can claim it.
+				s.log.Warn("persistent agent not booted: session claim failed", "agent", name, "err", err)
+				continue
+			}
+			if !claimed {
+				s.log.Info("persistent agent runs on another instance", "agent", name)
+				continue
+			}
 		}
 		msg := session.Message{
 			ID:   "boot:" + name,
@@ -152,13 +176,16 @@ func (s *Supervisor) BootPersistent() {
 				Principal: "system:supervisor",
 			},
 		}
-		if err := s.DeliverLocal(name, "boot", msg); err != nil {
+		if err := s.DeliverLocal(name, daemonKey, msg); err != nil {
 			s.log.Warn("persistent agent boot failed", "agent", name, "err", err)
 			continue
 		}
 		s.log.Info("persistent agent booted", "agent", name)
 	}
 }
+
+// daemonKey is the session key a daemon agent's boot turn is delivered to.
+const daemonKey = "boot"
 
 // Agents returns the agent definitions (the reload watcher reads these).
 func (s *Supervisor) Agents() map[string]*AgentDef { return s.defs }
@@ -170,6 +197,12 @@ func (s *Supervisor) Agents() map[string]*AgentDef { return s.defs }
 // a second copy of the conversation.
 type SessionRouter interface {
 	Route(ctx context.Context, agent, key string, msg session.Message) error
+	// Claim takes ownership of a session for this instance, reporting whether
+	// it now owns it, and keeps owning it until it is released. It is asked
+	// before work that must happen exactly once per session in the deployment —
+	// see BootPersistent — so a router that cannot answer must return an error
+	// rather than a hopeful true.
+	Claim(ctx context.Context, sessKey string) (bool, error)
 }
 
 // SetHub installs the router that decides whether a delivered message is this

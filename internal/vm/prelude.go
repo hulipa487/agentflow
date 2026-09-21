@@ -189,6 +189,25 @@ af = { op = op }
 
 session = {}
 function session.inbox() return op({ type = "inbox" }) end
+-- session.state is a small durable key/value store for this session alone: a
+-- cursor, a step count, the last thing said. It survives a restart, and in a
+-- fleet it follows the session to whichever instance owns it next. Needs the
+-- session.state capability. Keys may contain letters, digits and . _ - :
+-- (128 chars); values are any JSON-encodable Lua value, up to 64 KiB, and 256
+-- keys per session. get returns nil for a key that was never set.
+session.state = {}
+function session.state.set(key, value)
+  return op({ type = "session.state.set", key = key, value = value })
+end
+function session.state.get(key)
+  return op({ type = "session.state.get", key = key })
+end
+function session.state.delete(key)
+  return op({ type = "session.state.delete", key = key })
+end
+function session.state.list()
+  return op({ type = "session.state.list" })
+end
 -- session.send(text, opts?) replies to the active inbound message. opts may
 -- carry attachments = array of part tables ({type="image", mime=..., handle=...})
 -- — typically msg.attachments forwarded from the inbound message. Channels
@@ -231,6 +250,16 @@ time = {}
 function time.sleep(seconds) op({ type = "sleep", seconds = seconds }) end
 
 agent = {}
+-- agent.info() -> this session's own identity: name, session_id, address,
+-- model, instructions, history_budget, memory bindings, shell, skills and
+-- capabilities. Two fields follow the *person* being served rather than the
+-- agent: a profile may name a model and may add a layer of instructions, and
+-- when it does, model is that model (with agent_model carrying what the agent
+-- would otherwise have used) and instructions is the agent's instructions with
+-- the person's layer appended as its own paragraph — instructions_append
+-- carries that layer alone. A loop that reads these two fields honours a
+-- per-user override without knowing it exists; one that wants to branch on the
+-- preference can read agent_model and instructions_append.
 function agent.info()
   return op({ type = "agent.info" })
 end

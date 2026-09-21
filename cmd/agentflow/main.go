@@ -295,6 +295,14 @@ func main() {
 	defer leaseMgr.Close()
 	log.Info("instance identity", "owner", leaseMgr.Owner())
 
+	// Shell handle registry. A handle is a resource out on a host — a container
+	// the session can reach from any instance — not a structure in this process,
+	// so it is recorded where the fleet can see it: that is what lets the
+	// instance that takes a session over adopt the shell the session was using,
+	// and what lets a handle whose instance was killed be reclaimed rather than
+	// living on the host forever.
+	shellMgr.SetRegistry(caps.ShellStore{Store: rtStore}, leaseMgr.Owner())
+
 	// singleton runs fn only while this instance holds the named lease. A store
 	// that cannot answer is a store that cannot arbitrate: the work is skipped
 	// rather than run by everyone.
@@ -943,6 +951,37 @@ func main() {
 	hub := sessionhub.New(leaseMgr, hubQueue, sup.DeliverLocal, log)
 	sup.SetHub(hub)
 	go hub.Drain(ctx)
+
+	// Shell handle reclaim. A session that ends reaps its own shells, but an
+	// instance that is killed never runs that, and its containers would stay on
+	// the host for good. One instance per deployment sweeps for them: a handle
+	// whose session is alive nowhere, and which no live session has used for the
+	// grace window, is released. A handle whose session is alive is left alone —
+	// and has its clock refreshed, which is what makes the window a grace period
+	// for a failover rather than a countdown from creation.
+	reclaim := func() {
+		n, err := shellMgr.Sweep(ctx, shell.ReclaimGrace, hub.Live)
+		if err != nil {
+			log.Warn("shell reclaim failed", "err", err)
+			return
+		}
+		if n > 0 {
+			log.Info("shell handles reclaimed", "handles", n)
+		}
+	}
+	singleton(ctx, "shell-reclaim", reclaim)
+	go func() {
+		tick := time.NewTicker(shell.ReclaimInterval)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				singleton(ctx, "shell-reclaim", reclaim)
+			}
+		}
+	}()
 
 	// Token ledger retention: the daily rollup and (when enabled) the per-call
 	// detail log age out on a daily tick, like the journal. One instance does it:

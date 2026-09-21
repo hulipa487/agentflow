@@ -153,6 +153,45 @@ func TestConcurrentContendersProduceOneWinner(t *testing.T) {
 
 // An owner string has to be unique per process: two instances that believe they
 // are one would renew each other's leases and both run the singleton work.
+// Held answers "is this work still someone's?" from the store, which is the
+// only place the question has an answer: the holder may be a peer. A reclaim
+// pass deletes another instance's resources on the strength of it, so what it
+// reads has to be the deployment's view rather than this process's.
+func TestHeldIsTheDeploymentsView(t *testing.T) {
+	a, b := twoManagers(t)
+	ctx := context.Background()
+
+	if held, err := b.Held(ctx, "shell-reclaim"); err != nil || held {
+		t.Fatalf("a free lease reads as held: held=%v err=%v", held, err)
+	}
+	if _, err := a.Acquire(ctx, "shell-reclaim"); err != nil {
+		t.Fatal(err)
+	}
+	// b has never held it, and still sees it as held — the whole point.
+	if held, err := b.Held(ctx, "shell-reclaim"); err != nil || !held {
+		t.Fatalf("a peer's lease must read as held: held=%v err=%v", held, err)
+	}
+	// A holder that stopped renewing is gone, and the lease reads as free.
+	expire(t, a, "shell-reclaim")
+	if held, err := b.Held(ctx, "shell-reclaim"); err != nil || held {
+		t.Fatalf("an expired lease must read as free: held=%v err=%v", held, err)
+	}
+	// A release is immediate rather than eventual.
+	if _, err := a.Acquire(ctx, "shell-reclaim"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Release(ctx, "shell-reclaim"); err != nil {
+		t.Fatal(err)
+	}
+	if held, err := b.Held(ctx, "shell-reclaim"); err != nil || held {
+		t.Fatalf("a released lease reads as held: held=%v err=%v", held, err)
+	}
+	// A name that was never leased is free, not an error.
+	if held, err := b.Held(ctx, "never-leased"); err != nil || held {
+		t.Fatalf("unknown lease: held=%v err=%v", held, err)
+	}
+}
+
 func TestOwnerIDIsUniquePerProcess(t *testing.T) {
 	seen := map[string]bool{}
 	for i := 0; i < 100; i++ {

@@ -402,6 +402,16 @@ func (r *Registry) refresh(id Identity, replyTo string, profile map[string]any) 
 	}
 	now := time.Now().Unix()
 	username, name := profileStrings(profile)
+	// An inbound that carries no profile fields is not evidence that the handle
+	// has none: a webhook, a bare channel update, or the same person's message
+	// arriving at a *different instance* all resolve with nothing to add. Keep
+	// what is known rather than blanking it.
+	if username == "" {
+		username = id.Username
+	}
+	if name == "" {
+		name = id.Name
+	}
 	changed := replyTo != id.ReplyTo || username != id.Username || name != id.Name
 	if !changed && now-id.LastSeen < int64(lastSeenInterval.Seconds()) {
 		return

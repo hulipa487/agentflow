@@ -440,6 +440,46 @@ func TestRefreshThrottlesLastSeen(t *testing.T) {
 	}
 }
 
+// An inbound that carries no profile fields must not erase what is already
+// known about a handle. A webhook, a bare channel update, and the same person's
+// message arriving at another instance all resolve with nothing to add — a
+// registry that wrote those blanks back would forget a handle's name the first
+// time it was heard from on a different path. (Found by the Postgres run: two
+// instances, same handle, the second resolving without profile data.)
+func TestAbsentProfileFieldsDoNotEraseKnownOnes(t *testing.T) {
+	r := newTestRegistry(t)
+	if _, err := r.Resolve("telegram", "tg:30", "chat",
+		map[string]any{"username": "oscar", "name": "Oscar W"}); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if _, err := r.Resolve("telegram", "tg:30", "chat-moved", nil); err != nil {
+		t.Fatalf("resolve without profile data: %v", err)
+	}
+	id, ok, err := r.lookupIdentity("tg:30")
+	if err != nil || !ok {
+		t.Fatalf("lookup: ok=%v err=%v", ok, err)
+	}
+	if id.Username != "oscar" || id.Name != "Oscar W" {
+		t.Fatalf("known profile fields were erased: %+v", id)
+	}
+	if id.ReplyTo != "chat-moved" {
+		t.Fatalf("the delivery target must still move, got %q", id.ReplyTo)
+	}
+	// A channel that reports a *new* username does update it, and the field it
+	// says nothing about is left alone.
+	if _, err := r.Resolve("telegram", "tg:30", "chat-moved",
+		map[string]any{"username": "oscar2"}); err != nil {
+		t.Fatalf("resolve with a new username: %v", err)
+	}
+	id, _, _ = r.lookupIdentity("tg:30")
+	if id.Username != "oscar2" {
+		t.Fatalf("a changed username must be recorded, got %q", id.Username)
+	}
+	if id.Name != "Oscar W" {
+		t.Fatalf("an absent name must be left alone, got %q", id.Name)
+	}
+}
+
 func countRows(t *testing.T, r *Registry, query string, args ...any) int {
 	t.Helper()
 	var n int

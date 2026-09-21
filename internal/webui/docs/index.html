@@ -27,6 +27,7 @@
     <li><a href="#summary" class="nav-link">Project Summary</a></li>
     <li><a href="#install" class="nav-link">Install Guide</a></li>
     <li><a href="#architecture" class="nav-link">Architecture</a></li>
+    <li><a href="#deploy" class="nav-link">Deployment</a></li>
     <li><a href="#quickstart" class="nav-link">Quick Start</a></li>
     <li><a href="#config" class="nav-link">Configuration Guide</a></li>
     <li><a href="#config-ref" class="nav-link">Full Config Reference</a></li>
@@ -275,6 +276,72 @@ project launch: user ──► main ──[directive: start_project]──► ag
       <tr><td>safety</td><td>Guard</td><td>Core-owned, runs on ingress and egress regardless of the loop handler. Cannot be uninstalled from Lua.</td></tr>
     </tbody>
   </table>
+</section>
+
+<section id="deploy" class="section">
+  <h2>Deployment: one file to a fleet</h2>
+  <p>The engine runs from a single SQLite file on one machine to several instances behind a load balancer, and the change between those is the persistence target — not a different binary, and not a different config shape. Everything below is one ladder: each rung adds a dependency and buys a guarantee, and the rung below keeps working.</p>
+
+  <h3>Tier 0 — one instance, one file</h3>
+  <p>The default. <code>runtime.persistence: sqlite://./data/agentflow.db</code> (or nothing at all) gives you the journal, the file store's metadata, the token ledger, the identity registry, the credential store, the lease table and the session inbox, each in a local file beside the runtime database. Nothing to install, nothing to reach over a network, and every guarantee the engine makes about a single instance holds: the audit trail is complete, quotas are enforced from a ledger that survives a restart, and scheduled work fires.</p>
+  <p>With a self-hosted model (Ollama, vLLM, llama.cpp behind an OpenAI-compatible endpoint) this tier needs no third-party service at all.</p>
+
+  <h3>Tier 1 — a fleet sharing one store</h3>
+  <p>Point <code>runtime.persistence</code> at a PostgreSQL DSN and the stores follow it:</p>
+  <pre><code>runtime:
+  persistence: postgres://agentflow:${PG_PASSWORD}@db.internal:5432/agentflow?sslmode=require</code></pre>
+  <p>That one line shares the runtime store, the identity registry and the credential store. Each has an explicit override (<code>runtime.identity.persistence</code>, <code>runtime.credentials.path</code>) for the deliberate case — a shared identity registry with per-instance journals is legal, and the engine warns at boot when the two disagree, because it is usually a mistake.</p>
+  <table>
+    <thead><tr><th>State</th><th>Where it lives at Tier 1</th><th>Why it has to be shared</th></tr></thead>
+    <tbody>
+      <tr><td>Message journal</td><td><code>message_journal</code></td><td>The audit trail is only an audit trail if it covers the whole deployment.</td></tr>
+      <tr><td>File store metadata</td><td><code>files_meta</code> (blobs stay in media storage)</td><td>A commit made on one instance has to be readable on the next.</td></tr>
+      <tr><td>Token ledger</td><td><code>usage_daily</code> / <code>usage_events</code></td><td>Quotas and agent budgets are measured against it from every instance.</td></tr>
+      <tr><td>Profiles and identities</td><td><code>profiles</code>, <code>identities</code>, <code>user_tokens</code></td><td>One handle must resolve to one user scope everywhere, or a person's files and memory split in half.</td></tr>
+      <tr><td>Credentials</td><td><code>credentials</code></td><td>A key added through one console resolves on every instance.</td></tr>
+      <tr><td>Singleton leases</td><td><code>leases</code></td><td>What makes the work below run once per deployment rather than once per instance.</td></tr>
+      <tr><td>Session inbox</td><td><code>session_inbox</code></td><td>Messages for a session that runs elsewhere wait here instead of starting a second copy of the conversation.</td></tr>
+    </tbody>
+  </table>
+  <p>Each store opens its own schema on boot, from the same statements, so a new table or index appears on the next start without a migration step. Stores on one DSN share a connection pool (ten connections per instance), which is the number that matters when a fleet multiplies it by its instance count.</p>
+
+  <h3>Tier 2 — shared memory for durable conversations</h3>
+  <p>A session's conversation is not held in the actor: the default loop recalls it from the memory backend (<code>memory.recall</code>) and writes each turn back. That is what makes a conversation survive a failover — provided the backend is shared. Redis, PostgreSQL, Qdrant and MongoDB backends are all shared by construction; a per-instance SQLite or volatile backend gives each instance its own view of the conversation, and a takeover starts from an empty history.</p>
+  <p>So the fleet configuration pairs Tier 1 with a shared memory backend:</p>
+  <pre><code>memory:
+  backends:
+    vec: { type: qdrant, url: http://qdrant.internal:6333, api_key: ${QDRANT_KEY} }
+    hot: { type: redis, url: redis://redis.internal:6379 }</code></pre>
+
+  <h3>What multi-active guarantees</h3>
+  <table>
+    <thead><tr><th>Guarantee</th><th>Mechanism</th><th>Limit worth knowing</th></tr></thead>
+    <tbody>
+      <tr><td>One conversation runs in one place</td><td>A <code>session:&lt;agent|key&gt;</code> lease; an instance that cannot take it queues the message instead of delivering it</td><td>A lease outlives a hard-killed holder by its TTL (30s by default), and a graceful shutdown releases it immediately</td></tr>
+      <tr><td>Every message reaches its session</td><td>The shared inbox, drained by the owner, ordered by enqueue time</td><td>At-least-once: a crash between delivery and acknowledgement redelivers. A repost of the same message id from the same instance is one row</td></tr>
+      <tr><td>A takeover carries the backlog</td><td>Undelivered rows stay claimable; the new owner drains them</td><td>An in-flight turn is lost and re-delivered, so a loop may see a message twice</td></tr>
+      <tr><td>A scheduled trigger fires once</td><td>A <code>trigger:&lt;name&gt;</code> lease, claimed for the trigger's own interval</td><td>A killed holder stalls its trigger until the claim expires (one interval plus a margin)</td></tr>
+      <tr><td>Housekeeping runs once</td><td><code>files-gc</code>, <code>files-scratch</code>, <code>journal-prune</code>, <code>usage-prune</code> leases</td><td>A sweep that outlives its lease can overlap another instance's</td></tr>
+      <tr><td>Budgets hold in aggregate</td><td>A daily agent budget reads the ledger rather than its own counter (refreshed at most every 15s)</td><td>Overshoot is bounded by what the fleet spends in one refresh interval, not by the instance count. Rolling-window budgets stay per-instance</td></tr>
+      <tr><td>Per-user quotas hold</td><td>The ledger, with in-flight holds, from the first version</td><td>None: it was never in-process</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Invariants a deployment has to keep</h3>
+  <ul>
+    <li><strong>Route handlers are stateless.</strong> The router is one Luau state per process, and whichever instance receives an inbound runs it. A route that keeps per-chat state in Lua gives each instance a different answer. Sessions are the place for state that must persist; the router's job is to decide where a message goes.</li>
+    <li><strong><code>ADMIN_TOKEN</code> is set explicitly.</strong> Otherwise every instance mints its own console token at boot, and each console rejects the others'. The engine says so at boot.</li>
+    <li><strong>Message ids are unique per instance, not per fleet.</strong> Channel drivers often number their own messages (<code>wh-1</code>). The inbox qualifies them by the instance that accepted them, so nothing is lost — but an audit lookup on the journal by id alone can match two instances' rows. Treat the id as a per-instance key when querying.</li>
+    <li><strong>Compare config epochs.</strong> <code>/admin/api/state</code> reports <code>config_epoch</code>: a short hash of the configuration fragments as written. Two instances disagreeing means one is running a different deployment, and a rotated secret does not move it (it hashes what was written, not what was resolved).</li>
+  </ul>
+
+  <h3>Geo-clusters</h3>
+  <p>The store is the sync point, so a geo-cluster is a question about the store, not about the engine. What follows is the shape that works today and the part that is still open.</p>
+  <ul>
+    <li><strong>One shared store per region, with sessions pinned to the region that owns them.</strong> A session lease makes a conversation single-writer, which is what keeps it consistent — and it also means a session's traffic should reach its region rather than crossing the world for every turn. Route by user (or by channel) at the edge so a person's traffic lands where their session lives.</li>
+    <li><strong>A cross-region takeover is a lease handover.</strong> It works — the backlog comes with it — but every turn pays the round trip to the store after that. Treat a region failover as a deliberate move, not a load-balancing decision.</li>
+    <li><strong>The append-heavy plane wants a wide-column store.</strong> The journal and the usage ledger are append-mostly, keyed by time, and pruned by age — the natural fit for Cassandra/ScyllaDB, Redis for the hot leases, and a vector store for retrieval. The engine's SQL stores are behind interfaces (<code>storedb</code> for the statement dialect, and per-store schemas) precisely so a backend like that can be added without touching the code above it; writing that backend is the remaining work, and the ledger's aggregate semantics (sums, folds, one row per user/day/agent/model) are the constraint that rules out a bare counter store.</li>
+  </ul>
 </section>
 
 <section id="quickstart" class="section">

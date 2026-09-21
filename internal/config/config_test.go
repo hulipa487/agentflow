@@ -382,6 +382,63 @@ func TestValidateFiles(t *testing.T) {
 	}
 }
 
+// TestValidateUsers exercises the users-API rules: the profile store lives in
+// the identity layer, registration mode is a closed vocabulary, and the link
+// TTL must parse.
+func TestValidateUsers(t *testing.T) {
+	no := false
+	tests := []struct {
+		name    string
+		users   UsersConfig
+		ident   bool
+		wantErr string
+	}{
+		{name: "defaults ok"},
+		{
+			name:    "enabled requires the identity layer",
+			users:   UsersConfig{Enabled: true},
+			wantErr: "requires runtime.identity.enabled",
+		},
+		{name: "enabled with identity ok", users: UsersConfig{Enabled: true}, ident: true},
+		{name: "invite mode ok", users: UsersConfig{Enabled: true, Registration: "invite"}, ident: true},
+		{
+			name:    "unknown registration mode",
+			users:   UsersConfig{Registration: "closed"},
+			wantErr: "registration must be open or invite",
+		},
+		{
+			name:    "malformed link ttl",
+			users:   UsersConfig{LinkTTL: "soon"},
+			wantErr: "runtime.users.link_ttl",
+		},
+		{name: "link ttl ok", users: UsersConfig{LinkTTL: "15m"}},
+		{name: "auto-claim opt-out ok", users: UsersConfig{RequireRegistration: &no}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Config{Agents: map[string]Agent{"bot": {Loop: "./loop.lua"}}}
+			c.Runtime.Users = tt.users
+			c.Runtime.Identity.Enabled = tt.ident
+			err := validate("cfg.yaml", c)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("expected error containing %q, got: %v", tt.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected no error, got: %v", err)
+			}
+		})
+	}
+	// Defaults: registration required, open mode, 10m challenge lifetime.
+	u := UsersConfig{}
+	if !u.RegistrationRequired() || u.RegistrationMode() != "open" || u.LinkChallengeTTL() != 10*time.Minute {
+		t.Fatalf("users defaults: required=%v mode=%q ttl=%v",
+			u.RegistrationRequired(), u.RegistrationMode(), u.LinkChallengeTTL())
+	}
+}
+
 // TestValidateLegalSearch exercises the legal-search engine rules: only hklii
 // is supported (no key), and default resolution.
 func TestValidateLegalSearch(t *testing.T) {

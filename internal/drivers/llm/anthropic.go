@@ -124,12 +124,16 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 					PartialJSON string `json:"partial_json"`
 				} `json:"delta"`
 				Usage struct {
-					InputTokens  int `json:"input_tokens"`
-					OutputTokens int `json:"output_tokens"`
+					InputTokens              int `json:"input_tokens"`
+					OutputTokens             int `json:"output_tokens"`
+					CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+					CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 				} `json:"usage"`
 				Message struct {
 					Usage struct {
-						InputTokens int `json:"input_tokens"`
+						InputTokens              int `json:"input_tokens"`
+						CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+						CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 					} `json:"usage"`
 				} `json:"message"`
 			}
@@ -139,6 +143,8 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 			switch ev.Type {
 			case "message_start":
 				usage.Input = ev.Message.Usage.InputTokens
+				usage.Cached = ev.Message.Usage.CacheReadInputTokens
+				usage.CacheWrite = ev.Message.Usage.CacheCreationInputTokens
 			case "content_block_start":
 				if ev.ContentBlock == nil {
 					continue
@@ -176,6 +182,14 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 				}
 			case "message_delta":
 				usage.Output = ev.Usage.OutputTokens
+				// Some deployments report the cache split here instead of (or
+				// as well as) message_start; a zero never overwrites a value.
+				if ev.Usage.CacheReadInputTokens > 0 {
+					usage.Cached = ev.Usage.CacheReadInputTokens
+				}
+				if ev.Usage.CacheCreationInputTokens > 0 {
+					usage.CacheWrite = ev.Usage.CacheCreationInputTokens
+				}
 			case "error":
 				events <- event{err: fmt.Errorf("anthropic stream error: %s", data)}
 				return

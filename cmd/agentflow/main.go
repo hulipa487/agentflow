@@ -26,6 +26,7 @@ import (
 	"agentflow/internal/builtins"
 
 	"agentflow/internal/config"
+	"agentflow/internal/core/accounting"
 	"agentflow/internal/core/budget"
 	"agentflow/internal/core/caps"
 	"agentflow/internal/core/credentials"
@@ -46,6 +47,7 @@ import (
 	"agentflow/internal/core/supervisor"
 	"agentflow/internal/core/tools"
 	"agentflow/internal/core/triggers"
+	"agentflow/internal/core/users"
 	"agentflow/internal/drivers/browser"
 	"agentflow/internal/drivers/fetch"
 	"agentflow/internal/drivers/ghhook"
@@ -247,6 +249,35 @@ func main() {
 	if err != nil {
 		log.Error("runtime store failed", "err", err)
 		os.Exit(1)
+	}
+	// Per-call token detail in the ledger (the daily rollup is always written).
+	usageEvents := cfg.Usage.UsageEvents()
+
+	// Identity registry (opt-in). Opened here rather than with the rest of the
+	// identity wiring below, because the per-user quota the LLM handlers
+	// enforce resolves its limits from profiles.
+	var identReg *identity.Registry
+	if cfg.Runtime.Identity.Enabled {
+		idPath := cfg.IdentityPath()
+		if dir := filepath.Dir(idPath); dir != "" && dir != "." {
+			_ = os.MkdirAll(dir, 0750)
+		}
+		identReg, err = identity.Open(idPath, log)
+		if err != nil {
+			log.Error("identity registry failed", "err", err)
+			os.Exit(1)
+		}
+		// An unlinked handle carries no personal scope unless the deployment
+		// opts back into claiming a profile on first contact.
+		identReg.SetAutoClaim(!cfg.Runtime.Users.RegistrationRequired())
+	}
+
+	// Per-user token quota: durable (read from the ledger, so a restart
+	// forgives nothing) and only meaningful for a linked handle — traffic with
+	// no profile has no account to charge.
+	var userQuota *accounting.Quota
+	if identReg != nil {
+		userQuota = accounting.New(rtStore, identReg.LimitFor, cfg.Usage.DefaultTokensPerDay)
 	}
 
 	// User-scoped file store: same blob-store family as media (fs or S3),
@@ -452,11 +483,12 @@ func main() {
 		handlers := map[string]session.OpHandler{}
 		enforce := cfg.Plugins.EnforceCaps()
 		var withheld []string
-		// Budget metering: if the agent declares tokens_per_day, wrap LLM
-		// handlers with reserve/commit/release.
-		llmHandlers := caps.LLMHandlers(llmMgr, mediaStore)
+		// LLM handlers are always metered, so every call reaches the per-user
+		// ledger; a declared tokens_per_day additionally turns the pool into a
+		// hard budget enforced before the call.
+		var pool *budget.Pool
 		if tokensPerDay := budgetTokens(a); tokensPerDay > 0 {
-			pool := budget.NewPool(tokensPerDay)
+			pool = budget.NewPool(tokensPerDay)
 			if w := budgetWindow(a); w > 0 {
 				// Rolling-window budget: usage drains continuously as commits age
 				// out, so there is no midnight cliff. Skip the daily reset.
@@ -464,8 +496,15 @@ func main() {
 			} else {
 				pool.StartDailyReset()
 			}
-			llmHandlers = caps.MeteredLLMHandlers(llmMgr, mediaStore, pool)
 		}
+		llmHandlers := caps.MeteredLLMHandlers(llmMgr, mediaStore, caps.Metering{
+			Pool:   pool,
+			Quota:  userQuota,
+			Agent:  name,
+			Ledger: rtStore,
+			Events: usageEvents,
+			Log:    log,
+		})
 		for k, h := range gateOps(enforce, name, effectiveCaps, "llm.chat", llmHandlers, &withheld) {
 			handlers[k] = h
 		}
@@ -590,16 +629,23 @@ func main() {
 		// spawned from it — e.g. a manager variant or worker pool gets its
 		// own budget. (Static agents each get their own pool above; drawing a
 		// profile's pool from the parent's budget is a follow-up.)
-		llmHandlers := caps.LLMHandlers(llmMgr, mediaStore)
+		var pool *budget.Pool
 		if p.Budget.TokensPerDay > 0 {
-			pool := budget.NewPool(p.Budget.TokensPerDay)
+			pool = budget.NewPool(p.Budget.TokensPerDay)
 			if w, err := time.ParseDuration(p.Budget.Window); err == nil && w > 0 {
 				pool.SetWindow(w)
 			} else {
 				pool.StartDailyReset()
 			}
-			llmHandlers = caps.MeteredLLMHandlers(llmMgr, mediaStore, pool)
 		}
+		llmHandlers := caps.MeteredLLMHandlers(llmMgr, mediaStore, caps.Metering{
+			Pool:   pool,
+			Quota:  userQuota,
+			Agent:  pname,
+			Ledger: rtStore,
+			Events: usageEvents,
+			Log:    log,
+		})
 		for k, h := range gateOps(enforce, pname, profileCaps, "llm.chat", llmHandlers, &withheld) {
 			handlers[k] = h
 		}
@@ -716,6 +762,28 @@ func main() {
 
 	sup = supervisor.New(defs, gw, opPool, shellMgr, log)
 
+	// Token ledger retention: the daily rollup and (when enabled) the per-call
+	// detail log age out on a daily tick, like the journal.
+	if days := cfg.Usage.UsageRetention(); days > 0 {
+		if err := rtStore.PruneUsage(time.Now().AddDate(0, 0, -days)); err != nil {
+			log.Warn("usage prune failed", "err", err)
+		}
+		go func() {
+			tick := time.NewTicker(24 * time.Hour)
+			defer tick.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-tick.C:
+					if err := rtStore.PruneUsage(time.Now().AddDate(0, 0, -days)); err != nil {
+						log.Warn("usage prune failed", "err", err)
+					}
+				}
+			}
+		}()
+	}
+
 	// Message journal (core-owned audit). Every inbound event is recorded at
 	// the router and every egress at the session actor; loops and channels
 	// can neither skip nor forge it. Journal errors are logged, never fatal.
@@ -751,6 +819,7 @@ func main() {
 				Channel:     rec.Channel,
 				Chat:        rec.ReplyTo,
 				Sender:      rec.ReplyTo,
+				UserUUID:    rec.UserUUID,
 				Agent:       rec.Agent,
 				SessionID:   rec.SessionID,
 				Type:        "agent",
@@ -807,6 +876,10 @@ func main() {
 			if ts == 0 {
 				ts = time.Now().Unix()
 			}
+			// The identity sink stamps the profile behind the message; an
+			// unregistered handle stamps an empty one, which is what the audit
+			// view needs to tell personal traffic from anonymous traffic.
+			userUUID, _ := msg.Payload["user_uuid"].(string)
 			if err := rtStore.RecordMessage(ctx, runtime.JournalEntry{
 				ID:          msg.ID,
 				Ts:          ts,
@@ -815,6 +888,7 @@ func main() {
 				Channel:     in.Channel,
 				Chat:        chat,
 				Sender:      msg.From,
+				UserUUID:    userUUID,
 				Agent:       in.Agent,
 				Type:        msg.Type,
 				Text:        msg.Text,
@@ -828,24 +902,24 @@ func main() {
 	go rtr.Run(ctx)
 
 	// Identity layer (opt-in). When enabled, every inbound channel event is
-	// minted a stable user UUID before the router sees it, and the supervisor
-	// gains a user resolver for session.push_user. When disabled, the sink is
-	// the router directly — unchanged behavior.
-	var identReg *identity.Registry
+	// resolved to an identity before the router sees it, and the supervisor
+	// gains a user resolver for session.push_user. The registry itself was
+	// opened earlier (the quota needs it); this wires the sink. When disabled,
+	// the sink is the router directly — unchanged behavior.
 	var sink router.Sink = rtr
-	if cfg.Runtime.Identity.Enabled {
-		idPath := cfg.IdentityPath()
-		if dir := filepath.Dir(idPath); dir != "" && dir != "." {
-			_ = os.MkdirAll(dir, 0750)
-		}
-		identReg, err = identity.Open(idPath, log)
-		if err != nil {
-			log.Error("identity registry failed", "err", err)
-			os.Exit(1)
-		}
-		sink = identity.NewSink(rtr, identReg, log)
+	if identReg != nil {
+		sc := identity.NewSink(rtr, identReg, log)
+		// A link attempt is answered where the user made it: the sink sends
+		// the confirmation in-channel through the same gateway replies use.
+		sc.SetReply(func(channel, replyTo, text string) {
+			if err := gw.Send(channel, replyTo, text, nil); err != nil {
+				log.Warn("identity reply failed", "channel", channel, "err", err)
+			}
+		})
+		sink = sc
 		sup.SetUserResolver(identReg)
-		log.Info("identity layer enabled", "db", idPath)
+		log.Info("identity layer enabled", "db", cfg.IdentityPath(),
+			"require_registration", cfg.Runtime.Users.RegistrationRequired())
 	}
 
 	// Channels. All HTTP channels (webhook, ghhook, telegram-webhook/auto)
@@ -864,6 +938,21 @@ func main() {
 
 	httpdLog := log.With("module", "httpd")
 	httpSrv := httpd.New(cfg.Gateway.Listen, httpdLog)
+
+	// User-facing profile API (opt-in): registration and channel linking on
+	// the same public listener the HTTP channels attach to. Off by default —
+	// the surface is public, so opening it is a deliberate act.
+	if cfg.Runtime.Users.Enabled {
+		if identReg == nil {
+			// Config validation already rejects this pairing; the check stays
+			// so a future refactor cannot mount a dead endpoint.
+			log.Error("users API requires runtime.identity.enabled")
+			os.Exit(1)
+		}
+		httpSrv.Handle(users.Prefix+"/", users.New(identReg, cfg.Runtime.Users, log).Handler().ServeHTTP)
+		log.Info("user API enabled", "prefix", users.Prefix,
+			"registration", cfg.Runtime.Users.RegistrationMode())
+	}
 	var telegramDrivers []*telegram.Driver
 	for i, ch := range cfg.Gateway.Channels {
 		name := ch.Name

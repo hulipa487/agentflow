@@ -5,11 +5,16 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
+	"sync"
 
+	"agentflow/internal/core/accounting"
 	"agentflow/internal/core/budget"
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/metrics"
+	"agentflow/internal/core/runtime"
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/tools"
 	"agentflow/internal/drivers/llm"
@@ -215,14 +220,150 @@ func errString(err error) any {
 	return err.Error()
 }
 
-// MeteredLLMHandlers wraps LLMHandlers with budget reserve/commit/release.
-// Before each llm.chat call, it reserves a conservative estimate (the model's
-// MaxTokens or a default, plus a flat surcharge per media part — images and
-// PDFs cost real input tokens even before any text). After the call, it
-// commits the actual reported usage and releases unused reservation. On
-// exhaustion, the call returns a structured error instead of reaching the
-// provider.
-func MeteredLLMHandlers(m *llm.Manager, ms media.Store, pool *budget.Pool) map[string]session.OpHandler {
+// UsageRecorder receives one record per metered LLM call, for per-user
+// accounting. A nil recorder disables accounting (tests, minimal setups).
+type UsageRecorder interface {
+	RecordUsage(rec runtime.UsageRecord, withEvent bool) error
+}
+
+// Metering carries what the metered handlers need beyond the driver: the
+// agent's budget pool (nil = no budget configured, so calls are accounted but
+// not limited), the per-user quota, the attribution for the ledger, and where
+// to complain when a ledger write fails.
+type Metering struct {
+	Pool   *budget.Pool
+	Quota  *accounting.Quota
+	Agent  string
+	Ledger UsageRecorder // nil = no accounting
+	Events bool          // also write the per-call detail row
+	Log    *slog.Logger
+}
+
+// denyJSON is the structured refusal a loop receives when a limit bites, so it
+// can tell the user which wall they hit rather than reporting a provider error.
+func denyJSON(kind string, err error) string {
+	b, _ := json.Marshal(map[string]any{"ok": false, "error": kind, "detail": err.Error()})
+	return string(b)
+}
+
+// reserveQuota checks the user's daily quota before a call. It returns
+// (lease, nil) to proceed, (nil, nil) when there is no quota to enforce (no
+// quota configured, or a context with no user), and (nil, err) when the call
+// must be refused. An infrastructure failure fails open — counted and logged,
+// never silent — because an unreadable ledger must not stop the runtime.
+func (mt Metering) reserveQuota(ctx context.Context, amount int64) (*accounting.Lease, error) {
+	if mt.Quota == nil {
+		return nil, nil
+	}
+	lease, err := mt.Quota.Reserve(ctx, session.UserUUIDFromCtx(ctx), amount)
+	if err == nil {
+		return lease, nil
+	}
+	if errors.Is(err, accounting.ErrQuotaExhausted) {
+		metrics.Inc("agentflow_user_quota_denied")
+		return nil, err
+	}
+	metrics.Inc("agentflow_user_quota_unavailable")
+	if mt.Log != nil {
+		mt.Log.Warn("quota check failed; allowing the call", "err", err)
+	}
+	return nil, nil
+}
+
+func (mt Metering) releaseQuota(l *accounting.Lease) {
+	if l != nil {
+		l.Release()
+	}
+}
+
+// reserve takes a budget lease when the deployment configured one. A nil pool
+// means the call is accounted but unlimited.
+func (mt Metering) reserve(amount int64) (*budget.Lease, error) {
+	if mt.Pool == nil {
+		return nil, nil
+	}
+	return mt.Pool.Reserve(amount)
+}
+
+func (mt Metering) release(l *budget.Lease) {
+	if mt.Pool != nil && l != nil {
+		mt.Pool.Release(l)
+	}
+}
+
+func (mt Metering) commit(l *budget.Lease, actual int64) {
+	if mt.Pool != nil && l != nil {
+		_ = mt.Pool.Commit(l, actual)
+	}
+}
+
+// usageCounts mirrors the token fields of a metered reply.
+type usageCounts struct {
+	Input, Output, Cached, CacheWrite, Reasoning int
+}
+
+// replyUsage extracts provider-reported usage from a handler response.
+func replyUsage(resp string) (usageCounts, bool) {
+	var result struct {
+		Usage struct {
+			Input      int `json:"input"`
+			Output     int `json:"output"`
+			Cached     int `json:"cached"`
+			CacheWrite int `json:"cache_write"`
+			Reasoning  int `json:"reasoning"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(resp), &result); err != nil {
+		return usageCounts{}, false
+	}
+	u := usageCounts{
+		Input:      result.Usage.Input,
+		Output:     result.Usage.Output,
+		Cached:     result.Usage.Cached,
+		CacheWrite: result.Usage.CacheWrite,
+		Reasoning:  result.Usage.Reasoning,
+	}
+	return u, u.Input+u.Output > 0
+}
+
+// record writes one ledger row. Attribution comes from the context's user
+// stamp, so a channel turn is charged to its user and engine-fired work lands
+// in the shared service bucket rather than on somebody's account.
+func (mt Metering) record(ctx context.Context, op session.Op, kind string, u usageCounts, ok bool) {
+	if mt.Ledger == nil {
+		return
+	}
+	rec := runtime.UsageRecord{
+		UserID:     session.UserUUIDFromCtx(ctx),
+		Agent:      mt.Agent,
+		Model:      op.Model,
+		Kind:       kind,
+		Input:      u.Input,
+		Output:     u.Output,
+		Cached:     u.Cached,
+		CacheWrite: u.CacheWrite,
+		Reasoning:  u.Reasoning,
+		OK:         ok,
+	}
+	if err := mt.Ledger.RecordUsage(rec, mt.Events); err != nil {
+		metrics.Inc("agentflow_usage_record_failed")
+		if mt.Log != nil {
+			mt.Log.Warn("usage record failed", "err", err, "user_id", rec.UserID, "kind", kind)
+		}
+	}
+}
+
+// MeteredLLMHandlers wraps LLMHandlers with budget reserve/commit/release and
+// per-call accounting. Before each llm.chat call, it reserves a conservative
+// estimate (the model's MaxTokens or a default, plus a flat surcharge per media
+// part — images and PDFs cost real input tokens even before any text). After
+// the call, it commits the actual reported usage and releases unused
+// reservation. On exhaustion, the call returns a structured error instead of
+// reaching the provider.
+//
+// Every metered call — success or failure — reaches the ledger, so "how many
+// invocations" is answerable per user as well as "how many tokens".
+func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]session.OpHandler {
 	base := LLMHandlers(m, ms)
 	chat := base["llm.chat"]
 	metered := func(ctx context.Context, op session.Op) (string, bool) {
@@ -234,36 +375,40 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, pool *budget.Pool) map[s
 		// Media surcharge: provider-reported usage arrives after the call, but
 		// reserve up front so a media-heavy turn cannot blow past the budget.
 		estimate += int64(1600 * countMediaParts(op.Messages))
-		lease, err := pool.Reserve(estimate)
+		// The user's daily quota and the agent's budget both bound the call;
+		// whichever is hit first refuses it.
+		ql, qerr := mt.reserveQuota(ctx, estimate)
+		if qerr != nil {
+			return denyJSON("user_quota_exhausted", qerr), false
+		}
+		lease, err := mt.reserve(estimate)
 		if err != nil {
+			mt.releaseQuota(ql)
 			metrics.Inc("agentflow_budget_denied")
-			b, _ := json.Marshal(map[string]any{
-				"ok":     false,
-				"error":  "budget_exhausted",
-				"detail": err.Error(),
-			})
-			return string(b), false
+			return denyJSON("budget_exhausted", err), false
 		}
 		resp, ok := chat(ctx, op)
 		if !ok {
-			pool.Release(lease)
+			mt.release(lease)
+			mt.releaseQuota(ql)
+			// The provider failed without reporting usage: the ledger records
+			// the attempt (and its tokens stay zero).
+			mt.record(ctx, op, "chat", usageCounts{}, false)
 			return resp, false
 		}
-		// Extract usage from the response and commit.
-		var result map[string]any
+		u, haveUsage := replyUsage(resp)
 		actual := estimate
-		if err := json.Unmarshal([]byte(resp), &result); err == nil {
-			if usage, ok := result["usage"].(map[string]any); ok {
-				in, _ := usage["input"].(float64)
-				out, _ := usage["output"].(float64)
-				if in+out > 0 {
-					actual = int64(in + out)
-				}
-			}
+		if haveUsage {
+			actual = int64(u.Input + u.Output)
 		}
-		_ = pool.Commit(lease, actual)
+		mt.commit(lease, actual)
 		metrics.Inc("agentflow_llm_calls")
 		metrics.Add("agentflow_llm_tokens", actual)
+		// Ledger first, then release the quota hold: the durable record has to
+		// land before the reservation drops, or a concurrent call could read a
+		// stale (smaller) spend and over-admit.
+		mt.record(ctx, op, "chat", u, true)
+		mt.releaseQuota(ql)
 		return resp, ok
 	}
 	base["llm.chat"] = metered
@@ -283,32 +428,156 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, pool *budget.Pool) map[s
 				estimate += 2048
 			}
 		}
-		lease, err := pool.Reserve(estimate)
+		ql, qerr := mt.reserveQuota(ctx, estimate)
+		if qerr != nil {
+			return denyJSON("user_quota_exhausted", qerr), false
+		}
+		lease, err := mt.reserve(estimate)
 		if err != nil {
-			b, _ := json.Marshal(map[string]any{
-				"ok":     false,
-				"error":  "budget_exhausted",
-				"detail": err.Error(),
-			})
-			return string(b), false
+			mt.releaseQuota(ql)
+			metrics.Inc("agentflow_budget_denied")
+			return denyJSON("budget_exhausted", err), false
 		}
 		resp, ok := embed(ctx, op)
 		if !ok {
-			pool.Release(lease)
+			mt.release(lease)
+			mt.releaseQuota(ql)
+			mt.record(ctx, op, "embed", usageCounts{}, false)
 			return resp, false
 		}
-		var result map[string]any
-		if err := json.Unmarshal([]byte(resp), &result); err == nil {
-			if usage, ok := result["usage"].(map[string]any); ok {
-				if in, _ := usage["input"].(float64); in > 0 {
-					_ = pool.Commit(lease, int64(in))
-					return resp, ok
-				}
-			}
+		u, haveUsage := replyUsage(resp)
+		if haveUsage {
+			mt.commit(lease, int64(u.Input))
+		} else {
+			mt.commit(lease, estimate)
 		}
-		_ = pool.Commit(lease, estimate)
+		metrics.Inc("agentflow_llm_calls")
+		mt.record(ctx, op, "embed", u, true)
+		mt.releaseQuota(ql)
 		return resp, ok
 	}
 	base["llm.embed"] = meteredEmbed
+
+	// Streaming holds a budget and quota reservation from open to its terminal
+	// frame (or to close, if the consumer walks away), so a streaming loop is
+	// limited like a buffered one instead of slipping past the gate. Usage is
+	// only complete on the terminal frame, so the ledger records there.
+	type streamHold struct {
+		budget   *budget.Lease
+		quota    *accounting.Lease
+		estimate int64
+	}
+	var (
+		holdMu sync.Mutex
+		holds  = map[string]*streamHold{}
+	)
+	takeHold := func(id string) *streamHold {
+		holdMu.Lock()
+		defer holdMu.Unlock()
+		h := holds[id]
+		delete(holds, id)
+		return h
+	}
+
+	open := base["llm.stream.open"]
+	base["llm.stream.open"] = func(ctx context.Context, op session.Op) (string, bool) {
+		estimate := int64(op.MaxTokens)
+		if estimate <= 0 {
+			estimate = 4096
+		}
+		estimate += int64(1600 * countMediaParts(op.Messages))
+		ql, qerr := mt.reserveQuota(ctx, estimate)
+		if qerr != nil {
+			return denyJSON("user_quota_exhausted", qerr), false
+		}
+		lease, err := mt.reserve(estimate)
+		if err != nil {
+			mt.releaseQuota(ql)
+			metrics.Inc("agentflow_budget_denied")
+			return denyJSON("budget_exhausted", err), false
+		}
+		resp, ok := open(ctx, op)
+		if !ok {
+			mt.release(lease)
+			mt.releaseQuota(ql)
+			return resp, false
+		}
+		// Key the hold by the handle the caller was given.
+		var out struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal([]byte(resp), &out); err == nil && out.ID != "" {
+			holdMu.Lock()
+			holds[out.ID] = &streamHold{budget: lease, quota: ql, estimate: estimate}
+			holdMu.Unlock()
+			return resp, true
+		}
+		// No handle to key a hold on: release rather than leak the reservation.
+		mt.release(lease)
+		mt.releaseQuota(ql)
+		return resp, true
+	}
+
+	next := base["llm.stream.next"]
+	base["llm.stream.next"] = func(ctx context.Context, op session.Op) (string, bool) {
+		resp, ok := next(ctx, op)
+		if !ok {
+			return resp, ok
+		}
+		var frame struct {
+			Done  bool `json:"done"`
+			Usage struct {
+				Input      int `json:"input"`
+				Output     int `json:"output"`
+				Cached     int `json:"cached"`
+				CacheWrite int `json:"cache_write"`
+				Reasoning  int `json:"reasoning"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(resp), &frame); err != nil || !frame.Done {
+			return resp, ok
+		}
+		u := usageCounts{
+			Input:      frame.Usage.Input,
+			Output:     frame.Usage.Output,
+			Cached:     frame.Usage.Cached,
+			CacheWrite: frame.Usage.CacheWrite,
+			Reasoning:  frame.Usage.Reasoning,
+		}
+		actual := int64(u.Input + u.Output)
+		h := takeHold(op.Stream)
+		if h != nil {
+			if actual <= 0 {
+				actual = h.estimate // provider reported nothing: charge the reserve
+			}
+			mt.commit(h.budget, actual)
+		}
+		metrics.Inc("agentflow_llm_calls")
+		metrics.Add("agentflow_llm_tokens", actual)
+		mt.record(ctx, op, "stream", u, true)
+		if h != nil {
+			mt.releaseQuota(h.quota)
+		}
+		return resp, ok
+	}
+
+	closeStream := base["llm.stream.close"]
+	base["llm.stream.close"] = func(ctx context.Context, op session.Op) (string, bool) {
+		// An abandoned stream still gives its reservation back — otherwise the
+		// user's quota would stay held until the process restarted.
+		if h := takeHold(op.Stream); h != nil {
+			mt.release(h.budget)
+			mt.releaseQuota(h.quota)
+		}
+		return closeStream(ctx, op)
+	}
+
+	// Rerank reports no token usage; the invocation is what can be accounted.
+	rerank := base["llm.rerank"]
+	base["llm.rerank"] = func(ctx context.Context, op session.Op) (string, bool) {
+		resp, ok := rerank(ctx, op)
+		mt.record(ctx, op, "rerank", usageCounts{}, ok)
+		return resp, ok
+	}
 	return base
 }

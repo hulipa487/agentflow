@@ -58,7 +58,7 @@ end`
 	}
 	sup := New(defs, gw, pool.New(2), nil, log)
 	sup.Start(context.Background())
-	sup.BootPersistent()
+	sup.BootPersistent(context.Background())
 
 	if got := awaitProbe(t, recorded, "daemon boot turn"); got != "boot" {
 		t.Fatalf("daemon first message type = %q, want boot", got)

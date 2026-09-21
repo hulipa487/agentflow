@@ -1388,7 +1388,7 @@ func main() {
 	// Daemon agents (persistent: true) get a synthetic boot message so their
 	// sessions spawn now — after channels are registered, so a boot-turn reply
 	// has somewhere to go — instead of waiting for first external traffic.
-	sup.BootPersistent()
+	sup.BootPersistent(ctx)
 
 	log.Info("agentflow up", "agents", len(defs), "channels", len(cfg.Gateway.Channels))
 	<-ctx.Done()

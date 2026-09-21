@@ -263,6 +263,40 @@ func TestMessageWithoutAnIDIsRefused(t *testing.T) {
 // The session key has to be exactly what the supervisor keys its actors by, or
 // the hub and the session map would disagree about which session a message
 // belongs to.
+// A claim is what makes a daemon boot once per deployment rather than once per
+// instance: the claimant owns the session from then on — the drain renews it and
+// delivers its traffic — and a peer is told no. It is ownership, not a lock.
+func TestClaimGivesTheSessionToOneInstance(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hub.db")
+	a, aDelivered := oneInstance(t, path, "instance-a")
+	b, _ := oneInstance(t, path, "instance-b")
+	ctx := context.Background()
+
+	ok, err := a.Claim(ctx, "daemon|boot")
+	if err != nil || !ok {
+		t.Fatalf("the first claim must win: ok=%v err=%v", ok, err)
+	}
+	if ok, err := a.Claim(ctx, "daemon|boot"); err != nil || !ok {
+		t.Fatalf("the owner must be able to renew its own claim: ok=%v err=%v", ok, err)
+	}
+	if ok, err := b.Claim(ctx, "daemon|boot"); err != nil || ok {
+		t.Fatalf("a peer must not take a claimed session: ok=%v err=%v", ok, err)
+	}
+
+	// The claim shows up as ownership, so the drain renews it and picks up what
+	// is queued for the session — a peer's message reaches the owner.
+	if a.Held() != 1 {
+		t.Fatalf("a claimed session must count as held, held=%d", a.Held())
+	}
+	if err := b.Route(ctx, "daemon", "boot", session.Message{ID: "m1", Type: "user", Ts: time.Now().Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	a.drainOnce(ctx)
+	if got := aDelivered.got(); len(got) != 1 || got[0] != "m1" {
+		t.Fatalf("the owner did not drain the session it claimed: %v", got)
+	}
+}
+
 func TestSessionKeyRoundTrip(t *testing.T) {
 	key := SessionKey("bot", "telegram:42")
 	if key != "bot|telegram:42" {

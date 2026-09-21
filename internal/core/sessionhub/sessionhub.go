@@ -93,6 +93,18 @@ func (h *Hub) SetSessionTTL(d time.Duration) {
 	}
 }
 
+// Claim takes the session for this instance and keeps it: from here on the
+// drain renews the claim and delivers anything queued for it, exactly as for a
+// session this instance was routed a message for.
+//
+// It is what a boot push uses. Starting a daemon agent is local work, but
+// *which* instance runs a daemon is a fleet decision — a daemon is one session,
+// and one conversation must not exist twice. The instance that claims it owns
+// it, receives its traffic, and hands it over when it dies; the others skip it.
+func (h *Hub) Claim(ctx context.Context, sessKey string) (bool, error) {
+	return h.claim(ctx, sessKey)
+}
+
 // Held reports how many sessions this instance owns.
 func (h *Hub) Held() int {
 	h.mu.Lock()

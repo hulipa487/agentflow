@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"agentflow/internal/core/storedb"
 )
 
 type Config struct {
@@ -214,6 +216,12 @@ type Runtime struct {
 	Identity    IdentityConfig    `yaml:"identity"`
 	Users       UsersConfig       `yaml:"users"`
 	Credentials CredentialsConfig `yaml:"credentials"`
+	Cluster     ClusterConfig     `yaml:"cluster"`
+	LogPlane    LogPlaneConfig    `yaml:"log_plane"`
+	// Region names where this instance runs, for a deployment spread over more
+	// than one. Empty (the default) means the deployment has no regions:
+	// nothing carries a region label and nothing is compared.
+	Region string `yaml:"region"`
 	// TimezoneOffsetHours is the instance-wide UTC offset applied to cron
 	// trigger matching (e.g. 8 for UTC+8, -5.5 for UTC-5:30). 0 = UTC, the
 	// default. every: triggers are unaffected: an interval has no wall clock.
@@ -235,6 +243,71 @@ type CredentialsConfig struct {
 	Enabled      bool   `yaml:"enabled"`
 	Path         string `yaml:"path"`           // sqlite path or postgres DSN; "" = follow runtime.persistence
 	MasterKeyEnv string `yaml:"master_key_env"` // env var holding the master key; default "CREDENTIALS_MASTER_KEY"
+}
+
+// LogPlaneConfig is where the append-only planes live: the message journal and
+// the per-call usage detail.
+//
+// They are the two things the engine writes constantly, reads rarely (an
+// operator view) and expires by age, which is what makes them worth keeping
+// somewhere other than the transactional store. What must NOT move with them is
+// the ledger's daily rollups: a quota check and a budget refresh read those
+// before every call, and a value stale by a replication lag would let a
+// deployment overspend.
+//
+// Empty (the default) keeps both planes in the runtime store, which is what
+// every deployment had before there was a choice.
+type LogPlaneConfig struct {
+	// Persistence is a directory, or "file://<directory>". A backend with its
+	// own scheme joins it here as one is written; an unrecognised scheme is a
+	// boot error rather than a directory named after it.
+	Persistence string `yaml:"persistence"`
+}
+
+// LogPlaneDir returns the directory the log plane is written to, or "" when the
+// runtime store keeps the log itself.
+func (c *Config) LogPlaneDir() string {
+	p := strings.TrimSpace(c.Runtime.LogPlane.Persistence)
+	p = strings.TrimPrefix(p, "file://")
+	return stripSQLiteScheme(p)
+}
+
+// ClusterConfig is the store every instance of a deployment shares for the
+// state that has to be deployment-singular rather than region-local: the lease
+// table and the session inbox.
+//
+// The two share one target because they have to be one store. A lease in one
+// place and the inbox in another routes a session to an owner that never sees
+// its messages, and a lease table per region means an instance in one region
+// cannot see that a session is already running in another — it takes the
+// session and starts a second copy of the conversation. That is what a
+// multi-region deployment sets this to the one store every region can reach
+// for; a single-instance deployment and a single-region fleet leave it empty
+// and get exactly the behaviour they had before.
+type ClusterConfig struct {
+	Persistence string `yaml:"persistence"` // sqlite path or postgres DSN; "" = follow runtime.persistence
+	// SessionTTL is how long a session claim survives without renewal, and
+	// PollInterval is how often an instance looks for messages waiting for the
+	// sessions it owns. Defaults: 30s and 250ms. They are a pair: the poll is
+	// the added latency a message pays when it arrives on the wrong instance,
+	// and the TTL is how long a killed instance's sessions stay unavailable.
+	// A deployment whose lease store is in another region raises both — the TTL
+	// to several times the poll, and never below a round trip to the store.
+	SessionTTL   string `yaml:"session_ttl"`   // Go duration; default 30s
+	PollInterval string `yaml:"poll_interval"` // Go duration; default 250ms
+}
+
+// ClusterSessionTTL parses session_ttl. Empty or malformed is 0, meaning the
+// hub's own default; malformed values fail at validation.
+func (c ClusterConfig) ClusterSessionTTL() time.Duration {
+	d, _ := time.ParseDuration(c.SessionTTL)
+	return d
+}
+
+// ClusterPollInterval parses poll_interval, on the same rule.
+func (c ClusterConfig) ClusterPollInterval() time.Duration {
+	d, _ := time.ParseDuration(c.PollInterval)
+	return d
 }
 
 // AdminConfig configures the metrics/admin HTTP endpoint.
@@ -990,6 +1063,45 @@ func validate(path string, c *Config) error {
 	if off := c.Runtime.TimezoneOffsetHours; off < -12 || off > 14 {
 		return fmt.Errorf("%s: runtime.timezone_offset_hours %g is outside the real-world range -12..14", path, off)
 	}
+	// A region ends up in a metric label and a log line, so it is a token
+	// rather than free text. Empty is the default and means the deployment has
+	// no regions at all.
+	if r := c.Runtime.Region; r != "" {
+		if len(r) > 32 {
+			return fmt.Errorf("%s: runtime.region %q is longer than 32 characters", path, r)
+		}
+		for i := 0; i < len(r); i++ {
+			ch := r[i]
+			switch {
+			case ch >= 'a' && ch <= 'z', ch >= 'A' && ch <= 'Z', ch >= '0' && ch <= '9':
+			case ch == '-' || ch == '_' || ch == '.':
+			default:
+				return fmt.Errorf("%s: runtime.region %q may contain only letters, digits and . _ -", path, r)
+			}
+		}
+	}
+	for key, raw := range map[string]string{
+		"runtime.cluster.session_ttl":   c.Runtime.Cluster.SessionTTL,
+		"runtime.cluster.poll_interval": c.Runtime.Cluster.PollInterval,
+	} {
+		if raw == "" {
+			continue
+		}
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("%s: %s: %v", path, key, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("%s: %s must be positive", path, key)
+		}
+	}
+	// The log plane is a directory (the append-log backend) or empty. A value
+	// naming a scheme this build has no backend for is a boot error rather than
+	// a directory called "scylla:".
+	if p := strings.TrimSpace(c.Runtime.LogPlane.Persistence); p != "" &&
+		strings.Contains(p, "://") && !strings.HasPrefix(p, "file://") {
+		return fmt.Errorf("%s: runtime.log_plane.persistence %q: no such backend (a directory path, or empty to keep the log in the runtime store)", path, p)
+	}
 	if c.Runtime.Credentials.Enabled && c.CredentialsMasterKeyEnv() == "" {
 		return fmt.Errorf("%s: runtime.credentials.enabled requires master_key_env to name the env var holding the master key", path)
 	}
@@ -1516,6 +1628,13 @@ func (c *Config) PersistencePath() string {
 	if p == "" {
 		p = "sqlite://./data/agentflow.db"
 	}
+	return stripSQLiteScheme(p)
+}
+
+// stripSQLiteScheme removes a "sqlite://" prefix, which names the local-file
+// backend explicitly; every store constructor wants the bare path, and a path
+// that kept the scheme would be created as a file called "sqlite:".
+func stripSQLiteScheme(p string) string {
 	const prefix = "sqlite://"
 	if len(p) > len(prefix) && p[:len(prefix)] == prefix {
 		return p[len(prefix):]
@@ -1523,13 +1642,24 @@ func (c *Config) PersistencePath() string {
 	return p
 }
 
+// ClusterStore returns where the state that has to be one store across every
+// instance — and every region — lives: the lease table and the session inbox.
+// It follows runtime.persistence unless runtime.cluster.persistence names its
+// own target, which is what a multi-region deployment sets to the one store all
+// regions can reach.
+func (c *Config) ClusterStore() string {
+	if p := c.Runtime.Cluster.Persistence; p != "" {
+		return stripSQLiteScheme(p)
+	}
+	return c.PersistencePath()
+}
+
 // DataDir is the directory local blobs (media, files) default to. It is the
 // persistence directory when the runtime store is a SQLite file — the two live
 // together — and "./data" when persistence is a server DSN, where there is no
 // local directory to sit beside.
 func (c *Config) DataDir() string {
-	p := c.Runtime.Persistence
-	if p != "" && (strings.HasPrefix(p, "postgres://") || strings.HasPrefix(p, "postgresql://")) {
+	if storedb.BackendFor(c.Runtime.Persistence) != storedb.BackendSQLite {
 		return "./data"
 	}
 	dir := filepath.Dir(c.PersistencePath())
@@ -1546,7 +1676,7 @@ func (c *Config) DataDir() string {
 // saying so twice.
 func (c *Config) IdentityStore() string {
 	if c.Runtime.Identity.Persistence != "" {
-		return c.Runtime.Identity.Persistence
+		return stripSQLiteScheme(c.Runtime.Identity.Persistence)
 	}
 	return c.storeBesideRuntime("identity.db")
 }
@@ -1557,7 +1687,7 @@ func (c *Config) IdentityStore() string {
 // a fleet.
 func (c *Config) CredentialsStore() string {
 	if c.Runtime.Credentials.Path != "" {
-		return c.Runtime.Credentials.Path
+		return stripSQLiteScheme(c.Runtime.Credentials.Path)
 	}
 	return c.storeBesideRuntime("credentials.db")
 }
@@ -1567,7 +1697,7 @@ func (c *Config) CredentialsStore() string {
 // persistence directory.
 func (c *Config) storeBesideRuntime(name string) string {
 	p := c.PersistencePath()
-	if strings.HasPrefix(p, "postgres://") || strings.HasPrefix(p, "postgresql://") {
+	if storedb.BackendFor(p) != storedb.BackendSQLite {
 		return p
 	}
 	dir := filepath.Dir(p)

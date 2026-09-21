@@ -48,6 +48,12 @@ type Deps struct {
 	// how the console (and the lease table) tell one instance from another.
 	Instance string
 
+	// Region names where this instance runs (runtime.region), empty when the
+	// deployment has no regions. It is what an operator — or a load balancer
+	// reading this endpoint — needs to know to send a session's traffic to the
+	// region that owns it.
+	Region string
+
 	// Users is the per-user surface: profiles, the usage ledger and the message
 	// journal (both live in the runtime store), the quota, and the file store.
 	// Each nil handle degrades with a named reason rather than a blank answer.
@@ -225,6 +231,7 @@ func (u *UI) handleState(w http.ResponseWriter, r *http.Request) {
 		"config_path":         d.ConfigPath,
 		"config_epoch":        d.Cfg.Epoch,
 		"instance":            d.Instance,
+		"region":              d.Region,
 		"agents":              agents,
 		"channels":            channels,
 		"sessions":            sessions,

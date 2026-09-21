@@ -59,6 +59,7 @@ import (
 	"agentflow/internal/drivers/httpd"
 	"agentflow/internal/drivers/legal"
 	"agentflow/internal/drivers/llm"
+	"agentflow/internal/drivers/logfile"
 	"agentflow/internal/drivers/mcp"
 	"agentflow/internal/drivers/mongodb"
 	"agentflow/internal/drivers/pgvector"
@@ -281,25 +282,73 @@ func main() {
 	// Per-call token detail in the ledger (the daily rollup is always written).
 	usageEvents := cfg.Usage.UsageEvents()
 
+	// The log plane: the two append-only planes — the message journal and the
+	// per-call usage detail — written constantly, read rarely, expired by age.
+	// Empty keeps them in the runtime store, which is what every deployment had
+	// before the plane could be configured; a directory puts them in an append
+	// log instead (internal/drivers/logfile).
+	var logPlane *logfile.Log
+	if dir := cfg.LogPlaneDir(); dir != "" {
+		lp, err := logfile.Open(dir)
+		if err != nil {
+			log.Error("log plane failed", "err", err)
+			os.Exit(1)
+		}
+		defer lp.Close()
+		logPlane = lp
+		log.Info("log plane enabled", "backend", "file", "dir", dir)
+	}
+	// journalSink is where the audit trail goes, eventLog where the per-call
+	// detail goes, and usageWriter is what the metering path calls: the rollup
+	// stays in the transactional store — a quota check reads it before every
+	// call — while the detail follows the plane.
+	var journalSink runtime.Journal = rtStore
+	var eventLog runtime.EventLog = rtStore
+	var usageWriter caps.UsageRecorder = rtStore
+	if logPlane != nil {
+		journalSink, eventLog = logPlane, logPlane
+		usageWriter = splitUsage{rollups: rtStore, events: logPlane}
+	}
+
 	// Singleton arbitration. Scheduled work — every:/cron: triggers, the file
 	// GC, the retention prunes — has to run once per deployment, not once per
 	// instance, and the lease is what decides which instance runs each piece. It
 	// lives in the same store as everything else, so a deployment that shares a
 	// database shares the arbitration for free, and one that runs alone is
 	// uncontended.
-	leaseMgr, err := lease.Open(cfg.PersistencePath(), lease.OwnerID(), lease.DefaultTTL, log)
+	leaseMgr, err := lease.Open(cfg.ClusterStore(), lease.OwnerID(), lease.DefaultTTL, log)
 	if err != nil {
 		log.Error("lease manager failed", "err", err)
 		os.Exit(1)
 	}
 	defer leaseMgr.Close()
-	log.Info("instance identity", "owner", leaseMgr.Owner())
+	log.Info("instance identity", "owner", leaseMgr.Owner(), "region", cfg.Runtime.Region)
 
-	// Every metric this instance exposes says which instance it came from. A
-	// scrape of N instances is otherwise N indistinguishable series, and the
-	// instance id here is the one the logs and the lease table use, so a
-	// dashboard label leads back to the process that produced it.
-	if err := metricReg.SetLabels(map[string]string{"instance": leaseMgr.Owner()}); err != nil {
+	// Two topology smells that are otherwise silent, because leases arbitrate
+	// which instance owns a piece of work and a lease store no peer can see
+	// makes every instance believe it is alone: singleton work runs once per
+	// instance instead of once per deployment, and with a region set, an
+	// instance in another region takes a session that is already running and
+	// starts a second copy of the conversation.
+	clusterTarget := cfg.ClusterStore()
+	if storedb.BackendFor(clusterTarget) != storedb.BackendFor(cfg.PersistencePath()) {
+		log.Warn("the lease store is on a different backend from the runtime store: singleton work will run once per instance rather than once per deployment",
+			"lease_store", storedb.Display(clusterTarget))
+	}
+	if cfg.Runtime.Region != "" && storedb.BackendFor(clusterTarget) == storedb.BackendSQLite {
+		log.Warn("runtime.region is set but the lease store is a local file: an instance in another region cannot see this one's sessions and will start a second copy of the conversation",
+			"region", cfg.Runtime.Region)
+	}
+
+	// Every metric this instance exposes says which instance — and which region
+	// — it came from. A scrape of N instances is otherwise N indistinguishable
+	// series, and the instance id here is the one the logs and the lease table
+	// use, so a dashboard label leads back to the process that produced it.
+	labels := map[string]string{"instance": leaseMgr.Owner()}
+	if cfg.Runtime.Region != "" {
+		labels["region"] = cfg.Runtime.Region
+	}
+	if err := metricReg.SetLabels(labels); err != nil {
 		log.Warn("metric labels not set", "err", err)
 	}
 
@@ -649,7 +698,7 @@ func main() {
 			Pool:   pool,
 			Quota:  userQuota,
 			Agent:  name,
-			Ledger: rtStore,
+			Ledger: usageWriter,
 			Events: usageEvents,
 			Log:    log,
 		})
@@ -809,7 +858,7 @@ func main() {
 			Pool:   pool,
 			Quota:  userQuota,
 			Agent:  pname,
-			Ledger: rtStore,
+			Ledger: usageWriter,
 			Events: usageEvents,
 			Log:    log,
 		})
@@ -950,13 +999,23 @@ func main() {
 	// take it) delivers the message itself, and one that does not queues it for
 	// the owner. Without a shared store both are local, the lease is
 	// uncontended, and this behaves exactly as it did before.
-	hubQueue, err := inbox.Open(cfg.PersistencePath(), leaseMgr.Owner(), log)
+	hubQueue, err := inbox.Open(cfg.ClusterStore(), leaseMgr.Owner(), log)
 	if err != nil {
 		log.Error("session inbox failed", "err", err)
 		os.Exit(1)
 	}
 	defer hubQueue.Close()
 	hub := sessionhub.New(leaseMgr, hubQueue, sup.DeliverLocal, log)
+	// A store in another region makes the hub's two periods a deployment's
+	// business: the poll is the added latency a message pays when it arrives on
+	// the wrong instance, and the TTL is how long a killed instance's sessions
+	// stay unavailable. Unset, the hub's own defaults (250ms, 30s) stand.
+	if d := cfg.Runtime.Cluster.ClusterPollInterval(); d > 0 {
+		hub.SetPoll(d)
+	}
+	if d := cfg.Runtime.Cluster.ClusterSessionTTL(); d > 0 {
+		hub.SetSessionTTL(d)
+	}
 	sup.SetHub(hub)
 	go hub.Drain(ctx)
 
@@ -1022,8 +1081,18 @@ func main() {
 	// concurrently is N times the work for no benefit.
 	if days := cfg.Usage.UsageRetention(); days > 0 {
 		prune := func() {
-			if err := rtStore.PruneUsage(time.Now().AddDate(0, 0, -days)); err != nil {
+			cutoff := time.Now().AddDate(0, 0, -days)
+			if err := rtStore.PruneUsage(cutoff); err != nil {
 				log.Warn("usage prune failed", "err", err)
+			}
+			// The per-call detail may live on the log plane, where the rollup
+			// prune above cannot reach it: retention is per plane.
+			if logPlane != nil {
+				if n, err := logPlane.PruneEvents(cutoff); err != nil {
+					log.Warn("usage event prune failed", "err", err)
+				} else if n > 0 {
+					log.Info("usage events pruned", "rows", n, "retention_days", days)
+				}
 			}
 		}
 		singleton(ctx, "usage-prune", prune)
@@ -1048,7 +1117,7 @@ func main() {
 		if days := cfg.Audit.AuditRetention(); days > 0 {
 			prune := func() {
 				cutoff := time.Now().AddDate(0, 0, -days)
-				if n, err := rtStore.PruneMessages(ctx, cutoff); err != nil {
+				if n, err := journalSink.PruneMessages(ctx, cutoff); err != nil {
 					log.Warn("journal prune failed", "err", err)
 				} else if n > 0 {
 					log.Info("journal pruned", "rows", n, "retention_days", days)
@@ -1088,7 +1157,7 @@ func main() {
 			if entry.ID == "" {
 				entry.ID = uuid.NewString()
 			}
-			if err := rtStore.RecordMessage(ctx, entry); err != nil {
+			if err := journalSink.RecordMessage(ctx, entry); err != nil {
 				log.Warn("journal egress write failed", "err", err)
 			}
 		}
@@ -1143,7 +1212,7 @@ func main() {
 			// unregistered handle stamps an empty one, which is what the audit
 			// view needs to tell personal traffic from anonymous traffic.
 			userUUID, _ := msg.Payload["user_uuid"].(string)
-			if err := rtStore.RecordMessage(ctx, runtime.JournalEntry{
+			if err := journalSink.RecordMessage(ctx, runtime.JournalEntry{
 				ID:          msg.ID,
 				Ts:          ts,
 				Direction:   "in",
@@ -1368,6 +1437,7 @@ func main() {
 			ConfigPath: *cfgPath,
 			Cfg:        cfg,
 			Instance:   leaseMgr.Owner(),
+			Region:     cfg.Runtime.Region,
 			Models:     llmMgr,
 			History:    history,
 			Creds:      credStore,
@@ -1380,6 +1450,8 @@ func main() {
 			Users: webui.UserDeps{
 				Identities: identReg,
 				Store:      rtStore,
+				Events:     eventLog,
+				Journal:    journalSink,
 				Quota:      userQuota,
 				Files:      filesMgr,
 			},
@@ -1750,6 +1822,28 @@ func resolveMediaS3(ctx context.Context, res *config.Resolver, s3 config.MediaS3
 		*key.dst = v
 	}
 	return out, true
+}
+
+// splitUsage writes the ledger's two halves to the two places they belong: the
+// rollup — which every quota check and budget refresh reads before a call — to
+// the transactional store where its sums are exact and immediate, and the
+// per-call detail to the log plane. It is what the metering path holds when a
+// deployment configures one.
+type splitUsage struct {
+	rollups runtime.Ledger
+	events  runtime.EventLog
+}
+
+func (w splitUsage) RecordUsage(rec runtime.UsageRecord, withEvent bool) error {
+	if err := w.rollups.RecordUsage(rec, false); err != nil {
+		return err
+	}
+	if !withEvent {
+		return nil
+	}
+	// EventFrom applies the same normalisation the rollup just did, so the
+	// detail agrees with the rollup it sums into.
+	return w.events.AppendEvent(rec.UserID, runtime.EventFrom(rec))
 }
 
 func shellProfileMap(cfg *config.Config, name string) map[string]any {

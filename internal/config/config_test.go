@@ -857,6 +857,127 @@ loop: plugin:per_chat
 
 // TestValidateTimezoneOffset: the cron matching offset is a fixed UTC offset
 // in the real-world range, and TimezoneOffset converts it to a duration.
+func TestValidateRegionAndClusterPeriods(t *testing.T) {
+	base := func() *Config {
+		return &Config{Agents: map[string]Agent{"bot": {Loop: "./loop.lua"}}}
+	}
+	for _, tt := range []struct {
+		name    string
+		region  string
+		ttl     string
+		poll    string
+		wantErr string
+	}{
+		{name: "no region"},
+		{name: "a token", region: "eu-west-1"},
+		{name: "dots and underscores", region: "eu.west_1"},
+		{name: "too long", region: strings.Repeat("r", 33), wantErr: "longer than 32 characters"},
+		{name: "not a token", region: "eu west", wantErr: "may contain only letters, digits"},
+		{name: "periods", ttl: "45s", poll: "1s"},
+		{name: "a malformed period", ttl: "45", wantErr: "session_ttl"},
+		{name: "a zero period", poll: "0s", wantErr: "must be positive"},
+		{name: "a negative period", ttl: "-1s", wantErr: "must be positive"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := base()
+			c.Runtime.Region = tt.region
+			c.Runtime.Cluster.SessionTTL = tt.ttl
+			c.Runtime.Cluster.PollInterval = tt.poll
+			err := validate("cfg.yaml", c)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("expected an error containing %q, got: %v", tt.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected no error, got: %v", err)
+			}
+		})
+	}
+
+	// Unset periods are 0, which the hub reads as "use my own default" — the
+	// engine's defaults live in one place rather than being restated here.
+	if got := (&ClusterConfig{}).ClusterSessionTTL(); got != 0 {
+		t.Fatalf("unset session_ttl = %v, want 0", got)
+	}
+	if got := (&ClusterConfig{PollInterval: "2s"}).ClusterPollInterval(); got != 2*time.Second {
+		t.Fatalf("poll_interval = %v", got)
+	}
+}
+
+// The cluster store is where the state that has to be one store across every
+// region lives: the lease table and the session inbox. It follows the runtime
+// store unless it names its own target.
+func TestClusterStoreTarget(t *testing.T) {
+	local := &Config{Runtime: Runtime{Persistence: "sqlite://./data/agentflow.db"}}
+	if got := local.ClusterStore(); got != "./data/agentflow.db" {
+		t.Fatalf("cluster store follows persistence: %q", got)
+	}
+	own := &Config{Runtime: Runtime{
+		Persistence: "sqlite://./data/agentflow.db",
+		Cluster:     ClusterConfig{Persistence: "postgres://db.internal/agentflow"},
+	}}
+	if got := own.ClusterStore(); got != "postgres://db.internal/agentflow" {
+		t.Fatalf("an explicit cluster store wins: %q", got)
+	}
+	// The scheme is stripped for the local-file form, or the store would create
+	// a file called "sqlite:".
+	prefixed := &Config{Runtime: Runtime{
+		Persistence: "./data/agentflow.db",
+		Cluster:     ClusterConfig{Persistence: "sqlite://./data/cluster.db"},
+	}}
+	if got := prefixed.ClusterStore(); got != "./data/cluster.db" {
+		t.Fatalf("sqlite:// not stripped: %q", got)
+	}
+	// The same rule for the two per-store targets that came before it.
+	sibling := &Config{Runtime: Runtime{
+		Persistence: "sqlite://./data/agentflow.db",
+		Identity:    IdentityConfig{Persistence: "sqlite://./data/ids.db"},
+		Credentials: CredentialsConfig{Path: "sqlite://./data/creds.db"},
+	}}
+	if got := sibling.IdentityStore(); got != "./data/ids.db" {
+		t.Fatalf("identity store: %q", got)
+	}
+	if got := sibling.CredentialsStore(); got != "./data/creds.db" {
+		t.Fatalf("credential store: %q", got)
+	}
+}
+
+// The log plane is a directory or nothing. A value naming a backend this build
+// does not have is a boot error rather than a directory called "scylla:".
+func TestLogPlaneTarget(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		value   string
+		wantDir string
+		wantErr string
+	}{
+		{name: "unset keeps the log in the runtime store"},
+		{name: "a directory", value: "./data/log", wantDir: "./data/log"},
+		{name: "an explicit file scheme", value: "file://./data/log", wantDir: "./data/log"},
+		{name: "an unknown backend", value: "scylla://host:9042", wantErr: "no such backend"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Config{Agents: map[string]Agent{"bot": {Loop: "./loop.lua"}}}
+			c.Runtime.LogPlane.Persistence = tt.value
+			err := validate("cfg.yaml", c)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("expected an error containing %q, got: %v", tt.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected no error, got: %v", err)
+			}
+			if got := c.LogPlaneDir(); got != tt.wantDir {
+				t.Fatalf("LogPlaneDir = %q, want %q", got, tt.wantDir)
+			}
+		})
+	}
+}
+
 func TestValidateTimezoneOffset(t *testing.T) {
 	tests := []struct {
 		name    string

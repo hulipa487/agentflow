@@ -1276,6 +1276,7 @@ func main() {
 		console := webui.New(webui.Deps{
 			ConfigPath: *cfgPath,
 			Cfg:        cfg,
+			Instance:   leaseMgr.Owner(),
 			Models:     llmMgr,
 			History:    history,
 			Creds:      credStore,

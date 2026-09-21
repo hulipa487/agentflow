@@ -2,6 +2,14 @@
 // default) in a singleton Luau service state. Channel drivers submit inbound
 // events; the Lua route handler computes a session key; the router resolves
 // and forwards through the supervisor.
+//
+// A route handler has to be stateless, in the sense that matters for a
+// deployment running more than one instance: this state is per process, and
+// whichever instance receives an inbound is the one that runs the handler. Two
+// instances routing the same message must reach the same session key, so a
+// handler that remembers per-chat state in Lua will give each instance its own
+// answer. The session is where state that has to persist belongs; the router's
+// job is to decide where a message goes.
 package router
 
 import (

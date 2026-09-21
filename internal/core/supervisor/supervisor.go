@@ -266,7 +266,9 @@ func (s *Supervisor) onActorExit(id session.Identity, reason session.EndReason) 
 		s.sched.CancelOwner(id.SessionID)
 	}
 	if s.shellMgr != nil {
-		s.shellMgr.ReapSession(id.SessionID)
+		// The context is detached on purpose: the session is already gone, and
+		// the reap must not be cancelled by whatever cancelled it.
+		s.shellMgr.ReapSession(context.Background(), id.SessionID)
 	}
 
 	if parent != nil {

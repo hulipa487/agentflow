@@ -208,6 +208,48 @@ func (p *DockerProvider) Alive(handle *Handle) bool {
 	return err == nil && strings.TrimSpace(out) == "true"
 }
 
+// Attach rebuilds a handle for a container this process did not create: one
+// spawned by an instance that has since died, or before a restart. A container
+// is addressed by its id from anywhere that can reach the Docker host, which is
+// what lets a session keep its shell across a failover.
+//
+// It confirms the container is running rather than trusting the record: a
+// handle that reports ready and then fails every command is worse than an error
+// that says the container is gone, and the caller can spawn a fresh one.
+func (p *DockerProvider) Attach(rec Record) (*Handle, error) {
+	if rec.Container == "" {
+		return nil, fmt.Errorf("docker: handle %q has no container to attach to", rec.ID)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, stderr, err := runDocker(ctx, []string{"inspect", "-f", "{{.State.Running}}", rec.Container}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("docker: container %s for handle %q is not reachable: %w (stderr: %s)",
+			rec.Container, rec.ID, err, strings.TrimSpace(stderr))
+	}
+	if strings.TrimSpace(out) != "true" {
+		return nil, fmt.Errorf("docker: container %s for handle %q is no longer running", rec.Container, rec.ID)
+	}
+	return &Handle{
+		ID:       rec.ID,
+		Provider: "docker",
+		Image:    rec.Image,
+		State:    HandleRunning,
+		Meta:     map[string]any{"image": rec.Image, "container": rec.Container},
+		internal: rec.Container,
+	}, nil
+}
+
+// Forget removes the container a record describes, for a handle whose instance
+// is gone and which no process has open. Removing a container that has already
+// vanished is not an error, so a reclaim pass that runs twice is harmless.
+func (p *DockerProvider) Forget(ctx context.Context, rec Record) error {
+	if rec.Container == "" {
+		return nil
+	}
+	return p.removeContainer(ctx, rec.Container)
+}
+
 // containerID returns the stored container id, or an error if the handle is
 // not a live docker handle.
 func (p *DockerProvider) containerID(handle *Handle) (string, error) {

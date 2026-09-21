@@ -171,7 +171,10 @@ func registerShellProfileBuiltins(r *Registry, mgr *shell.Manager) {
 			if unavail != nil {
 				return unavail, nil
 			}
-			h := mgr.Current(owner)
+			h, err := mgr.Current(ctx, owner)
+			if err != nil {
+				return map[string]any{"ok": false, "error": err.Error()}, nil
+			}
 			if h == nil {
 				return map[string]any{"ok": true, "destroyed": false}, nil
 			}

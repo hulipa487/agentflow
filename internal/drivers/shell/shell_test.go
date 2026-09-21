@@ -89,7 +89,7 @@ func TestManagerSpawnExecReap(t *testing.T) {
 	}
 
 	// Reap should destroy the handle.
-	mgr.ReapSession("session-1")
+	mgr.ReapSession(ctx, "session-1")
 	if len(tp.destroyed) != 1 {
 		t.Fatalf("expected 1 destroy, got %d", len(tp.destroyed))
 	}
@@ -156,6 +156,76 @@ func TestDockerPersistsStateAcrossCalls(t *testing.T) {
 	}
 	if !strings.Contains(res.Stdout, "persisted") {
 		t.Fatalf("persistence violated: /tmp/once not preserved across calls (stdout=%q)", res.Stdout)
+	}
+}
+
+// The property the fleet depends on: a container this process did not create is
+// addressable from its record alone, by a handle that carries nothing but the
+// container id. Gated on a daemon — the unit tests cover the manager's logic,
+// this covers Docker itself.
+func TestDockerContainerIsAttachableFromARecord(t *testing.T) {
+	if !dockerAvailable() {
+		t.Skip("docker daemon not reachable; skipping the attach integration test")
+	}
+	p := NewDockerProvider(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx := context.Background()
+
+	h, err := p.Spawn(ctx, SpawnOpts{Image: "alpine:3.20", Env: map[string]string{"MSG": "adopted"}})
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	defer func() { _ = p.Destroy(ctx, h) }()
+	if _, err := p.Exec(ctx, h, "echo $MSG > /tmp/adopted"); err != nil {
+		t.Fatalf("exec write: %v", err)
+	}
+
+	// A handle rebuilt from the record alone reaches the same container, with
+	// the file the first one wrote — the file is the proof it is the same
+	// filesystem and not a fresh container.
+	rec := recordOf(h, "session-1", "instance-a")
+	if rec.Container == "" {
+		t.Fatal("the record does not name the container")
+	}
+	attached, err := p.Attach(rec)
+	if err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	res, err := p.Exec(ctx, attached, "cat /tmp/adopted")
+	if err != nil {
+		t.Fatalf("exec on the attached handle: %v", err)
+	}
+	if !strings.Contains(res.Stdout, "adopted") {
+		t.Fatalf("the attached handle is not the same container: %q", res.Stdout)
+	}
+
+	// Forget removes it from the record alone, which is what the reclaim pass
+	// does for an instance that is gone — and twice is harmless.
+	if err := p.Forget(ctx, rec); err != nil {
+		t.Fatalf("forget: %v", err)
+	}
+	if p.Alive(attached) {
+		t.Fatal("the container survived Forget")
+	}
+	if err := p.Forget(ctx, rec); err != nil {
+		t.Fatalf("second forget: %v", err)
+	}
+}
+
+// A record with no container is refused rather than turned into a handle that
+// fails every later call.
+func TestDockerAttachRefusesARecordWithNoContainer(t *testing.T) {
+	p := NewDockerProvider(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if _, err := p.Attach(Record{ID: "h-1"}); err == nil {
+		t.Fatal("a record naming no container must not attach")
+	}
+	// A container that does not exist is reported as unreachable rather than
+	// attached. Gated on a daemon: without one the docker call fails for a
+	// different reason, and the assertion would pass for the wrong one.
+	if !dockerAvailable() {
+		t.Skip("docker daemon not reachable; skipping the unreachable-container case")
+	}
+	if _, err := p.Attach(Record{ID: "h-1", Container: "no-such-container"}); err == nil {
+		t.Fatal("a container that does not exist must not attach")
 	}
 }
 

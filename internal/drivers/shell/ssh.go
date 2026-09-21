@@ -76,6 +76,13 @@ func (p *SSHProvider) Alive(handle *Handle) bool {
 	return sshAlive(handle.internal.(*ssh.Client))
 }
 
+// Forget releases the record of an SSH handle. There is nothing to tear down:
+// the handle's state is a client in the process that opened it, it dies with
+// that process, and a record deliberately carries no password or key to dial
+// again with — which is also why an SSH handle cannot be adopted elsewhere and
+// is re-dialled from the session's own shell profile instead.
+func (p *SSHProvider) Forget(ctx context.Context, rec Record) error { return nil }
+
 // sshDial connects to host (host:port) as user with the auth derived from opts
 // (password and/or key_file). The dial is ctx-cancellable.
 func sshDial(ctx context.Context, host, user string, opts SpawnOpts) (*ssh.Client, error) {

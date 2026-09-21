@@ -1098,7 +1098,9 @@ func main() {
 		})
 		sink = sc
 		sup.SetUserResolver(identReg)
-		log.Info("identity layer enabled", "store", cfg.IdentityStore(),
+		// storedb.Display, not the raw target: in a fleet this is a DSN, and a
+		// DSN carries a password.
+		log.Info("identity layer enabled", "store", storedb.Display(cfg.IdentityStore()),
 			"require_registration", cfg.Runtime.Users.RegistrationRequired())
 	}
 

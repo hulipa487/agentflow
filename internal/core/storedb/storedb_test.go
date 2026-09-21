@@ -62,6 +62,35 @@ func TestRedactDSN(t *testing.T) {
 	}
 }
 
+// Anything that logs a store target uses Display: a DSN carries a password, a
+// file path carries nothing, and a path that merely looks like a DSN (or
+// contains an "@") must survive intact.
+func TestDisplay(t *testing.T) {
+	cases := map[string]string{
+		"postgres://u:s3cret@h:5432/db":         "postgres://***@h:5432/db",
+		"postgresql://o:pw@ep-x.neon.tech/db":   "postgresql://***@ep-x.neon.tech/db",
+		"./data/identity.db":                    "./data/identity.db",
+		"":                                      "",
+		"postgres-ish.db":                       "postgres-ish.db",
+		`C:\Users\oscar@work\identity.db`:       `C:\Users\oscar@work\identity.db`,
+		"/srv/agentflow/data/credentials.db":    "/srv/agentflow/data/credentials.db",
+		"postgres://db.internal:5432/agentflow": "postgres://db.internal:5432/agentflow",
+	}
+	for in, want := range cases {
+		if got := Display(in); got != want {
+			t.Errorf("Display(%q) = %q, want %q", in, got, want)
+		}
+	}
+	for _, in := range []string{
+		"postgres://user:s3cret@db/agentflow",
+		"postgresql://neondb_owner:npg_secret@ep-x-pooler.ap-southeast-2.aws.neon.tech/neondb?sslmode=require",
+	} {
+		if got := Display(in); strings.Contains(got, "s3cret") || strings.Contains(got, "npg_secret") {
+			t.Errorf("Display leaked a password: %q", got)
+		}
+	}
+}
+
 // A store opens, migrates and round-trips rows with "?" placeholders.
 func TestOpenSQLiteAndRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "store.db")

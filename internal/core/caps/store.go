@@ -124,5 +124,34 @@ func StoreHandlers(am *memory.AgentMemory, mgr *memory.Manager) map[string]sessi
 			}
 			return okJSON(map[string]any{"records": recs})
 		},
+
+		"store.scopes": func(ctx context.Context, op session.Op) (string, bool) {
+			if am == nil {
+				return fail(fmt.Errorf("agent has no memory profile"))
+			}
+			// Same single-store fallback as store.query.
+			table := op.Table
+			if table == "" && len(am.Stores) == 1 {
+				for k := range am.Stores {
+					table = k
+				}
+			}
+			h, bind, err := resolve(ctx, table)
+			if err != nil {
+				return fail(err)
+			}
+			// Only a wrapped (scoped) handle can enumerate; the mode check
+			// lives in the wrapper (maintenance-only) so channel sessions are
+			// denied at the memory layer, not by handler convention.
+			se, ok := h.(memory.ScopeEnumerator)
+			if !ok {
+				return fail(fmt.Errorf("store %q: scope enumeration needs a scoped store", table))
+			}
+			scopes, err := se.Scopes(bind.Table)
+			if err != nil {
+				return fail(err)
+			}
+			return okJSON(scopes)
+		},
 	}
 }

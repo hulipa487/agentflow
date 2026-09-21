@@ -290,6 +290,13 @@ end
 function store.delete(table, key)
   return op({ type = "store.delete", table = table, key = key })
 end
+-- store.scopes(table) -> { "user:<uuid>", ... } — the user scopes present in
+-- a table, sorted. Maintenance provenance only (system/scheduler sessions,
+-- e.g. the nightly distiller); channel and agent-hop sessions are denied —
+-- scope enumeration must never be reachable from a user's own turn.
+function store.scopes(table)
+  return op({ type = "store.scopes", table = table })
+end
 
 memory = {}
 function memory.write(record)

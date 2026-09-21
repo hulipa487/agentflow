@@ -29,6 +29,7 @@
 package memory
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 )
@@ -255,12 +256,17 @@ func (s *scopedHandle) allowedStrata() map[string]bool {
 func (s *scopedHandle) GC(table string, window int) error { return s.inner.GC(table, window) }
 func (s *scopedHandle) Close() error                      { return s.inner.Close() }
 
-// Scopes enumerates the distinct user scopes present in a table (maintenance
-// mode). The default implementation scans keys once; it is correct on every
-// driver and conversation-scale cheap. Distinct scope names are returned
-// sorted; the service/agent/legacy strata are not user scopes and are
-// omitted.
+// Scopes enumerates the distinct user scopes present in a table. Maintenance
+// mode only — every other mode is denied, because scope enumeration is the
+// agent's own maintenance loop's per-user iteration and must never be
+// reachable from a channel turn. The default implementation scans keys once;
+// it is correct on every driver and conversation-scale cheap. Distinct scope
+// names are returned sorted; the service/agent/legacy strata are not user
+// scopes and are omitted.
 func (s *scopedHandle) Scopes(table string) ([]string, error) {
+	if s.mode != ModeMaintenance {
+		return nil, fmt.Errorf("memory: scope enumeration requires maintenance mode")
+	}
 	it, err := s.inner.Query(table, Query{Kind: "all"})
 	if err != nil {
 		return nil, err

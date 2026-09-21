@@ -37,6 +37,7 @@ import (
 	"agentflow/internal/core/memory"
 	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/netguard"
+	"agentflow/internal/core/oidc"
 	"agentflow/internal/core/pool"
 	"agentflow/internal/core/reload"
 	"agentflow/internal/core/router"
@@ -289,6 +290,23 @@ func main() {
 		// An unlinked handle carries no personal scope unless the deployment
 		// opts back into claiming a profile on first contact.
 		identReg.SetAutoClaim(!cfg.Runtime.Users.RegistrationRequired())
+
+		// Channel traits, keyed by the name drivers report. The built-in
+		// defaults are per driver *type*, and drivers report the configured
+		// channel name — so a deployment that names its channels (the normal
+		// case) would treat telegram as unverifiable without this.
+		channelTraits := map[string]identity.ChannelTraits{}
+		for _, ch := range cfg.Gateway.Channels {
+			name := ch.Name
+			if name == "" {
+				name = ch.Type
+			}
+			channelTraits[name] = identity.Traits(ch.Type)
+		}
+		if err := identReg.SetChannelTraits(channelTraits); err != nil {
+			log.Error("identity channel traits failed", "err", err)
+			os.Exit(1)
+		}
 	}
 
 	// Per-user token quota: durable (read from the ledger, so a restart
@@ -583,7 +601,7 @@ func main() {
 			Quota:         userQuota,
 			HasCredential: hasCred,
 		}.Handlers()
-		for k, h := range gateOps(enforce, name, effectiveCaps, "user.current", userHandlers, &withheld) {
+		for k, h := range gateOps(enforce, name, effectiveCaps, "users", userHandlers, &withheld) {
 			handlers[k] = h
 		}
 		// runtime.* and credential.get stay ungated: the first is loop
@@ -734,7 +752,7 @@ func main() {
 			Quota:         userQuota,
 			HasCredential: hasCred,
 		}.Handlers()
-		for k, h := range gateOps(enforce, pname, profileCaps, "user.current", userHandlers, &withheld) {
+		for k, h := range gateOps(enforce, pname, profileCaps, "users", userHandlers, &withheld) {
 			handlers[k] = h
 		}
 		for k, h := range runtimeHandlers {
@@ -1019,9 +1037,39 @@ func main() {
 			log.Error("users API requires runtime.identity.enabled")
 			os.Exit(1)
 		}
-		httpSrv.Handle(users.Prefix+"/", users.New(identReg, cfg.Runtime.Users, log).Handler().ServeHTTP)
+		// Identity provider (opt-in): the engine verifies access tokens rather
+		// than logging anyone in. An unreachable issuer fails the boot — a
+		// misconfigured provider should not look like "every login is wrong".
+		var oidcVerifier *oidc.Verifier
+		if oc := cfg.Runtime.Users.OIDC; oc != nil {
+			v, err := oidc.New(oidc.Config{
+				Issuer:       oc.Issuer,
+				Audience:     oc.Audience,
+				JWKSURL:      oc.JWKSURL,
+				SubjectClaim: oc.SubjectClaim,
+				EmailClaim:   oc.EmailClaim,
+				NameClaim:    oc.NameClaim,
+			}, log)
+			if err != nil {
+				log.Error("identity provider unusable", "err", err, "issuer", oc.Issuer)
+				os.Exit(1)
+			}
+			oidcVerifier = v
+			log.Info("identity provider enabled", "issuer", oc.Issuer,
+				"audience", oc.Audience, "jit_provisioning", cfg.Runtime.Users.JITEnabled())
+		}
+		httpSrv.Handle(users.Prefix+"/", users.New(identReg, cfg.Runtime.Users, log, users.Options{
+			LinkableChannels: identReg.LinkableChannels(),
+			Files:            filesMgr,
+			Store:            rtStore,
+			Quota:            userQuota,
+			Verifier:         oidcVerifier,
+			JITProvisioning:  cfg.Runtime.Users.JITEnabled(),
+		}).Handler().ServeHTTP)
 		log.Info("user API enabled", "prefix", users.Prefix,
-			"registration", cfg.Runtime.Users.RegistrationMode())
+			"registration", cfg.Runtime.Users.RegistrationMode(),
+			"linkable", identReg.LinkableChannels(),
+			"cors_origins", len(cfg.Runtime.Users.CORSOrigins))
 	}
 	var telegramDrivers []*telegram.Driver
 	for i, ch := range cfg.Gateway.Channels {

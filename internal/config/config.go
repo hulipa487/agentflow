@@ -261,6 +261,37 @@ type UsersConfig struct {
 	RequireRegistration *bool `yaml:"require_registration"`
 	// LinkTTL is how long a channel-link challenge stays valid (default 10m).
 	LinkTTL string `yaml:"link_ttl"`
+	// CORSOrigins is the allow-list of browser origins permitted to call the
+	// user API with credentials. Empty (the default) means no CORS headers at
+	// all — an external frontend cannot call the API until an operator names
+	// its origin. Each entry is a full origin ("https://app.example.com"), no
+	// trailing slash.
+	CORSOrigins []string `yaml:"cors_origins"`
+	// JITProvisioning creates a profile on a verified first login (default
+	// true). Set false when every profile must be provisioned by an operator
+	// before anyone can sign in.
+	JITProvisioning *bool `yaml:"jit_provisioning"`
+	// OIDC, when set, makes the engine trust access tokens from an external
+	// identity provider. Login — passwords, OAuth, MFA, session lifetimes and
+	// revocation — lives there; the engine only verifies what it is handed.
+	OIDC *OIDCConfig `yaml:"oidc"`
+}
+
+// OIDCConfig describes the identity provider whose tokens this deployment
+// accepts.
+type OIDCConfig struct {
+	// Issuer is the expected `iss` claim, and the base for key discovery when
+	// JWKSURL is empty.
+	Issuer string `yaml:"issuer"`
+	// Audience, when set, must appear in the token's `aud` claim. Setting it is
+	// what stops a token minted for another service being replayed here.
+	Audience string `yaml:"audience"`
+	// JWKSURL overrides OpenID discovery (<issuer>/.well-known/openid-configuration).
+	JWKSURL string `yaml:"jwks_url"`
+	// Claim names carrying the profile fields; empty means sub/email/name.
+	SubjectClaim string `yaml:"subject_claim"`
+	EmailClaim   string `yaml:"email_claim"`
+	NameClaim    string `yaml:"name_claim"`
 }
 
 // RegistrationRequired reports whether an unknown handle must be linked to a
@@ -284,6 +315,28 @@ func (u UsersConfig) LinkChallengeTTL() time.Duration {
 	}
 	d, _ := time.ParseDuration(u.LinkTTL) // validated at boot; error impossible here
 	return d
+}
+
+// JITEnabled reports whether a verified first login creates a profile (default
+// true).
+func (u UsersConfig) JITEnabled() bool {
+	return u.JITProvisioning == nil || *u.JITProvisioning
+}
+
+// OriginAllowed reports whether a browser origin may call the user API. The
+// list is empty by default, which means no origin may: opening the API to a
+// frontend is a deliberate act, and an unreviewed wildcard would let any page a
+// user visits call the API as them.
+func (u UsersConfig) OriginAllowed(origin string) bool {
+	if origin == "" {
+		return false
+	}
+	for _, o := range u.CORSOrigins {
+		if o == origin {
+			return true
+		}
+	}
+	return false
 }
 
 // Model is a named LLM provider configuration. The omitempty tags keep the
@@ -1313,6 +1366,24 @@ func validate(path string, c *Config) error {
 	if c.Runtime.Users.LinkTTL != "" {
 		if _, err := time.ParseDuration(c.Runtime.Users.LinkTTL); err != nil {
 			return fmt.Errorf("%s: runtime.users.link_ttl: %v", path, err)
+		}
+	}
+
+	// The identity provider, when configured, must be describable: an issuer is
+	// required (it is both the discovery base and the expected `iss`), and a
+	// jwks_url is only needed when discovery is not available.
+	if c.Runtime.Users.OIDC != nil && c.Runtime.Users.OIDC.Issuer == "" {
+		return fmt.Errorf("%s: runtime.users.oidc.issuer is required (set it or remove the block)", path)
+	}
+	for _, o := range c.Runtime.Users.CORSOrigins {
+		// An origin is scheme://host[:port] and nothing else: a trailing slash
+		// or a path would never match the browser's Origin header, so a typo
+		// here would fail silently at request time.
+		if !strings.HasPrefix(o, "http://") && !strings.HasPrefix(o, "https://") {
+			return fmt.Errorf("%s: runtime.users.cors_origins entry %q must start with http:// or https://", path, o)
+		}
+		if strings.HasSuffix(o, "/") || strings.Contains(strings.TrimPrefix(strings.TrimPrefix(o, "https://"), "http://"), "/") {
+			return fmt.Errorf("%s: runtime.users.cors_origins entry %q must be a bare origin (no trailing slash, no path)", path, o)
 		}
 	}
 

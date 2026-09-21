@@ -179,7 +179,36 @@ func (s *Store) UsageDaily(day string) ([]UsageRow, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []UsageRow
+	out := []UsageRow{}
+	for rows.Next() {
+		var r UsageRow
+		if err := rows.Scan(&r.UserID, &r.Day, &r.Agent, &r.Model,
+			&r.Input, &r.Output, &r.Cached, &r.CacheWrite, &r.Reasoning, &r.Calls, &r.Failed); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// UsageHistory returns one user's daily rows for the window ending today,
+// newest first — the per-user trend a frontend renders.
+func (s *Store) UsageHistory(userID string, days int) ([]UsageRow, error) {
+	if days <= 0 || days > 90 {
+		days = 7
+	}
+	from := DayKey(time.Now().AddDate(0, 0, -(days - 1)))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT user_id, day, agent, model, input, output, cached, cache_write, reasoning, calls, failed
+		FROM usage_daily WHERE user_id = ? AND day >= ?
+		ORDER BY day DESC, model`, userID, from)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []UsageRow{}
 	for rows.Next() {
 		var r UsageRow
 		if err := rows.Scan(&r.UserID, &r.Day, &r.Agent, &r.Model,
@@ -217,7 +246,7 @@ func (s *Store) UsageEvents(userID string, since time.Time, limit int) ([]UsageE
 		return nil, err
 	}
 	defer rows.Close()
-	var out []UsageEvent
+	out := []UsageEvent{}
 	for rows.Next() {
 		var e UsageEvent
 		var ok int

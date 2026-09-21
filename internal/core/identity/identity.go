@@ -28,8 +28,10 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"agentflow/internal/core/metrics"
@@ -67,10 +69,16 @@ type ChannelTraits struct {
 // channelDefaults is the per-driver table of traits. An unknown channel gets
 // the most conservative treatment: asserted, undeliverable, unlinkable.
 var channelDefaults = map[string]ChannelTraits{
-	"telegram": {Trust: TrustVerified, Deliverable: true, Linkable: true},
-	"webhook":  {Trust: TrustAsserted, Deliverable: false, Linkable: false},
-	"ghhook":   {Trust: TrustSystem, Deliverable: false, Linkable: false},
+	"telegram":  {Trust: TrustVerified, Deliverable: true, Linkable: true},
+	oidcChannel: {Trust: TrustVerified}, // a login, not an address: nothing to deliver to
+	"webhook":   {Trust: TrustAsserted, Deliverable: false, Linkable: false},
+	"ghhook":    {Trust: TrustSystem, Deliverable: false, Linkable: false},
 }
+
+// oidcChannel is the pseudo-channel an external identity provider's logins bind
+// to. It is verified (the issuer signed the token) but neither deliverable nor
+// linkable: there is no address behind it, and nothing to prove possession of.
+const oidcChannel = "oidc"
 
 // Traits returns the traits for a channel name.
 func Traits(channel string) ChannelTraits {
@@ -135,6 +143,12 @@ type Registry struct {
 	// profile, so the handle gets a personal scope immediately. Default false —
 	// unknown handles stay in the shared service stratum until linked.
 	autoClaim bool
+	// traits overrides the built-in per-driver defaults, keyed by the channel
+	// name drivers actually report (the configured channel name). A deployment
+	// that names its channels — the normal case — needs this: the defaults are
+	// keyed by driver type, and a named telegram channel would otherwise be
+	// treated as unverifiable and unlinkable.
+	traits atomic.Pointer[map[string]ChannelTraits]
 }
 
 // Open creates the registry, opening (or creating) the sqlite database at
@@ -167,6 +181,59 @@ func (r *Registry) SetAutoClaim(v bool) {
 	r.mu.Lock()
 	r.autoClaim = v
 	r.mu.Unlock()
+}
+
+// SetChannelTraits installs this deployment's per-channel traits, keyed by the
+// channel name drivers report. Identities already stored are refreshed to
+// match — including rows written before the traits were known, which would
+// otherwise stay unverifiable for the life of the database — and the resolution
+// cache is dropped, since a cached answer carries the old traits.
+func (r *Registry) SetChannelTraits(m map[string]ChannelTraits) error {
+	cp := m
+	r.traits.Store(&cp)
+	r.mu.Lock()
+	r.cache = map[string]Resolution{}
+	r.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for name, t := range m {
+		if _, err := r.db.ExecContext(ctx,
+			`UPDATE identities SET trust = ?, deliverable = ?, linkable = ? WHERE channel = ?`,
+			t.Trust, boolInt(t.Deliverable), boolInt(t.Linkable), name); err != nil {
+			return fmt.Errorf("identity: set traits for %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// traitsOf resolves a channel's traits: this deployment's entry when it has
+// one, else the built-in default for that name (which is what an unnamed
+// channel falls back to). It never takes the registry lock, because minting
+// calls it while holding it.
+func (r *Registry) traitsOf(channel string) ChannelTraits {
+	if m := r.traits.Load(); m != nil {
+		if t, ok := (*m)[channel]; ok {
+			return t
+		}
+	}
+	return Traits(channel)
+}
+
+// LinkableChannels lists the channel names this deployment can link, sorted.
+func (r *Registry) LinkableChannels() []string {
+	m := r.traits.Load()
+	if m == nil {
+		return nil
+	}
+	out := make([]string, 0, len(*m))
+	for name, t := range *m {
+		if t.Linkable {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (r *Registry) migrate() error {
@@ -398,7 +465,7 @@ func scanIdentity(s rowScanner) (Identity, error) {
 func (r *Registry) mintIdentity(nativeFrom, channel, replyTo string, profile map[string]any) (Resolution, error) {
 	now := time.Now().Unix()
 	username, name := profileStrings(profile)
-	t := Traits(channel)
+	t := r.traitsOf(channel)
 	userID := ""
 	if r.autoClaim {
 		userID = "u_" + randomID(12)
@@ -813,7 +880,10 @@ type TokenRef struct {
 // shows it to the profile owner, who proves possession by sending it from the
 // handle they are linking.
 func (r *Registry) StartLink(userID, channel string, ttl time.Duration) (string, int64, error) {
-	if !Traits(channel).Linkable {
+	// traitsOf, not Traits: the deployment's configured channel names are what
+	// drivers report, and a named telegram channel is not in the type-keyed
+	// defaults.
+	if !r.traitsOf(channel).Linkable {
 		return "", 0, fmt.Errorf("channel %q cannot be linked: its sender identity is not verifiable", channel)
 	}
 	if ttl <= 0 {
@@ -957,7 +1027,73 @@ func (r *Registry) LimitFor(userID string) (int64, error) {
 	return p.TokensPerDay, nil
 }
 
-// --- helpers ----------------------------------------------------------------
+// ProvisionOIDC resolves the profile behind a verified OIDC login, creating one
+// on first login when jit is set. The identity is keyed by the full
+// "<issuer>|<subject>" string, so two issuers can never collide on a subject.
+//
+// A provisioned profile is a real profile: same scope, same quota, same audit
+// as one created through the API. The login is only a way to prove which
+// profile is asking.
+func (r *Registry) ProvisionOIDC(identityKey, displayName, email string, jit bool) (Identity, bool, error) {
+	if strings.TrimSpace(identityKey) == "" {
+		return Identity{}, false, fmt.Errorf("identity: empty oidc identity key")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Under the lock: two concurrent first logins must not each mint a profile.
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	id, ok, err := r.lookupIdentity(identityKey)
+	if err != nil {
+		return Identity{}, false, err
+	}
+	now := time.Now().Unix()
+	if ok {
+		if _, err := r.db.ExecContext(ctx,
+			`UPDATE identities SET last_seen = ? WHERE id = ?`, now, id.ID); err != nil {
+			r.log.Warn("oidc last_seen refresh failed", "err", err)
+		}
+		id.LastSeen = now
+		return id, false, nil
+	}
+	if !jit {
+		return Identity{}, false, fmt.Errorf("identity: no profile is provisioned for this login yet")
+	}
+
+	userID := "u_" + randomID(12)
+	if _, err := r.db.ExecContext(ctx,
+		`INSERT INTO profiles (user_id, display_name, email, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?)`, userID, displayName, email, now, now); err != nil {
+		return Identity{}, false, fmt.Errorf("identity: provision profile: %w", err)
+	}
+	t := Traits(oidcChannel)
+	id = Identity{
+		ID: "i_" + randomID(12), UserID: userID, Channel: oidcChannel,
+		NativeFrom:  identityKey,
+		Username:    email,
+		Name:        displayName,
+		Trust:       t.Trust,
+		Deliverable: t.Deliverable,
+		Linkable:    t.Linkable,
+		FirstSeen:   now,
+		LastSeen:    now,
+	}
+	if _, err := r.db.ExecContext(ctx,
+		`INSERT INTO identities (`+identityCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id.ID, id.UserID, id.Channel, id.NativeFrom, id.ReplyTo, id.Username, id.Name,
+		id.Trust, boolInt(id.Deliverable), boolInt(id.Linkable), id.FirstSeen, id.LastSeen); err != nil {
+		return Identity{}, false, fmt.Errorf("identity: provision identity: %w", err)
+	}
+	r.cache[identityKey] = id.resolution()
+	metrics.Inc("agentflow_user_provisions")
+	issuer, _, _ := strings.Cut(identityKey, "|")
+	r.log.Info("profile provisioned from an oidc login", "user_id", userID, "identity", id.ID, "issuer", issuer)
+	return id, true, nil
+}
+
+// --- helpers ---
 
 // hashSecret is the at-rest form of every bearer secret (tokens, link codes,
 // invite codes): a stored hash cannot be replayed as the secret itself.

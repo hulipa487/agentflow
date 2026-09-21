@@ -1,12 +1,17 @@
 // Package users serves the user-facing profile API on the shared public HTTP
 // listener: profile registration, channel linking, and self-service views.
 //
-// The surface carries no operator token — it is for the users themselves. A
-// caller proves which profile it is with a per-profile bearer token issued at
-// registration, and proves a channel handle by echoing a one-time challenge
-// back from that handle. Neither half alone links anything: the code is only
-// visible to whoever holds the profile token, and only the handle's owner can
-// send from the handle.
+// It is designed to be driven by a frontend the engine does not ship. Nothing
+// here renders HTML; the contract is JSON over HTTP, and authentication is a
+// bearer token in every case — either an access token from the deployment's
+// identity provider, verified against that issuer's published keys, or one of
+// the per-profile API tokens this package issues. There is no cookie and no
+// server-side login, so there is nothing ambient for another site to replay and
+// no CSRF token to carry.
+//
+// Two proofs keep a profile honest. The caller proves which profile it is with
+// the token it holds; it proves a channel handle by echoing a one-time challenge
+// back from that handle. Neither half alone links anything.
 package users
 
 import (
@@ -21,8 +26,11 @@ import (
 	"time"
 
 	"agentflow/internal/config"
+	"agentflow/internal/core/files"
 	"agentflow/internal/core/identity"
 	"agentflow/internal/core/metrics"
+	"agentflow/internal/core/oidc"
+	"agentflow/internal/core/runtime"
 )
 
 // Prefix is the subtree this API owns on the shared HTTP listener.
@@ -32,27 +40,63 @@ const Prefix = "/v1/users"
 // body is a mistake or an attack.
 const maxBody = 8 << 10
 
+// Options are the runtime handles the API needs beyond configuration.
+type Options struct {
+	// LinkableChannels are the configured channels whose sender identity the
+	// platform authenticates — the ones a profile may actually link. Reporting
+	// an unlinkable channel would send a user to a flow that cannot work.
+	LinkableChannels []string
+	// Files answers /me/projects. Nil means the file store is disabled.
+	Files *files.Manager
+	// Store answers /me/usage. Nil means accounting is disabled.
+	Store *runtime.Store
+	// Quota reports the caller's limit. Nil means no quota is configured.
+	Quota QuotaStatus
+	// Verifier checks access tokens minted by the deployment's identity
+	// provider. Nil means no provider is configured, and only API tokens work.
+	Verifier *oidc.Verifier
+	// JITProvisioning creates a profile on a verified first login.
+	JITProvisioning bool
+}
+
+// QuotaStatus is the quota's read surface, as the API needs it.
+type QuotaStatus interface {
+	Status(userID string) (used, limit, inFlight int64, err error)
+}
+
 // API serves the user profile endpoints.
 type API struct {
-	reg       *identity.Registry
-	log       *slog.Logger
-	mode      string // "open" | "invite"
-	linkTTL   time.Duration
-	inviteTTL time.Duration
-	limiter   *ipLimiter
+	reg      *identity.Registry
+	log      *slog.Logger
+	cfg      config.UsersConfig
+	mode     string // "open" | "invite"
+	linkTTL  time.Duration
+	verifier *oidc.Verifier
+	jit      bool
+	linkable []string
+	files    *files.Manager
+	store    *runtime.Store
+	quota    QuotaStatus
+	limiter  *ipLimiter
 }
 
 // New builds the API. mode selects whether registration is open or requires an
 // operator-issued invite.
-func New(reg *identity.Registry, cfg config.UsersConfig, log *slog.Logger) *API {
+func New(reg *identity.Registry, cfg config.UsersConfig, log *slog.Logger, opts Options) *API {
 	return &API{
-		reg:       reg,
-		log:       log.With("module", "users"),
-		mode:      cfg.RegistrationMode(),
-		linkTTL:   cfg.LinkChallengeTTL(),
-		inviteTTL: 7 * 24 * time.Hour,
-		// Registration and linking are the write endpoints, so they share one
-		// modest per-address budget: 30 requests a minute, bursting to 10.
+		reg:      reg,
+		log:      log.With("module", "users"),
+		cfg:      cfg,
+		mode:     cfg.RegistrationMode(),
+		linkTTL:  cfg.LinkChallengeTTL(),
+		verifier: opts.Verifier,
+		jit:      opts.JITProvisioning,
+		linkable: opts.LinkableChannels,
+		files:    opts.Files,
+		store:    opts.Store,
+		quota:    opts.Quota,
+		// Registration and the public endpoints are the anonymous surface; they
+		// share one modest per-address budget.
 		limiter: newIPLimiter(30, 10),
 	}
 }
@@ -61,13 +105,65 @@ func New(reg *identity.Registry, cfg config.UsersConfig, log *slog.Logger) *API 
 // listener with httpd.Server.Handle(Prefix+"/", api.Handler()).
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc(Prefix+"/config", a.public(a.handleConfig))
 	mux.HandleFunc(Prefix+"/register", a.limited(a.handleRegister))
-	mux.HandleFunc(Prefix+"/me", a.authed(a.handleMe))
-	mux.HandleFunc(Prefix+"/me/", a.authed(a.handleMeSubtree))
-	return mux
+	mux.HandleFunc(Prefix+"/me", a.handleMe)
+	mux.HandleFunc(Prefix+"/me/", a.handleMeSubtree)
+	return a.cors(mux)
+}
+
+// --- CORS -------------------------------------------------------------------
+
+// cors answers cross-origin requests for origins an operator has named. With no
+// configured origins the API sends no CORS headers at all: a browser on another
+// origin then cannot call it, which is the safe default.
+func (a *API) cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" && a.cfg.OriginAllowed(origin) {
+			h := w.Header()
+			h.Set("Access-Control-Allow-Origin", origin)
+			// Deliberately no Allow-Credentials: requests carry a bearer token,
+			// never a cookie, so a browser has no ambient authority to lend to
+			// another origin.
+			h.Add("Vary", "Origin")
+			if r.Method == http.MethodOptions {
+				h.Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+				h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+				h.Set("Access-Control-Max-Age", "600")
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		} else if r.Method == http.MethodOptions {
+			// A preflight from an unknown origin: answer it plainly and without
+			// CORS headers, so the browser refuses the actual request rather
+			// than us having to guess.
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // --- endpoints --------------------------------------------------------------
+
+// handleConfig is the one public endpoint a frontend calls first: it says
+// whether registration is open or invite-only, and which channels can be
+// linked here, so the UI renders a flow that can actually succeed.
+func (a *API) handleConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "GET required")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"registration":      a.mode,
+		"linkable_channels": a.linkable,
+		// How a frontend should authenticate: an access token from the
+		// deployment's identity provider when one is configured, or an API
+		// token from /register. Both go in Authorization: Bearer.
+		"identity_provider": a.verifier != nil,
+	})
+}
 
 type registerRequest struct {
 	Invite      string `json:"invite"`
@@ -81,6 +177,9 @@ type registerResponse struct {
 	Me     profileView `json:"profile"`
 }
 
+// handleRegister creates a profile and returns its API token exactly once. It is
+// for scripts and for deployments with no identity provider; a deployment that
+// has one does not need it, because logins provision profiles themselves.
 func (a *API) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeErr(w, http.StatusMethodNotAllowed, "POST required")
@@ -113,16 +212,17 @@ func (a *API) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	metrics.Inc("agentflow_user_registrations")
-	a.log.Info("user registered", "user_id", p.UserID, "mode", a.mode, "channel", "")
+	a.log.Info("user registered", "user_id", p.UserID, "mode", a.mode)
 
-	writeJSON(w, http.StatusCreated, registerResponse{
-		UserID: p.UserID,
-		Token:  tok,
-		Me:     viewOf(p),
-	})
+	writeJSON(w, http.StatusCreated, registerResponse{UserID: p.UserID, Token: tok, Me: viewOf(p)})
 }
 
-func (a *API) handleMe(w http.ResponseWriter, r *http.Request, userID string) {
+func (a *API) handleMe(w http.ResponseWriter, r *http.Request) {
+	auth, ok := a.requireAuth(w, r)
+	if !ok {
+		return
+	}
+	userID := auth.userID
 	switch r.Method {
 	case http.MethodGet:
 		p, ok, err := a.reg.Get(userID)
@@ -163,17 +263,25 @@ func (a *API) handleMe(w http.ResponseWriter, r *http.Request, userID string) {
 	}
 }
 
-// handleMeSubtree serves /v1/users/me/links, /v1/users/me/links/{id} and
-// /v1/users/me/token/rotate.
-func (a *API) handleMeSubtree(w http.ResponseWriter, r *http.Request, userID string) {
+// handleMeSubtree serves /me/links, /me/links/{id}, /me/token/rotate,
+// /me/usage and /me/projects.
+func (a *API) handleMeSubtree(w http.ResponseWriter, r *http.Request) {
+	auth, ok := a.requireAuth(w, r)
+	if !ok {
+		return
+	}
 	rest := strings.TrimPrefix(r.URL.Path, Prefix+"/me/")
 	switch {
 	case rest == "links":
-		a.handleLinks(w, r, userID)
+		a.handleLinks(w, r, auth.userID)
 	case strings.HasPrefix(rest, "links/"):
-		a.handleUnlink(w, r, userID, strings.TrimPrefix(rest, "links/"))
+		a.handleUnlink(w, r, auth.userID, strings.TrimPrefix(rest, "links/"))
 	case rest == "token/rotate":
-		a.handleRotate(w, r, userID)
+		a.handleRotate(w, r, auth.userID, auth)
+	case rest == "usage":
+		a.handleUsage(w, r, auth.userID)
+	case rest == "projects":
+		a.handleProjects(w, r, auth.userID)
 	default:
 		writeErr(w, http.StatusNotFound, "no such endpoint")
 	}
@@ -241,8 +349,9 @@ func (a *API) handleUnlink(w http.ResponseWriter, r *http.Request, userID, ident
 }
 
 // handleRotate issues a fresh token and revokes the one that authorized the
-// call, so a leaked token can be retired without losing access.
-func (a *API) handleRotate(w http.ResponseWriter, r *http.Request, userID string) {
+// call, so a leaked token can be retired without losing access. A cookie
+// session has no token to rotate, so this is a bearer-only operation.
+func (a *API) handleRotate(w http.ResponseWriter, r *http.Request, userID string, auth authResult) {
 	if r.Method != http.MethodPost {
 		writeErr(w, http.StatusMethodNotAllowed, "POST required")
 		return
@@ -261,20 +370,128 @@ func (a *API) handleRotate(w http.ResponseWriter, r *http.Request, userID string
 	writeJSON(w, http.StatusOK, map[string]string{"token": tok})
 }
 
+// handleUsage reports what the caller has spent: today's totals, a short daily
+// trend, and where their quota stands.
+func (a *API) handleUsage(w http.ResponseWriter, r *http.Request, userID string) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "GET required")
+		return
+	}
+	if a.store == nil {
+		writeErr(w, http.StatusServiceUnavailable, "accounting is not enabled")
+		return
+	}
+	today, err := a.store.UsageForDay(userID, runtime.DayKey(time.Now()))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not read usage")
+		return
+	}
+	history, err := a.store.UsageHistory(userID, 7)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not read usage history")
+		return
+	}
+	out := map[string]any{
+		"day":     runtime.DayKey(time.Now()),
+		"today":   today,
+		"history": history,
+	}
+	if a.quota != nil {
+		used, limit, inFlight, err := a.quota.Status(userID)
+		if err == nil {
+			out["quota"] = map[string]any{
+				"used": used, "limit": limit, "in_flight": inFlight,
+				"unlimited": limit == 0,
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleProjects lists the caller's own file projects. The scope is resolved
+// from the profile id, so a user can only ever see their own.
+func (a *API) handleProjects(w http.ResponseWriter, r *http.Request, userID string) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "GET required")
+		return
+	}
+	if a.files == nil {
+		writeErr(w, http.StatusServiceUnavailable, "the file store is not enabled")
+		return
+	}
+	projects, err := a.files.Projects(r.Context(), "user:"+userID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not list projects")
+		return
+	}
+	if projects == nil {
+		// An empty listing is [], not null: a frontend should not have to
+		// special-case "no projects yet".
+		projects = []string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"projects": projects})
+}
+
+// --- auth -------------------------------------------------------------------
+
+// authResult is how a request proved who it is.
+type authResult struct {
+	userID string
+	// viaProvider marks an identity-provider login rather than an API token.
+	viaProvider bool
+}
+
+// requireAuth resolves the caller from a bearer token. Two kinds are accepted:
+// an API token issued by this package (afu_…), or an access token from the
+// deployment's identity provider, verified against the issuer's published keys.
+// There is no third path — no cookie, and so nothing ambient to replay.
+func (a *API) requireAuth(w http.ResponseWriter, r *http.Request) (authResult, bool) {
+	tok := bearerToken(r)
+	if tok == "" {
+		writeErr(w, http.StatusUnauthorized, "unauthorized: send Authorization: Bearer <token>")
+		return authResult{}, false
+	}
+	if !strings.HasPrefix(tok, "afu_") {
+		return a.authProvider(w, r, tok)
+	}
+	userID, ok := a.reg.TokenUser(tok)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, "unauthorized")
+		return authResult{}, false
+	}
+	return authResult{userID: userID}, true
+}
+
+// authProvider verifies an identity-provider access token and resolves it to a
+// profile, creating one on first login when just-in-time provisioning is on.
+func (a *API) authProvider(w http.ResponseWriter, r *http.Request, token string) (authResult, bool) {
+	if a.verifier == nil {
+		writeErr(w, http.StatusUnauthorized, "this deployment has no identity provider configured; use an API token")
+		return authResult{}, false
+	}
+	claims, err := a.verifier.Verify(r.Context(), token)
+	if err != nil {
+		a.log.Warn("access token rejected", "err", err)
+		writeErr(w, http.StatusUnauthorized, "unauthorized")
+		return authResult{}, false
+	}
+	id, created, err := a.reg.ProvisionOIDC(
+		claims.Identity(a.verifier.Issuer()), claims.Name, claims.Email, a.jit)
+	if err != nil {
+		writeErr(w, http.StatusForbidden, err.Error())
+		return authResult{}, false
+	}
+	if created {
+		metrics.Inc("agentflow_user_provisions")
+	}
+	return authResult{userID: id.UserID, viaProvider: true}, true
+}
+
 // --- middleware -------------------------------------------------------------
 
-// authed resolves the bearer token to a profile. Every endpoint except
-// registration requires it.
-func (a *API) authed(next func(http.ResponseWriter, *http.Request, string)) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		userID, ok := a.reg.TokenUser(bearerToken(r))
-		if !ok {
-			writeErr(w, http.StatusUnauthorized, "unauthorized")
-			return
-		}
-		next(w, r, userID)
-	}
-}
+// public applies the rate limit without requiring authentication (register,
+// session start, config).
+func (a *API) public(next http.HandlerFunc) http.HandlerFunc { return a.limited(next) }
 
 // limited applies the per-address budget to the endpoints an anonymous caller
 // can reach.
@@ -297,7 +514,8 @@ func bearerToken(r *http.Request) string {
 }
 
 // clientIP is the peer address. Behind a reverse proxy this is the proxy, so a
-// deployment that fronts the listener must rate limit there as well.
+// deployment that fronts the listener must rate limit there as well — see the
+// note on trusted proxies in the docs.
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {

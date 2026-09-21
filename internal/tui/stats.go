@@ -79,6 +79,7 @@ var statSections = []statSection{
 	{"Identity", []statDef{
 		{"agentflow_identity_mints", "minted", false},
 		{"agentflow_user_registrations", "registered", false},
+		{"agentflow_user_provisions", "provisioned", false},
 		{"agentflow_user_links", "linked", false},
 	}},
 }

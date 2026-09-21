@@ -3,6 +3,7 @@ package webui
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"time"
 
 	"agentflow/internal/core/accounting"
@@ -136,6 +137,57 @@ func (u *UI) handleUserLimit(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	if err := u.deps.Users.Identities.Update(id, nil, nil, req.TokensPerDay); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	p, _, _ := u.deps.Users.Identities.Get(id)
+	writeJSON(w, http.StatusOK, map[string]any{"profile": p})
+}
+
+// handleUserSettings sets a profile's per-user overrides: the model that
+// person's turns run on, and a layer of instructions appended to the agent's
+// own. An empty string clears an override and returns them to inheriting.
+//
+// The model is validated against the live registry rather than stored blindly.
+// A name that resolves to nothing would otherwise fail *every* turn that person
+// takes, at the provider call, long after this request returned — the operator
+// setting it is the one who can act on the error, so they get it here.
+//
+// This is deliberately an operator surface and not part of /v1/users: which
+// model a person runs on is a cost decision, not a preference they set on
+// themselves.
+func (u *UI) handleUserSettings(w http.ResponseWriter, r *http.Request) {
+	if !u.usersAvailable(w) {
+		return
+	}
+	var req struct {
+		Model              *string `json:"model"`
+		InstructionsAppend *string `json:"instructions_append"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if req.Model == nil && req.InstructionsAppend == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "nothing to set: pass model or instructions_append (an empty string clears it)",
+		})
+		return
+	}
+	if req.Model != nil && *req.Model != "" {
+		if u.deps.Models == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "no models are configured"})
+			return
+		}
+		if _, ok := u.deps.Models.List()[*req.Model]; !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "unknown model " + strconv.Quote(*req.Model) + ": it is not in the models registry",
+			})
+			return
+		}
+	}
+	id := r.PathValue("id")
+	if err := u.deps.Users.Identities.SetOverrides(id, req.Model, req.InstructionsAppend); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}

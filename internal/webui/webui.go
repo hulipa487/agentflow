@@ -158,6 +158,7 @@ func (u *UI) API() http.Handler {
 	mux.HandleFunc("GET /admin/api/users", u.handleUsers)
 	mux.HandleFunc("GET /admin/api/users/{id}", u.handleUser)
 	mux.HandleFunc("POST /admin/api/users/{id}/limit", u.handleUserLimit)
+	mux.HandleFunc("PUT /admin/api/users/{id}/settings", u.handleUserSettings)
 	mux.HandleFunc("POST /admin/api/users/{id}/unlink", u.handleUserUnlink)
 	mux.HandleFunc("POST /admin/api/users/invites", u.handleInviteIssue)
 	return mux

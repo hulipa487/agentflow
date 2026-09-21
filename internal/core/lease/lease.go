@@ -19,6 +19,7 @@ package lease
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -131,6 +132,23 @@ func (m *Manager) AcquireFor(ctx context.Context, name string, ttl time.Duration
 	}
 	m.log.Debug("lease acquired", "name", name, "ttl", ttl.String())
 	return true, nil
+}
+
+// Held reports whether the named lease is currently held by anyone, from the
+// store's point of view rather than this process's. It answers "is this work
+// still someone's?" — the question a reclaim pass asks before deleting another
+// instance's resources, which no amount of local state can answer, because the
+// holder may be a peer that is alive and well.
+func (m *Manager) Held(ctx context.Context, name string) (bool, error) {
+	var expires int64
+	err := m.st.QueryRow(ctx, `SELECT expires_at FROM leases WHERE name = ?`, name).Scan(&expires)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lease: read %q: %w", name, err)
+	}
+	return expires > time.Now().UnixNano(), nil
 }
 
 // Release gives up a lease this instance holds, so another instance can take it

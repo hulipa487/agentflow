@@ -216,6 +216,15 @@ func (h *Hub) drainOnce(ctx context.Context) {
 	}
 }
 
+// Live reports whether this deployment still owns the session — the question a
+// reclaim pass asks before destroying a session's resources. It reads the lease
+// rather than this instance's held set, because the session may be alive on
+// another instance, and "nobody has it" is the only answer that licenses
+// deleting anything.
+func (h *Hub) Live(ctx context.Context, sessKey string) (bool, error) {
+	return h.leases.Held(ctx, sessionLease+":"+sessKey)
+}
+
 // Release gives up every session this instance owns, so a shutdown hands them
 // over immediately instead of making the fleet wait out the leases.
 func (h *Hub) Release(ctx context.Context) {

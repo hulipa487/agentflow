@@ -415,6 +415,7 @@ var blockingOps = map[string]bool{
 	"store.get":          true,
 	"store.query":        true,
 	"store.delete":       true,
+	"store.scopes":       true,
 	"shell.spawn":        true,
 	"shell.exec":         true,
 	"shell.write":        true,

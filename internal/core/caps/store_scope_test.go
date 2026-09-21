@@ -24,6 +24,11 @@ func scopedStoreTest(t *testing.T) map[string]session.OpHandler {
 	}
 	mgr := memory.NewManager(reg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	am := memory.AgentMemory{
+		// Real profiles carry the binding under both maps (logical and
+		// physical names); store.scopes' single-store fallback reads Stores.
+		Stores: map[string]memory.StoreBinding{
+			"t": {Backend: "v", Table: "t", Scoping: "user"},
+		},
 		Tables: map[string]memory.StoreBinding{
 			"t": {Backend: "v", Table: "t", Scoping: "user"},
 		},
@@ -132,5 +137,64 @@ func TestStoreScopeInteractiveQueryStrips(t *testing.T) {
 	m := recs[0].(map[string]any)
 	if m["key"] != "turn:a" {
 		t.Fatalf("query keys must be scope-stripped, got %q", m["key"])
+	}
+}
+
+// TestStoreScopesOp: store.scopes enumerates user scopes under maintenance
+// provenance and is denied to every other mode — the distiller's per-scope
+// iteration surface. The interactive denial is the isolation pin: without the
+// mode guard, a channel session could enumerate every user scope in the
+// table.
+func TestStoreScopesOp(t *testing.T) {
+	h := scopedStoreTest(t)
+	u1, u2 := userCtx("u1"), userCtx("u2")
+	putVal(t, h, u1, "turn:a", "1")
+	putVal(t, h, u2, "turn:b", "2")
+	putVal(t, h, context.Background(), "kb:shared", "fleet")
+
+	resp, ok := h["store.scopes"](maintCtx(), session.Op{Type: "store.scopes", Table: "t"})
+	if !ok {
+		t.Fatalf("maintenance store.scopes failed: %s", resp)
+	}
+	var scopes []string
+	if err := json.Unmarshal([]byte(resp), &scopes); err != nil {
+		t.Fatal(err)
+	}
+	if len(scopes) != 2 || scopes[0] != "user:u1" || scopes[1] != "user:u2" {
+		t.Fatalf("scopes must list user scopes sorted (never service/legacy), got %v", scopes)
+	}
+
+	// Empty table name falls back to the only store, like store.query.
+	if _, ok := h["store.scopes"](maintCtx(), session.Op{Type: "store.scopes"}); !ok {
+		t.Fatal("store.scopes with empty table must fall back to the only store")
+	}
+
+	// Channel sessions and service contexts are denied.
+	if _, ok := h["store.scopes"](u1, session.Op{Type: "store.scopes", Table: "t"}); ok {
+		t.Fatal("interactive store.scopes must be denied")
+	}
+	if _, ok := h["store.scopes"](context.Background(), session.Op{Type: "store.scopes", Table: "t"}); ok {
+		t.Fatal("service store.scopes must be denied")
+	}
+}
+
+// TestStoreScopesSharedDenied: a shared binding has no scope wrapper, so
+// enumeration is refused rather than answered with table-wide keys.
+func TestStoreScopesSharedDenied(t *testing.T) {
+	reg := memory.NewRegistry()
+	reg.RegisterProvider(volatile.Provider{})
+	reg.AddBackend("v", "volatile", nil)
+	if err := reg.Open(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	mgr := memory.NewManager(reg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	am := memory.AgentMemory{
+		Tables: map[string]memory.StoreBinding{
+			"t": {Backend: "v", Table: "t"}, // Scoping "" — shared
+		},
+	}
+	h := StoreHandlers(&am, mgr)
+	if _, ok := h["store.scopes"](maintCtx(), session.Op{Type: "store.scopes", Table: "t"}); ok {
+		t.Fatal("shared-binding store.scopes must be denied")
 	}
 }

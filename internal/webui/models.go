@@ -202,13 +202,19 @@ func (u *UI) handleModelUpsert(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	u.deps.Models.Upsert(name, m)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "applied": "runtime", "note": "live now; persist to keep across restarts"})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "applied": "runtime",
+		"note": "live on this instance; persist to keep across restarts, and note that other instances of a deployment keep their current models until they restart",
+	})
 }
 
 func (u *UI) handleModelRemove(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	u.deps.Models.Remove(name)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "applied": "runtime", "note": "live now; persist to keep across restarts"})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "applied": "runtime",
+		"note": "removed on this instance; persist to keep it removed across restarts, and note that other instances of a deployment keep their current models until they restart",
+	})
 }
 
 // handleModelTest exercises the live model with a minimal real call through

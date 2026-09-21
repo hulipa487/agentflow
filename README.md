@@ -33,7 +33,7 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 - **Config directories** — `-configdir <dir>` loads `system.yaml` + `channels.yaml` + `profiles/*.yaml` (one agent per file, `spawn: true` routes to `profiles.agent`) + `triggers/*.yaml` instead of a single `-config` file; same strict validation after merge, and the directory is the base for every relative path.
 - **Budget** — per-agent token pools with reserve/commit/release around LLM calls; daily reset or rolling-window accounting; spawn profiles get their own shared pool.
 - **Safety** — core-owned ingress/egress chain (source-attribution, signal-gate, steady-directive, support-offer, affect-guard) that cannot be uninstalled from Lua.
-- **Observability** — `/healthz`, `/readyz`, `/metrics`, `/v1/sessions` on loopback; an embedded web console on the admin server (token-authenticated, `-no-webui` to disable); shared channel listener serves `GET /health`.
+- **Observability** — `/healthz`, `/readyz`, `/metrics`, `/admin/sessions` on loopback; an embedded web console on the admin server (token-authenticated, `-no-webui` to disable); shared channel listener serves `GET /health`.
 
 ### Driver set
 

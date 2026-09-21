@@ -372,7 +372,11 @@ func NewAdminServer(addr, token string, reg *Registry, log *slog.Logger) *AdminS
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/readyz", s.handleReady)
 	mux.HandleFunc("/metrics", s.auth(s.handleMetrics))
-	mux.HandleFunc("/v1/sessions", s.auth(s.handleSessions))
+	// /admin/sessions, not /v1/sessions: /v1 is the public user API's version
+	// prefix, and this listener is the private admin one — the path said a
+	// public client could reach a listing of every live session on the
+	// instance, which was never true.
+	mux.HandleFunc("/admin/sessions", s.auth(s.handleSessions))
 	mux.HandleFunc("/admin/credentials", s.auth(s.handleCredentials))
 	mux.HandleFunc("/admin/credentials/", s.auth(s.handleCredentialsDelete))
 	s.mux = mux

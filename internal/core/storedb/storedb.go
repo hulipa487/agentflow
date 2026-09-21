@@ -168,6 +168,18 @@ func (d *DB) Backend() string { return d.backend }
 // Target reports where the store lives, in a form safe to log.
 func (d *DB) Target() string { return d.target }
 
+// Display renders a store target for a log line or an error message: a
+// PostgreSQL DSN loses its credentials, a SQLite path is already safe. Anything
+// that logs a target — including the config layer, which holds one before any
+// store is opened — goes through this, because a DSN carries a password and a
+// log line does not get to keep it.
+func Display(target string) string {
+	if BackendFor(target) != BackendPostgres {
+		return target
+	}
+	return RedactDSN(target)
+}
+
 // Close releases this store's hold on the pool. The pool closes with the last
 // holder, so a store closing does not pull the connection out from under its
 // neighbours.

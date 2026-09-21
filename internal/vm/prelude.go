@@ -589,6 +589,10 @@ function shell.spawn(opts)
     user       = opts.user,
     password   = opts.password,
     key_file   = opts.key_file,
+    volumes    = opts.volumes,
+    project    = opts.project,
+    ref        = opts.ref,
+    scratch_mount = opts.scratch_mount,
     shell_opts = opts.shell_opts,
   })
 end

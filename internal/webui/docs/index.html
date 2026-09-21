@@ -312,8 +312,12 @@ project launch: user ──► main ──[directive: start_project]──► ag
   <p>So the fleet configuration pairs Tier 1 with a shared memory backend:</p>
   <pre><code>memory:
   backends:
-    vec: { type: qdrant, url: http://qdrant.internal:6333, api_key: ${QDRANT_KEY} }
-    hot: { type: redis, url: redis://redis.internal:6379 }</code></pre>
+    vec:
+      provider: qdrant
+      config: { url: http://qdrant.internal:6333, api_key: ${QDRANT_KEY} }
+    hot:
+      provider: redis
+      config: { url: redis://redis.internal:6379 }</code></pre>
 
   <h3>The log plane</h3>
   <p>The engine's state has three shapes, and the shape is what decides where it belongs:</p>

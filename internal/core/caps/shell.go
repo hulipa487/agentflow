@@ -136,6 +136,12 @@ func ShellHandlers(mgr *shell.Manager, fm *files.Manager, agent string) map[stri
 // checkoutInto resolves the project's snapshot and writes every file into the
 // container directory of the first volume mount. Container paths are POSIX
 // regardless of the host OS.
+//
+// The word "checkout" in the error below is load-bearing beyond this engine: a
+// deployment's cold-start retry matches on it to tell "this project has nothing
+// to check out yet" from a broken shell, and falls back to a bare container on
+// that basis. Reword it only together with a structured alternative — the test
+// TestShellSpawnCheckoutFailureNamesCheckout is what will stop you.
 func checkoutInto(ctx context.Context, mgr *shell.Manager, fm *files.Manager, handleID, owner, scope, project, ref, volume string) error {
 	if ref == "" {
 		ref = "main"

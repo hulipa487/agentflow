@@ -202,6 +202,40 @@ func TestShellSpawnCheckoutRequiresVolume(t *testing.T) {
 	}
 }
 
+// A checkout that cannot resolve — a project with no commits yet, which is the
+// ordinary first-task path — fails the spawn with the word "checkout" in the
+// message, and leaves no half-prepared container behind.
+//
+// The phrase is a contract with a consumer outside this repo: a deployment's
+// cold-start retry matches on it to tell "nothing to check out yet" from a
+// broken shell and respawns bare. This test is what makes a reword a failure
+// here rather than a silent degradation there.
+func TestShellSpawnCheckoutFailureNamesCheckout(t *testing.T) {
+	fm := testFileManager(t)
+	tp := newTestShellProvider("docker")
+	mgr := shell.NewManager([]shell.ShellProvider{tp}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h := ShellHandlers(mgr, fm, "tester")
+	ctx := session.WithOwner(context.Background(), "session-1")
+
+	resp, ok := h["shell.spawn"](ctx, session.Op{
+		Type:    "shell.spawn",
+		Project: "never-committed",
+		Ref:     "main",
+		Volumes: []string{"/host/work:/work"},
+	})
+	if ok {
+		t.Fatalf("a checkout that cannot resolve must fail the spawn: %s", resp)
+	}
+	if !strings.Contains(resp, "checkout") {
+		t.Fatalf("the failure no longer names the checkout; a retry matching on that word would stop falling back: %s", resp)
+	}
+	// The container spawned for the attempt is destroyed, not left running: the
+	// retry that follows starts from nothing.
+	if got := strings.Join(tp.events, ","); got != "spawn,destroy" {
+		t.Fatalf("events = %v, want spawn then destroy", tp.events)
+	}
+}
+
 // TestShellSpawnScratchMount: the owning session's scratch lands in the given
 // container directory before ready.
 func TestShellSpawnScratchMount(t *testing.T) {

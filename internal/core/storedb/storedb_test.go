@@ -2,6 +2,7 @@ package storedb
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -19,6 +20,93 @@ func TestBackendFor(t *testing.T) {
 		if got := BackendFor(target); got != want {
 			t.Errorf("BackendFor(%q) = %q, want %q", target, got, want)
 		}
+	}
+}
+
+// A target names its backend with a scheme, or is a bare path meaning the
+// first allowed backend. The parser is the one place that decides, so the
+// differences between callers live in what they allow rather than in how they
+// read a string.
+func TestParseTarget(t *testing.T) {
+	store := []string{BackendSQLite, BackendPostgres}
+	for _, tt := range []struct {
+		name    string
+		raw     string
+		allowed []string
+		backend string
+		address string
+		wantErr string
+	}{
+		{name: "a postgres dsn", raw: "postgres://u:p@h:5432/db", allowed: store,
+			backend: BackendPostgres, address: "postgres://u:p@h:5432/db"},
+		{name: "the postgresql spelling", raw: "postgresql://h/db", allowed: store,
+			backend: BackendPostgres, address: "postgresql://h/db"},
+		{name: "an explicit sqlite file", raw: "sqlite://./data/x.db", allowed: store,
+			backend: BackendSQLite, address: "./data/x.db"},
+		{name: "a bare path is the local form", raw: "./data/x.db", allowed: store,
+			backend: BackendSQLite, address: "./data/x.db"},
+		{name: "a drive letter is not a scheme", raw: `C:\data\x.db`, allowed: store,
+			backend: BackendSQLite, address: `C:\data\x.db`},
+		{name: "the log plane takes a directory", raw: "./data/log", allowed: []string{BackendFile},
+			backend: BackendFile, address: "./data/log"},
+		{name: "the log plane spells it file://", raw: "file://./data/log", allowed: []string{BackendFile},
+			backend: BackendFile, address: "./data/log"},
+		{name: "a store will not take the log plane's backend", raw: "file://./data/log", allowed: store,
+			wantErr: "this setting takes sqlite, postgres"},
+		{name: "the log plane will not take a store's", raw: "sqlite://./data/log", allowed: []string{BackendFile},
+			wantErr: "this setting takes file"},
+		{name: "an unknown scheme", raw: "mongodb://host/db", allowed: store,
+			wantErr: "does not have (mongodb)"},
+		{name: "another one", raw: "scylla://host:9042", allowed: store,
+			wantErr: "does not have (scylla)"},
+		{name: "no address", raw: "sqlite://", allowed: store, wantErr: "has no address"},
+		{name: "nothing at all", raw: "   ", allowed: store, wantErr: "empty target"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseTarget(tt.raw, tt.allowed...)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("expected an error containing %q, got %v", tt.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.Backend != tt.backend || got.Address != tt.address {
+				t.Fatalf("parsed %q as %s %q, want %s %q", tt.raw, got.Backend, got.Address, tt.backend, tt.address)
+			}
+		})
+	}
+}
+
+// The trap the parser exists for: a scheme the engine does not have used to be
+// classified as a local file path, so a Mongo DSN became a directory named
+// "mongodb:" on one operating system and an invalid-path failure on another.
+// It is now refused, by name, before anything tries to open it.
+func TestOpenRefusesAnUnknownScheme(t *testing.T) {
+	dir := t.TempDir()
+	for _, target := range []string{
+		"mongodb://host/db",
+		"scylla://host:9042",
+		"mysql://host/db",
+		filepath.Join(dir, "x.db") + "://odd",
+	} {
+		_, err := Open(target)
+		if err == nil {
+			t.Fatalf("Open(%q) succeeded, want a refusal", target)
+		}
+		if !strings.Contains(err.Error(), "does not have") {
+			t.Fatalf("Open(%q) = %v, want it to name the unknown scheme", target, err)
+		}
+	}
+	// Nothing was created on the way to that refusal.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("a refused target created %d entries: %v", len(entries), entries)
 	}
 }
 

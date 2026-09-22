@@ -39,16 +39,20 @@ func OpenStore(target string, log *slog.Logger) (Store, error) {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	switch BackendFor(target) {
-	case BackendPostgres:
-		s, err := OpenPostgres(target)
+	parsed, err := storedb.ParseTarget(target, storedb.BackendSQLite, storedb.BackendPostgres)
+	if err != nil {
+		return nil, err
+	}
+	switch parsed.Backend {
+	case storedb.BackendPostgres:
+		s, err := OpenPostgres(parsed.Address)
 		if err != nil {
 			return nil, err
 		}
 		log.Info("runtime store ready", "backend", BackendPostgres, "target", s.Path())
 		return s, nil
 	default:
-		s, err := OpenSQLite(target)
+		s, err := OpenSQLite(parsed.Address)
 		if err != nil {
 			return nil, err
 		}

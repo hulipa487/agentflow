@@ -33,17 +33,16 @@ const (
 	BackendPostgres = "postgres"
 )
 
-// BackendFor reports which backend a target selects. The scheme decides: a
-// postgres:// or postgresql:// target is a server, anything else is a SQLite
-// file path (the config layer strips any "sqlite://" prefix before it reaches
-// here).
+// BackendFor reports which backend a target names, for a label rather than a
+// decision — a log line, a comparison, a warning. A target this build cannot
+// parse reads as SQLite, which is what a bare path is; opening or validating a
+// target goes through ParseTarget, which reports the schemes that exist instead
+// of guessing at one.
 func BackendFor(target string) string {
-	switch {
-	case strings.HasPrefix(target, "postgres://"), strings.HasPrefix(target, "postgresql://"):
-		return BackendPostgres
-	default:
-		return BackendSQLite
+	if t, err := ParseTarget(target, BackendSQLite, BackendPostgres, BackendFile); err == nil {
+		return t.Backend
 	}
+	return BackendSQLite
 }
 
 // maxOpenPostgres bounds a server pool. This is one number for the whole
@@ -84,15 +83,16 @@ type DB struct {
 // Migrating is the caller's job: schema is per store, and a shared pool must
 // not decide what a store's tables look like.
 func Open(target string) (*DB, error) {
-	backend := BackendFor(target)
-	key := target
+	parsed, err := ParseTarget(target, BackendSQLite, BackendPostgres)
+	if err != nil {
+		return nil, err
+	}
+	backend, address := parsed.Backend, parsed.Address
+	key := address
 	if backend == BackendSQLite {
-		if target == "" {
-			return nil, fmt.Errorf("storedb: empty sqlite path")
-		}
-		abs, err := filepath.Abs(target)
+		abs, err := filepath.Abs(address)
 		if err != nil {
-			abs = target
+			abs = address
 		}
 		if err := os.MkdirAll(filepath.Dir(abs), 0750); err != nil {
 			return nil, fmt.Errorf("storedb: create directory for %s: %w", abs, err)
@@ -169,15 +169,22 @@ func (d *DB) Backend() string { return d.backend }
 func (d *DB) Target() string { return d.target }
 
 // Display renders a store target for a log line or an error message: a
-// PostgreSQL DSN loses its credentials, a SQLite path is already safe. Anything
-// that logs a target — including the config layer, which holds one before any
-// store is opened — goes through this, because a DSN carries a password and a
-// log line does not get to keep it.
+// PostgreSQL DSN loses its credentials, and every other address is already safe
+// to show. A target that will not parse is shown as written, unless it carries
+// userinfo behind a scheme — that is redacted anyway, so a misconfigured target
+// cannot leak a password on its way into the boot error that rejects it.
 func Display(target string) string {
-	if BackendFor(target) != BackendPostgres {
-		return target
+	parsed, err := ParseTarget(target, BackendSQLite, BackendPostgres, BackendFile)
+	if err == nil {
+		if parsed.Backend == BackendPostgres {
+			return RedactDSN(parsed.Address)
+		}
+		return parsed.Address
 	}
-	return RedactDSN(target)
+	if strings.Contains(target, "://") && strings.Contains(target, "@") {
+		return RedactDSN(target)
+	}
+	return target
 }
 
 // Close releases this store's hold on the pool. The pool closes with the last

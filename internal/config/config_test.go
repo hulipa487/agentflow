@@ -945,7 +945,7 @@ func TestClusterStoreTarget(t *testing.T) {
 }
 
 // The log plane is a directory or nothing. A value naming a backend this build
-// does not have is a boot error rather than a directory called "scylla:".
+// does not have is a boot error rather than a directory named after it.
 func TestLogPlaneTarget(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
@@ -956,7 +956,7 @@ func TestLogPlaneTarget(t *testing.T) {
 		{name: "unset keeps the log in the runtime store"},
 		{name: "a directory", value: "./data/log", wantDir: "./data/log"},
 		{name: "an explicit file scheme", value: "file://./data/log", wantDir: "./data/log"},
-		{name: "an unknown backend", value: "scylla://host:9042", wantErr: "no such backend"},
+		{name: "an unknown backend", value: "mysql://host:3306", wantErr: "does not have (mysql)"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &Config{Agents: map[string]Agent{"bot": {Loop: "./loop.lua"}}}
@@ -975,6 +975,79 @@ func TestLogPlaneTarget(t *testing.T) {
 				t.Fatalf("LogPlaneDir = %q, want %q", got, tt.wantDir)
 			}
 		})
+	}
+}
+
+// Every store target is parsed at validation, so a scheme the engine has no
+// backend for is a boot error naming the setting — not a directory named after
+// the scheme, which is what "anything that is not postgres is a file path" used
+// to do to it.
+func TestStoreTargetsRejectUnknownSchemes(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		set    func(c *Config)
+		wantIn string
+	}{
+		{name: "the runtime store", set: func(c *Config) { c.Runtime.Persistence = "mongodb://host/agentflow" },
+			wantIn: "runtime.persistence"},
+		{name: "the cluster store", set: func(c *Config) { c.Runtime.Cluster.Persistence = "scylla://host:9042" },
+			wantIn: "runtime.cluster.persistence"},
+		{name: "the identity store", set: func(c *Config) { c.Runtime.Identity.Persistence = "mysql://host/db" },
+			wantIn: "runtime.identity.persistence"},
+		{name: "the credential store", set: func(c *Config) { c.Runtime.Credentials.Path = "redis://host/0" },
+			wantIn: "runtime.credentials.path"},
+		// A store target cannot be the log plane's directory backend, and the
+		// log plane cannot be a store's.
+		{name: "a file target for a store", set: func(c *Config) { c.Runtime.Persistence = "file://./data/log" },
+			wantIn: "this setting takes sqlite, postgres"},
+		{name: "a store target for the log plane", set: func(c *Config) { c.Runtime.LogPlane.Persistence = "sqlite://./data/log" },
+			wantIn: "this setting takes file"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Config{Agents: map[string]Agent{"bot": {Loop: "./loop.lua"}}}
+			tt.set(c)
+			err := validate("cfg.yaml", c)
+			if err == nil {
+				t.Fatal("expected a boot error")
+			}
+			if !strings.Contains(err.Error(), tt.wantIn) {
+				t.Fatalf("error %q does not name the setting (%q)", err, tt.wantIn)
+			}
+		})
+	}
+
+	// The shapes that must keep working.
+	for _, target := range []string{"./data/agentflow.db", "sqlite://./data/agentflow.db", "postgres://h/db"} {
+		c := &Config{Agents: map[string]Agent{"bot": {Loop: "./loop.lua"}}}
+		c.Runtime.Persistence = target
+		if err := validate("cfg.yaml", c); err != nil {
+			t.Fatalf("validate(%q): %v", target, err)
+		}
+	}
+	// And the resolved addresses: a path for the path backends, the DSN as
+	// written for PostgreSQL.
+	c := &Config{Runtime: Runtime{Persistence: "sqlite://./data/agentflow.db"}}
+	if got := c.PersistencePath(); got != "./data/agentflow.db" {
+		t.Fatalf("PersistencePath = %q", got)
+	}
+	if got := c.DataDir(); got != "data" { // filepath.Dir cleans the leading "./"
+		t.Fatalf("DataDir = %q", got)
+	}
+	c = &Config{Runtime: Runtime{
+		Persistence: "postgres://u:p@h:5432/agentflow",
+		Cluster:     ClusterConfig{Persistence: "postgres://u:p@h2:5432/agentflow"},
+	}}
+	if got := c.PersistencePath(); got != "postgres://u:p@h:5432/agentflow" {
+		t.Fatalf("PersistencePath dropped the scheme: %q", got)
+	}
+	if got := c.ClusterStore(); got != "postgres://u:p@h2:5432/agentflow" {
+		t.Fatalf("ClusterStore dropped the scheme: %q", got)
+	}
+	if got := c.DataDir(); got != "./data" {
+		t.Fatalf("DataDir for a server store = %q", got)
+	}
+	if got := c.storeBesideRuntime("identity.db"); got != "postgres://u:p@h:5432/agentflow" {
+		t.Fatalf("a per-store target must follow a server runtime store: %q", got)
 	}
 }
 

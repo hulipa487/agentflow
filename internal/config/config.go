@@ -268,8 +268,14 @@ type LogPlaneConfig struct {
 // runtime store keeps the log itself.
 func (c *Config) LogPlaneDir() string {
 	p := strings.TrimSpace(c.Runtime.LogPlane.Persistence)
-	p = strings.TrimPrefix(p, "file://")
-	return stripSQLiteScheme(p)
+	if p == "" {
+		return ""
+	}
+	t, err := storedb.ParseTarget(p, storedb.BackendFile)
+	if err != nil {
+		return p // validation refuses it with a message naming the setting
+	}
+	return t.Address
 }
 
 // ClusterConfig is the store every instance of a deployment shares for the
@@ -1095,12 +1101,27 @@ func validate(path string, c *Config) error {
 			return fmt.Errorf("%s: %s must be positive", path, key)
 		}
 	}
-	// The log plane is a directory (the append-log backend) or empty. A value
-	// naming a scheme this build has no backend for is a boot error rather than
-	// a directory called "scylla:".
-	if p := strings.TrimSpace(c.Runtime.LogPlane.Persistence); p != "" &&
-		strings.Contains(p, "://") && !strings.HasPrefix(p, "file://") {
-		return fmt.Errorf("%s: runtime.log_plane.persistence %q: no such backend (a directory path, or empty to keep the log in the runtime store)", path, p)
+	// Every store target is parsed here, once, so that a scheme this build has
+	// no backend for is a boot error naming the schemes that exist — rather than
+	// a directory named after the scheme nothing could open.
+	for _, t := range []struct {
+		key     string
+		target  string
+		allowed []string
+	}{
+		{"runtime.persistence", c.Runtime.Persistence, []string{storedb.BackendSQLite, storedb.BackendPostgres}},
+		{"runtime.cluster.persistence", c.Runtime.Cluster.Persistence, []string{storedb.BackendSQLite, storedb.BackendPostgres}},
+		{"runtime.identity.persistence", c.Runtime.Identity.Persistence, []string{storedb.BackendSQLite, storedb.BackendPostgres}},
+		{"runtime.credentials.path", c.Runtime.Credentials.Path, []string{storedb.BackendSQLite, storedb.BackendPostgres}},
+		{"runtime.log_plane.persistence", c.Runtime.LogPlane.Persistence, []string{storedb.BackendFile}},
+	} {
+		if strings.TrimSpace(t.target) == "" {
+			continue
+		}
+		if _, err := storedb.ParseTarget(t.target, t.allowed...); err != nil {
+			// The parser's own "storedb:" prefix reads oddly inside a config error.
+			return fmt.Errorf("%s: %s: %s", path, t.key, strings.TrimPrefix(err.Error(), "storedb: "))
+		}
 	}
 	if c.Runtime.Credentials.Enabled && c.CredentialsMasterKeyEnv() == "" {
 		return fmt.Errorf("%s: runtime.credentials.enabled requires master_key_env to name the env var holding the master key", path)
@@ -1622,24 +1643,30 @@ func (c *Config) ResolveMemoryProfile(a Agent) MemoryProfile {
 	return MemoryProfile{}
 }
 
-// PersistencePath strips the sqlite:// prefix from Runtime.Persistence.
+// defaultPersistence is the runtime store a configuration that names none gets:
+// one SQLite file beside the blobs.
+const defaultPersistence = "sqlite://./data/agentflow.db"
+
+// PersistencePath is the runtime store's target, resolved to the address its
+// backend opens: a file path for SQLite, a DSN for PostgreSQL.
 func (c *Config) PersistencePath() string {
 	p := c.Runtime.Persistence
 	if p == "" {
-		p = "sqlite://./data/agentflow.db"
+		p = defaultPersistence
 	}
-	return stripSQLiteScheme(p)
+	return storeAddress(p)
 }
 
-// stripSQLiteScheme removes a "sqlite://" prefix, which names the local-file
-// backend explicitly; every store constructor wants the bare path, and a path
-// that kept the scheme would be created as a file called "sqlite:".
-func stripSQLiteScheme(p string) string {
-	const prefix = "sqlite://"
-	if len(p) > len(prefix) && p[:len(prefix)] == prefix {
-		return p[len(prefix):]
+// storeAddress resolves a store target to what its backend opens, and returns
+// it as written when it will not parse: validation has already refused that
+// configuration with a message naming the setting, and this is not the place a
+// boot should die with a second, worse one.
+func storeAddress(target string) string {
+	t, err := storedb.ParseTarget(target, storedb.BackendSQLite, storedb.BackendPostgres)
+	if err != nil {
+		return strings.TrimSpace(target)
 	}
-	return p
+	return t.Address
 }
 
 // ClusterStore returns where the state that has to be one store across every
@@ -1649,7 +1676,7 @@ func stripSQLiteScheme(p string) string {
 // regions can reach.
 func (c *Config) ClusterStore() string {
 	if p := c.Runtime.Cluster.Persistence; p != "" {
-		return stripSQLiteScheme(p)
+		return storeAddress(p)
 	}
 	return c.PersistencePath()
 }
@@ -1657,12 +1684,14 @@ func (c *Config) ClusterStore() string {
 // DataDir is the directory local blobs (media, files) default to. It is the
 // persistence directory when the runtime store is a SQLite file — the two live
 // together — and "./data" when persistence is a server DSN, where there is no
-// local directory to sit beside.
+// local directory to sit beside. A target that will not parse takes the same
+// answer: validation refuses it before anything reads this.
 func (c *Config) DataDir() string {
-	if storedb.BackendFor(c.Runtime.Persistence) != storedb.BackendSQLite {
+	t, err := storedb.ParseTarget(c.Runtime.Persistence, storedb.BackendSQLite, storedb.BackendPostgres)
+	if err != nil || t.Backend != storedb.BackendSQLite {
 		return "./data"
 	}
-	dir := filepath.Dir(c.PersistencePath())
+	dir := filepath.Dir(t.Address)
 	if dir == "" || dir == "." {
 		return "./data"
 	}
@@ -1676,7 +1705,7 @@ func (c *Config) DataDir() string {
 // saying so twice.
 func (c *Config) IdentityStore() string {
 	if c.Runtime.Identity.Persistence != "" {
-		return stripSQLiteScheme(c.Runtime.Identity.Persistence)
+		return storeAddress(c.Runtime.Identity.Persistence)
 	}
 	return c.storeBesideRuntime("identity.db")
 }
@@ -1687,7 +1716,7 @@ func (c *Config) IdentityStore() string {
 // a fleet.
 func (c *Config) CredentialsStore() string {
 	if c.Runtime.Credentials.Path != "" {
-		return stripSQLiteScheme(c.Runtime.Credentials.Path)
+		return storeAddress(c.Runtime.Credentials.Path)
 	}
 	return c.storeBesideRuntime("credentials.db")
 }
@@ -1697,8 +1726,8 @@ func (c *Config) CredentialsStore() string {
 // persistence directory.
 func (c *Config) storeBesideRuntime(name string) string {
 	p := c.PersistencePath()
-	if storedb.BackendFor(p) != storedb.BackendSQLite {
-		return p
+	if t, err := storedb.ParseTarget(p, storedb.BackendSQLite, storedb.BackendPostgres); err == nil && t.Backend != storedb.BackendSQLite {
+		return t.Address
 	}
 	dir := filepath.Dir(p)
 	if dir == "" || dir == "." {

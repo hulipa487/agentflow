@@ -1,13 +1,63 @@
 package main
 
 import (
+	"bytes"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
 	"agentflow/internal/config"
 )
+
+// TestWarnInertConfig: every field below is parsed — so an existing config keeps
+// booting — and read by nothing. The warning is the only thing that tells a
+// deployment its setting did nothing, which is exactly the failure this fixes:
+// a setting that looks applied is worse than one that is absent.
+func TestWarnInertConfig(t *testing.T) {
+	str := func(s string) *string { return &s }
+	workers, visible, cost := 4, true, 3
+
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	cfg := &config.Config{}
+	cfg.Runtime.VM.MemoryLimit = str("64m")
+	cfg.Runtime.VM.InstructionBudget = str("10m")
+	cfg.Runtime.Scheduler.Workers = &workers
+	cfg.Runtime.Reload.Watch = &visible
+	cfg.Profiles.Memory = map[string]config.MemoryProfile{
+		"p": {Stores: map[string]config.Store{
+			"s": {Backend: "b", Table: "t", Collection: str("c"), Policy: str("q")},
+		}},
+	}
+	cfg.Tools.Policy.Write = str("w")
+	cfg.Tools.Policy.Overrides = map[string]config.ToolSpecOverride{
+		"builtin:x": {CostLevel: &cost, UserVisible: &visible},
+	}
+
+	warnInertConfig(cfg, log)
+
+	out := buf.String()
+	for _, want := range []string{
+		"vm.memory_limit", "vm.instruction_budget", "scheduler.workers", "reload.watch",
+		"memory store collection", "memory store policy",
+		"tools.policy.write", "cost_level", "user_visible",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("nothing warned about %q; got:\n%s", want, out)
+		}
+	}
+
+	// A config that sets none of them says nothing: the warnings must not fire
+	// on the defaults, or every boot would carry a wall of noise.
+	buf.Reset()
+	warnInertConfig(&config.Config{}, log)
+	if got := buf.String(); got != "" {
+		t.Fatalf("an empty config produced warnings:\n%s", got)
+	}
+}
 
 // TestMemoryFromConfigRetention: the store's retention reaches the backend as a
 // write TTL. It was parsed with time.ParseDuration and the error discarded, and

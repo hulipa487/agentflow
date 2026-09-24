@@ -2,7 +2,9 @@
 // MCP, runtime persistence, agent capabilities/skills/memory).
 //
 // The file is environment-expanded (${VAR}, ${VAR:-default}) before parsing,
-// and parsed strictly: an unknown key is a boot error, per docs/yaml-config.md.
+// and parsed strictly: an unknown key is a boot error. The config reference is
+// the "Full Config Reference" section of the embedded documentation site
+// (internal/webui/docs/index.html, served at /docs/).
 package config
 
 import (
@@ -18,6 +20,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"agentflow/internal/core/safety"
 	"agentflow/internal/core/storedb"
 )
 
@@ -201,15 +204,30 @@ func (u UsageConfig) UsageRetention() int {
 
 // Runtime contains instance-wide tuning and persistence.
 type Runtime struct {
+	// These four keys are parsed so a configuration that sets them keeps
+	// booting, and nothing reads them. They are pointers precisely so "unset"
+	// is distinguishable from "set to the zero value", which is the only thing
+	// they are now used for: main warns once per key that is actually present.
+	//
+	// They are kept rather than deleted because decodeStrict uses
+	// KnownFields(true), so removing a field turns an existing config into a
+	// parse error — a boot failure for a setting that does nothing. Removing
+	// them for real is a release note, not a silent change.
+	//
+	// What they claimed to do, and what is true:
+	//   vm.memory_limit        no allocator cap exists in the Luau shim
+	//   vm.instruction_budget  the per-resume budget is fixed at 5,000,000
+	//   scheduler.workers      the op pool size is the -workers flag
+	//   reload.watch           the reload watcher always runs
 	VM struct {
-		MemoryLimit       string `yaml:"memory_limit"`
-		InstructionBudget string `yaml:"instruction_budget"`
+		MemoryLimit       *string `yaml:"memory_limit"`
+		InstructionBudget *string `yaml:"instruction_budget"`
 	} `yaml:"vm"`
 	Scheduler struct {
-		Workers int `yaml:"workers"`
+		Workers *int `yaml:"workers"`
 	} `yaml:"scheduler"`
 	Reload struct {
-		Watch bool `yaml:"watch"`
+		Watch *bool `yaml:"watch"`
 	} `yaml:"reload"`
 	Persistence string            `yaml:"persistence"` // e.g. sqlite://./data/agentflow.db
 	Admin       AdminConfig       `yaml:"admin"`
@@ -503,13 +521,18 @@ type MemoryProfile struct {
 }
 
 type Store struct {
-	Backend    string   `yaml:"backend"`
-	Table      string   `yaml:"table"`
-	Collection string   `yaml:"collection"`
+	Backend string `yaml:"backend"`
+	Table   string `yaml:"table"`
+	// Collection and Policy are parsed and read by nothing: a store is bound by
+	// backend and table, and the policy knobs they suggest were never
+	// implemented. They are pointers so main can warn when one is actually set
+	// — the same treatment the runtime: keys get, and for the same reason:
+	// deleting a field turns an existing config into a strict-decode boot error.
+	Collection *string  `yaml:"collection"`
 	Retention  string   `yaml:"retention"`
 	Window     int      `yaml:"window"`
 	Requires   []string `yaml:"requires"`
-	Policy     string   `yaml:"policy"`
+	Policy     *string  `yaml:"policy"`
 	// Shared opts the store into cross-agent sharing (a deliberate knowledge
 	// base). Private stores (the default) are isolated per agent: the
 	// physical table is prefixed with the agent name at bind time. Existing
@@ -600,8 +623,10 @@ type Tools struct {
 }
 
 type ToolsPolicy struct {
-	Default   string                      `yaml:"default"`
-	Write     string                      `yaml:"write"`
+	Default string `yaml:"default"`
+	// Write is parsed and read by nothing. A pointer so main can warn when it
+	// is set, without turning an existing config into a boot error.
+	Write     *string                     `yaml:"write"`
 	Forbidden []string                    `yaml:"forbidden"`
 	Overrides map[string]ToolSpecOverride `yaml:"overrides"`
 }
@@ -948,6 +973,17 @@ func expandEnv(b []byte) []byte {
 	})
 }
 
+// ExpandEnv resolves ${VAR} (and ${VAR:-default}) references in config bytes
+// against the process environment, leaving everything else alone.
+//
+// It is the same expansion Load applies to a config file before decoding, and
+// it is exported so a caller that has to reason about a value's pre-expansion
+// text can ask the question exactly rather than approximating it. The console
+// uses it to decide whether a live model key is still the file's placeholder —
+// which it must write back as written — or a value the operator has since
+// replaced, which it must write as given.
+func ExpandEnv(b []byte) []byte { return expandEnv(b) }
+
 func Load(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -1056,13 +1092,73 @@ func decodeStrictRaw(data []byte, v any, label string) error {
 	return nil
 }
 
+// validateMemoryRetention rejects a store retention that would silently become
+// zero — the failure mode the field shipped with. It walks every declared
+// profile and the built-in preset, neither of which is otherwise checked here;
+// the built-in one matters because it ships the two spellings ("30d",
+// "forever") a deployment inherits without writing anything at all.
+func validateMemoryRetention(path string, c *Config) error {
+	check := func(label string, stores map[string]Store) error {
+		for sname, s := range stores {
+			if s.Retention == "" {
+				continue
+			}
+			if _, err := ParseRetention(s.Retention); err != nil {
+				return fmt.Errorf("%s: %s store %q: invalid retention %q (use ms, s, m, h, d, or \"forever\"): %w",
+					path, label, sname, s.Retention, err)
+			}
+		}
+		return nil
+	}
+	if err := check("built-in memory profile", DefaultMemoryProfile().Stores); err != nil {
+		return err
+	}
+	for pname, p := range c.Profiles.Memory {
+		if err := check(fmt.Sprintf("memory profile %q", pname), p.Stores); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateSafetyProfiles rejects a safety reference the engine cannot resolve.
+// Every branch of resolveSafety that is not "", "none" or "default" needs a
+// profiles.safety entry, and every filter named inside one needs to be a filter
+// the baseline actually has — an unknown filter would otherwise be dropped from
+// the chain without a word.
+func validateSafetyProfiles(path string, c *Config) error {
+	known := map[string]bool{}
+	for _, n := range safety.FilterNames() {
+		known[n] = true
+	}
+	for pname, p := range c.Profiles.Safety {
+		for _, f := range p.Filters {
+			if !known[f] {
+				return fmt.Errorf("%s: profiles.safety %q names unknown filter %q (known: %s)",
+					path, pname, f, strings.Join(safety.FilterNames(), ", "))
+			}
+		}
+	}
+	for name, a := range c.Agents {
+		switch a.Safety {
+		case "", "none", "default":
+		default:
+			if _, ok := c.Profiles.Safety[a.Safety]; !ok {
+				return fmt.Errorf("%s: agent %q references unknown safety profile %q (use \"default\", \"none\", or a profiles.safety entry)",
+					path, name, a.Safety)
+			}
+		}
+	}
+	return nil
+}
+
 func validate(path string, c *Config) error {
 	if len(c.Agents) == 0 {
 		return fmt.Errorf("%s: no agents defined", path)
 	}
-	if c.Runtime.Scheduler.Workers <= 0 {
-		c.Runtime.Scheduler.Workers = 8
-	}
+	// (runtime.scheduler.workers used to be defaulted to 8 here. Nothing ever
+	// read it — the op pool size is the -workers flag — so the default existed
+	// only to fill a field that had no effect. It is now a presence flag.)
 	if c.Runtime.Persistence == "" {
 		c.Runtime.Persistence = "sqlite://./data/agentflow.db"
 	}
@@ -1151,6 +1247,33 @@ func validate(path string, c *Config) error {
 		return err
 	}
 
+	// tools.policy.default. ToolVisibility reads this as "anything that is not
+	// exactly none allows everything", so a typo like "non" exposed every tool
+	// in the registry. The permissive default stays — an omitted key means every
+	// tool, and that is what the docs and every existing config assume — so what
+	// closes the hole is rejecting the value that is neither, not inverting the
+	// comparison (which would deny every tool to every config that omits it).
+	switch strings.ToLower(c.Tools.Policy.Default) {
+	case "", "all", "none":
+	default:
+		return fmt.Errorf("%s: tools.policy.default %q is not a policy (want \"all\", \"none\", or unset)", path, c.Tools.Policy.Default)
+	}
+
+	// Memory store retention. This runs over every declared profile AND the
+	// built-in preset, because a retention that does not parse is silently
+	// zero — which is how the shipped `retention: "30d"` came to mean "never
+	// expires" while looking configured.
+	if err := validateMemoryRetention(path, c); err != nil {
+		return err
+	}
+
+	// Safety profile names. An unknown one used to resolve to safety.None with
+	// no warning, so a typo in an agent's safety: field turned the core-owned
+	// chain off silently — the opposite of failing closed.
+	if err := validateSafetyProfiles(path, c); err != nil {
+		return err
+	}
+
 	allowedCaps := map[string]bool{}
 	for _, cap := range c.Plugins.AllowCapabilities {
 		allowedCaps[cap] = true
@@ -1171,6 +1294,12 @@ func validate(path string, c *Config) error {
 		allowedCaps["net.mail"] = true
 		allowedCaps["files"] = true
 		allowedCaps["users"] = true
+		// session.state is a persistence surface (a durable per-session
+		// scratchpad in the shared store), so it is not handed out by default —
+		// but it has to be declarable. It was missing from this set, so an
+		// agent that followed caps/sessionstate.go's own instruction and listed
+		// it in capabilities failed the boot instead.
+		allowedCaps["session.state"] = true
 	}
 
 	for name, a := range c.Agents {
@@ -1333,6 +1462,15 @@ func validate(path string, c *Config) error {
 		case "ghhook":
 			if ch.Path != "" && !strings.HasSuffix(ch.Path, "/") {
 				return fmt.Errorf("%s: ghhook channel %q path must end with / (got %q)", path, ch.Name, ch.Path)
+			}
+			// The GitHub webhook secret is what makes an event trustworthy: the
+			// signature is the only thing distinguishing a real delivery from
+			// anyone who found the path. It may be a lazy reference (${VAR} /
+			// cred:<service>); an unresolvable one skips the channel at
+			// construction with a warning, which is safe — the alternative was
+			// running it unauthenticated.
+			if ch.Secret == "" {
+				return fmt.Errorf("%s: ghhook channel %q has no secret; set secret (the GitHub webhook secret) — an unauthenticated ghhook accepts any event", path, ch.Name)
 			}
 		case "telegram":
 			// Token presence is not validated here: the token may be a lazy

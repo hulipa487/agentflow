@@ -15,12 +15,12 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
   - **Loop-declared tools**: a loop defines model-visible tools in Lua with `tool.def` (merged into `tools.list`, dispatched by `tools.run`).
   - **Ops** (`http.request`, `llm.chat`, `store.*`, `shell.*`, `mail.*`): reachable from Lua only — `tools.run` resolves names through the exposed tool set, so a model can never dispatch one.
 - **Tool policy** — `tools.policy.default: none|all`, per-agent `skills:` filters (one shared loop directory can carry tools only some agents see), and per-tool `overrides` that retitle/re-document any tool (description + per-param descriptions; `{prompt: key}` resolves from the prompt registry). Overrides reach loop-declared tools too.
-- **Capabilities, enforced** — `agents.<name>.capabilities` gates ops at runtime with a refusal naming what is missing; `plugins.enforce_capabilities: false` restores the old declare-only behavior. Defaults: `llm.chat`, `memory`, `tools`, `agent.send`, `net.http` (`net.mail` and `shell.exec` must be declared).
+- **Capabilities, enforced** — `agents.<name>.capabilities` gates ops at runtime with a refusal naming what is missing; `plugins.enforce_capabilities: false` restores the old declare-only behavior. Defaults: `llm.chat`, `memory`, `tools`, `agent.send`, `net.http`, `users` (`net.mail`, `shell.exec` and `session.state` must be declared).
 - **Naming** — `builtin:` is the tool namespace alone: loop plugins are `plugin:<name>`, memory providers are bare (`sqlite`), the built-in memory profile is `conversational`. A name in the wrong field fails at boot with the corrective spelling.
 - **HTTP** — `http.request` / `os.env` Lua ops with scheme validation, body cap, secret-header redaction, and an address guard that refuses private, loopback, link-local and reserved destinations in the dialer (DNS rebinding and redirect hops covered).
-- **Mail** — `mail.imap.fetch` / `mail.smtp.send` Lua ops (cap `net.mail`); passwords resolve from the credential store at call time and never cross the Lua bridge.
+- **Mail** — `mail.imap_fetch` / `mail.smtp_send` Lua ops (cap `net.mail`); passwords resolve from the credential store at call time and never cross the Lua bridge.
 - **Multimodal** — channels ingest media into a content-addressed blob store (per-channel allow-list + size ceiling; local filesystem or S3/MinIO backend via the top-level `media:` config); loops forward part descriptors into `llm.chat` and the runtime resolves them at request time. Every provider covers images + PDFs; audio on the OpenAI shapes (input_audio) and Gemini; video via the MiniMax/Kimi/GLM `video_url` convention on the OpenAI shapes, a video block on Anthropic, and the Gemini Files API (resumable upload, referenced by URI, auto-deleted after 48h) on Gemini. Opt-in via `media:` on a channel.
-- **Files** — user-scoped project trees with engine-native snapshot versioning (commits + named refs on a parent chain — deliberately not a git server). Scope is engine-resolved per turn (`user:<uuid>` for channel turns, else `agent:<name>`); bytes are content-addressed (`files:` config, fs or S3-compatible); snapshot metadata lives in the runtime sqlite store, inspectable with plain SQL. `files.put/read/list/delete/commit/checkout` + per-session `files.scratch.*` with TTL (cap `files`); puts accept content, base64, or an existing `{handle=...}` so rollback can restore a commit's tree without bytes crossing Lua. A boot-time mark-sweep GC reclaims orphaned blobs past `files.gc_grace` (commit trees stay live so rollback keeps working). Shell spawns can mount volumes and check out a snapshot (or the session's scratch) into the container before it reports ready; `http.request` / `builtin:fetch` / `builtin:browser` can save bodies straight to scratch.
+- **Files** — user-scoped project trees with engine-native snapshot versioning (commits + named refs on a parent chain — deliberately not a git server). Scope is engine-resolved per turn (`user:<uuid>` for channel turns, else `agent:<name>`); bytes are content-addressed (`files:` config, fs or S3-compatible); snapshot metadata lives in the runtime sqlite store, inspectable with plain SQL. `files.put/read/list/delete/commit/checkout` + `files.projects()` (the caller's own project names) + per-session `files.scratch.*` with TTL (cap `files`); puts accept content, base64, or an existing `{handle=...}` so rollback can restore a commit's tree without bytes crossing Lua. A boot-time mark-sweep GC reclaims orphaned blobs past `files.gc_grace` (commit trees stay live so rollback keeps working). Shell spawns can mount volumes and check out a snapshot (or the session's scratch) into the container before it reports ready; `http.request` / `builtin:fetch` / `builtin:browser` can save bodies straight to scratch.
 - **Audit journal** — core-owned `message_journal` in the runtime store: every inbound (router) and outbound (session egress) message is recorded with channel, sender, agent, session, text, attachment handles, and delivery status — loops and channels can neither bypass nor forge it. Retention is configurable (`audit.retention_days`, default 90, 0 = forever).
 - **Config at runtime** — loops read their deployment instead of having it baked in: `agent.config()` (own profile incl. `goal` + extras + the resolved `prompts` registry, secrets as opaque markers), `runtime.triggers()` (the merged triggers list, answered to both loops and the gateway route — replaces baked CRON_TASKS/ROUTES tables), and `credential.get(name)` (allow-listed, logged, counted; the value never touches the journal). `os.time()` and `os.date()` give loops a UTC wall clock.
 - **Prompt registry** — a top-level `prompts:` map holds deployment prompt text in one place (`file:` resolved relative to the configdir, or `inline:`/`text:` literals) instead of hardcoding it in Lua. The resolved text is surfaced read-only to loops as `agent.config().prompts`; `instructions` accepts `{prompt: <key>}` as well as a file path, and a tool override's `description` accepts the same form. A `file:`-backed entry stays live: editing the file republishes the text to every loop and refreshes in place the system prompt of any agent sourced from that key, with no session restart. An unreadable prompt file or an unknown key fails the boot, never a silently empty prompt.
@@ -33,7 +33,7 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 - **Config directories** — `-configdir <dir>` loads `system.yaml` + `channels.yaml` + `profiles/*.yaml` (one agent per file, `spawn: true` routes to `profiles.agent`) + `triggers/*.yaml` instead of a single `-config` file; same strict validation after merge, and the directory is the base for every relative path.
 - **Budget** — per-agent token pools with reserve/commit/release around LLM calls; daily reset or rolling-window accounting; spawn profiles get their own shared pool.
 - **Safety** — core-owned ingress/egress chain (source-attribution, signal-gate, steady-directive, support-offer, affect-guard) that cannot be uninstalled from Lua.
-- **Observability** — `/healthz`, `/readyz`, `/metrics`, `/admin/sessions` on loopback; an embedded web console on the admin server (token-authenticated, `-no-webui` to disable); shared channel listener serves `GET /health`.
+- **Observability** — `/healthz`, `/readyz`, `/metrics`, `/admin/sessions`, `/admin/credentials` on loopback; an embedded web console on the admin server (token-authenticated, `-no-webui` to disable); shared channel listener serves `GET /health`.
 
 ### Driver set
 
@@ -48,7 +48,7 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 | Mail | IMAP fetch + SMTP send (in-process, cap `net.mail`) |
 | Shell | Docker, SSH |
 | Tools | builtins + MCP stdio |
-| Web search | Doubao (Volcano Engine), Ollama (hosted web search), StackOverflow (StackExchange API), GitHub (repository search), YouTube (Data API v3) — one `builtin:web_search` tool, per-call `engine` param; honest-unavailable when unconfigured |
+| Web search | Doubao (Volcano Engine), Ollama (hosted web search), StackOverflow (StackExchange API), GitHub (repository search), YouTube (Data API v3), plus the grounding engines `google_search` (Gemini) and `x_search` (Grok), each taking their own `model:` — one `builtin:web_search` tool, per-call `engine` param; honest-unavailable when unconfigured |
 | Legal | HKLII (Hong Kong case law + legislation, with citations) and NPC (China National Database of Laws and Regulations) — `builtin:legal_search` + `builtin:legal_read` (full text, extracted from Word docs via the built-in parser); free, no key |
 | Browser | Cloudflare Browser Run (formerly Browser Rendering) Quick Actions — one `builtin:browser` tool with a per-call `action` (`markdown`, `content`, `links`, `scrape`, `json`, `accessibility_tree`); reads a page through a real headless browser, so JavaScript-rendered content is present where a raw HTTP fetch returns an empty shell; honest-unavailable when unconfigured |
 | HTTP | `builtin:fetch` — a curl-like client (method, headers, `body`/`json`, query, redirects, timeout, and an alerted TLS-verification skip) for APIs and plain pages. Connections to private, loopback, link-local, ULA and reserved addresses are refused **in the dialer**, so redirect hops and DNS rebinding are covered too — including a zoned address, which a prefix check alone would miss. `net.http.allow_private: true` opts out for deployments that call internal services |
@@ -145,7 +145,7 @@ Full docs (install guide, architecture, config reference, Lua plugin development
 # open http://127.0.0.1:9090/docs/
 ```
 
-No separate server or build step — the site is `go:embed`ded from `internal/webui/docs/` and readable without the admin token. The config reference there covers every key this README only summarizes: models, memory, gateway/channels (including Telegram's `mode: polling | webhook | auto`, `secret_token` webhook auth, and the stale-webhook cleanup on polling), tools policy, media, audit, triggers, and the `-configdir` layout.
+No separate server or build step — the site is `go:embed`ded from `internal/webui/docs/` and readable without the admin token. (It is mounted on the admin server, so `-no-webui` disables the docs site along with the console.) The config reference there covers every key this README only summarizes: models, memory, gateway/channels (including Telegram's `mode: polling | webhook | auto`, `secret_token` webhook auth, and the stale-webhook cleanup on polling), tools policy, media, audit, triggers, and the `-configdir` layout.
 
 ## Repository layout
 
@@ -169,6 +169,48 @@ agentflow/
 
 ## Upgrade notes
 
+- **Safety profile references must resolve, and `profiles.safety` now applies.** An agent's
+  `safety:` field accepted any string and resolved an unknown one to `safety.None` with no
+  warning — so a typo silently turned the core-owned chain off, which is the opposite of failing
+  closed. A name that is not `"default"`, `"none"` or a `profiles.safety` entry is now a boot
+  error, as is an unknown filter name inside such an entry. Two consequences for an existing
+  config: a deployment with a typo'd name will now refuse to start, and a deployment that *has*
+  a `profiles.safety` entry will find that it is honoured rather than ignored — the entry selects
+  from the baseline filters by name, keeping each one's configured phrases. An entry with no
+  filters is an explicit empty chain, which still runs the dispatcher; `safety: none` bypasses it.
+  Note also that only `affect-guard` ever drops; the other four classify (their reason now
+  reaches the journal rather than being discarded).
+- **`tools.policy.default` must be `all`, `none` or unset.** It was compared against the literal
+  `"none"`, so any other value — a typo like `non` — meant "allow every tool". The permissive
+  default is unchanged (an omitted key still means every tool); only a value that is neither is
+  now a boot error.
+- **`retention` now does what it says, which starts expiring data.** A memory store's
+  `retention` was parsed with Go's `time.ParseDuration` and the error discarded — and Go has no
+  day unit — so the `conversational` preset's `retention: "30d"` silently became zero, which
+  reads as "never expires". It now parses (`ms`, `s`, `m`, `h`, `d`, or `forever`) and becomes
+  the default write TTL for any `store.put` with no explicit TTL. **On the default preset, rows
+  written from now on expire 30 days after they are written.** Rows written before the upgrade
+  carry no expiry and are never aged out — this is a per-row TTL, not a sweep, so nothing
+  existing is deleted. A retention that does not parse is now a boot error rather than a silent
+  zero.
+- **Gemini refuses client-side function tools.** The `gemini` (interactions) provider never mapped
+  `opts.Tools`: a tool-using loop against it ran with no tools at all, and the model simply never
+  called one — nothing said why. Such a call is now refused with an error naming `server_tools`,
+  which is the path that does work there. A loop passing tools to a gemini model was already not
+  getting them; it now says so instead of quietly degrading.
+- **The admin plane always requires a token now, and a public listen needs a real one.**
+  `ADMIN_TOKEN` is honoured exactly as before, but a per-boot token is minted whenever it is
+  unset — previously that happened only when the console was enabled, so `-no-webui` left
+  `/metrics`, `/admin/sessions` and `/admin/credentials` (which provisions and lists encrypted
+  per-tenant keys) unauthenticated on whatever address `runtime.admin.listen` named. A per-boot
+  token is only a secret if nothing else can reach the port, so a **non-loopback
+  `runtime.admin.listen` with no `ADMIN_TOKEN` is now a boot error** instead of a quietly open
+  endpoint. Set `ADMIN_TOKEN` in any deployment that binds the admin server to a non-loopback
+  address, or that scrapes `/metrics` without a bearer token.
+- **Channels authenticate, or they refuse.** Three changes, each closing a path that used to let a delivery through:
+  - **`ghhook` requires `secret`.** Its HMAC check returned `true` when no secret was configured, so a channel without one accepted any event posted to its path and handed it to the router as an agent turn. A ghhook channel with no secret is now a boot error; an unresolvable `${VAR}`/`cred:<service>` reference skips the channel at construction rather than running it unauthenticated.
+  - **telegram refuses deliveries it cannot authenticate.** A missing webhook secret token (a generation failure — it is minted per boot otherwise) now returns `503` instead of admitting the update. Its `allow_users` list is also checked *before* media is downloaded and written to the blob store, so a non-allowed sender can no longer make the runtime fetch and persist a file.
+  - **`webhook`'s `callback_url` is now address-guarded.** It goes through the same outbound guard `http.request` and `builtin:fetch` share, so a caller can no longer have the runtime POST an agent's reply to a private, loopback or link-local address. A deployment whose callback receiver *is* on a private network must set `net.http.allow_private: true` — which relaxes that guard on all three paths at once.
 - **Memory stores are private per agent by default.** Two agents on the same memory profile bind `<agent>.<table>` (e.g. `writer.dialogue`), so history cannot leak across agents. Loops are unaffected (table names are the profile's; the prefix is applied at bind time). A deliberately shared store opts in with `shared: true`:
   ```yaml
   profiles:
@@ -180,6 +222,7 @@ agentflow/
 
 ## Notes
 
+- **Flags** — `-config <file>` (default `agentflow.yaml`) or `-configdir <dir>`, mutually exclusive; `-workers N` sets the op worker pool size (default 8); `-log-level`, `-no-tui`, `-no-webui`. `-workers` is the only way to size the pool: `runtime.scheduler.workers` is parsed and read by nothing.
 - **Log levels** — five additive levels, selected with `-log-level` (default `info`): `error` (runtime cannot continue), `warn` (degraded: upstream 429/502, retries), `info` (lifecycle: launch, channels, webhooks), `debug` (every interaction: LLM API request, memory put/query, telegram update, op dispatch), `dev` (temporary development logs). Setting a level prints it and everything above.
 - **Luau is a git submodule**, not vendored code: `third_party/luau` pins upstream `luau-lang/luau` at release **0.731** (the full upstream tree; only `VM`, `Common`, `Ast`, `Bytecode` and `Compiler` are compiled). A fresh clone needs `git clone --recurse-submodules` (or `git submodule update --init`) before `make`. To upgrade: `git -C third_party/luau fetch --tags && git -C third_party/luau checkout <new-tag> && git add third_party/luau`, then `make` and run the test suite.
 - **`config.yaml`** is gitignored — it's the local instance config and may contain credentials. Keep secrets in it or in environment variables, never in tracked files.

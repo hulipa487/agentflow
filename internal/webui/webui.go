@@ -35,6 +35,12 @@ var docsFS embed.FS
 // and Logs may be nil (credentials disabled / log tail off).
 type Deps struct {
 	ConfigPath string
+	// ConfigDir is set instead of ConfigPath when the instance runs from a
+	// config directory (-configdir): such an instance has several fragments
+	// rather than one file, so the Config tab and the model persist/revert
+	// paths — all of which swap a single file — report a named reason instead
+	// of editing the wrong one.
+	ConfigDir  string
 	Cfg        *config.Config
 	Models     *llm.Manager
 	History    *metrics.History
@@ -223,12 +229,20 @@ func (u *UI) handleState(w http.ResponseWriter, r *http.Request) {
 			"busy":       s.Busy,
 		})
 	}
+	// config_path reports what this instance actually runs from — a config
+	// file, or the directory whose fragments it was built from. Reporting the
+	// -config default in both cases is what made a -configdir instance look
+	// like it was reading a file that does not exist.
+	configPath := d.ConfigPath
+	if d.ConfigDir != "" {
+		configPath = d.ConfigDir
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":                  true,
 		"version":             d.Version,
 		"started_at":          d.StartedAt.Unix(),
 		"uptime_s":            int64(time.Since(d.StartedAt).Seconds()),
-		"config_path":         d.ConfigPath,
+		"config_path":         configPath,
 		"config_epoch":        d.Cfg.Epoch,
 		"instance":            d.Instance,
 		"region":              d.Region,

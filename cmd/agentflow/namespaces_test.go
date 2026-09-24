@@ -70,7 +70,7 @@ func TestBuiltinNames(t *testing.T) {
 	if len(names) == 0 {
 		t.Fatal("the builtin plugin names must be exported")
 	}
-	for _, want := range []string{"plugin:per_chat", "plugin:recency", "plugin:semantic", "plugin:ttl"} {
+	for _, want := range []string{"plugin:per_chat", "plugin:recency", "plugin:semantic", "plugin:fact_extractor"} {
 		if !contains(names, want) {
 			t.Fatalf("%q must be in %v", want, names)
 		}

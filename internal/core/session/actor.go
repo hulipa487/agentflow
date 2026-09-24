@@ -20,6 +20,7 @@ import (
 	"agentflow/internal/config"
 	"agentflow/internal/core/address"
 	"agentflow/internal/core/media"
+	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/memory"
 	"agentflow/internal/core/pool"
 	"agentflow/internal/core/safety"
@@ -690,6 +691,7 @@ func (a *Actor) dispatchInline(ctx context.Context, op Op, current *Message) (re
 			})
 			if res.Drop {
 				a.log.Info("safety ingress dropped message", "reason", res.Reason)
+				metrics.Inc("agentflow_safety_drops")
 				m.Text = "" // loop sees an empty message, not the original
 			} else if res.Text != m.Text {
 				m.Text = res.Text
@@ -933,6 +935,7 @@ func (a *Actor) egress(ctx context.Context, channel, replyTo, text string, attac
 		})
 		if res.Drop {
 			a.log.Info("safety egress dropped reply", "reason", res.Reason)
+			metrics.Inc("agentflow_safety_drops")
 			journal("blocked_safety", res.Reason)
 			return `"reply blocked by safety filter"`, false
 		}
@@ -1095,6 +1098,30 @@ func (a *Actor) waitInbox(ctx context.Context) (Message, bool) {
 		return Message{}, false
 	case <-ctx.Done():
 		return Message{}, false
+	}
+}
+
+// waitInboxOrTimeout is waitInbox with an extra escape: a deadline, reported as
+// expired rather than as a stop. It exists for the confirmation wait — an
+// unanswered prompt used to park the actor, and the suspended Luau coroutine
+// with it, until the process shut down. A confirm-gated tool invoked on a
+// scheduler turn hits that every time, because a timer message carries no
+// channel to reply on and nobody is there to answer.
+func (a *Actor) waitInboxOrTimeout(ctx context.Context, d time.Duration) (Message, bool, bool) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	a.busy.Store(false) // idle while parked on the mailbox
+	select {
+	case m := <-a.Mailbox:
+		a.busy.Store(true)
+		return m, true, false
+	case <-t.C:
+		return Message{}, false, true
+	case <-a.reload:
+		a.log.Info("hot reload: restarting loop")
+		return Message{}, false, false
+	case <-ctx.Done():
+		return Message{}, false, false
 	}
 }
 
@@ -1313,9 +1340,20 @@ func (a *Actor) doConfirm(ctx context.Context, op Op, current *Message, respJSON
 	}
 	a.log.Info("confirm prompt sent", "tool", ci.Tool, "confirm_id", ci.ConfirmID)
 
+	// A prompt nobody answers must not park the session forever. Ten minutes is
+	// long enough for a person to notice and short enough that a turn with no
+	// one to answer it recovers on its own.
+	const confirmWait = 10 * time.Minute
+
 	var confirmed bool
 	for {
-		msg, goOn := a.waitInbox(ctx)
+		msg, goOn, expired := a.waitInboxOrTimeout(ctx, confirmWait)
+		if expired {
+			a.log.Warn("confirmation timed out; treating it as denied",
+				"tool", ci.Tool, "confirm_id", ci.ConfirmID, "waited", confirmWait)
+			r, _ := jsonString("tool invocation denied: no confirmation within " + confirmWait.String())
+			return r, false, true
+		}
 		if !goOn {
 			return "", false, false
 		}

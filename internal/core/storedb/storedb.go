@@ -254,8 +254,18 @@ func (d *DB) EnsureColumn(ctx context.Context, table, column, definition string)
 	// The identifiers are not parameters (no backend takes one for DDL) and
 	// come from this package's own callers, never from a request. The
 	// definition is a caller-supplied SQL fragment for the same reason.
-	if _, err := d.db.ExecContext(ctx,
-		fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, definition)); err != nil {
+	//
+	// PostgreSQL gets IF NOT EXISTS. HasColumn can only answer from a snapshot
+	// of the catalogue, so two instances booting together can both decide the
+	// column is missing — and a filter that was previously too permissive (see
+	// HasColumn) could have skipped an ALTER that is in fact unnecessary. IF NOT
+	// EXISTS makes the loser a no-op rather than a boot failure. SQLite has no
+	// such clause and does not need one: its catalogue lookup is schema-local.
+	add := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, definition)
+	if d.backend == BackendPostgres {
+		add = fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s", table, column, definition)
+	}
+	if _, err := d.db.ExecContext(ctx, add); err != nil {
 		return fmt.Errorf("storedb: add %s.%s: %w", table, column, err)
 	}
 	return nil
@@ -270,9 +280,14 @@ func (d *DB) HasColumn(ctx context.Context, table, column string) (bool, error) 
 	var err error
 	switch d.backend {
 	case BackendPostgres:
+		// current_schema() is load-bearing. information_schema.columns spans
+		// every schema on the search_path, so without it a same-named table in
+		// another schema answers yes and the caller skips an ALTER it needed —
+		// a missing column discovered later, far from here.
 		err = d.QueryRow(ctx, `
 			SELECT COUNT(*) FROM information_schema.columns
-			WHERE table_name = ? AND column_name = ?`, table, column).Scan(&n)
+			WHERE table_name = ? AND column_name = ? AND table_schema = current_schema()`,
+			table, column).Scan(&n)
 	default:
 		err = d.QueryRow(ctx,
 			`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&n)

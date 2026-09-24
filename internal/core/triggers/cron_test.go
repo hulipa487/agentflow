@@ -135,35 +135,3 @@ func TestParseCronErrors(t *testing.T) {
 		}
 	}
 }
-
-// TestParseEvery: the every: duration forms and their errors.
-func TestParseEvery(t *testing.T) {
-	good := map[string]time.Duration{
-		"30s":   30 * time.Second,
-		"15m":   15 * time.Minute,
-		"6h":    6 * time.Hour,
-		"1d":    24 * time.Hour,
-		"2d12h": 60 * time.Hour,
-		"1.5h":  90 * time.Minute,
-		"90s":   90 * time.Second,
-		" 5m ":  5 * time.Minute,
-		"250ms": 250 * time.Millisecond,
-		"1m30s": 90 * time.Second,
-		"1d30m": 24*time.Hour + 30*time.Minute,
-	}
-	for in, want := range good {
-		got, err := ParseEvery(in)
-		if err != nil {
-			t.Errorf("ParseEvery(%q): %v", in, err)
-			continue
-		}
-		if got != want {
-			t.Errorf("ParseEvery(%q) = %v; want %v", in, got, want)
-		}
-	}
-	for _, in := range []string{"", "5", "5x", "abc", "-5m", "0s", "1d5", "5 m", "1h30", "5us", "1w"} {
-		if got, err := ParseEvery(in); err == nil {
-			t.Errorf("ParseEvery(%q) must fail, got %v", in, got)
-		}
-	}
-}

@@ -227,7 +227,6 @@ func (r *Registry) Features(name string) []string {
 type Store struct {
 	Backend    string
 	Table      string
-	Collection string
 	Window     int
 	Retention  time.Duration
 	Requires   []string // provider features the backend must offer

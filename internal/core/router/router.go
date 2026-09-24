@@ -23,6 +23,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/runtime"
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/supervisor"
@@ -100,11 +101,14 @@ func (r *Router) Submit(in Inbound) {
 	}
 	select {
 	case r.mailbox <- in:
+		metrics.Inc("agentflow_ingress_total")
 		if r.Journal != nil {
 			r.Journal(in, "routed")
 		}
 	default:
 		r.log.Warn("router queue full, dropping event", "channel", in.Channel)
+		metrics.Inc("agentflow_ingress_total")
+		metrics.Inc("agentflow_ingress_dropped")
 		if r.Journal != nil {
 			r.Journal(in, "dropped_queue")
 		}
@@ -206,7 +210,14 @@ func (r *Router) runOnce(ctx context.Context) bool {
 		case "log":
 			r.log.Log(ctx, levelOf(op.Level), op.Msg)
 		default:
-			resp, ok = failJSON(fmt.Errorf("unknown op %s", op.Type)), false
+			// A route handler sees the whole prelude — the same base state every
+			// loop gets — but this state serves only the ops above. So llm.chat,
+			// files.*, shell.*, store.* and agent.* all look callable and always
+			// fail. Name the surface rather than reporting "unknown op", which
+			// reads like a typo in the chunk.
+			resp, ok = failJSON(fmt.Errorf(
+				"op %s is not available to a route handler: the router serves inbox, deliver, router.state.*, runtime.triggers and log — a route decides where a message goes, and a loop does the work",
+				op.Type)), false
 		}
 
 		status, msg = st.Resume(resp, ok)

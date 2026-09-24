@@ -30,7 +30,8 @@ import (
 // "uri", "mime_type"}. Files are auto-deleted by Google after 48 hours; a
 // process-level cache dedupes uploads of the same content within that window.
 // Client-side function tools are not mapped (the interactions tool schema
-// differs); only cfg.ServerTools are sent, as {"type":<name>} entries. The
+// differs); a call that supplies them is refused rather than silently sent
+// without. cfg.ServerTools are sent, as {"type":<name>} entries. The
 // interactions API rejects max_output_tokens, so no token cap is sent.
 func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs []Message, opts Opts) (<-chan event, bool, error) {
 	base := resolveBase(cfg, "https://generativelanguage.googleapis.com/v1beta")
@@ -60,6 +61,14 @@ func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs
 			}
 			body["thinking_config"] = tc
 		}
+	}
+	// Client-side function tools are not mapped for this provider: the
+	// interactions tool schema differs from the OpenAI shape. Dropping the list
+	// silently left a tool-using loop looking broken — the model simply never
+	// calls anything, and nothing says why — so refuse instead and name the
+	// path that does work.
+	if len(opts.Tools) > 0 {
+		return nil, false, fmt.Errorf("gemini: client-side function tools are not supported by the interactions provider (%d supplied); use server_tools, or a provider that maps them (anthropic, openai, openai-responses)", len(opts.Tools))
 	}
 	if len(cfg.ServerTools) > 0 {
 		tools := make([]map[string]any, 0, len(cfg.ServerTools))

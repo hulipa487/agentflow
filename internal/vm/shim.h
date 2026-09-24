@@ -48,9 +48,6 @@ int   afvm_check(const char* name, const char* code, size_t len,
 // If buf != NULL, copies up to buflen bytes.
 size_t afvm_lastmsg(afvm* v, char* buf, size_t buflen);
 
-// Reset the instruction budget (e.g. between turns).
-void  afvm_set_budget(afvm* v, long instr_budget);
-
 #ifdef __cplusplus
 }
 #endif

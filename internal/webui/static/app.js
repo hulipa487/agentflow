@@ -285,6 +285,18 @@ async function loadConfig() {
   const res = await api("/admin/api/config");
   if (!res.ok) return;
   const c = await res.json();
+  if (!c.ok) {
+    // A named reason this pane cannot be used here rather than a blank
+    // editor — a -configdir instance has fragments, not one file to swap.
+    configMtime = 0;
+    document.getElementById("configPath").textContent = "";
+    document.getElementById("configEditor").value = "";
+    document.getElementById("configView").textContent = "";
+    document.getElementById("restartBanner").classList.add("hidden");
+    document.getElementById("conflictBanner").classList.add("hidden");
+    document.getElementById("configStatus").textContent = c.error || "config unavailable";
+    return;
+  }
   configMtime = c.mtime;
   document.getElementById("configPath").textContent = c.path;
   document.getElementById("configEditor").value = c.raw;

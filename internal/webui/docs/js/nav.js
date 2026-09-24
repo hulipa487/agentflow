@@ -1,4 +1,5 @@
-// Sidebar active link + mobile toggle
+// Sidebar active link + smooth scroll. There is no mobile toggle: the narrow
+// layout is a horizontally scrollable bar, set in styles.css.
 (function () {
   const links = document.querySelectorAll('.nav-link');
   const sections = document.querySelectorAll('.section');

@@ -267,8 +267,18 @@ func anthropicTurns(msgs []Message) (system string, turns []map[string]any, err 
 				result = m.Content
 			}
 			block := map[string]any{"type": "tool_result", "tool_use_id": m.ToolCallID, "content": result}
-			// Merge into a preceding user tool_result message if present.
-			if n := len(turns); n > 0 {
+			// Merge into a preceding *user* tool_result message if present, which
+			// is the shape Anthropic requires: adjacent tool results share one
+			// user turn.
+			//
+			// The role check is load-bearing. The assistant branch above also
+			// builds a []map[string]any content array, so keying the merge on the
+			// content type alone appended a tool_result to the *assistant*
+			// message that carried the tool_use — and Anthropic rejects a
+			// tool_result in an assistant turn. Every real tool round-trip 400ed;
+			// the tests missed it because they assert substrings of the outgoing
+			// body, never which turn a block landed on.
+			if n := len(turns); n > 0 && turns[n-1]["role"] == "user" {
 				if prev, ok := turns[n-1]["content"].([]map[string]any); ok {
 					turns[n-1]["content"] = append(prev, block)
 					continue

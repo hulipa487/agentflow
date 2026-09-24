@@ -876,16 +876,30 @@ function llm.rerank(query, documents, opts)
   return op(with_opts({ type = "llm.rerank", text = query, documents = documents }, opts))
 end
 
--- llm.stream returns an iterator: for delta in llm.stream(msgs) do ... end
+-- llm.stream(msgs, opts) -> iterator [, close]
+-- for delta in llm.stream(msgs) do ... end
+--
+-- The iterator closes the stream when the provider reports done. It also
+-- returns a close function as a SECOND value, which the plain "for ... in"
+-- form discards: a loop that breaks out early should call it, or the stream
+-- stays open — holding its goroutine, its provider connection and its cancel
+-- func — until the session's context ends. (Lua's generic for has no other hook
+-- on abandonment.)
 function llm.stream(messages, opts)
   local h = op(with_opts({ type = "llm.stream.open", messages = messages }, opts))
   local done = false
-  return function()
+  local function close()
+    if done then return end
+    done = true
+    op({ type = "llm.stream.close", stream = h.id })
+  end
+  local function next_delta()
     if done then return nil end
     local r = op({ type = "llm.stream.next", stream = h.id })
-    if r.done then done = true; return nil end
+    if r.done then close(); return nil end
     return r.delta
   end
+  return next_delta, close
 end
 
 files = {}

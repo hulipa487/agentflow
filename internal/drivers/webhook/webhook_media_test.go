@@ -35,7 +35,7 @@ func newWebhook(t *testing.T, pol media.Policy) (*httptest.Server, *whSink, medi
 	}
 	sink := &whSink{}
 	srv := httpd.New(":0", discardLog())
-	d := New("wh", "", "bot", sink, srv, store, pol, Options{}, discardLog())
+	d := New("wh", "", "bot", sink, srv, store, pol, Options{}, loopbackPolicy(), discardLog())
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, sink, store, d
@@ -133,7 +133,7 @@ func TestWebhookAttachmentPolicyDrops(t *testing.T) {
 func TestWebhookMediaRepliesRejected(t *testing.T) {
 	// Deliver with attachments must error, never silently drop.
 	srv := httpd.New(":0", discardLog())
-	New("wh", "", "bot", &whSink{}, srv, nil, media.Policy{}, Options{}, discardLog())
+	New("wh", "", "bot", &whSink{}, srv, nil, media.Policy{}, Options{}, loopbackPolicy(), discardLog())
 	err := (&Driver{name: "wh", pending: map[string]chan string{}}).Deliver("wh-1", "hi", []media.Part{{Type: "image", Data: "xx"}})
 	if err == nil || !strings.Contains(err.Error(), "does not support media replies") {
 		t.Fatalf("want media-replies error, got %v", err)

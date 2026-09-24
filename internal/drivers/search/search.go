@@ -96,6 +96,19 @@ func (s *Set) Search(ctx context.Context, engine string, req Request) (string, *
 	return name, res, nil
 }
 
+// engineNames is every engine this build has, and the list the others answer
+// to: NewEngine's switch must build each one, and keyedEngines marks the ones
+// that need a credential. config validation accepts exactly these.
+//
+// They used to be three hand-kept lists in three files. Adding an engine to one
+// and not the others changed behaviour without saying so — a name the validator
+// accepted but NewEngine could not build, or an engine missing from
+// keyedEngines that skipped the honest-degradation warning for a missing key.
+var engineNames = []string{
+	"doubao", "ollama", "google_search", "x_search",
+	"stackoverflow", "github", "youtube",
+}
+
 // NewEngine builds one engine driver by name. The name selects the wire
 // protocol; SearchEngine carries the connection config.
 func NewEngine(name string, cfg config.SearchEngine) (Searcher, error) {
@@ -120,6 +133,7 @@ func NewEngine(name string, cfg config.SearchEngine) (Searcher, error) {
 
 // keyedEngines require an API key; a missing or unresolvable credential skips
 // the engine with a warning (honest degradation), it never fails the boot.
+// Every key here must also be in engineNames.
 var keyedEngines = map[string]bool{
 	"doubao": true, "ollama": true, "youtube": true,
 	"google_search": true, "x_search": true,

@@ -33,14 +33,15 @@ type Driver struct {
 	name   string
 	path   string
 	agent  string
-	secret string // webhook secret for HMAC verification; empty = skip verify (dev)
+	secret string // webhook secret for HMAC verification; required — an empty one verifies nothing
 	sink   router.Sink
 	log    *slog.Logger
 }
 
 // New builds the driver and attaches its handler to the shared httpd.Server.
-// secret is the GitHub webhook secret; when empty the signature check is
-// skipped (local development only — never in production).
+// secret is the GitHub webhook secret and is required: config.validate refuses
+// a ghhook channel without one, and an unresolvable ${VAR}/cred: reference skips
+// the channel at construction rather than running it unauthenticated.
 func New(name, path, agent, secret string, sink router.Sink, srv *httpd.Server, log *slog.Logger) *Driver {
 	if path == "" {
 		path = "/hooks/github/"
@@ -58,7 +59,6 @@ func New(name, path, agent, secret string, sink router.Sink, srv *httpd.Server, 
 }
 
 func (d *Driver) Name() string { return d.name }
-func (d *Driver) Path() string { return d.path }
 
 // Deliver implements gateway.Driver. Events have no chat target, so there is
 // nothing to deliver; this is always an error.
@@ -67,9 +67,15 @@ func (d *Driver) Deliver(replyTo string, text string, attachments []media.Part) 
 }
 
 // verifySignature checks the X-Hub-Signature-256 header against the body.
+//
+// An empty secret fails closed. It used to return true, so a channel built
+// without a secret — or one whose ${VAR}/cred: reference did not resolve —
+// accepted an unsigned event from anyone who found the path and handed it to
+// the router as an agent turn. config.validate now requires the secret, so this
+// is the belt for a driver constructed by hand.
 func (d *Driver) verifySignature(body []byte, sigHeader string) bool {
 	if d.secret == "" {
-		return true
+		return false
 	}
 	const prefix = "sha256="
 	if len(sigHeader) <= len(prefix) || sigHeader[:len(prefix)] != prefix {

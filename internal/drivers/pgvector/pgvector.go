@@ -79,6 +79,11 @@ func (h *Handle) migrate() error {
 	}
 	// The embedding column width is fixed at create time; changing dim on an
 	// existing database requires a manual ALTER TABLE (documented in docs).
+	// Two statements in one Exec, and a Sprintf'd dimension rather than a bind
+	// parameter — deliberately. pgx uses the simple protocol only when a
+	// statement carries no arguments, and the extended protocol refuses
+	// multi-command text, so passing dim as an argument here would break the
+	// migration rather than parameterize it.
 	_, err = h.db.ExecContext(ctx, fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS vec_kv (
 			table_name TEXT NOT NULL,

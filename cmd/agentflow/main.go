@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -88,7 +89,7 @@ func main() {
 	workers := flag.Int("workers", 8, "op worker pool size")
 	logLevel := flag.String("log-level", "info", "minimum log level: dev|debug|info|warn|error (additive)")
 	noTUI := flag.Bool("no-tui", false, "disable the terminal dashboard (plain stderr logs)")
-	noWebUI := flag.Bool("no-webui", false, "disable the web console (admin server keeps token-optional loopback behavior)")
+	noWebUI := flag.Bool("no-webui", false, "disable the web console (the admin server still requires the bearer token)")
 	flag.Parse()
 
 	// The credential CLI shares the -config/-configdir source selection; it
@@ -246,6 +247,8 @@ func main() {
 		os.Exit(1)
 	}
 	memMgr := memory.NewManager(memReg, log)
+	warnUnenforceableGC(cfg, log)
+	warnInertConfig(cfg, log)
 
 	// Drivers and shared infrastructure.
 	llmMgr := llm.NewManager(cfg.Models, log)
@@ -273,7 +276,17 @@ func main() {
 	// never by invoking a Luau state from a timer goroutine.
 	schedSvc := scheduler.New(log)
 
-	// Runtime store: persists timer/budget/child metadata.
+	// Runtime store: the message journal, the token ledger and its per-call
+	// detail, and the engine's key/value rows — file trees, session state, route
+	// state, shell handles.
+	//
+	// Scheduler timers are NOT here: the timer service is in-memory, so a
+	// restart forgets every every:/after:/cron: timer until the owning loop
+	// re-registers it. (This comment used to claim timer, budget and child
+	// metadata; those tables — timer_meta, child_meta, budget_usage — are no
+	// longer created by anything. They are left in place rather than dropped,
+	// because a boot-time DROP against an operator's database is not
+	// recoverable.)
 	rtStore, err := runtime.OpenStore(cfg.PersistencePath(), log)
 	if err != nil {
 		log.Error("runtime store failed", "err", err)
@@ -546,6 +559,15 @@ func main() {
 	tools.RegisterShellBuiltins(toolReg, shellMgr)
 	mcpClients := map[string]*mcp.Client{}
 	for sname, s := range cfg.MCP.Servers {
+		if s.URL != "" && s.Command == "" {
+			// The config declares a transport the driver does not have: mcp is
+			// stdio only, and the url/token fields are parsed but never read.
+			// Without this the run falls through to exec.Command("") and reports
+			// a start failure that names the wrong cause.
+			log.Warn("mcp server declares a url; the http transport is not implemented — only stdio (command) servers run",
+				"server", sname, "url", s.URL)
+			continue
+		}
 		c, err := mcp.NewClient(sname, s.Command, s.Args, log)
 		if err != nil {
 			log.Warn("mcp server failed", "server", sname, "err", err)
@@ -1341,7 +1363,7 @@ func main() {
 				wopts.Timeout, _ = time.ParseDuration(ch.Timeout) // validated at config load
 			}
 			wopts.Async = ch.Async
-			d := webhook.New(name, ch.Path, ch.Agent, sink, httpSrv, mstore, mpol, wopts, log)
+			d := webhook.New(name, ch.Path, ch.Agent, sink, httpSrv, mstore, mpol, wopts, netPolicy, log)
 			gw.Register(d)
 		case "telegram":
 			token, ok := credResolver.Resolve(ctx, ch.Token)
@@ -1400,24 +1422,15 @@ func main() {
 	watcher.Start()
 
 	// Metrics/admin: authenticated HTTP endpoint with health/readiness/metrics
-	// and a read-only sessions view. Binds to loopback by default. The web
-	// console (on by default, -no-webui to disable) mounts its SPA and JSON API
-	// here and requires the bearer token on every API route — with no
-	// ADMIN_TOKEN set, a per-boot token is generated and printed once.
+	// and a read-only sessions view. Binds to loopback by default.
 	adminAddr := cfg.Runtime.Admin.Listen
 	if adminAddr == "" {
 		adminAddr = "127.0.0.1:9090"
 	}
-	adminToken := os.Getenv("ADMIN_TOKEN")
-	if !*noWebUI && adminToken == "" {
-		b := make([]byte, 16)
-		if _, err := rand.Read(b); err != nil {
-			log.Error("admin token generation failed", "err", err)
-			os.Exit(1)
-		}
-		adminToken = hex.EncodeToString(b)
-		log.Info("web console admin token (set ADMIN_TOKEN to pin it)", "token", adminToken)
-		log.Warn("admin token is per-boot and per-instance: a fleet must set ADMIN_TOKEN, or every console rejects the others' tokens")
+	adminToken, tokErr := resolveAdminToken(os.Getenv("ADMIN_TOKEN"), adminAddr, log)
+	if tokErr != nil {
+		log.Error("admin plane has no usable authentication", "err", tokErr)
+		os.Exit(1)
 	}
 	admin := metrics.NewAdminServer(adminAddr, adminToken, metricReg, log)
 	admin.SetReady(true)
@@ -1435,6 +1448,7 @@ func main() {
 	if !*noWebUI {
 		console := webui.New(webui.Deps{
 			ConfigPath: *cfgPath,
+			ConfigDir:  *configDir,
 			Cfg:        cfg,
 			Instance:   leaseMgr.Owner(),
 			Region:     cfg.Runtime.Region,
@@ -1545,6 +1559,162 @@ func loadConfigSource(cfgPath, configDir string, log *slog.Logger) (*config.Conf
 		return config.LoadDir(configDir, log)
 	}
 	return config.Load(cfgPath)
+}
+
+// warnInertConfig reports configuration that is parsed — so a config that sets
+// it keeps booting — and that nothing reads. Each one claims a behaviour the
+// engine does not have, so staying silent is how a deployment comes to believe
+// it configured something.
+//
+// Every field here is a pointer for the same reason: presence has to be
+// distinguishable from a zero value, and that is now their only purpose.
+// Deleting one outright would turn an existing config into a parse error, since
+// decoding is strict — a boot failure for a setting that does nothing.
+func warnInertConfig(cfg *config.Config, log *slog.Logger) {
+	if v := cfg.Runtime.VM.MemoryLimit; v != nil {
+		log.Warn("runtime.vm.memory_limit has no effect: the Luau state has no allocator cap", "value", *v)
+	}
+	if v := cfg.Runtime.VM.InstructionBudget; v != nil {
+		log.Warn("runtime.vm.instruction_budget has no effect: the per-resume budget is fixed at 5,000,000", "value", *v)
+	}
+	if v := cfg.Runtime.Scheduler.Workers; v != nil {
+		log.Warn("runtime.scheduler.workers has no effect: the op pool size is the -workers flag", "value", *v)
+	}
+	if v := cfg.Runtime.Reload.Watch; v != nil {
+		log.Warn("runtime.reload.watch has no effect: the reload watcher always runs", "value", *v)
+	}
+
+	reportStore := func(profile string, stores map[string]config.Store) {
+		for name, s := range stores {
+			if s.Collection != nil {
+				log.Warn("memory store collection has no effect: a store is bound by backend and table",
+					"profile", profile, "store", name, "value", *s.Collection)
+			}
+			if s.Policy != nil {
+				log.Warn("memory store policy has no effect: no policy knob is implemented for a store",
+					"profile", profile, "store", name, "value", *s.Policy)
+			}
+		}
+	}
+	reportStore("built-in", config.DefaultMemoryProfile().Stores)
+	for name, p := range cfg.Profiles.Memory {
+		reportStore(name, p.Stores)
+	}
+
+	if v := cfg.Tools.Policy.Write; v != nil {
+		log.Warn("tools.policy.write has no effect: no tool write policy is implemented", "value", *v)
+	}
+	// These three are accepted on an override and copied onto the tool, and
+	// nothing ever consults them — so a deployment that sets one is configuring
+	// a decision the engine does not make. (`permission` is the exception: it
+	// works, as the exact string "forbidden".)
+	for tname, o := range cfg.Tools.Policy.Overrides {
+		if o.CostLevel != nil {
+			log.Warn("tools.policy.overrides.cost_level has no effect: nothing reads a tool's cost level",
+				"tool", tname, "value", *o.CostLevel)
+		}
+		if o.UserVisible != nil {
+			log.Warn("tools.policy.overrides.user_visible has no effect: nothing reads a tool's visibility",
+				"tool", tname, "value", *o.UserVisible)
+		}
+		if o.Autonomous != nil {
+			log.Warn("tools.policy.overrides.autonomous has no effect: nothing reads a tool's autonomy",
+				"tool", tname, "value", *o.Autonomous)
+		}
+	}
+}
+
+// gcNoOpProviders are the memory providers whose GC does not trim anything:
+// each returns nil without deleting. A store that declares a window or a
+// retention on one of them grows without bound while its config says otherwise
+// — the same shape of untruth as a retention string that never parsed, which is
+// why it is worth saying at boot.
+//
+// Named here rather than discovered, because the provider interface has no way
+// to say "my GC is a no-op". Implementing the trimming means deleting the entry.
+var gcNoOpProviders = map[string]bool{
+	"pgvector":    true,
+	"qdrant":      true,
+	"redisvector": true,
+	"redis":       true,
+}
+
+// warnUnenforceableGC reports stores whose backend cannot enforce the bound
+// they declare. It is a warning and not a boot error on purpose: the setting is
+// inert rather than harmful, and refusing to start would strand a deployment
+// that has one — the same call the deprecated runtime: keys get.
+func warnUnenforceableGC(cfg *config.Config, log *slog.Logger) {
+	report := func(label string, stores map[string]config.Store) {
+		for sname, s := range stores {
+			if s.Window == 0 && s.Retention == "" {
+				continue
+			}
+			b, ok := cfg.Memory.Backends[s.Backend]
+			if !ok || !gcNoOpProviders[b.Provider] {
+				continue
+			}
+			log.Warn("memory store declares a bound its backend does not enforce: this provider's GC deletes nothing, so the table grows without limit",
+				"profile", label, "store", sname, "backend", s.Backend, "provider", b.Provider,
+				"window", s.Window, "retention", s.Retention)
+		}
+	}
+	report("built-in", config.DefaultMemoryProfile().Stores)
+	for name, p := range cfg.Profiles.Memory {
+		report(name, p.Stores)
+	}
+}
+
+// loopbackListen reports whether an admin listen address is reachable only
+// from this host, which is what makes a per-boot token a secret worth having.
+//
+// It is deliberately strict, and answers from the address text alone rather
+// than resolving anything: an empty host (":9090") binds every interface, a
+// bare port or an unparseable address is not vouched for, and a name other
+// than "localhost" is not assumed to resolve to a loopback address. Anything
+// this cannot vouch for is treated as reachable and requires a real token.
+func loopbackListen(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// resolveAdminToken returns the bearer token the admin plane will require.
+//
+// It mints a per-boot token whenever ADMIN_TOKEN is unset — not only when the
+// console is on, which is what it used to do. Generating it inside
+// `if !*noWebUI` meant `-no-webui` with no ADMIN_TOKEN left an empty token, and
+// metrics.AdminServer.auth reads an empty token as "no auth required": /metrics,
+// /admin/sessions and credential provisioning were then served to anything that
+// could reach the port.
+//
+// A generated token is only a secret if nothing else can reach that port, so a
+// non-loopback listen with no ADMIN_TOKEN is refused rather than quietly
+// served. envToken is a parameter rather than read here so both branches are
+// testable.
+func resolveAdminToken(envToken, listen string, log *slog.Logger) (string, error) {
+	if log == nil {
+		log = slog.Default()
+	}
+	if envToken != "" {
+		return envToken, nil
+	}
+	if !loopbackListen(listen) {
+		return "", fmt.Errorf("runtime.admin.listen %q is not loopback and ADMIN_TOKEN is unset; set ADMIN_TOKEN, or bind runtime.admin.listen to a loopback address", listen)
+	}
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("admin token generation: %w", err)
+	}
+	token := hex.EncodeToString(b)
+	log.Info("admin token (set ADMIN_TOKEN to pin it)", "token", token)
+	log.Warn("admin token is per-boot and per-instance: a fleet must set ADMIN_TOKEN, or every instance rejects the others' tokens")
+	return token, nil
 }
 
 func capabilitySet(caps []string) map[string]bool {
@@ -1695,18 +1865,28 @@ func stringSet(values []string) map[string]bool {
 	return out
 }
 
-// resolveSafety turns a safety profile reference into a dispatcher. "none"
-// or "" means safety:none (explicit opt-out). "default" gives the builtin
-// baseline. Unknown names are treated as none with a warning.
+// resolveSafety turns a safety profile reference into a dispatcher. "" or
+// "none" opts out entirely; "default" is the built-in baseline; any other name
+// is a profiles.safety entry, which selects from the baseline's filters by name.
+//
+// The named case is new. It used to fall through to safety.None with no
+// warning, so a profiles.safety map was parsed by YAML and read by nothing, and
+// a typo in an agent's safety: field turned the chain off silently — the
+// opposite of failing closed. config.validate now rejects an unknown name at
+// load, so the fallback below is defensive only, and it falls back to the
+// baseline rather than to none.
 func resolveSafety(cfg *config.Config, ref string) *safety.Dispatcher {
 	switch ref {
 	case "", "none":
 		return safety.New(safety.None)
 	case "default":
 		return safety.New(safety.DefaultProfile())
-	default:
-		return safety.New(safety.None)
 	}
+	sp, ok := cfg.Profiles.Safety[ref]
+	if !ok {
+		return safety.New(safety.DefaultProfile())
+	}
+	return safety.New(safety.ProfileOf(ref, sp.Filters))
 }
 
 // budgetTokens extracts the tokens_per_day from the agent's budget config.
@@ -1755,17 +1935,18 @@ func memoryFromConfig(s config.Store) memory.Store {
 	ret := memory.Store{
 		Backend:    s.Backend,
 		Table:      s.Table,
-		Collection: s.Collection,
 		Window:     s.Window,
 		Requires:   s.Requires,
 		Shared:     s.Shared,
 		Scope:      s.Scope,
 	}
 	if s.Retention != "" {
-		d, err := time.ParseDuration(s.Retention)
-		if err == nil {
-			ret.Retention = d
-		}
+		// Validated at config load, so this cannot fail here. It used to be
+		// time.ParseDuration with the error discarded, and Go has no day unit —
+		// so the shipped `retention: "30d"` silently became zero, which reads as
+		// "never expires": the field looked configured and did nothing.
+		d, _ := config.ParseRetention(s.Retention)
+		ret.Retention = d
 	}
 	return ret
 }

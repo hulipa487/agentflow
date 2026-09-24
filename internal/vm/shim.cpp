@@ -32,7 +32,11 @@ struct afvm {
     long budget;
     long budget_max;
     int  phase;     // 0 = running plugin chunk, 1 = running loop fn
-    char fn[64];    // loop function name
+    // The loop function name. Sized well past anything a caller passes today
+    // ("loop", from both the session actor and the router) — it was 64, and a
+    // longer name was silently truncated by the snprintf in afvm_start, which
+    // then reported "global '<truncated>' is not defined".
+    char fn[128];
 };
 
 // ---------------------------------------------------------------- budget ---
@@ -120,10 +124,22 @@ void afvm_close(afvm* v) {
     free(v);
 }
 
-static int copy_err(lua_State* L, char* err, size_t errlen) {
+// err_text describes the error value on top of L's stack. lua_tostring covers
+// strings and numbers; anything else — a loop raising `error{code=1}` — has no
+// text form it can produce, and used to surface as an empty message. Naming the
+// type is the honest fallback, and it is shared so the start and resume paths
+// report a non-string error the same way.
+static const char* err_text(lua_State* L, char* scratch, size_t scratchlen) {
     const char* msg = lua_tostring(L, -1);
-    if (!msg) msg = "(non-string error)";
-    snprintf(err, errlen, "%s", msg);
+    if (msg) return msg;
+    const char* tn = lua_typename(L, lua_type(L, -1));
+    snprintf(scratch, scratchlen, "(non-string error: %s)", tn ? tn : "unknown");
+    return scratch;
+}
+
+static int copy_err(lua_State* L, char* err, size_t errlen) {
+    char scratch[64];
+    snprintf(err, errlen, "%s", err_text(L, scratch, sizeof(scratch)));
     lua_pop(L, 1);
     return 1;
 }
@@ -197,18 +213,19 @@ int afvm_resume(afvm* v, const char* resp, size_t len, int ok) {
 }
 
 size_t afvm_lastmsg(afvm* v, char* buf, size_t buflen) {
-    size_t len = 0;
-    const char* s = lua_tolstring(v->T, -1, &len);
+    // The resume path's only reader, and the reason a non-string error used to
+    // vanish: lua_tolstring returns NULL for anything but a string or a number,
+    // so the actor logged `loop error err=""` and the cause was lost. afvm_start
+    // has its own buffer and copy_err; afvm_resume has only this.
+    char scratch[64];
+    const char* s = err_text(v->T, scratch, sizeof(scratch));
     if (!s) return 0;
+    size_t len = strlen(s);
     if (buf) {
         size_t n = len < buflen ? len : buflen;
         memcpy(buf, s, n);
     }
     return len;
-}
-
-void afvm_set_budget(afvm* v, long instr_budget) {
-    v->budget = v->budget_max = instr_budget;
 }
 
 int afvm_check(const char* name, const char* code, size_t len,

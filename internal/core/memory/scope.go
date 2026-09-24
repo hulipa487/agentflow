@@ -236,7 +236,15 @@ func (s *scopedHandle) queryPrefix(table string, q Query) (Iterator, error) {
 		if err != nil {
 			return nil, err
 		}
-		its = append(its, &stripIterator{inner: it})
+		// Each per-stratum query returns only that stratum's rows, so filtering
+		// looks redundant here — but the list above also carries the RAW prefix
+		// as the legacy stratum, and a loop chooses that prefix. Passing
+		// "user:<someone-else>|" makes the legacy scan match another user's
+		// rows, so every result is re-checked against the allowed strata exactly
+		// as the text/vector/time_range paths do. Relying on the backend's
+		// prefix semantics to be the isolation boundary is what made this the
+		// one path that could return a row the caller may not read.
+		its = append(its, &filterIterator{inner: it, allow: s.allowedStrata(), strip: true})
 	}
 	return &mergeIterator{its: its}, nil
 }
@@ -335,36 +343,6 @@ func (f *filterIterator) Record() Record {
 	return *f.next
 }
 func (f *filterIterator) Err() error { return f.inner.Err() }
-
-// stripIterator strips scope prefixes without filtering (per-stratum prefix
-// queries return only that stratum's rows, all allowed by construction).
-type stripIterator struct {
-	inner Iterator
-	next  *Record
-	ok    bool
-}
-
-func (s *stripIterator) Next() bool {
-	if !s.inner.Next() {
-		s.ok = false
-		return false
-	}
-	rec := s.inner.Record()
-	if _, key, scoped := splitScopedKey(rec.Key); scoped {
-		rec.Key = key
-	}
-	s.next = &rec
-	s.ok = true
-	return true
-}
-
-func (s *stripIterator) Record() Record {
-	if !s.ok || s.next == nil {
-		return Record{}
-	}
-	return *s.next
-}
-func (s *stripIterator) Err() error { return s.inner.Err() }
 
 // mergeIterator concatenates per-stratum iterators in priority order.
 type mergeIterator struct {

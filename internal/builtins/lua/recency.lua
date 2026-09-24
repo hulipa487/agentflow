@@ -34,6 +34,13 @@ function memory_recall_handler(query, opts)
     q.text = query.text
     q.k = query.k or 10
   elseif query.kind == "time" then
+    -- The backends switch on "time_range"; this used to fall through with kind
+    -- still "time", so the one documented recall mode that takes a window
+    -- errored on every backend with `unsupported query kind "time"`.
+    q.kind = "time_range"
+    -- from/to are time.Time on the Go side, so they must be RFC3339 strings —
+    -- a numeric os.time() value fails the whole op's unmarshal rather than
+    -- being coerced.
     q.from = query.from
     q.to = query.to
   end

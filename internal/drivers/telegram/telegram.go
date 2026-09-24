@@ -64,7 +64,6 @@ type Driver struct {
 	sink        router.Sink
 	log         *slog.Logger
 	client      *http.Client
-	seq         int64
 }
 
 func New(name, token, agent, mode string, allowUsers []int64, path, publicURL, secretToken string, sink router.Sink, srv *httpd.Server, store media.Store, pol media.Policy, log *slog.Logger) *Driver {
@@ -82,7 +81,10 @@ func New(name, token, agent, mode string, allowUsers []int64, path, publicURL, s
 		// boot — Telegram only presents the secret it was last given.
 		generated, err := generateWebhookSecret()
 		if err != nil {
-			log.Warn("telegram webhook secret_token generation failed; webhook unauthenticated", "channel", name, "err", err)
+			// Fail closed: handleWebhook refuses every delivery without a
+			// secret, so this channel is inert until a restart succeeds. Logged
+			// at error rather than warning because nothing else will report it.
+			log.Error("telegram webhook secret_token generation failed; webhook deliveries will be refused", "channel", name, "err", err)
 		} else {
 			secretToken = generated
 			log.Info("telegram webhook secret_token generated (none configured)", "channel", name)
@@ -385,16 +387,22 @@ func (d *Driver) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	// Authenticate before parsing: an unauthenticated POST must never reach
 	// update handling. Missing is 401, mismatched is 403; both are checked
 	// in constant time.
-	if d.secretToken != "" {
-		got := r.Header.Get(secretTokenHeader)
-		if got == "" {
-			http.Error(w, "missing secret token", http.StatusUnauthorized)
-			return
-		}
-		if subtle.ConstantTimeCompare([]byte(got), []byte(d.secretToken)) != 1 {
-			http.Error(w, "secret token mismatch", http.StatusForbidden)
-			return
-		}
+	//
+	// A driver with no secret refuses everything. It used to fall through, which
+	// meant a generation failure at construction — only warned about — left the
+	// webhook path open to anyone who found it.
+	if d.secretToken == "" {
+		http.Error(w, "webhook authentication unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	got := r.Header.Get(secretTokenHeader)
+	if got == "" {
+		http.Error(w, "missing secret token", http.StatusUnauthorized)
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(got), []byte(d.secretToken)) != 1 {
+		http.Error(w, "secret token mismatch", http.StatusForbidden)
+		return
 	}
 	var u update
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&u); err != nil {
@@ -416,17 +424,19 @@ func (d *Driver) handleUpdate(u update) {
 	if text == "" {
 		text = m.Caption
 	}
+	// The allow-list is checked before media is ingested. ingestMedia downloads
+	// the file from Telegram and writes it to the blob store, so checking the
+	// sender afterwards let a non-allowed user make the runtime do both.
+	if len(d.allow) > 0 && !d.allow[m.From.ID] {
+		d.log.Warn("dropping message from non-allowed user", "user_id", m.From.ID)
+		return
+	}
 	atts := d.ingestMedia(m)
 	if text == "" && len(atts) == 0 {
 		return
 	}
 	d.log.Debug("telegram update received", "update_id", u.UpdateID, "chat_id", m.Chat.ID, "user_id", m.From.ID, "text_len", len(text), "media", len(atts))
-	if len(d.allow) > 0 && !d.allow[m.From.ID] {
-		d.log.Warn("dropping message from non-allowed user", "user_id", m.From.ID)
-		return
-	}
 	chatID := strconv.FormatInt(m.Chat.ID, 10)
-	d.seq++
 	d.sink.Submit(router.Inbound{
 		Channel: d.name,
 		Agent:   d.agent,

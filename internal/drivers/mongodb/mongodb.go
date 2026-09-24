@@ -55,7 +55,9 @@ type Handle struct {
 }
 
 // doc is the stored record shape. The ID is the logical key; the table name
-// is the collection name.
+// is the collection name. ExpiresAt is a pointer so "no expiry" is
+// distinguishable from "expires at the epoch" — but it is marshalled through an
+// explicit map on write, never through this struct (see Put).
 type doc struct {
 	ID        string `bson:"_id"`
 	Value     any    `bson:"value"`
@@ -73,9 +75,20 @@ func (h *Handle) Put(table, key string, value any, opts memory.PutOpts) error {
 		exp := now + int64(opts.TTL.Seconds())
 		expires = &exp
 	}
+	// The $set is an explicit map rather than the doc struct. ExpiresAt is
+	// `omitempty`, so encoding the struct omitted the field whenever there was
+	// no TTL — which left any previous expiry in place, and the record went on
+	// vanishing at its old deadline after being rewritten to last forever.
+	// Writing BSON null clears it, which is what both SQL drivers do
+	// (`expires_at = excluded.expires_at`).
 	_, err := coll.UpdateOne(ctx,
 		bson.M{"_id": key},
-		bson.M{"$set": doc{ID: key, Value: value, UpdatedAt: now, ExpiresAt: expires}},
+		bson.M{"$set": bson.M{
+			"_id":        key,
+			"value":      value,
+			"updated_at": now,
+			"expires_at": expires,
+		}},
 		options.UpdateOne().SetUpsert(true),
 	)
 	return err

@@ -526,14 +526,6 @@ func scanUsageRows(rows *sql.Rows) ([]UsageRow, error) {
 	return out, rows.Err()
 }
 
-// likeEscape neutralizes the LIKE metacharacters in a prefix. Scope keys embed
-// user ids like "u_1", and "_" is a single-character wildcard — unescaped, a
-// prefix scan would match rows outside the scope it was asked for.
-func likeEscape(s string) string {
-	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
-	return r.Replace(s)
-}
-
 // nullIfEmpty stores an empty string as NULL, matching what the SQLite store's
 // nullable columns mean so both backends read back the same shape.
 func nullIfEmpty(s string) any {

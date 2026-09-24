@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -52,7 +53,8 @@ func New(log *slog.Logger) *Service {
 }
 
 // Every registers a repeating timer. The first fire happens after interval.
-// The minimum is 1 second for production safety; tests may use shorter values.
+// The floor is 100ms, which is what the trigger service uses too — this comment
+// said "1 second for production safety" while the check below enforced 100ms.
 func (s *Service) Every(owner string, interval time.Duration, deliver Deliver) (TimerID, error) {
 	if interval < 100*time.Millisecond {
 		return "", fmt.Errorf("scheduler.every: interval must be >= 100ms, got %v", interval)
@@ -206,13 +208,39 @@ func parseCron(expr string) (*cronSchedule, error) {
 	if len(fields) != 5 {
 		return nil, fmt.Errorf("cron: expected 5 fields, got %d", len(fields))
 	}
-	// Only support minute and hour for now; day/month/weekday must be "*".
-	for i := 3; i < 5; i++ {
+	// Only minute and hour are honoured, so the other three must be "*". The
+	// bound used to start at index 3, which checked day-of-month and month and
+	// skipped day-of-week entirely — so "0 9 * * 1" was accepted and then fired
+	// every day.
+	for i := 2; i < 5; i++ {
 		if fields[i] != "*" {
-			return nil, fmt.Errorf("cron: day/month/weekday fields not yet supported (got %q)", fields[i])
+			return nil, fmt.Errorf("cron: day-of-month, month and day-of-week must be \"*\" (got %q in field %d)", fields[i], i+1)
 		}
 	}
-	return &cronSchedule{minute: fields[0], hour: fields[1]}, nil
+	hour := fields[1]
+	if hour != "*" {
+		h, err := strconv.Atoi(hour)
+		if err != nil || h < 0 || h > 23 {
+			return nil, fmt.Errorf("cron: hour %q must be \"*\" or 0-23", hour)
+		}
+	}
+	minute := fields[0]
+	if strings.HasPrefix(minute, "*/") {
+		// A step cannot be anchored to an hour, so next() discards the hour for
+		// this form. Refuse the pair rather than firing around the clock: that
+		// is what "*/15 9-17 * * *" used to do.
+		if hour != "*" {
+			return nil, fmt.Errorf("cron: minute %q needs hour \"*\" (got %q) — a step cannot be anchored to an hour; use a fixed minute", minute, hour)
+		}
+		if n, err := strconv.Atoi(minute[2:]); err != nil || n <= 0 {
+			return nil, fmt.Errorf("cron: minute step %q must be */N with N > 0", minute)
+		}
+	} else if _, err := strconv.Atoi(minute); err != nil {
+		// Sscanf used to leave m at 0 for anything unparseable, so a list or a
+		// range silently became "minute 0" instead of being refused.
+		return nil, fmt.Errorf("cron: minute %q must be N or */N", minute)
+	}
+	return &cronSchedule{minute: minute, hour: hour}, nil
 }
 
 func (c *cronSchedule) next(now time.Time) time.Time {

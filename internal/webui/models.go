@@ -127,8 +127,25 @@ func modelsEqual(a, b config.Model) bool {
 	return reflect.DeepEqual(a, b)
 }
 
+// modelsOrUnavailable returns the live model manager, or reports a named reason
+// there is none. The model routes were the only ones that dereferenced it
+// without checking, so a console wired without a manager panicked instead of
+// answering — and a nil manager is reachable: any test or embedder that builds
+// Deps for one surface only leaves it out.
+func (u *UI) modelsOrUnavailable(w http.ResponseWriter) (*llm.Manager, bool) {
+	if u.deps.Models == nil {
+		writeErr(w, http.StatusServiceUnavailable, "no models are configured")
+		return nil, false
+	}
+	return u.deps.Models, true
+}
+
 func (u *UI) handleModelsList(w http.ResponseWriter, r *http.Request) {
-	live := u.deps.Models.List()
+	mgr, ok := u.modelsOrUnavailable(w)
+	if !ok {
+		return
+	}
+	live := mgr.List()
 	file, fileErr := u.fileModels()
 
 	names := map[string]bool{}
@@ -169,6 +186,10 @@ func (u *UI) handleModelsList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (u *UI) handleModelUpsert(w http.ResponseWriter, r *http.Request) {
+	mgr, ok := u.modelsOrUnavailable(w)
+	if !ok {
+		return
+	}
 	name := r.PathValue("name")
 	if !modelNameRe.MatchString(name) {
 		writeErr(w, http.StatusBadRequest, "invalid model name (1-64 of [A-Za-z0-9_.:-])")
@@ -201,11 +222,11 @@ func (u *UI) handleModelUpsert(w http.ResponseWriter, r *http.Request) {
 	// The UI never round-trips secrets: an empty api_key on an existing model
 	// keeps the current key rather than wiping it.
 	if m.APIKey == "" {
-		if cur, err := u.deps.Models.Get(name); err == nil {
+		if cur, err := mgr.Get(name); err == nil {
 			m.APIKey = cur.APIKey
 		}
 	}
-	u.deps.Models.Upsert(name, m)
+	mgr.Upsert(name, m)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "applied": "runtime",
 		"note": "live on this instance; persist to keep across restarts, and note that other instances of a deployment keep their current models until they restart",
@@ -213,8 +234,19 @@ func (u *UI) handleModelUpsert(w http.ResponseWriter, r *http.Request) {
 }
 
 func (u *UI) handleModelRemove(w http.ResponseWriter, r *http.Request) {
+	mgr, ok := u.modelsOrUnavailable(w)
+	if !ok {
+		return
+	}
+	// The same name check upsert applies. Without it a delete reached the
+	// manager with whatever the path held, so the two routes disagreed about
+	// what a valid model name is.
 	name := r.PathValue("name")
-	u.deps.Models.Remove(name)
+	if !modelNameRe.MatchString(name) {
+		writeErr(w, http.StatusBadRequest, "invalid model name (1-64 of [A-Za-z0-9_.:-])")
+		return
+	}
+	mgr.Remove(name)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "applied": "runtime",
 		"note": "removed on this instance; persist to keep it removed across restarts, and note that other instances of a deployment keep their current models until they restart",
@@ -226,8 +258,12 @@ func (u *UI) handleModelRemove(w http.ResponseWriter, r *http.Request) {
 // verdict distinguishes the common failure classes so the UI can say whether
 // the key, the endpoint, or the model name is wrong.
 func (u *UI) handleModelTest(w http.ResponseWriter, r *http.Request) {
+	mgr, ok := u.modelsOrUnavailable(w)
+	if !ok {
+		return
+	}
 	name := r.PathValue("name")
-	cfg, err := u.deps.Models.Get(name)
+	cfg, err := mgr.Get(name)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
@@ -237,9 +273,9 @@ func (u *UI) handleModelTest(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	var callErr error
 	if cfg.Provider == "rerank" {
-		_, callErr = u.deps.Models.Rerank(ctx, name, "ping", []string{"pong"}, 1)
+		_, callErr = mgr.Rerank(ctx, name, "ping", []string{"pong"}, 1)
 	} else {
-		_, callErr = u.deps.Models.Chat(ctx, name, []llm.Message{{Role: "user", Content: "ping"}}, llm.Opts{MaxTokens: 1})
+		_, callErr = mgr.Chat(ctx, name, []llm.Message{{Role: "user", Content: "ping"}}, llm.Opts{MaxTokens: 1})
 	}
 	latency := time.Since(start).Milliseconds()
 	if callErr != nil {
@@ -279,6 +315,9 @@ func classifyModelError(err error) string {
 // (comments included) round-trips. The result is validated exactly like boot
 // before it replaces the live file; the previous file is kept as .bak.
 func (u *UI) handleModelsPersist(w http.ResponseWriter, r *http.Request) {
+	if _, ok := u.modelsOrUnavailable(w); !ok {
+		return
+	}
 	if err := u.persistModels(); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -287,6 +326,9 @@ func (u *UI) handleModelsPersist(w http.ResponseWriter, r *http.Request) {
 }
 
 func (u *UI) persistModels() error {
+	if u.deps.Models == nil {
+		return fmt.Errorf("no models are configured")
+	}
 	path, err := u.configFilePath()
 	if err != nil {
 		return err
@@ -342,6 +384,10 @@ func (u *UI) persistModels() error {
 // handleModelsRevert re-applies the config file's models: section to the live
 // manager, discarding unpersisted runtime edits.
 func (u *UI) handleModelsRevert(w http.ResponseWriter, r *http.Request) {
+	mgr, ok := u.modelsOrUnavailable(w)
+	if !ok {
+		return
+	}
 	path, err := u.configFilePath()
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -352,7 +398,7 @@ func (u *UI) handleModelsRevert(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, fmt.Sprintf("config file does not load: %v", err))
 		return
 	}
-	u.deps.Models.SetAll(cfg.Models)
+	mgr.SetAll(cfg.Models)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "applied": "runtime", "note": "runtime now matches the file"})
 }
 

@@ -32,7 +32,11 @@ struct afvm {
     long budget;
     long budget_max;
     int  phase;     // 0 = running plugin chunk, 1 = running loop fn
-    char fn[64];    // loop function name
+    // The loop function name. Sized well past anything a caller passes today
+    // ("loop", from both the session actor and the router) — it was 64, and a
+    // longer name was silently truncated by the snprintf in afvm_start, which
+    // then reported "global '<truncated>' is not defined".
+    char fn[128];
 };
 
 // ---------------------------------------------------------------- budget ---

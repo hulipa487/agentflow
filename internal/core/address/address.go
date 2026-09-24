@@ -28,9 +28,9 @@ type Address struct {
 
 // Parse accepts only agent:<name>, agent:<name>:new, session:<id>, and
 // user:<uuid>. Names and IDs may contain letters, digits, _, -, and .; a
-// user UUID may contain letters, digits, _, and - (the minted "u_<base62>"
-// format); accepting any other punctuation would make address splitting and
-// authorization ambiguous.
+// user UUID may contain letters, digits, _, and - (the minted "u_<hex>"
+// format — identity.randomID returns hex, not base62); accepting any other
+// punctuation would make address splitting and authorization ambiguous.
 func Parse(raw string) (Address, error) {
 	if rest, ok := strings.CutPrefix(raw, "session:"); ok {
 		if !validSession(rest) {

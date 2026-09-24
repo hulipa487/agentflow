@@ -176,7 +176,15 @@ func readCredentialValue(name string, stdin io.Reader, stderr io.Writer) (string
 		fmt.Fprintf(stderr, "Enter value for %s (input is echoed; prefer piping it): ", name)
 	}
 	sc := bufio.NewScanner(stdin)
+	// A PEM or service-account JSON runs well past the Scanner's 64 KiB default,
+	// and the default reports that as Scan() returning false — which surfaced as
+	// the misleading "no value on stdin for X" rather than "the value is too
+	// long". One megabyte is far past any credential and still a bound.
+	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
 	if !sc.Scan() {
+		if err := sc.Err(); err != nil {
+			return "", fmt.Errorf("reading the value for %s: %w", name, err)
+		}
 		return "", fmt.Errorf("no value on stdin for %s", name)
 	}
 	value := sc.Text()

@@ -169,6 +169,19 @@ agentflow/
 
 ## Upgrade notes
 
+- **The admin plane always requires a token now, and a public listen needs a real one.**
+  `ADMIN_TOKEN` is honoured exactly as before, but a per-boot token is minted whenever it is
+  unset — previously that happened only when the console was enabled, so `-no-webui` left
+  `/metrics`, `/admin/sessions` and `/admin/credentials` (which provisions and lists encrypted
+  per-tenant keys) unauthenticated on whatever address `runtime.admin.listen` named. A per-boot
+  token is only a secret if nothing else can reach the port, so a **non-loopback
+  `runtime.admin.listen` with no `ADMIN_TOKEN` is now a boot error** instead of a quietly open
+  endpoint. Set `ADMIN_TOKEN` in any deployment that binds the admin server to a non-loopback
+  address, or that scrapes `/metrics` without a bearer token.
+- **Channels authenticate, or they refuse.** Three changes, each closing a path that used to let a delivery through:
+  - **`ghhook` requires `secret`.** Its HMAC check returned `true` when no secret was configured, so a channel without one accepted any event posted to its path and handed it to the router as an agent turn. A ghhook channel with no secret is now a boot error; an unresolvable `${VAR}`/`cred:<service>` reference skips the channel at construction rather than running it unauthenticated.
+  - **telegram refuses deliveries it cannot authenticate.** A missing webhook secret token (a generation failure — it is minted per boot otherwise) now returns `503` instead of admitting the update. Its `allow_users` list is also checked *before* media is downloaded and written to the blob store, so a non-allowed sender can no longer make the runtime fetch and persist a file.
+  - **`webhook`'s `callback_url` is now address-guarded.** It goes through the same outbound guard `http.request` and `builtin:fetch` share, so a caller can no longer have the runtime POST an agent's reply to a private, loopback or link-local address. A deployment whose callback receiver *is* on a private network must set `net.http.allow_private: true` — which relaxes that guard on all three paths at once.
 - **Memory stores are private per agent by default.** Two agents on the same memory profile bind `<agent>.<table>` (e.g. `writer.dialogue`), so history cannot leak across agents. Loops are unaffected (table names are the profile's; the prefix is applied at bind time). A deliberately shared store opts in with `shared: true`:
   ```yaml
   profiles:

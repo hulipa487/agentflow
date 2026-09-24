@@ -101,7 +101,11 @@ func viewOf(name string, m config.Model) modelView {
 // fileModels loads the models: section from the config file (env-expanded,
 // exactly as boot sees it).
 func (u *UI) fileModels() (map[string]config.Model, error) {
-	cfg, err := config.Load(u.deps.ConfigPath)
+	path, err := u.configFilePath()
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := config.Load(path)
 	if err != nil {
 		return nil, err
 	}
@@ -283,7 +287,10 @@ func (u *UI) handleModelsPersist(w http.ResponseWriter, r *http.Request) {
 }
 
 func (u *UI) persistModels() error {
-	path := u.deps.ConfigPath
+	path, err := u.configFilePath()
+	if err != nil {
+		return err
+	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read config: %w", err)
@@ -301,6 +308,13 @@ func (u *UI) persistModels() error {
 	if err := modelsNode.Encode(u.deps.Models.List()); err != nil {
 		return fmt.Errorf("encode models: %w", err)
 	}
+	// config.Load expands ${VAR} across the whole document before decoding, so
+	// a model the file sources from a placeholder is held by the manager as the
+	// resolved secret. Encoding the live set verbatim would write that secret
+	// into the config file — and lose the placeholder the operator chose on
+	// purpose to keep it out. It would also move the config epoch, which hashes
+	// the file before expansion precisely so rotating a secret does not move it.
+	preserveFileAPIKeys(&modelsNode, fileAPIKeyNodes(root), u.deps.Models.List())
 	replaced := false
 	for i := 0; i+1 < len(root.Content); i += 2 {
 		if root.Content[i].Value == "models" {
@@ -328,13 +342,90 @@ func (u *UI) persistModels() error {
 // handleModelsRevert re-applies the config file's models: section to the live
 // manager, discarding unpersisted runtime edits.
 func (u *UI) handleModelsRevert(w http.ResponseWriter, r *http.Request) {
-	cfg, err := config.Load(u.deps.ConfigPath)
+	path, err := u.configFilePath()
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	cfg, err := config.Load(path)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, fmt.Sprintf("config file does not load: %v", err))
 		return
 	}
 	u.deps.Models.SetAll(cfg.Models)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "applied": "runtime", "note": "runtime now matches the file"})
+}
+
+// fileAPIKeyNodes returns each model's api_key node exactly as the file writes
+// it — before ${VAR} expansion. The node is kept whole rather than its value so
+// the original quoting style survives the round trip.
+func fileAPIKeyNodes(root *yaml.Node) map[string]*yaml.Node {
+	out := map[string]*yaml.Node{}
+	if root.Kind != yaml.MappingNode {
+		return out
+	}
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value != "models" {
+			continue
+		}
+		models := root.Content[i+1]
+		if models.Kind != yaml.MappingNode {
+			return out
+		}
+		for j := 0; j+1 < len(models.Content); j += 2 {
+			body := models.Content[j+1]
+			if body.Kind != yaml.MappingNode {
+				continue
+			}
+			for k := 0; k+1 < len(body.Content); k += 2 {
+				if body.Content[k].Value == "api_key" {
+					out[models.Content[j].Value] = body.Content[k+1]
+				}
+			}
+		}
+	}
+	return out
+}
+
+// preserveFileAPIKeys restores the file's own api_key text for every model
+// whose file text is a reference — an ${VAR} placeholder or a cred:<service>
+// lookup — and still resolves to what the manager holds.
+//
+// The second half of that test is what keeps a console edit from being lost. If
+// the operator typed a new key for a model the file sources from ${VAR}, the
+// manager no longer matches the placeholder's expansion, so the new value is
+// written instead: the placeholder was replaced, not merely re-rendered. A
+// model the file does not mention (one added through the console) has no
+// original text and is written as the manager holds it.
+func preserveFileAPIKeys(models *yaml.Node, fileKeys map[string]*yaml.Node, live map[string]config.Model) {
+	if models.Kind != yaml.MappingNode {
+		return
+	}
+	for i := 0; i+1 < len(models.Content); i += 2 {
+		orig, ok := fileKeys[models.Content[i].Value]
+		if !ok || !isSecretReference(orig.Value) {
+			continue
+		}
+		if string(config.ExpandEnv([]byte(orig.Value))) != live[models.Content[i].Value].APIKey {
+			continue // the operator replaced it; write what they set
+		}
+		body := models.Content[i+1]
+		if body.Kind != yaml.MappingNode {
+			continue
+		}
+		for k := 0; k+1 < len(body.Content); k += 2 {
+			if body.Content[k].Value == "api_key" {
+				body.Content[k+1] = orig
+			}
+		}
+	}
+}
+
+// isSecretReference reports whether s names a config-level indirection rather
+// than a literal secret: an ${VAR} placeholder (optionally ${VAR:-default}) or
+// a cred:<service> lookup.
+func isSecretReference(s string) bool {
+	return envPlaceholderRe.MatchString(s) || strings.HasPrefix(s, "cred:")
 }
 
 // validateThenSwap validates candidate as a full config (same code path as

@@ -20,6 +20,7 @@ import (
 	"agentflow/internal/config"
 	"agentflow/internal/core/address"
 	"agentflow/internal/core/media"
+	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/memory"
 	"agentflow/internal/core/pool"
 	"agentflow/internal/core/safety"
@@ -690,6 +691,7 @@ func (a *Actor) dispatchInline(ctx context.Context, op Op, current *Message) (re
 			})
 			if res.Drop {
 				a.log.Info("safety ingress dropped message", "reason", res.Reason)
+				metrics.Inc("agentflow_safety_drops")
 				m.Text = "" // loop sees an empty message, not the original
 			} else if res.Text != m.Text {
 				m.Text = res.Text
@@ -933,6 +935,7 @@ func (a *Actor) egress(ctx context.Context, channel, replyTo, text string, attac
 		})
 		if res.Drop {
 			a.log.Info("safety egress dropped reply", "reason", res.Reason)
+			metrics.Inc("agentflow_safety_drops")
 			journal("blocked_safety", res.Reason)
 			return `"reply blocked by safety filter"`, false
 		}

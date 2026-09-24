@@ -40,9 +40,6 @@ var statSections = []statSection{
 		{"agentflow_sessions_active", "active", true},
 		{"agentflow_children_spawned", "spawned", false},
 		{"agentflow_children_died", "died", false},
-		{"agentflow_requests_pending", "pending", true},
-		{"agentflow_timers_pending", "timers", true},
-		{"agentflow_tool_confirmations", "confirmations", false},
 	}},
 	{"LLM", []statDef{
 		{"agentflow_llm_calls", "calls", false},

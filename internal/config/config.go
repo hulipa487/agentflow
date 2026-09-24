@@ -202,15 +202,30 @@ func (u UsageConfig) UsageRetention() int {
 
 // Runtime contains instance-wide tuning and persistence.
 type Runtime struct {
+	// These four keys are parsed so a configuration that sets them keeps
+	// booting, and nothing reads them. They are pointers precisely so "unset"
+	// is distinguishable from "set to the zero value", which is the only thing
+	// they are now used for: main warns once per key that is actually present.
+	//
+	// They are kept rather than deleted because decodeStrict uses
+	// KnownFields(true), so removing a field turns an existing config into a
+	// parse error — a boot failure for a setting that does nothing. Removing
+	// them for real is a release note, not a silent change.
+	//
+	// What they claimed to do, and what is true:
+	//   vm.memory_limit        no allocator cap exists in the Luau shim
+	//   vm.instruction_budget  the per-resume budget is fixed at 5,000,000
+	//   scheduler.workers      the op pool size is the -workers flag
+	//   reload.watch           the reload watcher always runs
 	VM struct {
-		MemoryLimit       string `yaml:"memory_limit"`
-		InstructionBudget string `yaml:"instruction_budget"`
+		MemoryLimit       *string `yaml:"memory_limit"`
+		InstructionBudget *string `yaml:"instruction_budget"`
 	} `yaml:"vm"`
 	Scheduler struct {
-		Workers int `yaml:"workers"`
+		Workers *int `yaml:"workers"`
 	} `yaml:"scheduler"`
 	Reload struct {
-		Watch bool `yaml:"watch"`
+		Watch *bool `yaml:"watch"`
 	} `yaml:"reload"`
 	Persistence string            `yaml:"persistence"` // e.g. sqlite://./data/agentflow.db
 	Admin       AdminConfig       `yaml:"admin"`
@@ -1132,9 +1147,9 @@ func validate(path string, c *Config) error {
 	if len(c.Agents) == 0 {
 		return fmt.Errorf("%s: no agents defined", path)
 	}
-	if c.Runtime.Scheduler.Workers <= 0 {
-		c.Runtime.Scheduler.Workers = 8
-	}
+	// (runtime.scheduler.workers used to be defaulted to 8 here. Nothing ever
+	// read it — the op pool size is the -workers flag — so the default existed
+	// only to fill a field that had no effect. It is now a presence flag.)
 	if c.Runtime.Persistence == "" {
 		c.Runtime.Persistence = "sqlite://./data/agentflow.db"
 	}

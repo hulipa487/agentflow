@@ -80,8 +80,6 @@ func (s *Server) Handle(path string, fn http.HandlerFunc) {
 	s.mux.HandleFunc(path, fn)
 }
 
-func (s *Server) Listen() string { return s.listen }
-
 // Handler returns the underlying mux, so embedders and tests can serve it
 // through their own server instead of Start (e.g. httptest.NewServer).
 func (s *Server) Handler() http.Handler { return s.mux }

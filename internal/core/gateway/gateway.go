@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"agentflow/internal/core/media"
+	"agentflow/internal/core/metrics"
 )
 
 // Driver is a live channel's delivery half (webhook, telegram, ...).
@@ -44,12 +45,24 @@ func (r *Registry) Register(d Driver) {
 // Send delivers text to the message's origin channel. A reply to an unknown
 // channel is an error the session should hear about (op failure), not a
 // silent drop.
+//
+// It is also where egress is counted: every reply the engine delivers goes
+// through here, so one pair of increments covers the whole egress path, and a
+// failure is counted whether it is an unknown channel or a delivery error.
 func (r *Registry) Send(channel, replyTo, text string, attachments []media.Part) error {
+	metrics.Inc("agentflow_egress_total")
 	r.mu.RLock()
 	d, ok := r.drivers[channel]
 	r.mu.RUnlock()
 	if !ok {
+		metrics.Inc("agentflow_egress_failed")
+		metrics.Inc("agentflow_channel_errors")
 		return fmt.Errorf("unknown channel %q", channel)
 	}
-	return d.Deliver(replyTo, text, attachments)
+	if err := d.Deliver(replyTo, text, attachments); err != nil {
+		metrics.Inc("agentflow_egress_failed")
+		metrics.Inc("agentflow_channel_errors")
+		return err
+	}
+	return nil
 }

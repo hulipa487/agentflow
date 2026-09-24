@@ -33,8 +33,8 @@ import (
 	"time"
 
 	"agentflow/internal/core/media"
-	"agentflow/internal/core/netguard"
 	"agentflow/internal/core/metrics"
+	"agentflow/internal/core/netguard"
 	"agentflow/internal/core/router"
 	"agentflow/internal/core/session"
 	"agentflow/internal/drivers/httpd"
@@ -112,7 +112,6 @@ func New(name, path, agent string, sink router.Sink, srv *httpd.Server, store me
 }
 
 func (d *Driver) Name() string { return d.name }
-func (d *Driver) Path() string { return d.path }
 
 type inbound struct {
 	From        string          `json:"from"`

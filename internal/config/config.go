@@ -2,7 +2,9 @@
 // MCP, runtime persistence, agent capabilities/skills/memory).
 //
 // The file is environment-expanded (${VAR}, ${VAR:-default}) before parsing,
-// and parsed strictly: an unknown key is a boot error, per docs/yaml-config.md.
+// and parsed strictly: an unknown key is a boot error. The config reference is
+// the "Full Config Reference" section of the embedded documentation site
+// (internal/webui/docs/index.html, served at /docs/).
 package config
 
 import (

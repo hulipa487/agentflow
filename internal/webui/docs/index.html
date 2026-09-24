@@ -32,7 +32,7 @@
     <li><a href="#config" class="nav-link">Configuration Guide</a></li>
     <li><a href="#config-ref" class="nav-link">Full Config Reference</a></li>
     <li><a href="#lua" class="nav-link">Lua Plugin Development</a></li>
-    <li><a href="#hooks" class="nav-link">Hook Point Specs</a></li>
+    <li><a href="#hooks" class="nav-link">Hooks &amp; Extension Points</a></li>
 
   </ul>
 </aside>
@@ -67,7 +67,7 @@
   </table>
 
   <div class="callout">
-    <strong>Current status</strong>: <span>The core runtime (actors, memory, tools, shell, multi-agent, scheduler, budget, safety, metrics) is implemented and tested. Every storage backend is a real provider — SQLite, Redis, MongoDB, and PostgreSQL for KV/document storage, an in-memory volatile store for ephemeral data, and three vector stores for vector recall — pgvector, Qdrant, and Redis Stack/RediSearch (SQLite vector queries return an explicit unsupported error, never silent empties). LLM providers cover four API shapes: Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, and the Gemini Interactions API, each targeting self-hosted/proxied endpoints via <code>base_url</code>; per-model <code>server_tools</code> enable provider-native server-side tools such as Google Search grounding. Channels — webhook, GitHub webhook (<code>ghhook</code>), and Telegram (polling, webhook, and self-configuring <code>auto</code> mode) — all mount on one shared HTTP listener with a built-in <code>/health</code> probe. An in-process mail capability (<code>mail.imap_fetch</code> / <code>mail.smtp_send</code>) resolves passwords from the credential store at call time. <strong>Multimodal</strong> is supported: channels ingest media into a content-addressed blob store (per-channel allow-list + size ceiling; filesystem or S3 backend), loops forward part descriptors into <code>llm.chat</code>, and the runtime resolves blob handles at request time — Chat Completions takes images + audio, Anthropic/Responses/Gemini take images + PDFs (Gemini also video, uploaded to the Gemini Files API and referenced by URI — files auto-delete after 48h). A core-owned <strong>audit journal</strong> records every inbound and outbound message (text + attachment handles) to the runtime store with a 90-day default retention. Embeddings (<code>llm.embed</code>, OpenAI-compatible) and cross-encoder reranking (<code>llm.rerank</code>) close the semantic-memory loop: pgvector stores vectors on write and <code>plugin:semantic</code> recall pipelines embed -> vector k-NN -> rerank. Token budgets support daily reset or rolling-window accounting, and spawn profiles carry their own shared metered pool.</span>
+    <strong>Current status</strong>: <span>The core runtime (actors, memory, tools, shell, multi-agent, scheduler, budget, safety, metrics) is implemented and tested. Every storage backend is a real provider — SQLite, Redis, MongoDB, and PostgreSQL for KV/document storage, an in-memory volatile store for ephemeral data, and three vector stores for vector recall — pgvector, Qdrant, and Redis Stack/RediSearch (SQLite vector queries return an explicit unsupported error, never silent empties). LLM providers cover four API shapes: Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, and the Gemini Interactions API, each targeting self-hosted/proxied endpoints via <code>base_url</code>; per-model <code>server_tools</code> enable provider-native server-side tools such as Google Search grounding. Channels — webhook, GitHub webhook (<code>ghhook</code>), and Telegram (polling, webhook, and self-configuring <code>auto</code> mode) — all mount on one shared HTTP listener with a built-in <code>/health</code> probe. An in-process mail capability (<code>mail.imap_fetch</code> / <code>mail.smtp_send</code>) resolves passwords from the credential store at call time. <strong>Multimodal</strong> is supported: channels ingest media into a content-addressed blob store (per-channel allow-list + size ceiling; filesystem or S3 backend), loops forward part descriptors into <code>llm.chat</code>, and the runtime resolves blob handles at request time — Chat Completions takes images + audio, Anthropic/Responses/Gemini take images + PDFs (Gemini also video, uploaded to the Gemini Files API and referenced by URI — files auto-delete after 48h). A core-owned <strong>audit journal</strong> records every inbound and outbound message (text + attachment handles) to the runtime store with a 90-day default retention. Embeddings (<code>llm.embed</code>, OpenAI-compatible) and cross-encoder reranking (<code>llm.rerank</code>) close the semantic-memory loop: pgvector stores vectors on write and <code>plugin:semantic</code> recall pipelines embed -> vector k-NN -> rerank. Token budgets support daily reset or rolling-window accounting, and spawn profiles carry their own shared metered pool. <strong>Added since this paragraph was written</strong>, and documented in their own sections below: the identity and user layer (profiles, channel linking, OIDC, per-user quotas), the user-scoped file store with snapshot versioning, engine-fired scheduled triggers, config directories, the append-only log plane, geo-clusters, and the read-only operator TUI.</span>
   </div>
 </section>
 
@@ -338,7 +338,7 @@ project launch: user ──► main ──[directive: start_project]──► ag
       <tr><td>A cross-region arrival is arbitrated</td><td>The shared lease table and inbox: an instance that cannot take the session queues the message for the owner instead of running it</td><td>Requires <code>runtime.cluster.persistence</code>. With per-region leases the same arrival starts a second copy of the conversation, and nothing detects it</td></tr>
       <tr><td>A session keeps its shell across a failover</td><td>Every handle is recorded with the container it names; the instance that takes the session over adopts it by id</td><td>Docker containers are adopted; an SSH handle is dialled again from the session's shell profile, because a record never carries a password or key. A handle whose session is alive nowhere, and unused for 24h, is reclaimed</td></tr>
       <tr><td>A scheduled trigger fires once</td><td>A <code>trigger:&lt;name&gt;</code> lease, claimed for the trigger's own interval</td><td>A killed holder stalls its trigger until the claim expires (one interval plus a margin)</td></tr>
-      <tr><td>Housekeeping runs once</td><td><code>files-gc</code>, <code>files-scratch</code>, <code>journal-prune</code>, <code>usage-prune</code> leases</td><td>A sweep that outlives its lease can overlap another instance's</td></tr>
+      <tr><td>Housekeeping runs once</td><td><code>files-gc</code>, <code>files-scratch</code>, <code>journal-prune</code>, <code>usage-prune</code>, <code>shell-reclaim</code>, <code>rows-sweep</code> leases</td><td>A sweep that outlives its lease can overlap another instance's</td></tr>
       <tr><td>Budgets hold in aggregate</td><td>A daily agent budget reads the ledger rather than its own counter (refreshed at most every 15s)</td><td>Overshoot is bounded by what the fleet spends in one refresh interval, not by the instance count. Rolling-window budgets stay per-instance</td></tr>
       <tr><td>Per-user quotas hold</td><td>The ledger, with in-flight holds, from the first version</td><td>None: it was never in-process</td></tr>
     </tbody>
@@ -410,18 +410,26 @@ curl -X POST localhost:8080/webhook/ -d '{"from":"alice","text":"hello"}'   # no
   <h3>File skeleton</h3>
   <pre><code>version: "1"
 
-runtime:    { ... }   # core tuning: VM limits, workers, reload, persistence, admin
-models:     { ... }   # named LLM providers
-memory:     { ... }   # instance-wide backend instances
-media:      { ... }   # blob store backend: fs (default) | s3
-files:      { ... }   # user-scoped file store: fs (default) | s3, scratch TTL
-audit:      { ... }   # message journal: enabled, retention_days
-profiles:   { ... }   # reusable configs: memory/, safety/, shell/, agent/
-gateway:    { ... }   # channels
-mcp:        { ... }   # MCP servers
-tools:      { ... }   # global tool policy
-agents:     { ... }   # the agents themselves
-plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
+runtime:      { ... }   # instance-wide: persistence, admin, cluster, log_plane,
+                        #   identity, credentials, users, region, timezone_offset_hours
+models:       { ... }   # named LLM providers
+memory:       { ... }   # instance-wide backend instances
+profiles:     { ... }   # reusable configs: memory/, safety/, shell/, agent/
+gateway:      { ... }   # one shared listener + its channels
+mcp:          { ... }   # MCP servers
+tools:        { ... }   # global tool policy
+search:       { ... }   # web-search engines
+legal_search: { ... }   # HKLII / NPC
+browser:      { ... }   # Cloudflare Browser Run
+net:          { ... }   # outbound connection policy
+media:        { ... }   # blob store backend: fs (default) | s3
+files:        { ... }   # user-scoped file store: fs (default) | s3, scratch TTL
+audit:        { ... }   # message journal: enabled, retention_days
+usage:        { ... }   # per-user token ledger: quota, events, retention
+triggers:     [ ... ]   # scheduled / event tasks the engine fires
+prompts:      { ... }   # deployment-wide prompt registry
+agents:       { ... }   # the agents themselves
+plugins:      { ... }   # plugin dir, capability ceiling</code></pre>
 
   <h3>Philosophy</h3>
   <p>YAML defines <em>topology</em> — what exists and how it's wired. Behavior lives in Lua plugins. Parameters live in YAML. This separation means a working chatbot is a ~12-line YAML with zero code, while every point in the pipeline remains overridable.</p>
@@ -447,11 +455,11 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
   <table class="table config-table">
     <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
     <tbody>
-      <tr><td><code>vm.memory_limit</code></td><td>string</td><td>64m</td><td>Per Luau state allocator ceiling</td></tr>
-      <tr><td><code>vm.instruction_budget</code></td><td>string</td><td>10m</td><td>Per-resume interrupt watchdog</td></tr>
-      <tr><td><code>scheduler.workers</code></td><td>int</td><td>8</td><td>Op worker pool size</td></tr>
-      <tr><td><code>reload.watch</code></td><td>bool</td><td>true</td><td>Hot reload for plugins and instructions</td></tr>
-      <tr><td><code>persistence</code></td><td>string</td><td>sqlite://./data/agentflow.db</td><td>Runtime metadata (timers, budgets, child records)</td></tr>
+      <tr><td><code>vm.memory_limit</code></td><td>string</td><td>&mdash;</td><td><strong>Deprecated &mdash; no effect.</strong> The Luau state has no allocator cap. Parsed so an existing config still boots; the engine warns at boot when it is set</td></tr>
+      <tr><td><code>vm.instruction_budget</code></td><td>string</td><td>&mdash;</td><td><strong>Deprecated &mdash; no effect.</strong> The per-resume budget is fixed at 5,000,000. Warns when set</td></tr>
+      <tr><td><code>scheduler.workers</code></td><td>int</td><td>&mdash;</td><td><strong>Deprecated &mdash; no effect.</strong> The op pool size is the <code>-workers</code> flag. Warns when set</td></tr>
+      <tr><td><code>reload.watch</code></td><td>bool</td><td>&mdash;</td><td><strong>Deprecated &mdash; no effect.</strong> The reload watcher always runs. Warns when set</td></tr>
+      <tr><td><code>persistence</code></td><td>string</td><td>sqlite://./data/agentflow.db</td><td>Where the message journal, the token ledger and its per-call detail, and the engine&rsquo;s key/value rows (file trees, session state, route state, shell handles) live. Scheduler timers are <em>not</em> here: the timer service is in memory, so a restart forgets every timer until its loop re-registers it</td></tr>
       <tr><td><code>admin.listen</code></td><td>string</td><td>127.0.0.1:9090</td><td>Metrics/admin HTTP endpoint; also serves the web console</td></tr>
       <tr><td><code>identity.enabled</code></td><td>bool</td><td>false</td><td>Mint a stable user UUID per inbound; rewrites <code>from</code> to <code>user:&lt;uuid&gt;</code>, enabling <code>session.push_user</code>. Turning it on re-scopes existing state — see the note below the table</td></tr>
       <tr><td><code>identity.persistence</code></td><td>string</td><td>&lt;persistence dir&gt;/identity.db</td><td>sqlite path for the identity registry</td></tr>
@@ -477,11 +485,11 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
   <h3>User API</h3>
   <p>The engine ships <b>no user interface</b>. Instead it exposes a JSON-only profile API on the same public listener the HTTP channels use (<code>runtime.users.enabled</code>, requires <code>runtime.identity.enabled</code>), so a frontend can live in its own repository and deploy on its own cadence. The contract is published as OpenAPI at <code>/docs/openapi/users.yaml</code>.</p>
   <ul>
-    <li><b>Registration</b> — <code>POST /v1/users/register</code> creates a profile and returns its API token <i>once</i>. <code>runtime.users.registration: invite</code> makes it invite-only, with codes an operator issues from the console or the admin API.</li>
+    <li><b>Registration</b> — <code>POST /v1/users/register</code> creates a profile and returns its API token <i>once</i>. <code>runtime.users.registration: invite</code> makes it invite-only, with codes an operator issues from the admin API (<code>POST /admin/api/users/invites</code>).</li>
     <li><b>Channel linking</b> — <code>POST /v1/users/me/links</code> returns a single-use code; the user sends <code>/link &lt;code&gt;</code> <i>from the handle being linked</i>, and the engine completes the link when that message arrives. Only the profile owner sees the code and only the handle's owner can send from the handle, so neither half alone links anything. A message carrying a code never reaches a loop. Only channels whose sender identity the platform authenticates can be linked — telegram today; a webhook's self-declared sender and ghhook's constant one cannot.</li>
     <li><b>Self-service</b> — <code>/me</code> (profile and handles), <code>/me/usage</code> (today, a seven-day window, and the quota standing), <code>/me/projects</code> (the caller's file projects), <code>/me/links/{id}</code> to unlink, and <code>/me/token/rotate</code> to retire a leaked token.</li>
     <li><b>Authentication is a bearer token, always</b> — either an access token from the deployment's identity provider, or an <code>afu_…</code> API token from <code>POST /register</code>. There is no cookie and no server-side session, so there is nothing ambient for another site to replay and no CSRF token to carry.</li>
-    <li><b>Cross-origin</b> — CORS is <b>off until an operator lists an origin</b> in <code>runtime.users.cors_origins</code>; only a listed origin is answered, and credentials are allowed only for it. <code>GET /v1/users/config</code> is public and tells a frontend whether registration is open and which channels it can offer.</li>
+    <li><b>Cross-origin</b> — CORS is <b>off until an operator lists an origin</b> in <code>runtime.users.cors_origins</code>; only a listed origin is answered, and <code>Access-Control-Allow-Credentials</code> is deliberately never sent: requests carry a bearer token, never a cookie, so a browser has no ambient authority to lend to another origin. <code>GET /v1/users/config</code> is public and tells a frontend whether registration is open and which channels it can offer.</li>
   </ul>
   <p><b>Identity provider.</b> Set <code>runtime.users.oidc.issuer</code> (plus <code>audience</code>, and <code>jwks_url</code> when discovery is unavailable) and the engine verifies tokens minted there: signature against the issuer's JWKS, then <code>iss</code>/<code>aud</code>/<code>exp</code>, then the subject claim as the identity — keyed by <code>&lt;issuer&gt;|&lt;sub&gt;</code> so two issuers cannot collide. Login, passwords, MFA and session lifetime live in that provider; the engine only verifies. A verified first login provisions a profile from the token's <code>email</code>/<code>name</code> claims unless <code>jit_provisioning: false</code>, in which case an unknown subject is refused until an operator provisions them. Only asymmetric algorithms are accepted, and the issuer must be reachable at boot.</p>
   <p><b>Deployment note.</b> <code>POST /register</code> is rate limited per client address, so a frontend behind a reverse proxy must rate limit there too — every caller otherwise shares one address.</p>
@@ -494,7 +502,30 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
     <li><b>Config</b> — a raw YAML editor with boot-equivalent <i>Validate</i> (strict fields, env expansion, cross-references — errors name the line), an atomic <i>Save</i> that backs up first and refuses if the file changed on disk underneath you, and a masked structured view. Saving prompts a restart; the runtime never silently live-reloads topology.</li>
     <li><b>Metrics</b> — the counters as sparklines, sampled in-process (~2h at 5s) so no external TSDB is needed; <code>/metrics</code> stays the Prometheus integration point.</li>
   </ul>
-  <p><b>Auth:</b> every console API route (and <code>/metrics</code>, <code>/admin/sessions</code>, <code>/admin/credentials</code>) requires a bearer token — even on loopback. Set <code>ADMIN_TOKEN</code> to pin it; otherwise a random per-boot token is generated and printed once to the console. The static SPA files are served open but are inert without the token. Secrets are write-only throughout: list endpoints return metadata and fingerprints, never values, and the config view masks sensitive keys while preserving <code>${VAR}</code> placeholders.</p>
+  <p><b>Auth:</b> every console API route (and <code>/metrics</code>, <code>/admin/sessions</code>, <code>/admin/credentials</code>) requires a bearer token — even on loopback. Set <code>ADMIN_TOKEN</code> to pin it; otherwise a random per-boot token is generated and printed once to the console. <code>-no-webui</code> disables the console, <em>not</em> the authentication: the token is still minted, and a non-loopback <code>runtime.admin.listen</code> with no <code>ADMIN_TOKEN</code> is a boot error, because a token generated per boot is only a secret while nothing else can reach the port. The static SPA files are served open but are inert without the token. Secrets are write-only throughout: list endpoints return metadata and fingerprints, never values, and the config view masks sensitive keys while preserving <code>${VAR}</code> placeholders.</p>
+  <p><b>Admin API.</b> Everything the console does is a JSON route under <code>/admin/api/</code>, so an operator can script it. All of them require the same bearer token.</p>
+  <table class="table config-table">
+    <thead><tr><th>Route</th><th>Does</th></tr></thead>
+    <tbody>
+      <tr><td><code>GET /admin/api/state</code></td><td>Instance identity, uptime, config epoch, live sessions, agents and channels.</td></tr>
+      <tr><td><code>GET /admin/api/config</code></td><td>The raw config text, a masked structured view, and the file's mtime.</td></tr>
+      <tr><td><code>POST /admin/api/config/validate</code></td><td>Boot-equivalent validation of posted text (strict fields, env expansion, cross-references).</td></tr>
+      <tr><td><code>POST /admin/api/config/save</code></td><td>Validate, back up to <code>.bak</code>, atomically replace. Refuses with 409 if the file changed under you.</td></tr>
+      <tr><td><code>GET /admin/api/models</code></td><td>Live ∪ file model set; keys masked to a last-4 fingerprint.</td></tr>
+      <tr><td><code>PUT/DELETE /admin/api/models/{name}</code></td><td>Hot-apply a model to <em>this process</em> (see the fleet limitation above).</td></tr>
+      <tr><td><code>POST /admin/api/models/{name}/test</code></td><td>A 1-token call through the live manager, classified (auth / not_found / unreachable / …).</td></tr>
+      <tr><td><code>POST /admin/api/models/persist</code> · <code>/revert</code></td><td>Write the live set into the file, or reload the file's set into the live manager.</td></tr>
+      <tr><td><code>GET /admin/api/metrics</code></td><td>Sampled counter series (~2h at 5s) for the sparklines.</td></tr>
+      <tr><td><code>GET /admin/api/logs</code></td><td>SSE log tail: the ring replayed, then live.</td></tr>
+      <tr><td><code>GET /admin/api/users</code> · <code>/{id}</code></td><td>Profiles with today's usage and quota standing; one profile with its recent calls, audit tail and projects.</td></tr>
+      <tr><td><code>POST /admin/api/users/{id}/limit</code></td><td>Set a profile's daily token limit (0 inherits the deployment default).</td></tr>
+      <tr><td><code>PUT /admin/api/users/{id}/settings</code></td><td>A profile's model and instruction layer — the only way to set them, since which model a person runs on is a cost decision rather than a self-service one.</td></tr>
+      <tr><td><code>POST /admin/api/users/{id}/unlink</code></td><td>Detach one channel handle (the last one is refused).</td></tr>
+      <tr><td><code>POST /admin/api/users/invites</code></td><td>Mint a single-use registration invite.</td></tr>
+      <tr><td><code>GET/POST /admin/credentials</code> · <code>DELETE /admin/credentials/{service}?user=</code></td><td>The credential store: list metadata, provision a per-tenant key, revoke one. Write-only — a value is never returned.</td></tr>
+    </tbody>
+  </table>
+  <p>The users routes are API-only: the console has four tabs and none of them is Users, so invite codes, quota changes and a profile's model are set with <code>curl</code> or from a frontend until that changes.</p>
 
   <h3>Terminal dashboard</h3>
   <p>When stdout is a TTY the runtime also attaches a <b>Bubbletea terminal dashboard</b> in the alternate screen (<code>-no-tui</code> to disable). It is the console's Metrics tab in the terminal: the same counters, grouped by subsystem, with in-process sparklines and the live session counts in the header. It is a <b>read-only metrics display</b> — no operator actions, so nothing it shows can change the runtime; <code>q</code>/<code>esc</code> quits and restores the screen. The metrics pane flows into one to three columns by width and the log footer scales with the terminal (3–8 lines); on a terminal too short for both the pane is clipped with a visible marker rather than dropping rows silently, and below a minimum height it is dropped entirely so the frame always fits. Piped output (systemd, <code>| tee</code>) keeps the plain stderr logger instead.</p>
@@ -584,11 +615,12 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
     <thead><tr><th>Store key</th><th>Description</th></tr></thead>
     <tbody>
       <tr><td><code>backend</code></td><td>Required. References a backend instance name.</td></tr>
-      <tr><td><code>table</code> / <code>collection</code></td><td>Backend-specific physical target.</td></tr>
-      <tr><td><code>retention</code></td><td>Duration or <code>forever</code>. Core GC.</td></tr>
-      <tr><td><code>window</code></td><td>Max records kept. Core GC.</td></tr>
+      <tr><td><code>table</code></td><td>The physical table (or collection) this store binds to.</td></tr>
+      <tr><td><code>retention</code></td><td>A duration in <code>ms</code>, <code>s</code>, <code>m</code>, <code>h</code>, <code>d</code> units (compound and fractional allowed, e.g. <code>2d12h</code>), or the literal <code>forever</code>. <strong>It is a write TTL, not a sweep:</strong> it becomes the default TTL of any <code>store.put</code> with no explicit TTL, so a record expires that long after it is <em>written</em> and rows written before the setting existed never age out. A value that does not parse is a boot error.</td></tr>
+      <tr><td><code>window</code></td><td>Max records kept per physical table, trimmed by the periodic GC. Applies to the KV backends; <strong>the vector backends (pgvector, Qdrant, Redis) implement no trimming</strong>, so a window or retention on one of those declares a bound nothing enforces — the engine warns at boot and the table grows without limit.</td></tr>
       <tr><td><code>requires</code></td><td>Feature list validated against provider at boot.</td></tr>
       <tr><td><code>shared</code></td><td><code>true</code> opts the store into cross-agent sharing (a deliberate knowledge base). Default <code>false</code>: the physical table is isolated per agent (<code>&lt;agent&gt;.&lt;table&gt;</code>).</td></tr>
+      <tr><td><code>collection</code> / <code>policy</code></td><td><strong>Deprecated &mdash; no effect.</strong> A store is bound by backend and table, and no per-store policy knob is implemented. Parsed so an existing config still boots; the engine warns at boot when either is set.</td></tr>
     </tbody>
   </table>
   <div class="callout warn">
@@ -794,9 +826,10 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
                                                            # or {prompt: <key>} from prompts:
         params:                            # shallow-merged into parameters.properties
           query: { description: "What to look up, in the user's words" }
-        needs_confirm: false               # policy fields: needs_confirm, permission,
-        autonomous: true                   # cost_level, user_visible, autonomous</code></pre>
-  <p>Overrides are baked into the registry once at boot, after every tool is registered (builtins, legal, shell, MCP) and before any agent set is exposed. A <code>params</code> entry naming a param the schema does not declare is skipped with a warning, never an error. Policy fields apply per tool; <code>permission: forbidden</code> removes the tool from every exposed set.</p>
+        needs_confirm: false               # policy fields: needs_confirm, permission
+        autonomous: true                   #   (cost_level / user_visible / autonomous are
+                                           #    parsed and read by nothing — boot warns)</code></pre>
+  <p>Overrides are baked into the registry once at boot, after every tool is registered (builtins, legal, shell, MCP) and before any agent set is exposed. A <code>params</code> entry naming a param the schema does not declare is skipped with a warning, never an error. Policy fields apply per tool; <code>permission: forbidden</code> removes the tool from every exposed set — and is the only one of them with an effect. <code>cost_level</code>, <code>user_visible</code> and <code>autonomous</code> are accepted, copied onto the tool, and consulted by nothing; <code>tools.policy.write</code> is likewise parsed and unused. The engine warns at boot when one is set.</p>
   <p><strong>Reaching Lua-declared tools</strong>: an override may also name a tool a loop declares with <code>tool.def</code> — see below. Those entries are not baked at boot (the tool does not exist until a chunk loads); they are resolved when the loop builds its list, against the live prompt registry, so editing a <code>file:</code>-backed prompt shows up on the next <code>tools.list()</code>. A misspelled <em>prompt key</em> is still a boot error for either kind of tool. A tool name that is neither registered nor declared by any loaded loop cannot be caught at boot, so it is logged once at boot as held for a Lua declaration (one informational line naming them, so a typo is visible before any agent takes a turn) and then warned about once per name the first time a loop declares its tools without claiming it.</p>
 
   <h3><code>agents</code></h3>
@@ -820,7 +853,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
     extras:                             # optional — read-only via agent.config()
       goal: { type: autonomous, success_signal: "PR merged", max_turns: 40 }
       workflow: release-train</code></pre>
-  <p><strong>Capability ceiling</strong>: <code>plugins.allow_capabilities</code> (global) ⊇ <code>agents.&lt;name&gt;.capabilities</code> (per-agent) ⊇ spawn-spec grants (child). You cannot delegate what you lack. If an agent omits <code>capabilities</code> it gets the defaults <code>[llm.chat, memory, tools, agent.send, net.http]</code> — note <code>net.mail</code> is <em>not</em> a default and must be declared explicitly.</p>
+  <p><strong>Capability ceiling</strong>: <code>plugins.allow_capabilities</code> (global) ⊇ <code>agents.&lt;name&gt;.capabilities</code> (per-agent) ⊇ spawn-spec grants (child). You cannot delegate what you lack. If an agent omits <code>capabilities</code> it gets the defaults <code>[llm.chat, memory, tools, agent.send, net.http, users]</code> — note <code>net.mail</code>, <code>shell.exec</code> and <code>session.state</code> are <em>not</em> defaults and must be declared explicitly.</p>
   <p><strong>Capabilities are enforced at runtime</strong>, not merely validated at boot. Each capability gates the Lua ops behind it: <code>llm.chat</code> → <code>llm.*</code>, <code>memory</code> → <code>store.*</code>, <code>tools</code> → <code>tools.*</code>, <code>shell.exec</code> → <code>shell.*</code>, <code>net.http</code> → <code>http.request</code> and <code>os.env</code>, <code>net.mail</code> → <code>mail.*</code>, <code>files</code> → <code>files.*</code>. An agent that omits one is refused with a message naming the op, the agent and the missing capability — the op stays addressable and fails clearly rather than vanishing into <em>"attempt to call a nil value"</em>. <code>agent.send</code>, <code>agent.request</code> and <code>agent.spawn</code> were always enforced this way; the rest now match. <code>runtime.*</code> and <code>credential.get</code> are deliberately ungated — the first is loop machinery every agent needs, the second is already scoped by the agent's own credential list. A boot warning lists exactly what was withheld from each agent and profile. Set <code>plugins.enforce_capabilities: false</code> (default <code>true</code>) only to keep a configuration running that depended on every agent having every op.</p>
   <p><strong><code>builtin:</code> is the tool namespace.</strong> Four vocabularies used to spell it — loop/plugin names, tool names, memory provider names, and the built-in memory profile — and nothing in the string said which one a name belonged to. Each now has its own spelling, so the prefix means exactly one thing:</p>
   <ul>
@@ -944,12 +977,26 @@ session.send(text, { attachments = parts }) -- send with media (see below)
 session.push(channel, reply_to, text) -- proactive egress; cap: channel.push
 session.push(channel, reply_to, text, { attachments = parts })
 session.push_user(uuid, text)         -- proactive egress to a user UUID; cap: channel.push
-session.exit()                        -- terminate this session</code></pre>
+session.exit()                        -- terminate this session
+
+session.state.set(key, value)         -- cap: session.state (declare it)
+session.state.get(key)                -- nil when the key was never set
+session.state.delete(key)
+session.state.list()                  -- { key = value } for this session</code></pre>
   <p>Messages carry an <code>attachments</code> array of media part descriptors
   (<code>{type, mime, handle, name}</code>) when the channel ingested media.
   Forward them unchanged into <code>llm.chat</code> or <code>session.send</code>;
   the runtime resolves blob handles ("media:&lt;sha256&gt;") to bytes at the
   provider / channel boundary — raw media never enters Lua.</p>
+  <p><code>session.state</code> is a small durable key/value store for this
+  session alone: a cursor, a step count, the last thing said. It survives a
+  restart, and in a fleet it follows the session to whichever instance owns it
+  next, because the rows live in the shared store. Keys may contain letters,
+  digits and <code>. _ - :</code> up to 128 characters; a value is any
+  JSON-encodable Lua value up to 64 KiB, and a session may hold 256 keys. It is
+  opt-in — declare <code>session.state</code> in the agent's
+  <code>capabilities</code>, because it is a persistence surface rather than
+  something to hand out by default.</p>
 
   <h4><code>llm</code> — cap: <code>llm.chat</code></h4>
   <pre><code>llm.chat(messages, opts?) -> { text, thinking, thinking_blocks, usage, tool_calls }
@@ -1001,6 +1048,22 @@ agent.reply(request_id, payload)
 agent.list() -> [{ session_id, agent, parent_id }]
 agent.spawn(profile, spec?) -> { address, session_id, agent }</code></pre>
   <p><code>agent.config()</code> returns this agent's own profile as data: the config name, model, the instructions <em>path</em> (or <code>instructions_prompt</code> when the system prompt came from the <code>prompts</code> registry — <code>instructions_path</code> is then empty), the deployment's resolved <code>prompts</code> registry keyed by name, the profile's <code>extras.goal</code> hoisted to <code>goal</code>, and the remaining <code>extras</code> (a pm options block, a workflow name, …). Secret references inside render as opaque markers (<code>{env="VAR"}</code> / <code>{cred="service"}</code>) — a resolved secret never crosses the Lua bridge.</p>
+
+  <h4><code>user</code> — cap: <code>users</code></h4>
+  <pre><code>user.current() -> { registered, id, display_name, identities }
+user.usage() -> { registered, input, output, cached, reasoning, calls,
+                  failed, billable, used, limit, remaining, unlimited, in_flight }
+user.has_credential(service) -> { service, present }
+user.get(id) -> { ... }    -- maintenance provenance only
+user.list() -> [ { ... } ] -- maintenance provenance only</code></pre>
+  <p>Read-only facts about the person this turn belongs to. <code>users</code> is a
+  default capability, so a loop can call these without declaring anything. A loop
+  learns a name and a channel, never an email and never a credential value —
+  <code>has_credential</code> answers whether a key exists, not what it is.
+  <code>get</code>/<code>list</code> are restricted to engine-fired maintenance
+  provenance (a <code>system</code> or <code>scheduler</code> turn), which is what
+  makes a per-user maintenance loop possible without exposing one user's profile
+  to another user's turn.</p>
 
   <h4><code>runtime</code> and <code>credential</code> — deployment config as data</h4>
   <pre><code>runtime.triggers() -> { ok, triggers = [ { name, kind, run_on_boot,
@@ -1206,86 +1269,37 @@ end</code></pre>
 </section>
 
 <section id="hooks" class="section">
-  <h2>Hook Point Specifications</h2>
-  <p>Every hook name is <code>&lt;module&gt;.&lt;point&gt;</code>. Hooks are dispatched by the core; plugins register by implementing the function name.</p>
+  <h2>Hooks and extension points</h2>
+  <p>There is no hook registry. The engine dispatches three points itself, and everything else is a <strong>naming convention the Lua calls</strong>: a plugin contributes a global with the name its caller looks for, and that is the whole contract. The difference decides where a plugin's code has to live, so both are listed here.</p>
 
-  <h3>Gateway</h3>
+  <h3>Dispatched by the core</h3>
+  <p>These run on every turn whatever the loop does. Replacing the loop handler cannot uninstall them — that is the point of the first two.</p>
   <table class="table hook-table">
-    <thead><tr><th>Hook</th><th>Kind</th><th>Signature</th><th>Default</th></tr></thead>
+    <thead><tr><th>Point</th><th>Kind</th><th>Implemented by</th><th>Notes</th></tr></thead>
     <tbody>
-      <tr><td><code>gateway.ingress</code></td><td>filter</td><td><code>(raw, ctx) -> Message?</code></td><td>channel normalizers</td></tr>
-      <tr><td><code>gateway.route</code></td><td>handler</td><td><code>(msg, ctx) -> SessionAddr | {spawn}</code></td><td><code>plugin:per_chat</code></td></tr>
-      <tr><td><code>gateway.egress</code></td><td>filter</td><td><code>(msg, ctx) -> Message?</code></td><td>channel formatters</td></tr>
-      <tr><td><code>gateway.undeliverable</code></td><td>handler</td><td><code>(msg, err, ctx) -> ()</code></td><td>—</td></tr>
+      <tr><td><code>safety.ingress</code></td><td>filter</td><td>Go, core-owned</td><td>Runs before the loop sees a message; may drop it or rewrite the text. Of the five baseline filters only <code>affect-guard</code> ever drops — the rest classify, and their classification reaches the journal.</td></tr>
+      <tr><td><code>safety.egress</code></td><td>filter</td><td>Go, core-owned</td><td>Runs before the reply reaches the channel; may drop it.</td></tr>
+      <tr><td><code>gateway.route</code></td><td>handler</td><td>a Lua chunk named by <code>gateway.route</code>, default <code>plugin:per_chat</code></td><td>One Luau state per process. Reads the message and returns a session address. A route handler may call only <code>inbox</code>, <code>deliver</code>, <code>runtime.triggers</code>, <code>router.state.*</code> and <code>log</code>; anything else is refused by name.</td></tr>
     </tbody>
   </table>
 
-  <h3>Session</h3>
+  <h3>Naming conventions the Lua calls</h3>
+  <p>These are ordinary globals, not entry points the engine invokes. The prelude or the loop calls them by name when the deployment configures that behaviour, and shadowing a builtin means defining the same global in <code>plugins/&lt;name&gt;.lua</code>.</p>
   <table class="table hook-table">
-    <thead><tr><th>Hook</th><th>Kind</th><th>Signature</th><th>Notes</th></tr></thead>
+    <thead><tr><th>Configured as</th><th>Global the Lua must define</th><th>Called by</th></tr></thead>
     <tbody>
-      <tr><td><code>session.start</code></td><td>tap</td><td><code>(session) -> ()</code></td><td>First spawn only</td></tr>
-      <tr><td><code>session.resume</code></td><td>filter</td><td><code>(saved, ctx) -> table</code></td><td>After suspend / crash-restart</td></tr>
-      <tr><td><code>session.migrate</code></td><td>handler</td><td><code>(old_state, new_version) -> table</code></td><td>Hot reload continuity</td></tr>
-      <tr><td><code>session.end</code></td><td>tap</td><td><code>(session, reason) -> ()</code></td><td>Reason: shutdown | crash | terminated</td></tr>
+      <tr><td>memory profile <code>write: plugin:routing_table</code></td><td><code>memory_routing_table(record)</code></td><td>the prelude's <code>memory.write</code></td></tr>
+      <tr><td>memory profile <code>recall: plugin:recency</code></td><td><code>memory_recall_handler(query, opts)</code></td><td>the prelude's <code>memory.recall</code></td></tr>
+      <tr><td>memory profile <code>recall: plugin:semantic</code></td><td><code>memory_semantic_recall_handler(query, opts)</code></td><td>the prelude's <code>memory.recall</code></td></tr>
+      <tr><td>support chunk <code>plugin:token_budget</code></td><td><code>token_budget(messages, budget)</code></td><td>the loop, when it wants prompt trimming</td></tr>
+      <tr><td>support chunk <code>plugin:fact_extractor</code></td><td><code>fact_extractor_turn(turn)</code></td><td>the loop, after a turn</td></tr>
+      <tr><td>loop plugin <code>plugin:per_chat</code></td><td><code>loop()</code></td><td>nothing — it <em>is</em> a loop, not a helper</td></tr>
     </tbody>
   </table>
 
-  <h3>Loop</h3>
-  <p>The <code>loop</code> handler owns the session coroutine for its lifetime. The remaining hooks fire <em>inside</em> the loop — a loop may honor them voluntarily.</p>
-  <table class="table hook-table">
-    <thead><tr><th>Hook</th><th>Kind</th><th>Signature</th><th>Notes</th></tr></thead>
-    <tbody>
-      <tr><td><code>loop</code></td><td>handler</td><td><code>(session) -> ()</code></td><td>your loop file</td></tr>
-      <tr><td><code>loop.before_turn</code></td><td>filter</td><td><code>(turn, ctx) -> TurnCtx</code></td><td>Inject context, cost checks</td></tr>
-      <tr><td><code>loop.on_tool_call</code></td><td>filter</td><td><code>(call, ctx) -> "allow" | "deny" | ToolCall</code></td><td>Permission gating, rewrite</td></tr>
-      <tr><td><code>loop.on_tool_result</code></td><td>filter</td><td><code>(result, ctx) -> ToolResult</code></td><td>Honest degradation, truncation</td></tr>
-      <tr><td><code>loop.after_turn</code></td><td>tap</td><td><code>(record) -> ()</code></td><td>Memory writes, fact extraction</td></tr>
-      <tr><td><code>loop.on_interrupt</code></td><td>handler</td><td><code>(pending, ctx) -> "queue" | "cancel" | "prepend"</code></td><td>Mid-turn message policy</td></tr>
-    </tbody>
-  </table>
-
-  <h3>Memory</h3>
-  <table class="table hook-table">
-    <thead><tr><th>Hook</th><th>Kind</th><th>Signature</th><th>Default</th></tr></thead>
-    <tbody>
-      <tr><td><code>memory.write</code></td><td>filter</td><td><code>(record, ctx) -> MemoryRecord?</code></td><td><code>plugin:routing_table</code></td></tr>
-      <tr><td><code>memory.recall</code></td><td>handler</td><td><code>(query, ctx) -> {Memory}</code></td><td><code>plugin:recency</code></td></tr>
-      <tr><td><code>memory.compact</code></td><td>handler</td><td><code>(scope) -> ()</code></td><td>—</td></tr>
-      <tr><td><code>memory.on_write</code></td><td>tap</td><td><code>(record) -> ()</code></td><td>Audit</td></tr>
-    </tbody>
-  </table>
-
-  <h3>Shell</h3>
-  <table class="table hook-table">
-    <thead><tr><th>Hook</th><th>Kind</th><th>Signature</th><th>Default</th></tr></thead>
-    <tbody>
-      <tr><td><code>shell.provision</code></td><td>handler</td><td><code>(session) -> ShellHandle</code></td><td>Docker / SSH provider</td></tr>
-      <tr><td><code>shell.on_exec</code></td><td>tap</td><td><code>(cmd, result) -> ()</code></td><td>—</td></tr>
-    </tbody>
-  </table>
-
-  <h3>Safety — core-owned, unbypassable</h3>
   <div class="callout warn">
-    <strong>Security note</strong>: <span>These chains are dispatched by the <strong>core</strong>, not the loop. Replacing the loop handler can never uninstall them.</span>
+    <strong>What this section used to say</strong>: <span>It listed 26 hooks — <code>gateway.ingress</code>, <code>loop.before_turn</code>, <code>session.migrate</code>, <code>shell.before_exec</code>, <code>agent.start</code>, <code>core.on_reload</code> and others — with kinds, signatures and defaults, and stated that the core dispatched them. No dispatcher exists, so a plugin defining one of those names was silently never called. Two of them named builtins (<code>plugin:exec_policy</code> for <code>shell.before_exec</code>, <code>plugin:ttl</code> for <code>shell.teardown</code>) that were loaded into every session state and invoked by nothing; both are now removed. <strong>Shell commands are gated by the <code>shell.exec</code> capability alone — there is no command policy filter.</strong> Loops are restarted on a crash and hot-reloaded on a file change, which is what <code>session.resume</code> and <code>core.on_reload</code> were reaching for; a loop that needs to carry state across either uses <code>session.state.*</code>.</span>
   </div>
-  <table class="table hook-table">
-    <thead><tr><th>Hook</th><th>Kind</th><th>Signature</th></tr></thead>
-    <tbody>
-      <tr><td><code>safety.ingress</code></td><td>filter</td><td><code>(msg, ctx) -> Message</code></td></tr>
-      <tr><td><code>safety.egress</code></td><td>filter</td><td><code>(text, ctx) -> string?</code> (nil = drop)</td></tr>
-    </tbody>
-  </table>
-
-  <h3>Core lifecycle</h3>
-  <table class="table hook-table">
-    <thead><tr><th>Hook</th><th>Kind</th><th>Signature</th></tr></thead>
-    <tbody>
-      <tr><td><code>agent.start</code></td><td>tap</td><td><code>(agent) -> ()</code></td></tr>
-      <tr><td><code>agent.stop</code></td><td>tap</td><td><code>(agent) -> ()</code></td></tr>
-      <tr><td><code>core.on_reload</code></td><td>tap</td><td><code>(what) -> ()</code></td></tr>
-    </tbody>
-  </table>
 </section>
 
 

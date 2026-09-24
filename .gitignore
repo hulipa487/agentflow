@@ -20,8 +20,12 @@ plugins/orchestrator/
 # local loop plugins (instance-specific, e.g. loops/react.lua)
 loops/
 
-# local instance config (may carry secrets)
+# local instance config (may carry secrets). Both spellings: the README's quick
+# start writes config.yaml, and the -config flag defaults to agentflow.yaml —
+# without this line an operator following the default path commits credentials.
 config.yaml
+agentflow.yaml
+*.bak
 
 # editor / OS cruft
 *~

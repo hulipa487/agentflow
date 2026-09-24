@@ -213,8 +213,16 @@ footer {
 
 /* Responsive */
 @media (max-width: 900px) {
-  #sidebar { width: 100%; height: auto; position: relative; top: 0; border-right: none; border-bottom: 1px solid var(--border); display: none; }
-  #sidebar.open { display: block; }
+  /* A narrow screen gets the table of contents as a horizontally scrollable
+     bar. The previous rule set display:none and relied on a #sidebar.open
+     class no script ever adds, so the docs had no navigation at all on a
+     phone. */
+  #sidebar {
+    width: 100%; height: auto; position: relative; top: 0;
+    border-right: none; border-bottom: 1px solid var(--border);
+    padding: 8px 0;
+  }
+  .nav-list { display: flex; gap: 16px; overflow-x: auto; padding: 0 16px; white-space: nowrap; }
   #content { margin-left: 0; padding: 24px; }
   .nav-left .tagline { display: none; }
 }

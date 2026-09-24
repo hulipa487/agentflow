@@ -331,6 +331,16 @@ func (m *Manager) StreamOpen(ctx context.Context, model string, msgs []Message, 
 // StreamNext returns the next frame; done=true means the stream finished
 // (usage, toolCalls, and the terminal thinking payload are valid then). A
 // finished stream unregisters itself.
+//
+// A tool-call event ends the turn but is not the last event on the stream:
+// every provider emits it immediately *before* the usage frame. Returning Done
+// there — which this used to do — reported the call as costing nothing, and
+// usage feeds the per-user ledger and the agent budget. It also left the stream
+// registered, because that path never called StreamClose, so the entry, its
+// cancel func, the response body and the provider goroutine survived until the
+// process exited. So: keep receiving, accumulate, and return Done from the
+// close. A usage-only frame is swallowed for the same reason — it carries no
+// delta, and an empty delta reads to a Lua `for` as end-of-stream.
 func (m *Manager) StreamNext(ctx context.Context, id string) (Frame, error) {
 	m.mu.Lock()
 	st, ok := m.streams[id]
@@ -338,36 +348,40 @@ func (m *Manager) StreamNext(ctx context.Context, id string) (Frame, error) {
 	if !ok {
 		return Frame{}, fmt.Errorf("unknown stream %q", id)
 	}
-	select {
-	case ev, open := <-st.ch:
-		if !open {
+	for {
+		select {
+		case ev, open := <-st.ch:
+			if !open {
+				done := Frame{Done: true, Usage: st.usage, ToolCalls: st.calls, Thinking: st.thinking, ThinkingBlocks: st.blocks}
+				m.StreamClose(id)
+				return done, nil
+			}
+			if ev.usage.Input != 0 || ev.usage.Output != 0 {
+				st.usage = ev.usage
+			}
+			if len(ev.toolCalls) > 0 {
+				st.calls = ev.toolCalls
+			}
+			if ev.thinking != "" {
+				st.thinking = ev.thinking
+			}
+			if ev.thinkingBlocks != nil {
+				st.blocks = ev.thinkingBlocks
+			}
+			if ev.err != nil {
+				done := Frame{Done: true, Usage: st.usage, ToolCalls: st.calls, Thinking: st.thinking, ThinkingBlocks: st.blocks}
+				m.StreamClose(id)
+				return done, ev.err
+			}
+			if ev.delta != "" {
+				return Frame{Delta: ev.delta, Usage: st.usage}, nil
+			}
+			// A tool call, or a usage-only frame: no delta to hand back, so keep
+			// draining rather than reporting an empty one.
+		case <-ctx.Done():
 			m.StreamClose(id)
-			return Frame{Done: true, Usage: st.usage, ToolCalls: st.calls, Thinking: st.thinking, ThinkingBlocks: st.blocks}, nil
+			return Frame{}, ctx.Err()
 		}
-		if ev.usage.Input != 0 || ev.usage.Output != 0 {
-			st.usage = ev.usage
-		}
-		if len(ev.toolCalls) > 0 {
-			st.calls = ev.toolCalls
-		}
-		if ev.thinking != "" {
-			st.thinking = ev.thinking
-		}
-		if ev.thinkingBlocks != nil {
-			st.blocks = ev.thinkingBlocks
-		}
-		if ev.err != nil {
-			m.StreamClose(id)
-			return Frame{Done: true, Usage: st.usage, ToolCalls: st.calls, Thinking: st.thinking, ThinkingBlocks: st.blocks}, ev.err
-		}
-		if len(ev.toolCalls) > 0 {
-			// Tool calls arrive once at stream end; treat as done so the
-			// loop picks them up without waiting for the channel close.
-			return Frame{Done: true, Usage: st.usage, ToolCalls: st.calls, Thinking: st.thinking, ThinkingBlocks: st.blocks}, nil
-		}
-		return Frame{Delta: ev.delta, Usage: st.usage}, nil
-	case <-ctx.Done():
-		return Frame{}, ctx.Err()
 	}
 }
 

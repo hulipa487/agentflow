@@ -169,6 +169,11 @@ agentflow/
 
 ## Upgrade notes
 
+- **Gemini refuses client-side function tools.** The `gemini` (interactions) provider never mapped
+  `opts.Tools`: a tool-using loop against it ran with no tools at all, and the model simply never
+  called one — nothing said why. Such a call is now refused with an error naming `server_tools`,
+  which is the path that does work there. A loop passing tools to a gemini model was already not
+  getting them; it now says so instead of quietly degrading.
 - **The admin plane always requires a token now, and a public listen needs a real one.**
   `ADMIN_TOKEN` is honoured exactly as before, but a per-boot token is minted whenever it is
   unset — previously that happened only when the console was enabled, so `-no-webui` left

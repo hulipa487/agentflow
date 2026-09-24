@@ -53,7 +53,8 @@ func New(log *slog.Logger) *Service {
 }
 
 // Every registers a repeating timer. The first fire happens after interval.
-// The minimum is 1 second for production safety; tests may use shorter values.
+// The floor is 100ms, which is what the trigger service uses too — this comment
+// said "1 second for production safety" while the check below enforced 100ms.
 func (s *Service) Every(owner string, interval time.Duration, deliver Deliver) (TimerID, error) {
 	if interval < 100*time.Millisecond {
 		return "", fmt.Errorf("scheduler.every: interval must be >= 100ms, got %v", interval)

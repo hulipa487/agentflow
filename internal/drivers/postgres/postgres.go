@@ -59,6 +59,11 @@ func (h *Handle) migrate() error {
 	// A single generic table keyed by (table_name, key). The value is JSONB.
 	// A GIN index on value supports text_search. A btree on updated_at
 	// supports prefix_scan ordering.
+	// Several statements in one Exec. That works because pgx falls back to the
+	// simple protocol when a statement carries no arguments — adding a single
+	// bind parameter here would make it a prepared statement, and the extended
+	// protocol refuses multi-command text. storedb.ExecDDL exists for exactly
+	// that reason and runs one statement per call.
 	_, err := h.db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS store_kv (
 			table_name TEXT NOT NULL,

@@ -101,6 +101,33 @@ func TestValidateWebhookTimeout(t *testing.T) {
 	}
 }
 
+// TestValidateGhhookRequiresSecret: a GitHub webhook's signature is the only
+// thing distinguishing a real delivery from anyone who found the path, and the
+// driver used to skip the check entirely when no secret was configured. A
+// channel without one is now refused at boot. A lazy reference (${VAR} /
+// cred:<service>) is allowed, because an unresolvable one skips the channel at
+// construction rather than running it unauthenticated.
+func TestValidateGhhookRequiresSecret(t *testing.T) {
+	base := func(secret string) *Config {
+		return &Config{
+			Agents: map[string]Agent{"bot": {Loop: "plugin:per_chat"}},
+			Gateway: Gateway{
+				Channels: []Channel{{Name: "gh", Type: "ghhook", Agent: "bot", Secret: secret}},
+			},
+		}
+	}
+	if err := validate("cfg.yaml", base("s3cret")); err != nil {
+		t.Fatalf("a literal secret should validate: %v", err)
+	}
+	if err := validate("cfg.yaml", base("${GH_WEBHOOK_SECRET}")); err != nil {
+		t.Fatalf("a lazy reference should validate: %v", err)
+	}
+	err := validate("cfg.yaml", base(""))
+	if err == nil || !strings.Contains(err.Error(), "no secret") {
+		t.Fatalf("a ghhook channel without a secret must fail boot, got %v", err)
+	}
+}
+
 // TestValidateShellProfile exercises the provider-specific validation rules.
 func TestValidateShellProfile(t *testing.T) {
 	tests := []struct {

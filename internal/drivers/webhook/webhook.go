@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"agentflow/internal/core/media"
+	"agentflow/internal/core/netguard"
 	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/router"
 	"agentflow/internal/core/session"
@@ -61,7 +62,7 @@ type Driver struct {
 	pol   media.Policy
 	opts  Options
 	log   *slog.Logger
-	http  *http.Client // callback delivery
+	http  *http.Client // callback delivery, guarded by the shared outbound policy
 
 	seq     atomic.Uint64
 	mu      sync.Mutex
@@ -79,7 +80,7 @@ type job struct {
 	expires  time.Time
 }
 
-func New(name, path, agent string, sink router.Sink, srv *httpd.Server, store media.Store, pol media.Policy, opts Options, log *slog.Logger) *Driver {
+func New(name, path, agent string, sink router.Sink, srv *httpd.Server, store media.Store, pol media.Policy, opts Options, netPol netguard.Policy, log *slog.Logger) *Driver {
 	if path == "" {
 		path = "/webhook/"
 	}
@@ -95,7 +96,14 @@ func New(name, path, agent string, sink router.Sink, srv *httpd.Server, store me
 		pol:     pol,
 		opts:    opts,
 		log:     log.With("driver", "webhook", "channel", name),
-		http:    &http.Client{Timeout: 10 * time.Second},
+		// The callback client carries the same address guard the loop's
+		// http.request and builtin:fetch use. callback_url is caller-supplied
+		// and only scheme-checked, so without this any caller reaching the
+		// channel could have the runtime POST an agent's reply to an internal
+		// address — a service on the private network, or a cloud metadata
+		// endpoint on link-local. Sharing one Policy also means
+		// net.http.allow_private still permits a legitimate local receiver.
+		http:    &http.Client{Timeout: 10 * time.Second, Transport: netPol.Transport()},
 		pending: map[string]chan string{},
 		jobs:    map[string]*job{},
 	}

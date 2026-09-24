@@ -92,10 +92,12 @@ func TestHandleWebhookVerifiesSecretToken(t *testing.T) {
 	}
 }
 
-// TestHandleWebhookUnauthenticatedWhenNoSecret: a driver with no secret
-// (constructed without New, or a generation failure) keeps the historical
-// unauthenticated behavior rather than refusing everything.
-func TestHandleWebhookUnauthenticatedWhenNoSecret(t *testing.T) {
+// TestHandleWebhookRefusesWhenNoSecret: a driver with no secret — constructed
+// by hand, or a secret-generation failure at construction — refuses every
+// delivery rather than accepting them all. It used to fall through to update
+// handling, which meant the one failure mode that leaves the webhook
+// unauthenticated was also the one that admitted anything.
+func TestHandleWebhookRefusesWhenNoSecret(t *testing.T) {
 	sink := &captureSink{}
 	d := &Driver{
 		name:   "telegram",
@@ -111,8 +113,11 @@ func TestHandleWebhookUnauthenticatedWhenNoSecret(t *testing.T) {
 		strings.NewReader(`{"update_id":1,"message":{"message_id":1,"text":"hi","from":{"id":7},"chat":{"id":99}}}`))
 	rec := httptest.NewRecorder()
 	d.handleWebhook(rec, req)
-	if rec.Code != http.StatusOK || len(sink.inbs) != 1 {
-		t.Fatalf("no-secret driver must accept deliveries: code=%d sink=%d", rec.Code, len(sink.inbs))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("no-secret driver must refuse deliveries: got %d, want 503", rec.Code)
+	}
+	if len(sink.inbs) != 0 {
+		t.Fatalf("a refused delivery must not reach the sink: %d", len(sink.inbs))
 	}
 }
 

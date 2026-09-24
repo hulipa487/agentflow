@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -88,7 +89,7 @@ func main() {
 	workers := flag.Int("workers", 8, "op worker pool size")
 	logLevel := flag.String("log-level", "info", "minimum log level: dev|debug|info|warn|error (additive)")
 	noTUI := flag.Bool("no-tui", false, "disable the terminal dashboard (plain stderr logs)")
-	noWebUI := flag.Bool("no-webui", false, "disable the web console (admin server keeps token-optional loopback behavior)")
+	noWebUI := flag.Bool("no-webui", false, "disable the web console (the admin server still requires the bearer token)")
 	flag.Parse()
 
 	// The credential CLI shares the -config/-configdir source selection; it
@@ -1341,7 +1342,7 @@ func main() {
 				wopts.Timeout, _ = time.ParseDuration(ch.Timeout) // validated at config load
 			}
 			wopts.Async = ch.Async
-			d := webhook.New(name, ch.Path, ch.Agent, sink, httpSrv, mstore, mpol, wopts, log)
+			d := webhook.New(name, ch.Path, ch.Agent, sink, httpSrv, mstore, mpol, wopts, netPolicy, log)
 			gw.Register(d)
 		case "telegram":
 			token, ok := credResolver.Resolve(ctx, ch.Token)
@@ -1400,24 +1401,15 @@ func main() {
 	watcher.Start()
 
 	// Metrics/admin: authenticated HTTP endpoint with health/readiness/metrics
-	// and a read-only sessions view. Binds to loopback by default. The web
-	// console (on by default, -no-webui to disable) mounts its SPA and JSON API
-	// here and requires the bearer token on every API route — with no
-	// ADMIN_TOKEN set, a per-boot token is generated and printed once.
+	// and a read-only sessions view. Binds to loopback by default.
 	adminAddr := cfg.Runtime.Admin.Listen
 	if adminAddr == "" {
 		adminAddr = "127.0.0.1:9090"
 	}
-	adminToken := os.Getenv("ADMIN_TOKEN")
-	if !*noWebUI && adminToken == "" {
-		b := make([]byte, 16)
-		if _, err := rand.Read(b); err != nil {
-			log.Error("admin token generation failed", "err", err)
-			os.Exit(1)
-		}
-		adminToken = hex.EncodeToString(b)
-		log.Info("web console admin token (set ADMIN_TOKEN to pin it)", "token", adminToken)
-		log.Warn("admin token is per-boot and per-instance: a fleet must set ADMIN_TOKEN, or every console rejects the others' tokens")
+	adminToken, tokErr := resolveAdminToken(os.Getenv("ADMIN_TOKEN"), adminAddr, log)
+	if tokErr != nil {
+		log.Error("admin plane has no usable authentication", "err", tokErr)
+		os.Exit(1)
 	}
 	admin := metrics.NewAdminServer(adminAddr, adminToken, metricReg, log)
 	admin.SetReady(true)
@@ -1435,6 +1427,7 @@ func main() {
 	if !*noWebUI {
 		console := webui.New(webui.Deps{
 			ConfigPath: *cfgPath,
+			ConfigDir:  *configDir,
 			Cfg:        cfg,
 			Instance:   leaseMgr.Owner(),
 			Region:     cfg.Runtime.Region,
@@ -1545,6 +1538,59 @@ func loadConfigSource(cfgPath, configDir string, log *slog.Logger) (*config.Conf
 		return config.LoadDir(configDir, log)
 	}
 	return config.Load(cfgPath)
+}
+
+// loopbackListen reports whether an admin listen address is reachable only
+// from this host, which is what makes a per-boot token a secret worth having.
+//
+// It is deliberately strict, and answers from the address text alone rather
+// than resolving anything: an empty host (":9090") binds every interface, a
+// bare port or an unparseable address is not vouched for, and a name other
+// than "localhost" is not assumed to resolve to a loopback address. Anything
+// this cannot vouch for is treated as reachable and requires a real token.
+func loopbackListen(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// resolveAdminToken returns the bearer token the admin plane will require.
+//
+// It mints a per-boot token whenever ADMIN_TOKEN is unset — not only when the
+// console is on, which is what it used to do. Generating it inside
+// `if !*noWebUI` meant `-no-webui` with no ADMIN_TOKEN left an empty token, and
+// metrics.AdminServer.auth reads an empty token as "no auth required": /metrics,
+// /admin/sessions and credential provisioning were then served to anything that
+// could reach the port.
+//
+// A generated token is only a secret if nothing else can reach that port, so a
+// non-loopback listen with no ADMIN_TOKEN is refused rather than quietly
+// served. envToken is a parameter rather than read here so both branches are
+// testable.
+func resolveAdminToken(envToken, listen string, log *slog.Logger) (string, error) {
+	if log == nil {
+		log = slog.Default()
+	}
+	if envToken != "" {
+		return envToken, nil
+	}
+	if !loopbackListen(listen) {
+		return "", fmt.Errorf("runtime.admin.listen %q is not loopback and ADMIN_TOKEN is unset; set ADMIN_TOKEN, or bind runtime.admin.listen to a loopback address", listen)
+	}
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("admin token generation: %w", err)
+	}
+	token := hex.EncodeToString(b)
+	log.Info("admin token (set ADMIN_TOKEN to pin it)", "token", token)
+	log.Warn("admin token is per-boot and per-instance: a fleet must set ADMIN_TOKEN, or every instance rejects the others' tokens")
+	return token, nil
 }
 
 func capabilitySet(caps []string) map[string]bool {

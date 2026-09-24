@@ -948,6 +948,17 @@ func expandEnv(b []byte) []byte {
 	})
 }
 
+// ExpandEnv resolves ${VAR} (and ${VAR:-default}) references in config bytes
+// against the process environment, leaving everything else alone.
+//
+// It is the same expansion Load applies to a config file before decoding, and
+// it is exported so a caller that has to reason about a value's pre-expansion
+// text can ask the question exactly rather than approximating it. The console
+// uses it to decide whether a live model key is still the file's placeholder —
+// which it must write back as written — or a value the operator has since
+// replaced, which it must write as given.
+func ExpandEnv(b []byte) []byte { return expandEnv(b) }
+
 func Load(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -1333,6 +1344,15 @@ func validate(path string, c *Config) error {
 		case "ghhook":
 			if ch.Path != "" && !strings.HasSuffix(ch.Path, "/") {
 				return fmt.Errorf("%s: ghhook channel %q path must end with / (got %q)", path, ch.Name, ch.Path)
+			}
+			// The GitHub webhook secret is what makes an event trustworthy: the
+			// signature is the only thing distinguishing a real delivery from
+			// anyone who found the path. It may be a lazy reference (${VAR} /
+			// cred:<service>); an unresolvable one skips the channel at
+			// construction with a warning, which is safe — the alternative was
+			// running it unauthenticated.
+			if ch.Secret == "" {
+				return fmt.Errorf("%s: ghhook channel %q has no secret; set secret (the GitHub webhook secret) — an unauthenticated ghhook accepts any event", path, ch.Name)
 			}
 		case "telegram":
 			// Token presence is not validated here: the token may be a lazy

@@ -47,7 +47,10 @@ info:
     Behind a reverse proxy every caller shares one address, so a frontend
     deployed that way must rate limit there as well.
 servers:
-  - url: /
+  # The engine mounts this API under /v1/users (core/users.Prefix). Every path
+  # below is relative to that, so a client generated from this file reaches the
+  # right routes; with a bare "/" it would 404 on all of them.
+  - url: /v1/users
 paths:
   /config:
     get:

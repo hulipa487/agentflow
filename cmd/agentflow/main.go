@@ -248,7 +248,7 @@ func main() {
 	}
 	memMgr := memory.NewManager(memReg, log)
 	warnUnenforceableGC(cfg, log)
-	warnDeprecatedRuntimeKeys(cfg, log)
+	warnInertConfig(cfg, log)
 
 	// Drivers and shared infrastructure.
 	llmMgr := llm.NewManager(cfg.Models, log)
@@ -1561,15 +1561,16 @@ func loadConfigSource(cfgPath, configDir string, log *slog.Logger) (*config.Conf
 	return config.Load(cfgPath)
 }
 
-// warnDeprecatedRuntimeKeys reports the runtime: keys that are parsed — so a
-// config that sets them keeps booting — and that nothing reads. Each one claims
-// a behaviour the engine does not have, so staying silent about it is how a
-// deployment comes to believe it configured something.
+// warnInertConfig reports configuration that is parsed — so a config that sets
+// it keeps booting — and that nothing reads. Each one claims a behaviour the
+// engine does not have, so staying silent is how a deployment comes to believe
+// it configured something.
 //
-// The fields are pointers so presence is distinguishable from a zero value; that
-// is their only remaining purpose. Removing them outright would turn an existing
-// config into a parse error, because decoding is strict.
-func warnDeprecatedRuntimeKeys(cfg *config.Config, log *slog.Logger) {
+// Every field here is a pointer for the same reason: presence has to be
+// distinguishable from a zero value, and that is now their only purpose.
+// Deleting one outright would turn an existing config into a parse error, since
+// decoding is strict — a boot failure for a setting that does nothing.
+func warnInertConfig(cfg *config.Config, log *slog.Logger) {
 	if v := cfg.Runtime.VM.MemoryLimit; v != nil {
 		log.Warn("runtime.vm.memory_limit has no effect: the Luau state has no allocator cap", "value", *v)
 	}
@@ -1581,6 +1582,45 @@ func warnDeprecatedRuntimeKeys(cfg *config.Config, log *slog.Logger) {
 	}
 	if v := cfg.Runtime.Reload.Watch; v != nil {
 		log.Warn("runtime.reload.watch has no effect: the reload watcher always runs", "value", *v)
+	}
+
+	reportStore := func(profile string, stores map[string]config.Store) {
+		for name, s := range stores {
+			if s.Collection != nil {
+				log.Warn("memory store collection has no effect: a store is bound by backend and table",
+					"profile", profile, "store", name, "value", *s.Collection)
+			}
+			if s.Policy != nil {
+				log.Warn("memory store policy has no effect: no policy knob is implemented for a store",
+					"profile", profile, "store", name, "value", *s.Policy)
+			}
+		}
+	}
+	reportStore("built-in", config.DefaultMemoryProfile().Stores)
+	for name, p := range cfg.Profiles.Memory {
+		reportStore(name, p.Stores)
+	}
+
+	if v := cfg.Tools.Policy.Write; v != nil {
+		log.Warn("tools.policy.write has no effect: no tool write policy is implemented", "value", *v)
+	}
+	// These three are accepted on an override and copied onto the tool, and
+	// nothing ever consults them — so a deployment that sets one is configuring
+	// a decision the engine does not make. (`permission` is the exception: it
+	// works, as the exact string "forbidden".)
+	for tname, o := range cfg.Tools.Policy.Overrides {
+		if o.CostLevel != nil {
+			log.Warn("tools.policy.overrides.cost_level has no effect: nothing reads a tool's cost level",
+				"tool", tname, "value", *o.CostLevel)
+		}
+		if o.UserVisible != nil {
+			log.Warn("tools.policy.overrides.user_visible has no effect: nothing reads a tool's visibility",
+				"tool", tname, "value", *o.UserVisible)
+		}
+		if o.Autonomous != nil {
+			log.Warn("tools.policy.overrides.autonomous has no effect: nothing reads a tool's autonomy",
+				"tool", tname, "value", *o.Autonomous)
+		}
 	}
 }
 
@@ -1895,7 +1935,6 @@ func memoryFromConfig(s config.Store) memory.Store {
 	ret := memory.Store{
 		Backend:    s.Backend,
 		Table:      s.Table,
-		Collection: s.Collection,
 		Window:     s.Window,
 		Requires:   s.Requires,
 		Shared:     s.Shared,

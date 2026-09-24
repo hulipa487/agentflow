@@ -519,13 +519,18 @@ type MemoryProfile struct {
 }
 
 type Store struct {
-	Backend    string   `yaml:"backend"`
-	Table      string   `yaml:"table"`
-	Collection string   `yaml:"collection"`
+	Backend string `yaml:"backend"`
+	Table   string `yaml:"table"`
+	// Collection and Policy are parsed and read by nothing: a store is bound by
+	// backend and table, and the policy knobs they suggest were never
+	// implemented. They are pointers so main can warn when one is actually set
+	// — the same treatment the runtime: keys get, and for the same reason:
+	// deleting a field turns an existing config into a strict-decode boot error.
+	Collection *string  `yaml:"collection"`
 	Retention  string   `yaml:"retention"`
 	Window     int      `yaml:"window"`
 	Requires   []string `yaml:"requires"`
-	Policy     string   `yaml:"policy"`
+	Policy     *string  `yaml:"policy"`
 	// Shared opts the store into cross-agent sharing (a deliberate knowledge
 	// base). Private stores (the default) are isolated per agent: the
 	// physical table is prefixed with the agent name at bind time. Existing
@@ -616,8 +621,10 @@ type Tools struct {
 }
 
 type ToolsPolicy struct {
-	Default   string                      `yaml:"default"`
-	Write     string                      `yaml:"write"`
+	Default string `yaml:"default"`
+	// Write is parsed and read by nothing. A pointer so main can warn when it
+	// is set, without turning an existing config into a boot error.
+	Write     *string                     `yaml:"write"`
 	Forbidden []string                    `yaml:"forbidden"`
 	Overrides map[string]ToolSpecOverride `yaml:"overrides"`
 }

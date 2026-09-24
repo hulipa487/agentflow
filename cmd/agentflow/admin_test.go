@@ -4,7 +4,33 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
+
+	"agentflow/internal/config"
 )
+
+// TestMemoryFromConfigRetention: the store's retention reaches the backend as a
+// write TTL. It was parsed with time.ParseDuration and the error discarded, and
+// Go has no day unit — so the shipped `retention: "30d"` silently became zero,
+// which reads as "never expires".
+func TestMemoryFromConfigRetention(t *testing.T) {
+	cases := []struct {
+		in   string
+		want time.Duration
+	}{
+		{"30d", 30 * 24 * time.Hour},
+		{"1d", 24 * time.Hour},
+		{"12h", 12 * time.Hour},
+		{"forever", 0},
+		{"", 0}, // unset: no expiry
+	}
+	for _, c := range cases {
+		got := memoryFromConfig(config.Store{Backend: "b", Table: "t", Retention: c.in})
+		if got.Retention != c.want {
+			t.Errorf("retention %q -> %v; want %v", c.in, got.Retention, c.want)
+		}
+	}
+}
 
 // TestLoopbackListen: a per-boot admin token is only a secret if the port it
 // guards cannot be reached from elsewhere, so this answer decides whether a

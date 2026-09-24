@@ -206,7 +206,14 @@ func (r *Router) runOnce(ctx context.Context) bool {
 		case "log":
 			r.log.Log(ctx, levelOf(op.Level), op.Msg)
 		default:
-			resp, ok = failJSON(fmt.Errorf("unknown op %s", op.Type)), false
+			// A route handler sees the whole prelude — the same base state every
+			// loop gets — but this state serves only the ops above. So llm.chat,
+			// files.*, shell.*, store.* and agent.* all look callable and always
+			// fail. Name the surface rather than reporting "unknown op", which
+			// reads like a typo in the chunk.
+			resp, ok = failJSON(fmt.Errorf(
+				"op %s is not available to a route handler: the router serves inbox, deliver, router.state.*, runtime.triggers and log — a route decides where a message goes, and a loop does the work",
+				op.Type)), false
 		}
 
 		status, msg = st.Resume(resp, ok)

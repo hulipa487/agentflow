@@ -70,35 +70,51 @@ func New(profile *Profile) *Dispatcher {
 
 // Ingress runs all ingress filters in order. If any filter drops, the chain
 // stops and the drop is returned immediately.
+//
+// The last non-empty Reason is carried forward on the success path. It used to
+// be discarded there, which made most of the default chain unobservable: only
+// AffectGuard ever sets Drop, so a classification like "quoted" or "imminent"
+// from the filters that only advise never reached the caller or the journal.
+// Carrying it changes no text and no decision — it only stops the chain's
+// verdicts from being thrown away.
 func (d *Dispatcher) Ingress(ctx context.Context, in IngressInput) IngressResult {
 	if d.profile == None {
 		return IngressResult{Text: in.Message}
 	}
 	text := in.Message
+	reason := ""
 	for _, f := range d.profile.Filters {
 		res := f.Ingress(ctx, IngressInput{Message: text, Source: in.Source})
 		if res.Drop {
 			return res
 		}
 		text = res.Text
+		if res.Reason != "" {
+			reason = res.Reason
+		}
 	}
-	return IngressResult{Text: text}
+	return IngressResult{Text: text, Reason: reason}
 }
 
 // Egress runs all egress filters in order. If any filter drops, the chain stops.
+// The last non-empty Reason is carried forward, as in Ingress.
 func (d *Dispatcher) Egress(ctx context.Context, in EgressInput) EgressResult {
 	if d.profile == None {
 		return EgressResult{Text: in.Text}
 	}
 	text := in.Text
+	reason := ""
 	for _, f := range d.profile.Filters {
 		res := f.Egress(ctx, EgressInput{Text: text, Source: in.Source})
 		if res.Drop {
 			return res
 		}
 		text = res.Text
+		if res.Reason != "" {
+			reason = res.Reason
+		}
 	}
-	return EgressResult{Text: text}
+	return EgressResult{Text: text, Reason: reason}
 }
 
 // Profile returns the active profile name.

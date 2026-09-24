@@ -169,6 +169,30 @@ agentflow/
 
 ## Upgrade notes
 
+- **Safety profile references must resolve, and `profiles.safety` now applies.** An agent's
+  `safety:` field accepted any string and resolved an unknown one to `safety.None` with no
+  warning — so a typo silently turned the core-owned chain off, which is the opposite of failing
+  closed. A name that is not `"default"`, `"none"` or a `profiles.safety` entry is now a boot
+  error, as is an unknown filter name inside such an entry. Two consequences for an existing
+  config: a deployment with a typo'd name will now refuse to start, and a deployment that *has*
+  a `profiles.safety` entry will find that it is honoured rather than ignored — the entry selects
+  from the baseline filters by name, keeping each one's configured phrases. An entry with no
+  filters is an explicit empty chain, which still runs the dispatcher; `safety: none` bypasses it.
+  Note also that only `affect-guard` ever drops; the other four classify (their reason now
+  reaches the journal rather than being discarded).
+- **`tools.policy.default` must be `all`, `none` or unset.** It was compared against the literal
+  `"none"`, so any other value — a typo like `non` — meant "allow every tool". The permissive
+  default is unchanged (an omitted key still means every tool); only a value that is neither is
+  now a boot error.
+- **`retention` now does what it says, which starts expiring data.** A memory store's
+  `retention` was parsed with Go's `time.ParseDuration` and the error discarded — and Go has no
+  day unit — so the `conversational` preset's `retention: "30d"` silently became zero, which
+  reads as "never expires". It now parses (`ms`, `s`, `m`, `h`, `d`, or `forever`) and becomes
+  the default write TTL for any `store.put` with no explicit TTL. **On the default preset, rows
+  written from now on expire 30 days after they are written.** Rows written before the upgrade
+  carry no expiry and are never aged out — this is a per-row TTL, not a sweep, so nothing
+  existing is deleted. A retention that does not parse is now a boot error rather than a silent
+  zero.
 - **Gemini refuses client-side function tools.** The `gemini` (interactions) provider never mapped
   `opts.Tools`: a tool-using loop against it ran with no tools at all, and the model simply never
   called one — nothing said why. Such a call is now refused with an error naming `server_tools`,

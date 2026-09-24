@@ -18,6 +18,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"agentflow/internal/core/safety"
 	"agentflow/internal/core/storedb"
 )
 
@@ -1067,6 +1068,66 @@ func decodeStrictRaw(data []byte, v any, label string) error {
 	return nil
 }
 
+// validateMemoryRetention rejects a store retention that would silently become
+// zero — the failure mode the field shipped with. It walks every declared
+// profile and the built-in preset, neither of which is otherwise checked here;
+// the built-in one matters because it ships the two spellings ("30d",
+// "forever") a deployment inherits without writing anything at all.
+func validateMemoryRetention(path string, c *Config) error {
+	check := func(label string, stores map[string]Store) error {
+		for sname, s := range stores {
+			if s.Retention == "" {
+				continue
+			}
+			if _, err := ParseRetention(s.Retention); err != nil {
+				return fmt.Errorf("%s: %s store %q: invalid retention %q (use ms, s, m, h, d, or \"forever\"): %w",
+					path, label, sname, s.Retention, err)
+			}
+		}
+		return nil
+	}
+	if err := check("built-in memory profile", DefaultMemoryProfile().Stores); err != nil {
+		return err
+	}
+	for pname, p := range c.Profiles.Memory {
+		if err := check(fmt.Sprintf("memory profile %q", pname), p.Stores); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateSafetyProfiles rejects a safety reference the engine cannot resolve.
+// Every branch of resolveSafety that is not "", "none" or "default" needs a
+// profiles.safety entry, and every filter named inside one needs to be a filter
+// the baseline actually has — an unknown filter would otherwise be dropped from
+// the chain without a word.
+func validateSafetyProfiles(path string, c *Config) error {
+	known := map[string]bool{}
+	for _, n := range safety.FilterNames() {
+		known[n] = true
+	}
+	for pname, p := range c.Profiles.Safety {
+		for _, f := range p.Filters {
+			if !known[f] {
+				return fmt.Errorf("%s: profiles.safety %q names unknown filter %q (known: %s)",
+					path, pname, f, strings.Join(safety.FilterNames(), ", "))
+			}
+		}
+	}
+	for name, a := range c.Agents {
+		switch a.Safety {
+		case "", "none", "default":
+		default:
+			if _, ok := c.Profiles.Safety[a.Safety]; !ok {
+				return fmt.Errorf("%s: agent %q references unknown safety profile %q (use \"default\", \"none\", or a profiles.safety entry)",
+					path, name, a.Safety)
+			}
+		}
+	}
+	return nil
+}
+
 func validate(path string, c *Config) error {
 	if len(c.Agents) == 0 {
 		return fmt.Errorf("%s: no agents defined", path)
@@ -1162,6 +1223,33 @@ func validate(path string, c *Config) error {
 		return err
 	}
 
+	// tools.policy.default. ToolVisibility reads this as "anything that is not
+	// exactly none allows everything", so a typo like "non" exposed every tool
+	// in the registry. The permissive default stays — an omitted key means every
+	// tool, and that is what the docs and every existing config assume — so what
+	// closes the hole is rejecting the value that is neither, not inverting the
+	// comparison (which would deny every tool to every config that omits it).
+	switch strings.ToLower(c.Tools.Policy.Default) {
+	case "", "all", "none":
+	default:
+		return fmt.Errorf("%s: tools.policy.default %q is not a policy (want \"all\", \"none\", or unset)", path, c.Tools.Policy.Default)
+	}
+
+	// Memory store retention. This runs over every declared profile AND the
+	// built-in preset, because a retention that does not parse is silently
+	// zero — which is how the shipped `retention: "30d"` came to mean "never
+	// expires" while looking configured.
+	if err := validateMemoryRetention(path, c); err != nil {
+		return err
+	}
+
+	// Safety profile names. An unknown one used to resolve to safety.None with
+	// no warning, so a typo in an agent's safety: field turned the core-owned
+	// chain off silently — the opposite of failing closed.
+	if err := validateSafetyProfiles(path, c); err != nil {
+		return err
+	}
+
 	allowedCaps := map[string]bool{}
 	for _, cap := range c.Plugins.AllowCapabilities {
 		allowedCaps[cap] = true
@@ -1182,6 +1270,12 @@ func validate(path string, c *Config) error {
 		allowedCaps["net.mail"] = true
 		allowedCaps["files"] = true
 		allowedCaps["users"] = true
+		// session.state is a persistence surface (a durable per-session
+		// scratchpad in the shared store), so it is not handed out by default —
+		// but it has to be declarable. It was missing from this set, so an
+		// agent that followed caps/sessionstate.go's own instruction and listed
+		// it in capabilities failed the boot instead.
+		allowedCaps["session.state"] = true
 	}
 
 	for name, a := range c.Agents {

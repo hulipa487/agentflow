@@ -62,7 +62,8 @@ func NormalizeSchema(params map[string]any) map[string]any {
 				continue
 			}
 			out[k] = v
-		case "properties":
+		case "properties", "$defs", "definitions", "patternProperties", "dependentSchemas":
+			// A map of names to subschemas.
 			m, ok := v.(map[string]any)
 			if !ok {
 				out[k] = v
@@ -77,15 +78,46 @@ func NormalizeSchema(params map[string]any) map[string]any {
 				}
 			}
 			out[k] = nm
-		case "items":
-			if sm, ok := v.(map[string]any); ok {
-				out[k] = NormalizeSchema(sm)
-			} else {
+		case "items", "prefixItems":
+			// One schema, or the draft-07 tuple form: a list of them.
+			switch iv := v.(type) {
+			case map[string]any:
+				out[k] = NormalizeSchema(iv)
+			case []any:
+				out[k] = normalizeSchemaList(iv)
+			default:
 				out[k] = v
 			}
+		case "allOf", "anyOf", "oneOf":
+			if list, ok := v.([]any); ok {
+				out[k] = normalizeSchemaList(list)
+				continue
+			}
+			out[k] = v
+		case "additionalProperties", "not", "if", "then", "else", "contains", "propertyNames":
+			if sm, ok := v.(map[string]any); ok {
+				out[k] = NormalizeSchema(sm)
+				continue
+			}
+			out[k] = v
 		default:
 			out[k] = v
 		}
+	}
+	return out
+}
+
+// normalizeSchemaList normalizes each schema in a list-valued keyword. A
+// non-object member passes through: JSON Schema allows a boolean schema there,
+// and it has nothing to normalize.
+func normalizeSchemaList(list []any) []any {
+	out := make([]any, len(list))
+	for i, v := range list {
+		if sm, ok := v.(map[string]any); ok {
+			out[i] = NormalizeSchema(sm)
+			continue
+		}
+		out[i] = v
 	}
 	return out
 }
@@ -287,7 +319,10 @@ type ToolVisibility struct {
 // NewToolVisibility derives the rule from one agent's skills and the global
 // tools policy.
 func NewToolVisibility(skills []string, policy config.ToolsPolicy) ToolVisibility {
-	v := ToolVisibility{defaultAllow: policy.Default != "none"}
+	// Case-insensitive so it agrees with config validation, which accepts any
+	// casing of "none": comparing against the literal here would let "NONE"
+	// through validation and then read as allow-all.
+	v := ToolVisibility{defaultAllow: !strings.EqualFold(policy.Default, "none")}
 	if len(skills) > 0 {
 		v.anySkills = true
 		v.skills = make(map[string]bool, len(skills))

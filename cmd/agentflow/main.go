@@ -247,6 +247,7 @@ func main() {
 		os.Exit(1)
 	}
 	memMgr := memory.NewManager(memReg, log)
+	warnUnenforceableGC(cfg, log)
 
 	// Drivers and shared infrastructure.
 	llmMgr := llm.NewManager(cfg.Models, log)
@@ -547,6 +548,15 @@ func main() {
 	tools.RegisterShellBuiltins(toolReg, shellMgr)
 	mcpClients := map[string]*mcp.Client{}
 	for sname, s := range cfg.MCP.Servers {
+		if s.URL != "" && s.Command == "" {
+			// The config declares a transport the driver does not have: mcp is
+			// stdio only, and the url/token fields are parsed but never read.
+			// Without this the run falls through to exec.Command("") and reports
+			// a start failure that names the wrong cause.
+			log.Warn("mcp server declares a url; the http transport is not implemented — only stdio (command) servers run",
+				"server", sname, "url", s.URL)
+			continue
+		}
 		c, err := mcp.NewClient(sname, s.Command, s.Args, log)
 		if err != nil {
 			log.Warn("mcp server failed", "server", sname, "err", err)
@@ -1540,6 +1550,46 @@ func loadConfigSource(cfgPath, configDir string, log *slog.Logger) (*config.Conf
 	return config.Load(cfgPath)
 }
 
+// gcNoOpProviders are the memory providers whose GC does not trim anything:
+// each returns nil without deleting. A store that declares a window or a
+// retention on one of them grows without bound while its config says otherwise
+// — the same shape of untruth as a retention string that never parsed, which is
+// why it is worth saying at boot.
+//
+// Named here rather than discovered, because the provider interface has no way
+// to say "my GC is a no-op". Implementing the trimming means deleting the entry.
+var gcNoOpProviders = map[string]bool{
+	"pgvector":    true,
+	"qdrant":      true,
+	"redisvector": true,
+	"redis":       true,
+}
+
+// warnUnenforceableGC reports stores whose backend cannot enforce the bound
+// they declare. It is a warning and not a boot error on purpose: the setting is
+// inert rather than harmful, and refusing to start would strand a deployment
+// that has one — the same call the deprecated runtime: keys get.
+func warnUnenforceableGC(cfg *config.Config, log *slog.Logger) {
+	report := func(label string, stores map[string]config.Store) {
+		for sname, s := range stores {
+			if s.Window == 0 && s.Retention == "" {
+				continue
+			}
+			b, ok := cfg.Memory.Backends[s.Backend]
+			if !ok || !gcNoOpProviders[b.Provider] {
+				continue
+			}
+			log.Warn("memory store declares a bound its backend does not enforce: this provider's GC deletes nothing, so the table grows without limit",
+				"profile", label, "store", sname, "backend", s.Backend, "provider", b.Provider,
+				"window", s.Window, "retention", s.Retention)
+		}
+	}
+	report("built-in", config.DefaultMemoryProfile().Stores)
+	for name, p := range cfg.Profiles.Memory {
+		report(name, p.Stores)
+	}
+}
+
 // loopbackListen reports whether an admin listen address is reachable only
 // from this host, which is what makes a per-boot token a secret worth having.
 //
@@ -1741,18 +1791,28 @@ func stringSet(values []string) map[string]bool {
 	return out
 }
 
-// resolveSafety turns a safety profile reference into a dispatcher. "none"
-// or "" means safety:none (explicit opt-out). "default" gives the builtin
-// baseline. Unknown names are treated as none with a warning.
+// resolveSafety turns a safety profile reference into a dispatcher. "" or
+// "none" opts out entirely; "default" is the built-in baseline; any other name
+// is a profiles.safety entry, which selects from the baseline's filters by name.
+//
+// The named case is new. It used to fall through to safety.None with no
+// warning, so a profiles.safety map was parsed by YAML and read by nothing, and
+// a typo in an agent's safety: field turned the chain off silently — the
+// opposite of failing closed. config.validate now rejects an unknown name at
+// load, so the fallback below is defensive only, and it falls back to the
+// baseline rather than to none.
 func resolveSafety(cfg *config.Config, ref string) *safety.Dispatcher {
 	switch ref {
 	case "", "none":
 		return safety.New(safety.None)
 	case "default":
 		return safety.New(safety.DefaultProfile())
-	default:
-		return safety.New(safety.None)
 	}
+	sp, ok := cfg.Profiles.Safety[ref]
+	if !ok {
+		return safety.New(safety.DefaultProfile())
+	}
+	return safety.New(safety.ProfileOf(ref, sp.Filters))
 }
 
 // budgetTokens extracts the tokens_per_day from the agent's budget config.
@@ -1808,10 +1868,12 @@ func memoryFromConfig(s config.Store) memory.Store {
 		Scope:      s.Scope,
 	}
 	if s.Retention != "" {
-		d, err := time.ParseDuration(s.Retention)
-		if err == nil {
-			ret.Retention = d
-		}
+		// Validated at config load, so this cannot fail here. It used to be
+		// time.ParseDuration with the error discarded, and Go has no day unit —
+		// so the shipped `retention: "30d"` silently became zero, which reads as
+		// "never expires": the field looked configured and did nothing.
+		d, _ := config.ParseRetention(s.Retention)
+		ret.Retention = d
 	}
 	return ret
 }

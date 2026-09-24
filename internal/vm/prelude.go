@@ -618,10 +618,19 @@ function http.request(opts)
     url         = opts.url,
     headers     = opts.headers,
     body        = opts.body,
-    query       = opts.query,
+    -- The wire key is query_params: session.Op reads json:"query_params", and
+    -- this builder used to emit "query", which decoded to the zero value. The
+    -- option was accepted and silently ignored, so a loop that built a query
+    -- string this way sent an unparameterized request and got no error.
+    query_params = opts.query,
     json        = opts.json,
     timeout     = opts.timeout,
     auth        = opts.auth,   -- {service=...}: a stored credential, resolved by Go
+    -- save_to names a scratch file the response body is written to, so a large
+    -- body never crosses the bridge. The op and the Go handler both supported
+    -- it (and builtin:fetch documents it), but no builder emitted it, so the
+    -- documented feature was unreachable from Lua.
+    save_to     = opts.save_to,
   })
 end
 function http.get(url, opts)

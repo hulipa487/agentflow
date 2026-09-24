@@ -253,7 +253,7 @@ func (s *Service) build(tr config.Trigger) *job {
 		s.log.Warn("trigger skipped: every and cron are mutually exclusive", "trigger", tr.Name)
 		return nil
 	case tr.Every != "":
-		d, err := ParseEvery(tr.Every)
+		d, err := config.ParseEvery(tr.Every)
 		if err != nil {
 			s.log.Warn("trigger skipped: bad every interval", "trigger", tr.Name, "every", tr.Every, "err", err)
 			return nil

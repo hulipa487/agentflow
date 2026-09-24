@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"agentflow/internal/core/tools"
 )
@@ -27,6 +28,10 @@ type Client struct {
 	pending map[int64]chan response
 	alive   atomic.Bool
 	nextID  atomic.Int64
+	// wmu serializes writes to the child's stdin. It is separate from mu, which
+	// guards the pending map: holding that one across a blocking write also
+	// blocked readLoop, which needs it to deliver any response at all.
+	wmu sync.Mutex
 }
 
 type request struct {
@@ -76,7 +81,12 @@ func NewClient(name, command string, args []string, log *slog.Logger) (*Client, 
 	c.alive.Store(true)
 	go c.readLoop()
 
-	if _, err := c.call("initialize", map[string]any{
+	// The handshake is bounded: a server that starts but never answers would
+	// otherwise hang the boot. NewClient has no caller context to inherit, so it
+	// makes its own.
+	initCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := c.call(initCtx, "initialize", map[string]any{
 		"protocolVersion": "2024-11-05",
 		"capabilities":    map[string]any{},
 		"clientInfo":      map[string]any{"name": "agentflow", "version": "0.2.0"},
@@ -87,7 +97,14 @@ func NewClient(name, command string, args []string, log *slog.Logger) (*Client, 
 	return c, nil
 }
 
-func (c *Client) call(method string, params any) (json.RawMessage, error) {
+// call sends one JSON-RPC request and waits for its response.
+//
+// ctx is honoured, both for the wait and for the write. The write runs on its
+// own goroutine under a write-only mutex because holding the response mutex
+// across a blocking stdin write also blocked readLoop — which needs that mutex
+// to deliver any response at all — so a child that stopped draining stdin
+// deadlocked the entire client instead of stalling one call.
+func (c *Client) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	if !c.alive.Load() {
 		return nil, fmt.Errorf("mcp server %s is not running", c.name)
 	}
@@ -103,15 +120,30 @@ func (c *Client) call(method string, params any) (json.RawMessage, error) {
 	c.mu.Lock()
 	c.pending[id] = ch
 	c.mu.Unlock()
-
-	c.mu.Lock()
-	_, err = c.stdin.Write(b)
-	c.mu.Unlock()
-	if err != nil {
+	forget := func() {
 		c.mu.Lock()
 		delete(c.pending, id)
 		c.mu.Unlock()
-		return nil, err
+	}
+
+	werr := make(chan error, 1)
+	go func() {
+		c.wmu.Lock()
+		_, err := c.stdin.Write(b)
+		c.wmu.Unlock()
+		werr <- err
+	}()
+	select {
+	case err := <-werr:
+		if err != nil {
+			forget()
+			return nil, err
+		}
+	case <-ctx.Done():
+		// The write is abandoned rather than waited on. It holds only wmu, so
+		// the client stays usable and readLoop keeps delivering other calls.
+		forget()
+		return nil, ctx.Err()
 	}
 
 	select {
@@ -123,6 +155,9 @@ func (c *Client) call(method string, params any) (json.RawMessage, error) {
 			return nil, resp.Error
 		}
 		return resp.Result, nil
+	case <-ctx.Done():
+		forget()
+		return nil, ctx.Err()
 	}
 }
 
@@ -158,7 +193,7 @@ func (c *Client) readLoop() {
 
 // ListTools discovers tools exposed by the server.
 func (c *Client) ListTools(ctx context.Context) ([]tools.ToolSpec, error) {
-	res, err := c.call("tools/list", nil)
+	res, err := c.call(ctx, "tools/list", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -189,7 +224,7 @@ func (c *Client) ListTools(ctx context.Context) ([]tools.ToolSpec, error) {
 
 func (c *Client) makeInvoker(toolName string) func(context.Context, map[string]any) (any, error) {
 	return func(ctx context.Context, args map[string]any) (any, error) {
-		res, err := c.call("tools/call", map[string]any{
+		res, err := c.call(ctx, "tools/call", map[string]any{
 			"name":      toolName,
 			"arguments": args,
 		})

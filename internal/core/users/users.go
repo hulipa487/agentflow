@@ -475,14 +475,15 @@ func (a *API) authProvider(w http.ResponseWriter, r *http.Request, token string)
 		writeErr(w, http.StatusUnauthorized, "unauthorized")
 		return authResult{}, false
 	}
-	id, created, err := a.reg.ProvisionOIDC(
+	// The created flag is deliberately dropped. agentflow_user_provisions is
+	// incremented inside ProvisionOIDC, at the choke point every provisioning
+	// path goes through, and counting it again here made a first OIDC login read
+	// as two on the dashboard.
+	id, _, err := a.reg.ProvisionOIDC(
 		claims.Identity(a.verifier.Issuer()), claims.Name, claims.Email, a.jit)
 	if err != nil {
 		writeErr(w, http.StatusForbidden, err.Error())
 		return authResult{}, false
-	}
-	if created {
-		metrics.Inc("agentflow_user_provisions")
 	}
 	return authResult{userID: id.UserID, viaProvider: true}, true
 }

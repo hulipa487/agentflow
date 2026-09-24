@@ -224,10 +224,6 @@ size_t afvm_lastmsg(afvm* v, char* buf, size_t buflen) {
     return len;
 }
 
-void afvm_set_budget(afvm* v, long instr_budget) {
-    v->budget = v->budget_max = instr_budget;
-}
-
 int afvm_check(const char* name, const char* code, size_t len,
                char* err, size_t errlen) {
     Luau::Allocator alloc;

@@ -30,12 +30,6 @@ var semantic string
 //go:embed lua/fact_extractor.lua
 var factExtractor string
 
-//go:embed lua/exec_policy.lua
-var execPolicy string
-
-//go:embed lua/ttl.lua
-var ttl string
-
 var sources = map[string]string{
 	"per_chat":       perChat,
 	"token_budget":   tokenBudget,
@@ -43,12 +37,17 @@ var sources = map[string]string{
 	"recency":        recency,
 	"semantic":       semantic,
 	"fact_extractor": factExtractor,
-	"exec_policy":    execPolicy,
-	"ttl":            ttl,
 }
 
 // supportOrder fixes the evaluation order of support chunks in every session.
-var supportOrder = []string{"token_budget", "routing_table", "recency", "semantic", "fact_extractor", "exec_policy", "ttl"}
+//
+// exec_policy and ttl used to be here. Both were shadowable, listed and loaded
+// into every session's Lua state, and neither was ever called: shell.exec goes
+// straight to the manager, and shell_before_exec_policy/shell_ttl had no caller
+// in Go or in Lua. A shipped plugin whose entry point nothing invokes is a
+// promise the engine does not keep, so they are gone — and the docs now say
+// what is true, that shell commands are gated by the capability alone.
+var supportOrder = []string{"token_budget", "routing_table", "recency", "semantic", "fact_extractor"}
 
 // Names returns the builtin plugin names as config spells them —
 // "plugin:per_chat", not "per_chat".

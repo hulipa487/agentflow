@@ -825,7 +825,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
   <p><strong><code>builtin:</code> is the tool namespace.</strong> Four vocabularies used to spell it — loop/plugin names, tool names, memory provider names, and the built-in memory profile — and nothing in the string said which one a name belonged to. Each now has its own spelling, so the prefix means exactly one thing:</p>
   <ul>
     <li><strong>tools</strong> keep it: <code>builtin:web_search</code>, <code>builtin:fetch</code>, <code>builtin:browser</code>, <code>builtin:legal_read</code>;</li>
-    <li><strong>loops and plugins</strong> are <code>plugin:&lt;name&gt;</code>: <code>plugin:per_chat</code>, <code>plugin:recency</code>, <code>plugin:ttl</code>. This also settles the loop-versus-path question outright, since a path never begins with <code>plugin:</code> — where before a file named <code>per_chat</code> was unreachable;</li>
+    <li><strong>loops and plugins</strong> are <code>plugin:&lt;name&gt;</code>: <code>plugin:per_chat</code>, <code>plugin:recency</code>, <code>plugin:semantic</code>. This also settles the loop-versus-path question outright, since a path never begins with <code>plugin:</code> — where before a file named <code>per_chat</code> was unreachable;</li>
     <li><strong>memory providers</strong> are bare: <code>sqlite</code>, <code>qdrant</code>, <code>redisvector</code> — the <code>provider:</code> key already says what kind of name it is;</li>
     <li>the <strong>built-in memory profile</strong> is <code>conversational</code>, and that name is now reserved: a <code>profiles.memory</code> entry of the same name is a boot error rather than a profile that could never run.</li>
   </ul>
@@ -892,7 +892,7 @@ plugins:    { ... }   # plugin dir, capability ceiling</code></pre>
   <p>AgentFlow plugins are plain <a href="https://luau-lang.org/">Luau</a> scripts. YAML defines which plugin runs for which agent; the plugin defines the behavior. There are three kinds of plugin:</p>
   <ul>
     <li><strong>Loop plugin</strong> — defines a global <code>loop()</code> function that owns the session coroutine for its lifetime. The canonical pattern is <code>while true do local msg = session.inbox() ... end</code>.</li>
-    <li><strong>Support chunk</strong> — loaded into every session state <em>before</em> the loop plugin. Support chunks define globals and helper functions the loop reads. Builtins like <code>plugin:token_budget</code>, <code>plugin:routing_table</code>, <code>plugin:recency</code>, <code>plugin:semantic</code>, <code>plugin:fact_extractor</code>, <code>plugin:exec_policy</code>, and <code>plugin:ttl</code> are support chunks.</li>
+    <li><strong>Support chunk</strong> — loaded into every session state <em>before</em> the loop plugin. Support chunks define globals and helper functions the loop reads. Builtins like <code>plugin:token_budget</code>, <code>plugin:routing_table</code>, <code>plugin:recency</code>, <code>plugin:semantic</code> and <code>plugin:fact_extractor</code> are support chunks.</li>
     <li><strong>Shadow</strong> — a user plugin placed in <code>plugins/</code> with the same name as a builtin. It replaces the builtin instance-wide at load time.</li>
   </ul>
 
@@ -1261,8 +1261,6 @@ end</code></pre>
     <thead><tr><th>Hook</th><th>Kind</th><th>Signature</th><th>Default</th></tr></thead>
     <tbody>
       <tr><td><code>shell.provision</code></td><td>handler</td><td><code>(session) -> ShellHandle</code></td><td>Docker / SSH provider</td></tr>
-      <tr><td><code>shell.before_exec</code></td><td>filter</td><td><code>(cmd, ctx) -> "allow" | "deny" | string</code></td><td><code>plugin:exec_policy</code></td></tr>
-      <tr><td><code>shell.teardown</code></td><td>handler</td><td><code>(handle) -> ()</code></td><td><code>plugin:ttl</code></td></tr>
       <tr><td><code>shell.on_exec</code></td><td>tap</td><td><code>(cmd, result) -> ()</code></td><td>—</td></tr>
     </tbody>
   </table>

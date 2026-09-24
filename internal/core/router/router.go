@@ -23,6 +23,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/runtime"
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/supervisor"
@@ -100,11 +101,14 @@ func (r *Router) Submit(in Inbound) {
 	}
 	select {
 	case r.mailbox <- in:
+		metrics.Inc("agentflow_ingress_total")
 		if r.Journal != nil {
 			r.Journal(in, "routed")
 		}
 	default:
 		r.log.Warn("router queue full, dropping event", "channel", in.Channel)
+		metrics.Inc("agentflow_ingress_total")
+		metrics.Inc("agentflow_ingress_dropped")
 		if r.Journal != nil {
 			r.Journal(in, "dropped_queue")
 		}

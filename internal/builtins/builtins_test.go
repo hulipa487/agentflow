@@ -40,11 +40,11 @@ func TestPluginDirShadowsBuiltin(t *testing.T) {
 	}
 
 	// An unshadowed builtin still resolves to the embedded source, unwatched.
-	src, watch, err = Resolve("plugin:ttl")
+	src, watch, err = Resolve("plugin:semantic")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if src != sources["ttl"] || watch != "" {
+	if src != sources["semantic"] || watch != "" {
 		t.Fatal("unshadowed builtin must use the embedded source")
 	}
 }

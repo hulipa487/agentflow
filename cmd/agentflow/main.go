@@ -248,6 +248,7 @@ func main() {
 	}
 	memMgr := memory.NewManager(memReg, log)
 	warnUnenforceableGC(cfg, log)
+	warnDeprecatedRuntimeKeys(cfg, log)
 
 	// Drivers and shared infrastructure.
 	llmMgr := llm.NewManager(cfg.Models, log)
@@ -275,7 +276,17 @@ func main() {
 	// never by invoking a Luau state from a timer goroutine.
 	schedSvc := scheduler.New(log)
 
-	// Runtime store: persists timer/budget/child metadata.
+	// Runtime store: the message journal, the token ledger and its per-call
+	// detail, and the engine's key/value rows — file trees, session state, route
+	// state, shell handles.
+	//
+	// Scheduler timers are NOT here: the timer service is in-memory, so a
+	// restart forgets every every:/after:/cron: timer until the owning loop
+	// re-registers it. (This comment used to claim timer, budget and child
+	// metadata; those tables — timer_meta, child_meta, budget_usage — are no
+	// longer created by anything. They are left in place rather than dropped,
+	// because a boot-time DROP against an operator's database is not
+	// recoverable.)
 	rtStore, err := runtime.OpenStore(cfg.PersistencePath(), log)
 	if err != nil {
 		log.Error("runtime store failed", "err", err)
@@ -1548,6 +1559,29 @@ func loadConfigSource(cfgPath, configDir string, log *slog.Logger) (*config.Conf
 		return config.LoadDir(configDir, log)
 	}
 	return config.Load(cfgPath)
+}
+
+// warnDeprecatedRuntimeKeys reports the runtime: keys that are parsed — so a
+// config that sets them keeps booting — and that nothing reads. Each one claims
+// a behaviour the engine does not have, so staying silent about it is how a
+// deployment comes to believe it configured something.
+//
+// The fields are pointers so presence is distinguishable from a zero value; that
+// is their only remaining purpose. Removing them outright would turn an existing
+// config into a parse error, because decoding is strict.
+func warnDeprecatedRuntimeKeys(cfg *config.Config, log *slog.Logger) {
+	if v := cfg.Runtime.VM.MemoryLimit; v != nil {
+		log.Warn("runtime.vm.memory_limit has no effect: the Luau state has no allocator cap", "value", *v)
+	}
+	if v := cfg.Runtime.VM.InstructionBudget; v != nil {
+		log.Warn("runtime.vm.instruction_budget has no effect: the per-resume budget is fixed at 5,000,000", "value", *v)
+	}
+	if v := cfg.Runtime.Scheduler.Workers; v != nil {
+		log.Warn("runtime.scheduler.workers has no effect: the op pool size is the -workers flag", "value", *v)
+	}
+	if v := cfg.Runtime.Reload.Watch; v != nil {
+		log.Warn("runtime.reload.watch has no effect: the reload watcher always runs", "value", *v)
+	}
 }
 
 // gcNoOpProviders are the memory providers whose GC does not trim anything:

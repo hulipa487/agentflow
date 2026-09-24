@@ -59,7 +59,6 @@ func New(name, path, agent, secret string, sink router.Sink, srv *httpd.Server, 
 }
 
 func (d *Driver) Name() string { return d.name }
-func (d *Driver) Path() string { return d.path }
 
 // Deliver implements gateway.Driver. Events have no chat target, so there is
 // nothing to deliver; this is always an error.

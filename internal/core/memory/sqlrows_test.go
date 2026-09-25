@@ -78,9 +78,9 @@ func seedKV(t *testing.T, n int) *sql.DB {
 }
 
 // TestDrainRowsSurvivesDeferredCancel is the regression test for the iterator
-// lifetime bug: pgvector, postgres and mongodb all returned a live cursor from
-// a function that deferred its cancel, so database/sql (and the mongo driver)
-// closed the result before the caller read it. The symptom was intermittent —
+// lifetime bug: pgvector and postgres returned a live cursor from a function
+// that deferred its cancel, so database/sql closed the result before the
+// caller read it. The symptom was intermittent —
 // small result sets are usually buffered before the cancellation is observed,
 // which is why every existing test passed — and mid-iteration it showed up as
 // a truncated result plus context.Canceled from Err(), not as a Query error.

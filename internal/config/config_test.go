@@ -690,7 +690,7 @@ agents:
 // a config naming a real provider fails validation before it can be opened.
 func TestValidateMemoryBackendProviders(t *testing.T) {
 	supported := []string{
-		"sqlite", "redis", "mongodb", "postgres",
+		"sqlite", "redis", "postgres",
 		"pgvector", "qdrant", "redisvector", "volatile",
 	}
 	for _, provider := range supported {

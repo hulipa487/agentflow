@@ -117,7 +117,7 @@ type BackendConfig struct {
 
 // NewRegistry creates a registry. log is optional; when given, every backend
 // operation (Put/Get/Delete/Query) is logged at DEBUG via a decorator, giving
-// the interaction log (MongoDB insert, pgvector lookup, ...) for all
+// the interaction log (a redis round-trip, a pgvector lookup, ...) for all
 // providers from one place.
 func NewRegistry(log ...*slog.Logger) *Registry {
 	l := slog.New(slog.NewTextHandler(io.Discard, nil))

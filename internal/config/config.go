@@ -929,7 +929,7 @@ var DefaultCapabilities = []string{"llm.chat", "memory", "tools", "agent.send", 
 // provider, for the hint that catches the retired "builtin:" spelling.
 func memoryProviderKnown(name string) bool {
 	switch name {
-	case "sqlite", "redis", "mongodb", "postgres", "pgvector", "qdrant", "redisvector", "volatile":
+	case "sqlite", "redis", "postgres", "pgvector", "qdrant", "redisvector", "volatile":
 		return true
 	}
 	return false
@@ -1587,7 +1587,7 @@ func validate(path string, c *Config) error {
 
 	for bname, b := range c.Memory.Backends {
 		switch b.Provider {
-		case "sqlite", "redis", "mongodb", "postgres", "pgvector", "qdrant", "redisvector", "volatile":
+		case "sqlite", "redis", "postgres", "pgvector", "qdrant", "redisvector", "volatile":
 		default:
 			// The prefix used to be required. Saying so beats "unsupported
 			// provider", which reads as if the backend were unknown when it is

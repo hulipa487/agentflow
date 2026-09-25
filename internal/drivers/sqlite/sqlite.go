@@ -280,8 +280,8 @@ func (h *Handle) GC(table string, window int) error {
 	return err
 }
 
-// rowsIter streams a SQLite result set lazily, unlike the PostgreSQL and
-// MongoDB drivers, which drain into memory.DrainRows before returning.
+// rowsIter streams a SQLite result set lazily, unlike the PostgreSQL driver,
+// which drains into memory.DrainRows before returning.
 //
 // That asymmetry is deliberate, not an oversight: those drivers bound their
 // query to a context with a timeout and cancelled it on return, so a cursor

@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"agentflow/internal/core/memory"
-	"agentflow/internal/drivers/mongodb"
 	"agentflow/internal/drivers/pgvector"
 	"agentflow/internal/drivers/postgres"
 	"agentflow/internal/drivers/qdrant"
@@ -20,8 +19,8 @@ import (
 
 // TestBackendContract runs one contract against every memory provider.
 //
-// There was no such test. Four of the eight providers — mongodb, postgres,
-// pgvector and redis — had no tests at all, and the other four were covered by
+// There was no such test. Three of the seven providers — postgres, pgvector
+// and redis — had no tests at all, and the other four were covered by
 // bespoke assertions that could not notice a provider answering a query the
 // wrong way: a prefix scan that matches too much, a text search that finds
 // nothing, a vector query that returns an empty list where it should say the
@@ -47,12 +46,6 @@ func TestBackendContract(t *testing.T) {
 			name:     "volatile",
 			provider: volatile.Provider{},
 			cfg:      func(t *testing.T) map[string]any { return nil },
-		},
-		{
-			name:     "mongodb",
-			provider: mongodb.Provider{},
-			cfg:      func(t *testing.T) map[string]any { return map[string]any{"url": os.Getenv("AF_MONGO_URL"), "database": "af_contract"} },
-			gate:     "AF_MONGO_URL",
 		},
 		{
 			name:     "postgres",

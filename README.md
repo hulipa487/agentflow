@@ -40,7 +40,7 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 | Domain | Providers |
 |---|---|
 | LLM | `anthropic` (Messages API), `openai` (Chat Completions + Embeddings), `openai-responses` (Responses API), `gemini` (Interactions API), `rerank` (cross-encoder rerank) — all pointed at compatible endpoints via `base_url`; the wire is the official provider SDK (`anthropic-sdk-go`, `openai-go`, `genai`) |
-| Storage | SQLite, Redis, MongoDB, PostgreSQL, in-memory volatile |
+| Storage | SQLite, Redis, PostgreSQL, in-memory volatile |
 | Media store | local filesystem (default), S3 / MinIO (hand-rolled SigV4, no AWS SDK) — content-addressed `media:<sha256>` handles |
 | File store | same content-addressed blob family (`files:` config, fs or S3-compatible incl. Cloudflare R2); snapshot metadata in the runtime sqlite `files_meta` table |
 | Vector | pgvector (cosine similarity), Qdrant (gRPC; a `:6333` url port dials `:6334`), Redis |
@@ -159,7 +159,7 @@ agentflow/
 │   │                   #   safety, memory, budget, netguard, tools, caps, credentials,
 │   │                   #   identity, users, accounting, reload, metrics, runtime, ...
 │   ├── drivers/        # llm, search, legal, browser, fetch, shell, mcp, httpd, telegram,
-│   │                   #   webhook, ghhook, sqlite/redis/mongodb/postgres/volatile,
+│   │                   #   webhook, ghhook, sqlite/redis/postgres/volatile,
 │   │                   #   pgvector/qdrant/redisvector, s3media, docparse
 │   ├── tui/            # terminal dashboard (bubbletea): sectioned metrics + log footer
 │   ├── webui/          # embedded operator console (SPA + JSON API) + docs site (at /docs/)

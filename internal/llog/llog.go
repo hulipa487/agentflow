@@ -4,7 +4,7 @@
 // above it — slog's native >= comparison):
 //
 //	DEV    temporary development logs; never committed on purpose
-//	DEBUG  every external interaction: LLM API request, MongoDB insert,
+//	DEBUG  every external interaction: LLM API request, memory put/query,
 //	       pgvector lookup, telegram update received, tool call, ...
 //	INFO   lifecycle: runtime launch, channel registered, webhook set
 //	WARN   degraded but continuing: upstream 429/502, retry, channel error

@@ -62,7 +62,6 @@ import (
 	"agentflow/internal/drivers/llm"
 	"agentflow/internal/drivers/logfile"
 	"agentflow/internal/drivers/mcp"
-	"agentflow/internal/drivers/mongodb"
 	"agentflow/internal/drivers/pgvector"
 	"agentflow/internal/drivers/postgres"
 	"agentflow/internal/drivers/qdrant"
@@ -216,7 +215,6 @@ func main() {
 	memReg := memory.NewRegistry(log)
 	memReg.RegisterProvider(sqlite.Provider{})
 	memReg.RegisterProvider(redis.Provider{})
-	memReg.RegisterProvider(mongodb.Provider{})
 	memReg.RegisterProvider(postgres.Provider{})
 	memReg.RegisterProvider(pgvector.Provider{})
 	memReg.RegisterProvider(qdrant.Provider{})

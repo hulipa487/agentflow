@@ -45,3 +45,8 @@ coverage.*
 claude_dev/
 .claude/
 agentflow-test.exe
+
+# agent skills installed locally (npx skills add) — developer tooling, not part
+# of the build or the runtime, and not something every checkout needs
+.agents/
+skills-lock.json

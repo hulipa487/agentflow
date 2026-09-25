@@ -263,7 +263,11 @@ end
 		t.Fatalf("expected 2 provider calls, got %d", len(bodies))
 	}
 	cont := string(bodies[1])
-	for _, want := range []string{`"thinking":"because"`, `"signature":"sig9"`, `"tool_use_id":"tu_1"`, `"content":"42"`} {
+	// The tool result rides back as a content block rather than a bare JSON
+	// string: the official SDK models tool_result content as blocks only and
+	// has no string variant, and the Messages API accepts both forms. Its
+	// llm-package twin asserts the same shape.
+	for _, want := range []string{`"thinking":"because"`, `"signature":"sig9"`, `"tool_use_id":"tu_1"`, `"content":[{"text":"42","type":"text"}]`} {
 		if !strings.Contains(cont, want) {
 			t.Fatalf("continuation request missing %q\nbody: %s", want, cont)
 		}

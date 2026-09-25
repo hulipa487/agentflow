@@ -25,7 +25,10 @@ func newMediaMockTG(t *testing.T, fileBody string) (*mockTG, *captureSink, media
 	sink := &captureSink{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/botTEST/getFile", func(w http.ResponseWriter, r *http.Request) {
-		fid := r.URL.Query().Get("file_id")
+		// FormValue reads the query string or a form body, so this works
+		// whether the id arrives as hand-rolled query parameter or as the
+		// multipart field the SDK posts.
+		fid := r.FormValue("file_id")
 		if fid != "PHOTO1" {
 			_, _ = w.Write([]byte(`{"ok":false,"description":"bad file_id"}`))
 			return
@@ -135,12 +138,10 @@ func TestMediaPolicyRejectsDisallowedMime(t *testing.T) {
 
 	u := photoUpdate()
 	u.Message.Photo = nil
-	u.Message.Doc = &struct {
-		FileID   string `json:"file_id"`
-		FileName string `json:"file_name"`
-		MIME     string `json:"mime_type"`
-		FileSize int64  `json:"file_size"`
-	}{FileID: "DOC1", FileName: "x.pdf", MIME: "application/pdf"}
+	// The document field used to be an anonymous struct written out here; it is
+	// a named type now, because fromSDK has to build one out of the SDK's own
+	// model for every update that arrives by polling.
+	u.Message.Doc = &document{FileID: "DOC1", FileName: "x.pdf", MIME: "application/pdf"}
 	u.Message.Caption = "the doc"
 	d.handleUpdate(u)
 
@@ -179,7 +180,9 @@ func TestDeliverPhotoMultipart(t *testing.T) {
 		b, _ := io.ReadAll(r.Body)
 		gotBody = b
 		gotForm = r.Header.Get("Content-Type")
-		_, _ = w.Write([]byte(`{"ok":true}`))
+		// The SDK decodes the envelope's result into a *models.Message and
+		// reports a missing one as a decode error; real Telegram always sends it.
+		_, _ = w.Write([]byte(`{"ok":true,"result":{}}`))
 	}))
 	defer srv.Close()
 
@@ -227,7 +230,7 @@ func TestDeliverTextOnlyUsesSendMessage(t *testing.T) {
 	var gotMethod string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = strings.TrimPrefix(r.URL.Path, "/botTEST/")
-		_, _ = w.Write([]byte(`{"ok":true}`))
+		_, _ = w.Write([]byte(`{"ok":true,"result":{}}`))
 	}))
 	defer srv.Close()
 	d := &Driver{name: "telegram", token: "TEST", apiBase: srv.URL, log: testLogger(), client: &http.Client{Timeout: 5 * time.Second}}

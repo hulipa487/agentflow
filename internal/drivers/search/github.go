@@ -2,16 +2,16 @@ package search
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
 	"agentflow/internal/config"
+
+	ghapi "github.com/google/go-github/v66/github"
 )
 
 // The GitHub repository search API (api.github.com/search/repositories). No
@@ -25,7 +25,6 @@ import (
 const (
 	defaultGitHubURL = "https://api.github.com"
 	maxGitHubCount   = 100 // per_page ceiling
-	githubAPIVersion = "2022-11-28"
 )
 
 // github is a Searcher over /search/repositories. Each hit is a repository:
@@ -34,9 +33,7 @@ const (
 // description, and Score is the raw stargazer count (engine-native, not 0..1 —
 // GitHub's own relevance score is ~1.0 for every repo and carries no signal).
 type github struct {
-	baseURL string
-	key     string
-	http    *http.Client
+	client *ghapi.Client
 }
 
 func newGitHub(cfg config.SearchEngine) (*github, error) {
@@ -44,28 +41,16 @@ func newGitHub(cfg config.SearchEngine) (*github, error) {
 	if base == "" {
 		base = defaultGitHubURL
 	}
-	return &github{
-		baseURL: strings.TrimSuffix(base, "/"),
-		key:     cfg.APIKey,
-		http:    &http.Client{Timeout: cfg.TimeoutD()},
-	}, nil
-}
-
-type githubResponse struct {
-	TotalCount       int  `json:"total_count"`
-	IncompleteResult bool `json:"incomplete_results"`
-	Items            []struct {
-		FullName    string   `json:"full_name"`
-		HTMLURL     string   `json:"html_url"`
-		Description string   `json:"description"`
-		Language    string   `json:"language"`
-		Stars       int      `json:"stargazers_count"`
-		Forks       int      `json:"forks_count"`
-		Topics      []string `json:"topics"`
-		PushedAt    string   `json:"pushed_at"`
-	} `json:"items"`
-	// Error envelope (present on failures, with a non-200 status).
-	Message string `json:"message"`
+	u, err := url.Parse(base + "/")
+	if err != nil {
+		return nil, fmt.Errorf("search github: invalid base_url: %w", err)
+	}
+	client := ghapi.NewClient(&http.Client{Timeout: cfg.TimeoutD()})
+	client.BaseURL = u
+	if cfg.APIKey != "" {
+		client = client.WithAuthToken(cfg.APIKey)
+	}
+	return &github{client: client}, nil
 }
 
 // Search runs one repository search.
@@ -85,83 +70,89 @@ func (g *github) Search(ctx context.Context, req Request) (*Result, error) {
 		query += " pushed:" + q
 	}
 
-	q := url.Values{}
-	q.Set("q", query)
-	q.Set("per_page", strconv.Itoa(count))
-	hreq, err := http.NewRequestWithContext(ctx, http.MethodGet, g.baseURL+"/search/repositories?"+q.Encode(), nil)
+	result, _, err := g.client.Search.Repositories(ctx, query, &ghapi.SearchOptions{ListOptions: ghapi.ListOptions{PerPage: count}})
 	if err != nil {
-		return nil, fmt.Errorf("search github: build request: %w", err)
-	}
-	hreq.Header.Set("Accept", "application/vnd.github+json")
-	hreq.Header.Set("X-GitHub-Api-Version", githubAPIVersion)
-	hreq.Header.Set("User-Agent", "agentflow") // GitHub 403s requests with no UA
-	if g.key != "" {
-		hreq.Header.Set("Authorization", "Bearer "+g.key)
+		return nil, g.formatError(err)
 	}
 
-	resp, err := g.http.Do(hreq)
-	if err != nil {
-		return nil, fmt.Errorf("search github: %w", err)
-	}
-	defer resp.Body.Close()
-	payload, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
-	if err != nil {
-		return nil, fmt.Errorf("search github: read response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		var e struct {
-			Message string `json:"message"`
+	out := &Result{Query: strings.TrimSpace(req.Query), Results: make([]WebResult, 0, len(result.Repositories))}
+	for _, it := range result.Repositories {
+		if it == nil {
+			continue
 		}
-		_ = json.Unmarshal(payload, &e)
-		msg := e.Message
-		if msg == "" {
-			msg = truncate(payload, 512)
-		}
-		// Rate-limited (anonymous 10/min, or an abuse/secondary limit): say when
-		// to retry instead of leaving the caller guessing.
-		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
-			if ra := resp.Header.Get("Retry-After"); ra != "" {
-				msg += " (retry after " + ra + "s)"
-			} else if resp.Header.Get("X-RateLimit-Remaining") == "0" {
-				msg += " (search rate limit; an api_key lifts 10/min to 30/min)"
-			}
-		}
-		return nil, fmt.Errorf("search github: status %d: %s", resp.StatusCode, msg)
-	}
-
-	var gr githubResponse
-	if err := json.Unmarshal(payload, &gr); err != nil {
-		return nil, fmt.Errorf("search github: decode response: %w", err)
-	}
-	out := &Result{Query: strings.TrimSpace(req.Query), Results: make([]WebResult, 0, len(gr.Items))}
-	for _, it := range gr.Items {
+		stars := it.GetStargazersCount()
+		forks := it.GetForksCount()
+		desc := it.GetDescription()
 		w := WebResult{
-			Title:     it.FullName,
-			URL:       it.HTMLURL,
-			Content:   it.Description,
-			Score:     float64(it.Stars),
-			Published: it.PushedAt, // last code push, RFC3339
+			Title:     it.GetFullName(),
+			URL:       it.GetHTMLURL(),
+			Content:   desc,
+			Score:     float64(stars),
+			Published: "",
 		}
-		if len(it.Topics) > 0 {
-			topics := it.Topics
+		if it.PushedAt != nil {
+			w.Published = it.GetPushedAt().Format(time.RFC3339)
+		}
+		topics := it.Topics
+		if len(topics) > 0 {
 			if len(topics) > 3 {
 				topics = topics[:3]
 			}
 			w.Site = strings.Join(topics, ", ")
 		}
-		signal := fmt.Sprintf("★ %d", it.Stars)
-		if it.Language != "" {
-			signal += " · " + it.Language
+		signal := fmt.Sprintf("★ %d", stars)
+		if lang := it.GetLanguage(); lang != "" {
+			signal += " · " + lang
 		}
-		signal += fmt.Sprintf(" · %d forks", it.Forks)
-		if it.Description != "" {
-			w.Snippet = signal + ": " + truncate([]byte(it.Description), 240-len(signal)-2)
+		signal += fmt.Sprintf(" · %d forks", forks)
+		if desc != "" {
+			w.Snippet = signal + ": " + truncate([]byte(desc), 240-len(signal)-2)
 		} else {
 			w.Snippet = signal
 		}
 		out.Results = append(out.Results, w)
 	}
 	return out, nil
+}
+
+// formatError turns a go-github error into the same honest text the hand-
+// rolled client produced, including rate-limit hints.
+func (g *github) formatError(err error) error {
+	msg := err.Error()
+	status := 0
+	var h http.Header
+
+	switch e := err.(type) {
+	case *ghapi.RateLimitError:
+		status = e.Response.StatusCode
+		h = e.Response.Header
+	case *ghapi.AbuseRateLimitError:
+		status = e.Response.StatusCode
+		h = e.Response.Header
+		if e.RetryAfter != nil {
+			msg += fmt.Sprintf(" (retry after %ds)", int(e.RetryAfter.Seconds()))
+			return fmt.Errorf("search github: status %d: %s", status, msg)
+		}
+	default:
+		var er *ghapi.ErrorResponse
+		if errors.As(err, &er) {
+			status = er.Response.StatusCode
+			h = er.Response.Header
+			msg = er.Message
+		}
+	}
+
+	if status != 0 && (status == http.StatusForbidden || status == http.StatusTooManyRequests) {
+		if ra := h.Get("Retry-After"); ra != "" {
+			msg += " (retry after " + ra + "s)"
+		} else if h.Get("X-RateLimit-Remaining") == "0" {
+			msg += " (search rate limit; an api_key lifts 10/min to 30/min)"
+		}
+	}
+	if status != 0 {
+		return fmt.Errorf("search github: status %d: %s", status, msg)
+	}
+	return fmt.Errorf("search github: %w", err)
 }
 
 // githubTimeRange maps the shared TimeRange enum (and the YYYY-MM-DD..YYYY-MM-DD

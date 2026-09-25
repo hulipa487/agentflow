@@ -200,13 +200,14 @@ func TestDiscoveryResolvesJWKS(t *testing.T) {
 	doc.Store(jwksFor("k1", &key.PublicKey))
 	jwks := jwksServer(t, &doc)
 
-	issuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	issuer := httptest.NewServer(nil)
+	issuer.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/.well-known/openid-configuration" {
 			http.NotFound(w, r)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]string{"issuer": r.Host, "jwks_uri": jwks.URL})
-	}))
+		_ = json.NewEncoder(w).Encode(map[string]string{"issuer": issuer.URL, "jwks_uri": jwks.URL})
+	})
 	defer issuer.Close()
 
 	v, err := New(Config{Issuer: issuer.URL}, discard())
@@ -215,6 +216,23 @@ func TestDiscoveryResolvesJWKS(t *testing.T) {
 	}
 	if _, err := v.Verify(context.Background(), mint(t, key, "k1", issuer.URL, "", time.Now().Add(time.Hour))); err != nil {
 		t.Fatalf("verify after discovery: %v", err)
+	}
+}
+
+// go-oidc enforces that the discovery document's issuer exactly matches the
+// configured issuer URL.
+func TestDiscoveryRejectsMismatchedIssuer(t *testing.T) {
+	issuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/openid-configuration" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"issuer": "https://someone-else.example"})
+	}))
+	defer issuer.Close()
+
+	if _, err := New(Config{Issuer: issuer.URL}, discard()); err == nil {
+		t.Fatal("a discovery document advertising a different issuer must be rejected")
 	}
 }
 
@@ -245,11 +263,16 @@ func TestJWKSKeySelection(t *testing.T) {
 		t.Fatalf("the RSA key beside an unusable one should still verify: %v", err)
 	}
 
-	// Encryption keys are skipped, and a set with no signing key fails loudly.
+	// Encryption keys are skipped, so a set with no signing key cannot verify
+	// any token.
 	var enc atomic.Value
 	enc.Store(`{"keys":[{"kty":"RSA","kid":"k1","use":"enc","n":"AQAB","e":"AQAB"}]}`)
 	srv := jwksServer(t, &enc)
-	if _, err := New(Config{Issuer: testIssuer, JWKSURL: srv.URL}, discard()); err == nil {
-		t.Fatal("a JWKS with no usable signing key must fail construction")
+	vEnc, err := New(Config{Issuer: testIssuer, JWKSURL: srv.URL}, discard())
+	if err != nil {
+		t.Fatalf("construction with an encryption-only JWKS should succeed: %v", err)
+	}
+	if _, err := vEnc.Verify(context.Background(), mint(t, key, "k1", testIssuer, "", time.Now().Add(time.Hour))); err == nil {
+		t.Fatal("a JWKS with no usable signing key must reject every token")
 	}
 }

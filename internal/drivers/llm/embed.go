@@ -1,22 +1,23 @@
 package llm
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"sort"
 	"time"
 
 	"agentflow/internal/config"
 	"agentflow/internal/core/media"
+
+	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/option"
+	"github.com/openai/openai-go/packages/param"
 )
 
 // Embed computes embedding vectors for the given input texts with the named
 // model. Any OpenAI-compatible endpoint works (OpenAI, Ollama /v1, vLLM,
-// TEI, LiteLLM, OpenRouter): the driver POSTs {base_url}/embeddings.
+// TEI, LiteLLM, OpenRouter): the driver calls {base_url}/embeddings.
 // The anthropic provider has no embeddings API and returns an explicit
 // unsupported error rather than a confusing transport failure.
 func (m *Manager) Embed(ctx context.Context, model string, texts []string) ([][]float32, Usage, error) {
@@ -86,11 +87,20 @@ func openEmbed(ctx context.Context, client *http.Client, cfg config.Model, parts
 // extension used by jina-embeddings-v5-omni / jina-clip-v2.
 // https://platform.openai.com/docs/api-reference/embeddings/create
 //
-// base_url should include /v1 (same convention as chat); the runtime
-// appends only /embeddings. Text-only batches send plain strings; media
-// items become Jina typed docs ({"image": "<url|base64>"}, ...). With
+// base_url should include /v1 (same convention as chat); the runtime calls the
+// SDK's embeddings path relative to it. Text-only batches send plain strings;
+// media items become Jina typed docs ({"image": "<url|base64>"}, ...). With
 // Merged, the whole batch folds into one {"content": [...]} group yielding
 // a single embedding. task/dimensions pass through when set.
+//
+// The wire is owned by the official SDK (request encoding, the retry knobs,
+// response decoding and its error typing). The Jina extension is the one part
+// the SDK cannot model: EmbeddingNewParamsInputUnion covers strings and token
+// arrays only, and there is no `task` field. So the vanilla OpenAI case goes
+// through the typed fields, and the extension's `input`/`task` ride in the
+// params' extra-fields — which is how the SDK documents escaping its own
+// schema. The SDK's own retries are disabled: the Manager's doWithRetry owns
+// that policy.
 func openaiEmbed(ctx context.Context, client *http.Client, cfg config.Model, parts []media.Part, eo EmbedOpts) ([][]float32, Usage, bool, error) {
 	base := resolveBase(cfg, "https://api.openai.com/v1")
 	url := base + "/embeddings"
@@ -99,67 +109,58 @@ func openaiEmbed(ctx context.Context, client *http.Client, cfg config.Model, par
 	if err != nil {
 		return nil, Usage{}, false, err
 	}
-	body := map[string]any{
-		"model": cfg.Model,
-		"input": input,
+	params := openai.EmbeddingNewParams{Model: openai.EmbeddingModel(cfg.Model)}
+	extras := map[string]any{}
+	if texts, ok := input.([]string); ok {
+		params.Input = openai.EmbeddingNewParamsInputUnion{OfArrayOfStrings: texts}
+	} else {
+		extras["input"] = input
 	}
 	if eo.Task != "" {
-		body["task"] = eo.Task
+		extras["task"] = eo.Task
 	}
 	if eo.Dimensions > 0 {
-		body["dimensions"] = eo.Dimensions
+		params.Dimensions = param.NewOpt(int64(eo.Dimensions))
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(mustJSON(body)))
-	if err != nil {
-		return nil, Usage{}, false, err
-	}
-	req.Header.Set("content-type", "application/json")
-	if cfg.APIKey != "" {
-		req.Header.Set("authorization", "Bearer "+cfg.APIKey)
+	if len(extras) > 0 {
+		params.SetExtraFields(extras)
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, Usage{}, true, err
+	sdkOpts := []option.RequestOption{
+		option.WithBaseURL(base),
+		option.WithHTTPClient(client),
+		option.WithMaxRetries(0),
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		retryable, serr := statusError(resp.StatusCode, b)
-		return nil, Usage{}, retryable, fmt.Errorf("%s -> %w", url, serr)
-	}
+	sdkOpts = append(sdkOpts, openaiAuthOptions(cfg.APIKey)...)
+	api := openai.NewClient(sdkOpts...)
 
-	var parsed struct {
-		Data []struct {
-			Index     int       `json:"index"`
-			Embedding []float32 `json:"embedding"`
-		} `json:"data"`
-		Usage *struct {
-			PromptTokens int `json:"prompt_tokens"`
-			TotalTokens  int `json:"total_tokens"`
-		} `json:"usage"`
+	resp, err := api.Embeddings.New(ctx, params)
+	if err != nil {
+		return nil, Usage{}, openaiRetryable(err), fmt.Errorf("%s -> %w", url, err)
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<20)).Decode(&parsed); err != nil {
-		return nil, Usage{}, false, fmt.Errorf("%s -> decode embeddings response: %w", url, err)
-	}
-	if len(parsed.Data) == 0 {
+	if len(resp.Data) == 0 {
 		return nil, Usage{}, false, fmt.Errorf("%s -> embeddings response carried no data", url)
 	}
 	// The API is allowed to return entries out of order; index is canonical.
-	sort.Slice(parsed.Data, func(i, j int) bool { return parsed.Data[i].Index < parsed.Data[j].Index })
-	vectors := make([][]float32, len(parsed.Data))
-	for i, d := range parsed.Data {
+	sort.Slice(resp.Data, func(i, j int) bool { return resp.Data[i].Index < resp.Data[j].Index })
+	vectors := make([][]float32, len(resp.Data))
+	for i, d := range resp.Data {
 		if len(d.Embedding) == 0 {
 			return nil, Usage{}, false, fmt.Errorf("%s -> embedding %d is empty", url, d.Index)
 		}
-		vectors[i] = d.Embedding
+		// The SDK models a vector as []float64 (that is what the API sends);
+		// the driver's contract is []float32, so it is narrowed here.
+		v := make([]float32, len(d.Embedding))
+		for j, f := range d.Embedding {
+			v[j] = float32(f)
+		}
+		vectors[i] = v
 	}
 	var usage Usage
-	if parsed.Usage != nil {
-		usage.Input = parsed.Usage.PromptTokens
-		if usage.Input == 0 {
-			usage.Input = parsed.Usage.TotalTokens
-		}
+	if resp.Usage.PromptTokens > 0 {
+		usage.Input = int(resp.Usage.PromptTokens)
+	} else {
+		usage.Input = int(resp.Usage.TotalTokens)
 	}
 	return vectors, usage, false, nil
 }

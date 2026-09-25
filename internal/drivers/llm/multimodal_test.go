@@ -31,7 +31,9 @@ func multimodalChat(t *testing.T, provider string, msgs []Message, wantErr strin
 	srv := httptest.NewServer(simpleReply())
 	defer srv.Close()
 	m := NewManager(map[string]config.Model{
-		"default": {Provider: provider, Model: "m", BaseURL: srv.URL},
+		// The genai client's Gemini backend has no keyless mode, so a gemini model
+		// always carries a key here; every other provider is happy without one.
+		"default": {Provider: provider, Model: "m", BaseURL: srv.URL, APIKey: geminiTestKey(provider)},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	_, err := m.Chat(context.Background(), "default", msgs, Opts{})
 	if wantErr == "" {
@@ -45,6 +47,16 @@ func multimodalChat(t *testing.T, provider string, msgs []Message, wantErr strin
 	}
 }
 
+// geminiTestKey is the dummy api_key the gemini test models carry: the SDK
+// refuses to build a Gemini-backend client without one, and the mocks never
+// check it.
+func geminiTestKey(provider string) string {
+	if provider == "gemini" {
+		return "test-key"
+	}
+	return ""
+}
+
 // simpleReply serves a minimal non-streaming OK response; the assertions in
 // these tests run on the request body via assertBody.
 func simpleReply() http.HandlerFunc {
@@ -52,6 +64,53 @@ func simpleReply() http.HandlerFunc {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}
+}
+
+// openaiEmptyReply serves a minimal but *valid* OpenAI Chat Completions SSE
+// stream. The shared simpleReply writes only `data: [DONE]`, which the
+// official SDK's SSE reader consumes without ever yielding a chunk: the SDK
+// sees a 200 carrying no events at all and reports exactly that, rather than
+// treating it as an empty reply the way the hand-rolled reader did. These
+// tests assert on the request body, so they just need a stream the provider
+// understands.
+func openaiEmptyReply() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(
+			`data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}` + "\n\n" +
+				"data: [DONE]\n\n"))
+	}
+}
+
+// responsesEmptyReply is openaiEmptyReply's Responses-API counterpart: one
+// terminal event the SDK can decode, then the stream terminator.
+func responsesEmptyReply() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(
+			`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}` + "\n\n" +
+				"data: [DONE]\n\n"))
+	}
+}
+
+// anthropicEmptyReply serves a minimal but *valid* Anthropic SSE stream. The
+// shared simpleReply writes only OpenAI's `data: [DONE]`, which Anthropic never
+// sends — the SDK sees a 200 carrying no events at all and reports that, rather
+// than treating it as an empty reply the way the hand-rolled reader did. These
+// tests assert on the request body, so they just need a stream the provider
+// understands.
+func anthropicEmptyReply() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(
+			"event: message_start\n" +
+				`data: {"type":"message_start","message":{"usage":{"input_tokens":1}}}` + "\n\n" +
+				"event: message_stop\n" +
+				`data: {"type":"message_stop"}` + "\n\n"))
 	}
 }
 
@@ -68,7 +127,7 @@ func TestAnthropicImagePart(t *testing.T) {
 				t.Errorf("body missing %q\nbody: %s", want, b)
 			}
 		}
-		simpleReply()(w, r)
+		anthropicEmptyReply()(w, r)
 	}))
 	defer srv.Close()
 	multimodalChatOn(t, "anthropic", srv, []Message{imageTurn(pngB64)})
@@ -87,7 +146,7 @@ func TestAnthropicPDFPart(t *testing.T) {
 		if !strings.Contains(string(b), `"type":"document"`) {
 			t.Errorf("body missing document block\nbody: %s", b)
 		}
-		simpleReply()(w, r)
+		anthropicEmptyReply()(w, r)
 	}))
 	defer srv.Close()
 	multimodalChatOn(t, "anthropic", srv, []Message{{
@@ -107,7 +166,7 @@ func TestOpenAIChatImagePart(t *testing.T) {
 				t.Errorf("body missing %q\nbody: %s", want, b)
 			}
 		}
-		simpleReply()(w, r)
+		openaiEmptyReply()(w, r)
 	}))
 	defer srv.Close()
 	multimodalChatOn(t, "openai", srv, []Message{imageTurn(pngB64)})
@@ -119,7 +178,7 @@ func TestOpenAIChatImageURLPassthrough(t *testing.T) {
 		if !strings.Contains(string(b), `"url":"https://example.com/cat.png"`) {
 			t.Errorf("body missing url passthrough\nbody: %s", b)
 		}
-		simpleReply()(w, r)
+		openaiEmptyReply()(w, r)
 	}))
 	defer srv.Close()
 	multimodalChatOn(t, "openai", srv, []Message{{
@@ -139,7 +198,7 @@ func TestOpenAIChatAudioPart(t *testing.T) {
 				t.Errorf("body missing %q\nbody: %s", want, b)
 			}
 		}
-		simpleReply()(w, r)
+		openaiEmptyReply()(w, r)
 	}))
 	defer srv.Close()
 	multimodalChatOn(t, "openai", srv, []Message{{
@@ -148,6 +207,8 @@ func TestOpenAIChatAudioPart(t *testing.T) {
 	}})
 }
 
+// TestOpenAIChatPDFRejected: a base64-only file part is refused for want of a
+// URL — GLM's file_url takes a URL source only.
 func TestOpenAIChatPDFRejected(t *testing.T) {
 	multimodalChat(t, "openai", []Message{{
 		Role:  "user",
@@ -155,6 +216,9 @@ func TestOpenAIChatPDFRejected(t *testing.T) {
 	}}, "requires a url source")
 }
 
+// TestOpenAIChatVideoURL: the MiniMax/Kimi/GLM video_url convention. The SDK's
+// content-part union has no video_url variant, so the part is built through
+// param.Override; what matters here is that it reaches the wire.
 func TestOpenAIChatVideoURL(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
@@ -162,7 +226,7 @@ func TestOpenAIChatVideoURL(t *testing.T) {
 			!strings.Contains(string(b), `"url":"https://cdn.example.com/v.mp4"`) {
 			t.Errorf("body missing video_url\nbody: %s", b)
 		}
-		simpleReply()(w, r)
+		openaiEmptyReply()(w, r)
 	}))
 	defer srv.Close()
 	multimodalChatOn(t, "openai", srv, []Message{{
@@ -171,6 +235,7 @@ func TestOpenAIChatVideoURL(t *testing.T) {
 	}})
 }
 
+// TestOpenAIChatFileURL: GLM's file_url part, likewise carried by param.Override.
 func TestOpenAIChatFileURL(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
@@ -178,7 +243,7 @@ func TestOpenAIChatFileURL(t *testing.T) {
 			!strings.Contains(string(b), `"url":"https://cdn.example.com/doc.pdf"`) {
 			t.Errorf("body missing file_url\nbody: %s", b)
 		}
-		simpleReply()(w, r)
+		openaiEmptyReply()(w, r)
 	}))
 	defer srv.Close()
 	multimodalChatOn(t, "openai", srv, []Message{{
@@ -187,6 +252,10 @@ func TestOpenAIChatFileURL(t *testing.T) {
 	}})
 }
 
+// TestAnthropicVideoPart: MiniMax M3's Anthropic-compatible video block. The
+// SDK's writable content-block union has no video variant, so it goes out
+// through param.Override; the inline base64 source and its media type are what
+// this pins.
 func TestAnthropicVideoPart(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
@@ -199,7 +268,7 @@ func TestAnthropicVideoPart(t *testing.T) {
 				t.Errorf("body missing %q\nbody: %s", want, b)
 			}
 		}
-		simpleReply()(w, r)
+		anthropicEmptyReply()(w, r)
 	}))
 	defer srv.Close()
 	multimodalChatOn(t, "anthropic", srv, []Message{{
@@ -208,6 +277,8 @@ func TestAnthropicVideoPart(t *testing.T) {
 	}})
 }
 
+// TestResponsesVideoURL: the Responses video item, carried by param.Override
+// because the SDK's input-content union is input_text/input_image/input_file.
 func TestResponsesVideoURL(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
@@ -216,13 +287,22 @@ func TestResponsesVideoURL(t *testing.T) {
 				t.Errorf("body missing %q\nbody: %s", want, b)
 			}
 		}
-		simpleReply()(w, r)
+		responsesEmptyReply()(w, r)
 	}))
 	defer srv.Close()
 	multimodalChatOn(t, "openai-responses", srv, []Message{{
 		Role:  "user",
 		Parts: []media.Part{{Type: "video", MIME: "video/mp4", URL: "ms://file_xyz"}},
 	}})
+}
+
+// TestResponsesVideoRequiresURL: the Responses video input takes a URL or
+// provider file reference, not inline base64.
+func TestResponsesVideoRequiresURL(t *testing.T) {
+	multimodalChat(t, "openai-responses", []Message{{
+		Role:  "user",
+		Parts: []media.Part{{Type: "video", MIME: "video/mp4", Data: pngB64}},
+	}}, "requires a url source")
 }
 
 func TestResponsesPDFRequiresSource(t *testing.T) {
@@ -245,20 +325,13 @@ func TestResponsesImageAndPDF(t *testing.T) {
 				t.Errorf("body missing %q\nbody: %s", want, b)
 			}
 		}
-		simpleReply()(w, r)
+		responsesEmptyReply()(w, r)
 	}))
 	defer srv.Close()
 	multimodalChatOn(t, "openai-responses", srv, []Message{
 		imageTurn(pngB64),
 		{Role: "user", Parts: []media.Part{{Type: "file", MIME: "application/pdf", Data: pngB64, Name: "x.pdf"}}},
 	})
-}
-
-func TestResponsesVideoRequiresURL(t *testing.T) {
-	multimodalChat(t, "openai-responses", []Message{{
-		Role:  "user",
-		Parts: []media.Part{{Type: "video", MIME: "video/mp4", Data: pngB64}},
-	}}, "requires a url source")
 }
 
 // resetGeminiFileCache isolates cache-sensitive tests from each other (the
@@ -272,6 +345,12 @@ func resetGeminiFileCache() {
 // geminiFilesMock serves the Files API (start -> upload url header, finalize
 // -> file resource) plus the interactions endpoint, recording the upload
 // start count and the interactions request body.
+//
+// The interactions route is the path the SDK composes: {BaseURL}/{APIVersion}
+// /interactions, with the API version this provider defaults to when base_url
+// carries none of its own (see splitGeminiBase). The mock never set a
+// Content-Type before, because the hand-rolled client never looked; the SDK
+// decodes only a JSON reply and will not read a 200 it cannot classify.
 func geminiFilesMock(t *testing.T, gotBody *string, starts *int) *httptest.Server {
 	t.Helper()
 	var srv *httptest.Server
@@ -286,11 +365,16 @@ func geminiFilesMock(t *testing.T, gotBody *string, starts *int) *httptest.Serve
 			if string(b) != "hello" { // pngB64 decodes to "hello"
 				t.Errorf("uploaded bytes: %q", b)
 			}
+			// The SDK's resumable upload waits for the protocol's final status
+			// header before it will read the file resource (the hand-rolled client
+			// ignored it), so the mock has to speak it.
+			w.Header().Set("X-Goog-Upload-Status", "final")
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"file":{"name":"files/abc123","uri":"` + srv.URL + `/v1beta/files/abc123","state":"ACTIVE","mimeType":"image/png"}}`))
-		case r.URL.Path == "/interactions":
+		case r.URL.Path == "/v1beta/interactions":
 			b, _ := io.ReadAll(r.Body)
 			*gotBody = string(b)
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"steps":[{"type":"model_output","content":[{"type":"text","text":"a cat"}]}],"usage":{"input_tokens":10,"output_tokens":2}}`))
 		default:
@@ -307,7 +391,7 @@ func TestGeminiMediaParts(t *testing.T) {
 	srv := geminiFilesMock(t, &gotBody, &starts)
 	defer srv.Close()
 	m := NewManager(map[string]config.Model{
-		"default": {Provider: "gemini", Model: "m", BaseURL: srv.URL},
+		"default": {Provider: "gemini", Model: "m", BaseURL: srv.URL, APIKey: "test-key"},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	reply, err := m.Chat(context.Background(), "default", []Message{imageTurn(pngB64)}, Opts{})
 	if err != nil {
@@ -343,7 +427,7 @@ func TestGeminiUploadDeduped(t *testing.T) {
 	srv := geminiFilesMock(t, &gotBody, &starts)
 	defer srv.Close()
 	m := NewManager(map[string]config.Model{
-		"default": {Provider: "gemini", Model: "m", BaseURL: srv.URL},
+		"default": {Provider: "gemini", Model: "m", BaseURL: srv.URL, APIKey: "test-key"},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	// Two chats carrying the same bytes upload once (48h cache window).
 	for i := 0; i < 2; i++ {
@@ -362,7 +446,7 @@ func TestGeminiURLPartDownloaded(t *testing.T) {
 	srv := geminiFilesMock(t, &gotBody, &starts)
 	defer srv.Close()
 	m := NewManager(map[string]config.Model{
-		"default": {Provider: "gemini", Model: "m", BaseURL: srv.URL},
+		"default": {Provider: "gemini", Model: "m", BaseURL: srv.URL, APIKey: "test-key"},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	// A url part is downloaded then uploaded to the Files API.
 	_, err := m.Chat(context.Background(), "default", []Message{{
@@ -388,12 +472,14 @@ func TestGeminiTextOnlyStaysString(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		gotBody = string(b)
+		// The SDK decodes only a reply it can classify by content type.
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"steps":[],"usage":{"input_tokens":1,"output_tokens":1}}`))
 	}))
 	defer srv.Close()
 	m := NewManager(map[string]config.Model{
-		"default": {Provider: "gemini", Model: "m", BaseURL: srv.URL},
+		"default": {Provider: "gemini", Model: "m", BaseURL: srv.URL, APIKey: "test-key"},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if _, err := m.Chat(context.Background(), "default", []Message{{Role: "user", Content: "hi"}}, Opts{}); err != nil {
 		t.Fatalf("Chat: %v", err)

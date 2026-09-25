@@ -5,6 +5,8 @@ import (
 	"strings"
 
 	"agentflow/internal/config"
+
+	"google.golang.org/genai/interactions/models/interactions"
 )
 
 // Thinking is the provider-neutral thinking level: one vocabulary for every
@@ -24,7 +26,7 @@ import (
 //	anthropic        budget_tokens on a {type:"enabled"} thinking block
 //	openai           reasoning_effort on chat completions
 //	openai-responses reasoning.effort on the Responses API
-//	gemini           thinking_config.thinking_budget on the Interactions API
+//	gemini           generation_config.thinking_level (+ thinking_summaries)
 type Thinking string
 
 const (
@@ -96,14 +98,18 @@ var openaiEffort = map[Thinking]string{
 	ThinkingMax:    "high",
 }
 
-// geminiThinkingBudget maps a level onto Gemini's thinking_budget token
-// count. 0 disables thinking; the Interactions API rejects max_output_tokens,
-// so unlike Anthropic there is no per-request budget to clamp against.
-var geminiThinkingBudget = map[Thinking]int{
-	ThinkingOff:    0,
-	ThinkingLow:    1024,
-	ThinkingMedium: 4096,
-	ThinkingHigh:   16384,
-	ThinkingXHigh:  32768,
-	ThinkingMax:    65536,
+// geminiThinkingLevel maps a level onto the Interactions API's thinking_level.
+// The ladder is four rungs wide (minimal|low|medium|high), so "off" — a level
+// this provider used to express as thinking_budget 0 — bottoms out at minimal,
+// the lowest thinking it can ask for, and the two Anthropic-flavoured top rungs
+// both land on high. A non-off level additionally sets thinking_summaries,
+// which is how the API is asked to return the thought summaries the caller
+// reads back (the old include_thoughts flag).
+var geminiThinkingLevel = map[Thinking]interactions.ThinkingLevel{
+	ThinkingOff:    interactions.ThinkingLevelMinimal,
+	ThinkingLow:    interactions.ThinkingLevelLow,
+	ThinkingMedium: interactions.ThinkingLevelMedium,
+	ThinkingHigh:   interactions.ThinkingLevelHigh,
+	ThinkingXHigh:  interactions.ThinkingLevelHigh,
+	ThinkingMax:    interactions.ThinkingLevelHigh,
 }

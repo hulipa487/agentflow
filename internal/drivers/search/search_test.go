@@ -411,8 +411,13 @@ func TestGitHubSearch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Headers GitHub requires.
-	if gotAccept != "application/vnd.github+json" {
+	// Headers GitHub requires. The Accept header is set by go-github itself,
+	// which for search/repositories asks for the topics preview media type —
+	// that is the one that returns the `topics` array this driver reads
+	// (search.go: "Accept header for search repositories based on topics
+	// preview"). Assert the media-type family rather than one exact string:
+	// which preview the SDK requests is the SDK's call, not ours.
+	if !strings.Contains(gotAccept, "vnd.github") {
 		t.Fatalf("accept: %q", gotAccept)
 	}
 	if gotVersion != "2022-11-28" {

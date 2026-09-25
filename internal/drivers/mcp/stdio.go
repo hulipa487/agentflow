@@ -1,216 +1,92 @@
-// Package mcp implements a minimal MCP (Model Context Protocol) stdio client.
+// Package mcp implements an MCP (Model Context Protocol) stdio client on top of
+// the official Go SDK (github.com/modelcontextprotocol/go-sdk).
+//
+// The SDK owns the wire: JSON-RPC framing, the server/discover-then-initialize
+// handshake, the initialized notification, request correlation and context
+// cancellation. This package keeps only what is agentflow's own policy — the
+// bounded handshake that must not hang the boot, the child's stderr routed into
+// the runtime log, the "<server>/<tool>" namespacing the model sees, and the
+// tool-result mapping (including the honest-degradation rule that a transport
+// failure is reported as a result rather than an error).
 package mcp
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"os/exec"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"agentflow/internal/core/tools"
+
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// Client is a JSON-RPC client over a child process's stdio.
+// handshakeTimeout bounds Connect. A server that starts but never answers would
+// otherwise hang the boot, which is what the previous hand-rolled handshake
+// guarded against and the reason this is not left to the caller.
+const handshakeTimeout = 30 * time.Second
+
+// clientName / clientVersion identify this runtime to the server.
+const (
+	clientName    = "agentflow"
+	clientVersion = "0.2.0"
+)
+
+// Client is an MCP client session over a child process's stdio.
 type Client struct {
-	name   string
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stdout *bufio.Reader
-	log    *slog.Logger
-
-	mu      sync.Mutex
-	pending map[int64]chan response
+	name    string
+	session *mcpsdk.ClientSession
+	log     *slog.Logger
 	alive   atomic.Bool
-	nextID  atomic.Int64
-	// wmu serializes writes to the child's stdin. It is separate from mu, which
-	// guards the pending map: holding that one across a blocking write also
-	// blocked readLoop, which needs it to deliver any response at all.
-	wmu sync.Mutex
 }
 
-type request struct {
-	JSONRPC string `json:"jsonrpc"`
-	Method  string `json:"method"`
-	Params  any    `json:"params,omitempty"`
-	ID      int64  `json:"id"`
-}
-
-type response struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      int64           `json:"id"`
-	Result  json.RawMessage `json:"result,omitempty"`
-	Error   *rpcError       `json:"error,omitempty"`
-}
-
-type rpcError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
-func (e *rpcError) Error() string { return fmt.Sprintf("mcp rpc error %d: %s", e.Code, e.Message) }
-
-// NewClient starts an MCP server and performs the initialize handshake.
+// NewClient starts an MCP server and completes the handshake. It returns only
+// once the session is usable, so a caller that gets an error knows the server
+// never came up and can skip it.
 func NewClient(name, command string, args []string, log *slog.Logger) (*Client, error) {
-	c := &Client{
-		name:    name,
-		cmd:     exec.Command(command, args...),
-		log:     log.With("mcp_server", name),
-		pending: map[int64]chan response{},
-	}
-	stdin, err := c.cmd.StdinPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stdin pipe: %w", err)
-	}
-	stdout, err := c.cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stdout pipe: %w", err)
-	}
-	c.stdin = stdin
-	c.stdout = bufio.NewReader(stdout)
-	c.cmd.Stderr = &logWriter{c.log}
+	l := log.With("mcp_server", name)
+	cmd := exec.Command(command, args...)
+	// The child's stderr goes to the runtime log at debug. The SDK does not
+	// adopt a caller's exec.Cmd stderr, so it is set on the command before the
+	// transport takes ownership of it.
+	cmd.Stderr = &logWriter{l}
 
-	if err := c.cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start mcp server %s: %w", name, err)
-	}
-	c.alive.Store(true)
-	go c.readLoop()
+	c := &Client{name: name, log: l}
 
-	// The handshake is bounded: a server that starts but never answers would
-	// otherwise hang the boot. NewClient has no caller context to inherit, so it
-	// makes its own.
-	initCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), handshakeTimeout)
 	defer cancel()
-	if _, err := c.call(initCtx, "initialize", map[string]any{
-		"protocolVersion": "2024-11-05",
-		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]any{"name": "agentflow", "version": "0.2.0"},
-	}); err != nil {
-		_ = c.Close()
+
+	session, err := mcpsdk.NewClient(&mcpsdk.Implementation{
+		Name:    clientName,
+		Version: clientVersion,
+	}, nil).Connect(ctx, &mcpsdk.CommandTransport{Command: cmd}, nil)
+	if err != nil {
 		return nil, fmt.Errorf("mcp initialize %s: %w", name, err)
 	}
+	c.session = session
+	c.alive.Store(true)
 	return c, nil
-}
-
-// call sends one JSON-RPC request and waits for its response.
-//
-// ctx is honoured, both for the wait and for the write. The write runs on its
-// own goroutine under a write-only mutex because holding the response mutex
-// across a blocking stdin write also blocked readLoop — which needs that mutex
-// to deliver any response at all — so a child that stopped draining stdin
-// deadlocked the entire client instead of stalling one call.
-func (c *Client) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
-	if !c.alive.Load() {
-		return nil, fmt.Errorf("mcp server %s is not running", c.name)
-	}
-	id := c.nextID.Add(1)
-	req := request{JSONRPC: "2.0", Method: method, Params: params, ID: id}
-	b, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-	b = append(b, '\n')
-
-	ch := make(chan response, 1)
-	c.mu.Lock()
-	c.pending[id] = ch
-	c.mu.Unlock()
-	forget := func() {
-		c.mu.Lock()
-		delete(c.pending, id)
-		c.mu.Unlock()
-	}
-
-	werr := make(chan error, 1)
-	go func() {
-		c.wmu.Lock()
-		_, err := c.stdin.Write(b)
-		c.wmu.Unlock()
-		werr <- err
-	}()
-	select {
-	case err := <-werr:
-		if err != nil {
-			forget()
-			return nil, err
-		}
-	case <-ctx.Done():
-		// The write is abandoned rather than waited on. It holds only wmu, so
-		// the client stays usable and readLoop keeps delivering other calls.
-		forget()
-		return nil, ctx.Err()
-	}
-
-	select {
-	case resp, ok := <-ch:
-		if !ok {
-			return nil, fmt.Errorf("mcp server %s closed", c.name)
-		}
-		if resp.Error != nil {
-			return nil, resp.Error
-		}
-		return resp.Result, nil
-	case <-ctx.Done():
-		forget()
-		return nil, ctx.Err()
-	}
-}
-
-func (c *Client) readLoop() {
-	for {
-		line, err := c.stdout.ReadString('\n')
-		if err != nil {
-			c.alive.Store(false)
-			c.mu.Lock()
-			for id, ch := range c.pending {
-				close(ch)
-				delete(c.pending, id)
-			}
-			c.mu.Unlock()
-			return
-		}
-		var resp response
-		if err := json.Unmarshal([]byte(line), &resp); err != nil {
-			c.log.Warn("bad mcp json", "line", line, "err", err)
-			continue
-		}
-		c.mu.Lock()
-		ch, ok := c.pending[resp.ID]
-		if ok {
-			delete(c.pending, resp.ID)
-		}
-		c.mu.Unlock()
-		if ok {
-			ch <- resp
-		}
-	}
 }
 
 // ListTools discovers tools exposed by the server.
 func (c *Client) ListTools(ctx context.Context) ([]tools.ToolSpec, error) {
-	res, err := c.call(ctx, "tools/list", nil)
+	if !c.alive.Load() {
+		return nil, fmt.Errorf("mcp server %s is not running", c.name)
+	}
+	res, err := c.session.ListTools(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	var payload struct {
-		Tools []struct {
-			Name        string          `json:"name"`
-			Description string          `json:"description"`
-			InputSchema json.RawMessage `json:"inputSchema"`
-		} `json:"tools"`
-	}
-	if err := json.Unmarshal(res, &payload); err != nil {
-		return nil, err
-	}
 	var out []tools.ToolSpec
-	for _, t := range payload.Tools {
-		var schema map[string]any
-		_ = json.Unmarshal(t.InputSchema, &schema)
+	for _, t := range res.Tools {
+		if t == nil {
+			continue
+		}
+		// The schema stays a raw map: the registry hands it to a provider as
+		// JSON Schema, so it must not be reshaped into a typed struct here.
+		schema, _ := t.InputSchema.(map[string]any)
 		out = append(out, tools.ToolSpec{
 			Name:        c.name + "/" + t.Name,
 			Description: t.Description,
@@ -224,41 +100,37 @@ func (c *Client) ListTools(ctx context.Context) ([]tools.ToolSpec, error) {
 
 func (c *Client) makeInvoker(toolName string) func(context.Context, map[string]any) (any, error) {
 	return func(ctx context.Context, args map[string]any) (any, error) {
-		res, err := c.call(ctx, "tools/call", map[string]any{
-			"name":      toolName,
-			"arguments": args,
+		if !c.alive.Load() {
+			return tools.ResultUnavailable("mcp:"+c.name+"/"+toolName,
+				fmt.Sprintf("mcp server %s is not running", c.name)), nil
+		}
+		res, err := c.session.CallTool(ctx, &mcpsdk.CallToolParams{
+			Name:      toolName,
+			Arguments: args,
 		})
 		if err != nil {
+			// A failure to reach the server is reported as a structured result,
+			// not an error: the honest-degradation rule every tool follows.
 			return tools.ResultUnavailable("mcp:"+c.name+"/"+toolName, err.Error()), nil
 		}
-		var payload struct {
-			Content []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"content"`
-			IsError bool `json:"isError"`
-		}
-		if err := json.Unmarshal(res, &payload); err != nil {
-			return map[string]any{"ok": false, "error": err.Error()}, nil
-		}
 		var text string
-		for _, c := range payload.Content {
-			if c.Type == "text" {
-				text += c.Text
+		for _, content := range res.Content {
+			if tc, ok := content.(*mcpsdk.TextContent); ok {
+				text += tc.Text
 			}
 		}
-		return map[string]any{"ok": !payload.IsError, "text": text}, nil
+		return map[string]any{"ok": !res.IsError, "text": text}, nil
 	}
 }
 
-// Close terminates the server process.
+// Close terminates the server process. The transport closes stdin, waits, then
+// kills — so the child is reaped either way.
 func (c *Client) Close() error {
 	c.alive.Store(false)
-	_ = c.stdin.Close()
-	if c.cmd.Process != nil {
-		_ = c.cmd.Process.Kill()
+	if c.session == nil {
+		return nil
 	}
-	return c.cmd.Wait()
+	return c.session.Close()
 }
 
 type logWriter struct{ log *slog.Logger }

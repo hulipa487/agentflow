@@ -38,7 +38,9 @@ func thinkingServer(t *testing.T, provider string, body *[][]byte) *httptest.Ser
 func chatThinking(t *testing.T, srv *httptest.Server, provider, modelCfg string, opts Opts) error {
 	t.Helper()
 	m := NewManager(map[string]config.Model{
-		"default": {Provider: provider, Model: "m", BaseURL: srv.URL, Thinking: modelCfg},
+		// The genai client's Gemini backend has no keyless mode; the other
+		// providers ignore it and the mock never checks it.
+		"default": {Provider: provider, Model: "m", BaseURL: srv.URL, Thinking: modelCfg, APIKey: "test-key"},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	_, err := m.Chat(context.Background(), "default",
 		[]Message{{Role: "user", Content: "hi"}}, opts)
@@ -70,9 +72,13 @@ func TestThinkingRequestBodies(t *testing.T) {
 		{"openai unset sends nothing", "openai", "", "", 0, nil, []string{`"reasoning`}},
 		// Responses API nests the effort.
 		{"responses xhigh", "openai-responses", "", "xhigh", 0, []string{`"reasoning":{"effort":"xhigh"}`}, nil},
-		// Gemini: a token budget; 0 disables thinking.
-		{"gemini high", "gemini", "", "high", 0, []string{`"thinking_budget":16384`}, nil},
-		{"gemini off disables", "gemini", "", "off", 0, []string{`"thinking_budget":0`}, nil},
+		// Gemini: a level, plus a request for the thought summaries. The old
+		// hand-rolled wire sent a thinking_budget token count; the SDK's
+		// generation_config models a four-rung thinking_level instead, so the pin
+		// moves to that spelling. The rung ladder has no "off", so off lands on
+		// the lowest rung it has — see geminiThinkingLevel.
+		{"gemini high", "gemini", "", "high", 0, []string{`"thinking_level":"high"`, `"thinking_summaries":"auto"`}, nil},
+		{"gemini off takes the lowest rung", "gemini", "", "off", 0, []string{`"thinking_level":"minimal"`}, []string{`"thinking_summaries"`}},
 		// The per-model default applies with no per-call override.
 		{"model default applies", "openai", "high", "", 0, []string{`"reasoning_effort":"high"`}, nil},
 		// ...and the per-call override beats the model default.

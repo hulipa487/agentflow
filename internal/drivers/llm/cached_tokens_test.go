@@ -105,7 +105,9 @@ data: [DONE]
 			srv := captureServer(t, tc.prov, tc.canned, &body)
 			defer srv.Close()
 			m := NewManager(map[string]config.Model{
-				"default": {Provider: tc.prov, Model: "m", BaseURL: srv.URL},
+				// The genai client's Gemini backend has no keyless mode; the other
+				// providers ignore it and the mock never checks it.
+				"default": {Provider: tc.prov, Model: "m", BaseURL: srv.URL, APIKey: "test-key"},
 			}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 			reply, err := m.Chat(context.Background(), "default",
 				[]Message{{Role: "user", Content: "hi"}}, Opts{})

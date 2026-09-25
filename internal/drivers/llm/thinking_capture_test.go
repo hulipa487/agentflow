@@ -144,16 +144,33 @@ data: [DONE]
 			wantText:   "hi there",
 			wantThink:  "silent step",
 			wantBlocks: `"thought":true`,
-			wantReq:    []string{`"include_thoughts":true`},
+			// The level rides as the SDK's generation_config.thinking_level, and
+			// "return the thought summaries" is thinking_summaries rather than the
+			// hand-rolled include_thoughts flag the interactions body used to carry.
+			// The intent is unchanged: a level set means the request asks for them.
+			wantReq: []string{`"thinking_level":"low"`, `"thinking_summaries":"auto"`},
 		},
 		{
-			name:       "gemini without a level asks for nothing",
+			name:      "gemini without a level asks for nothing",
+			prov:      "gemini",
+			canned:    `{"steps":[{"type":"model_output","content":[{"type":"text","text":"hi"}]}],"usage":{"input_tokens":5,"output_tokens":6}}`,
+			wantText:  "hi",
+			wantThink: "",
+			// No level (and no temperature) means no generation_config at all, so
+			// nothing thinking-shaped reaches the wire.
+			absentReq: []string{`"thinking_level"`, `"thinking_summaries"`},
+		},
+		{
+			// The API's own reasoning shape — a thought step whose summary holds
+			// the text (the SDK models this as ThoughtStep, signature included) —
+			// is captured whole too, so a model that reports thinking this way is
+			// not silently read as having none.
+			name:       "gemini thought step",
 			prov:       "gemini",
-			canned:     `{"steps":[{"type":"model_output","content":[{"type":"text","text":"hi"}]}],"usage":{"input_tokens":5,"output_tokens":6}}`,
+			canned:     `{"steps":[{"type":"thought","signature":"sig-1","summary":[{"type":"text","text":"pondering"}]},{"type":"model_output","content":[{"type":"text","text":"hi"}]}],"usage":{"total_input_tokens":5,"total_output_tokens":6}}`,
 			wantText:   "hi",
-			wantThink:  "",
-			wantBlocks: "",
-			absentReq:  []string{`"thinking_config"`},
+			wantThink:  "pondering",
+			wantBlocks: `{"signature":"sig-1","summary":[{"text":"pondering","type":"text"}],"type":"thought"}`,
 		},
 	}
 	for _, tc := range cases {
@@ -162,7 +179,9 @@ data: [DONE]
 			srv := captureServer(t, tc.prov, tc.canned, &body)
 			defer srv.Close()
 			m := NewManager(map[string]config.Model{
-				"default": {Provider: tc.prov, Model: "m", BaseURL: srv.URL},
+				// The key is required by the genai client's Gemini backend (it has
+				// no keyless mode); the mock never checks it.
+				"default": {Provider: tc.prov, Model: "m", BaseURL: srv.URL, APIKey: "k"},
 			}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 			reply, err := m.Chat(context.Background(), "default",
 				[]Message{{Role: "user", Content: "hi"}}, Opts{Thinking: tc.thinking})
@@ -259,7 +278,7 @@ func TestThinkingReplayWire(t *testing.T) {
 					ToolCalls: []ToolCall{{ID: "tu_1", Name: "calc", Args: map[string]any{"x": 1}}}},
 				{Role: "tool", ToolCallID: "tu_1", Content: "42"},
 			},
-			want: []string{`"thinking":"because"`, `"signature":"sig9"`, `"data":"OPAQUE"`, `"tool_use_id":"tu_1"`, `"content":"42"`},
+			want: []string{`"thinking":"because"`, `"signature":"sig9"`, `"data":"OPAQUE"`, `"tool_use_id":"tu_1"`, `"content":[{"text":"42","type":"text"}]`},
 			before: [][2]string{
 				{`"thinking":"because"`, `"type":"tool_use"`},
 				{`"data":"OPAQUE"`, `"type":"tool_use"`},
@@ -272,9 +291,13 @@ func TestThinkingReplayWire(t *testing.T) {
 				{Role: "assistant", Content: "final", ThinkingBlocks: blocks},
 			},
 			want: []string{`"thinking":"because"`, `"data":"OPAQUE"`},
+			// Scoped to the assistant turn's own text ("final"), not the generic
+			// `"type":"text"`: the SDK models every message's content as blocks,
+			// so a plain user turn now carries a text block too and a bare
+			// substring search would match that earlier one.
 			before: [][2]string{
-				{`"thinking":"because"`, `"type":"text"`},
-				{`"data":"OPAQUE"`, `"type":"text"`},
+				{`"thinking":"because"`, `"text":"final"`},
+				{`"data":"OPAQUE"`, `"text":"final"`},
 			},
 		},
 	}

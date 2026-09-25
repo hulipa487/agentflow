@@ -2,17 +2,17 @@ package search
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"html"
-	"io"
 	"net/http"
-	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
 	"agentflow/internal/config"
+
+	"google.golang.org/api/googleapi"
+	"google.golang.org/api/option"
+	ytapi "google.golang.org/api/youtube/v3"
 )
 
 // The YouTube Data API v3 (www.googleapis.com/youtube/v3/search) — Google's
@@ -32,9 +32,8 @@ const (
 // title, Content is the description, and Published is the publish timestamp.
 // There is no relevance score in the response, so Score is left unset.
 type youtube struct {
-	baseURL string
-	key     string
-	http    *http.Client
+	svc     *ytapi.Service
+	timeout time.Duration
 }
 
 func newYouTube(cfg config.SearchEngine) (*youtube, error) {
@@ -45,41 +44,26 @@ func newYouTube(cfg config.SearchEngine) (*youtube, error) {
 	if base == "" {
 		base = defaultYouTubeURL
 	}
-	return &youtube{
-		baseURL: strings.TrimSuffix(base, "/"),
-		key:     cfg.APIKey,
-		http:    &http.Client{Timeout: cfg.TimeoutD()},
-	}, nil
-}
-
-type youtubeResponse struct {
-	Items []struct {
-		ID struct {
-			Kind       string `json:"kind"` // youtube#video | youtube#channel | youtube#playlist
-			VideoID    string `json:"videoId"`
-			ChannelID  string `json:"channelId"`
-			PlaylistID string `json:"playlistId"`
-		} `json:"id"`
-		Snippet struct {
-			Title                string `json:"title"`
-			Description          string `json:"description"`
-			ChannelTitle         string `json:"channelTitle"`
-			PublishedAt          string `json:"publishedAt"`          // RFC 3339
-			LiveBroadcastContent string `json:"liveBroadcastContent"` // none|live|upcoming
-		} `json:"snippet"`
-	} `json:"items"`
-	// Standard Google error envelope (present on failures, non-200 status).
-	Err *struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-		Errors  []struct {
-			Reason string `json:"reason"`
-		} `json:"errors"`
-	} `json:"error"`
+	// The key is applied by the transport google-api-go-client builds itself.
+	// That is also why there is no option.WithHTTPClient here: it "takes
+	// precedent over all other supplied options", so pairing it with
+	// WithAPIKey silently drops the key and every call comes back 403. The
+	// per-engine timeout is enforced on the context instead (see Search).
+	opts := []option.ClientOption{
+		option.WithAPIKey(cfg.APIKey),
+		option.WithEndpoint(base + "/"),
+	}
+	svc, err := ytapi.NewService(context.Background(), opts...)
+	if err != nil {
+		return nil, fmt.Errorf("search youtube: build service: %w", err)
+	}
+	return &youtube{svc: svc, timeout: cfg.TimeoutD()}, nil
 }
 
 // Search runs one YouTube search (videos only).
 func (y *youtube) Search(ctx context.Context, req Request) (*Result, error) {
+	ctx, cancel := context.WithTimeout(ctx, y.timeout)
+	defer cancel()
 	query := strings.TrimSpace(req.Query)
 	if query == "" {
 		return nil, fmt.Errorf("search youtube: query is required")
@@ -92,55 +76,38 @@ func (y *youtube) Search(ctx context.Context, req Request) (*Result, error) {
 		count = maxYouTubeCount
 	}
 
-	q := url.Values{}
-	q.Set("part", "snippet")
-	q.Set("type", "video")
-	q.Set("order", "relevance")
-	q.Set("maxResults", strconv.Itoa(count))
-	q.Set("q", query)
-	q.Set("key", y.key)
+	call := y.svc.Search.List([]string{"snippet"}).
+		Type("video").
+		Order("relevance").
+		MaxResults(int64(count)).
+		Q(query)
 	if after, before, ok := youtubeTimeRange(req.TimeRange); ok {
-		q.Set("publishedAfter", after)
+		call = call.PublishedAfter(after)
 		if before != "" {
-			q.Set("publishedBefore", before)
+			call = call.PublishedBefore(before)
 		}
 	}
 
-	hreq, err := http.NewRequestWithContext(ctx, http.MethodGet, y.baseURL+"/youtube/v3/search?"+q.Encode(), nil)
+	resp, err := call.Context(ctx).Do()
 	if err != nil {
-		return nil, fmt.Errorf("search youtube: build request: %w", err)
-	}
-	hreq.Header.Set("Accept", "application/json")
-
-	resp, err := y.http.Do(hreq)
-	if err != nil {
+		if ge, ok := err.(*googleapi.Error); ok {
+			return nil, fmt.Errorf("search youtube: %s", youtubeError(ge))
+		}
 		return nil, fmt.Errorf("search youtube: %w", err)
 	}
-	defer resp.Body.Close()
-	payload, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
-	if err != nil {
-		return nil, fmt.Errorf("search youtube: read response: %w", err)
-	}
-	var yr youtubeResponse
-	if err := json.Unmarshal(payload, &yr); err != nil {
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("search youtube: status %d: %s", resp.StatusCode, truncate(payload, 512))
-		}
-		return nil, fmt.Errorf("search youtube: decode response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("search youtube: %s", youtubeError(resp.StatusCode, &yr))
-	}
 
-	out := &Result{Query: query, Results: make([]WebResult, 0, len(yr.Items))}
-	for _, it := range yr.Items {
+	out := &Result{Query: query, Results: make([]WebResult, 0, len(resp.Items))}
+	for _, it := range resp.Items {
+		if it == nil || it.Id == nil || it.Snippet == nil {
+			continue
+		}
 		sn := it.Snippet
 		// Titles and descriptions arrive HTML-escaped (&#39;, &quot;, &amp;).
 		title := html.UnescapeString(sn.Title)
 		desc := html.UnescapeString(sn.Description)
 		w := WebResult{
 			Title:     title,
-			URL:       youtubeURL(it.ID.Kind, it.ID.VideoID, it.ID.ChannelID, it.ID.PlaylistID),
+			URL:       youtubeURL(it.Id.Kind, it.Id.VideoId, it.Id.ChannelId, it.Id.PlaylistId),
 			Site:      sn.ChannelTitle,
 			Content:   desc,
 			Published: sn.PublishedAt,
@@ -160,19 +127,16 @@ func (y *youtube) Search(ctx context.Context, req Request) (*Result, error) {
 
 // youtubeError renders Google's error envelope, with a plain-language hint for
 // the common quota-exhaustion case. Never includes the API key.
-func youtubeError(status int, yr *youtubeResponse) string {
-	if yr.Err == nil {
-		return fmt.Sprintf("status %d", status)
-	}
+func youtubeError(e *googleapi.Error) string {
 	reason := ""
-	if len(yr.Err.Errors) > 0 {
-		reason = yr.Err.Errors[0].Reason
+	if len(e.Errors) > 0 {
+		reason = e.Errors[0].Reason
 	}
-	msg := fmt.Sprintf("status %d: %s", status, yr.Err.Message)
+	msg := fmt.Sprintf("status %d: %s", e.Code, e.Message)
 	if reason != "" {
 		msg += " (reason " + reason + ")"
 	}
-	if status == http.StatusForbidden && strings.Contains(reason, "quota") {
+	if e.Code == http.StatusForbidden && strings.Contains(reason, "quota") {
 		msg += " — the daily YouTube Data API quota is spent (search.list costs 100 units/call against the default 10,000/day); it resets at midnight Pacific"
 	}
 	return msg

@@ -6,52 +6,45 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
 	"agentflow/internal/core/media"
+
+	"google.golang.org/genai"
 )
 
 // The Gemini Files API (ai.google.dev/gemini-api/docs/files): media is
 // uploaded once and referenced by URI in interactions.create, instead of
-// inline base64 on every call. Upload uses the resumable protocol:
+// inline base64 on every call.
 //
-//	POST {origin}/upload/v1beta/files   (X-Goog-Upload-Protocol: resumable,
-//	                                     X-Goog-Upload-Command: start)
+// The upload itself is the official SDK's (genai.Client.Files.Upload), which
+// speaks the same resumable protocol the hand-rolled client did:
+//
+//	POST {BaseURL}/upload/v1beta/files   (X-Goog-Upload-Protocol: resumable,
+//	                                      X-Goog-Upload-Command: start)
 //	  -> x-goog-upload-url response header
-//	POST {upload-url}                    (X-Goog-Upload-Command: upload, finalize,
-//	                                     raw bytes)
+//	POST {upload-url}                     (X-Goog-Upload-Command: upload, finalize,
+//	                                      raw bytes)
 //	  -> {"file": {"name", "uri", "state", "expirationTime"}}
 //
-// Files are automatically deleted by Google after 48 hours. A process-level
-// cache (content sha256 -> uri, expiry) dedupes repeat uploads of the same
-// bytes inside that window. The API key never appears in errors.
+// and files.get polling goes through genai.Client.Files.Get. What stays here is
+// the part the SDK does not offer: downloading a url source, the content-hash
+// dedupe and the wait for a file to become ACTIVE. Files are automatically
+// deleted by Google after 48 hours, which is the dedupe window, and the key
+// rides in the client the SDK was given rather than in any error this file
+// builds.
 type geminiFiles struct {
-	uploadURL string // {origin}/upload/v1beta/files
-	apiBase   string // {origin}/v1beta — files.get polls go to {apiBase}/{name}
-	key       string
-	http      *http.Client
+	client *genai.Client
+	key    string       // cache-key namespace: uploads are per-api-key
+	http   *http.Client // url-source downloads; the SDK never fetches those
 }
 
-func newGeminiFiles(base, key string, client *http.Client) *geminiFiles {
-	origin := base
-	if i := strings.Index(base, "://"); i >= 0 {
-		rest := base[i+3:]
-		if j := strings.Index(rest, "/"); j >= 0 {
-			origin = base[:i+3] + rest[:j]
-		}
-	}
-	return &geminiFiles{
-		uploadURL: origin + "/upload/v1beta/files",
-		apiBase:   base,
-		key:       key,
-		http:      client,
-	}
+func newGeminiFiles(client *genai.Client, key string, hc *http.Client) *geminiFiles {
+	return &geminiFiles{client: client, key: key, http: hc}
 }
 
 // geminiFileCacheEntry is one uploaded file's URI plus its server expiry.
@@ -106,7 +99,8 @@ func (f *geminiFiles) reference(ctx context.Context, p media.Part, mime string) 
 
 // download fetches a URL source for upload, capped at the Files API's 2 GB
 // per-file ceiling (kept far lower here: media over the bridge is bounded by
-// the channel policy anyway).
+// the channel policy anyway). The SDK only uploads readers it is handed, so the
+// fetch is ours.
 func (f *geminiFiles) download(ctx context.Context, url string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -135,130 +129,48 @@ func (f *geminiFiles) upload(ctx context.Context, data []byte, mime, name string
 		name = hex.EncodeToString(sum[:8])
 	}
 
-	// 1. Start the resumable upload: metadata only, upload URL in a header.
-	meta, _ := json.Marshal(map[string]any{"file": map[string]any{"display_name": name}})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.uploadURL, bytes.NewReader(meta))
-	if err != nil {
-		return "", fmt.Errorf("gemini files: build start: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Goog-Upload-Protocol", "resumable")
-	req.Header.Set("X-Goog-Upload-Command", "start")
-	req.Header.Set("X-Goog-Upload-Header-Content-Length", fmt.Sprint(len(data)))
-	req.Header.Set("X-Goog-Upload-Header-Content-Type", mime)
-	f.auth(req)
-	resp, err := f.http.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("gemini files: start upload: %w", err)
-	}
-	upURL := resp.Header.Get("X-Goog-Upload-Url")
-	if resp.StatusCode/100 != 2 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		resp.Body.Close()
-		return "", geminiFilesError("start upload", resp.StatusCode, b)
-	}
-	resp.Body.Close()
-	if upURL == "" {
-		return "", fmt.Errorf("gemini files: start upload returned no upload url")
-	}
-
-	// 2. Upload + finalize the bytes.
-	ureq, err := http.NewRequestWithContext(ctx, http.MethodPost, upURL, bytes.NewReader(data))
-	if err != nil {
-		return "", fmt.Errorf("gemini files: build upload: %w", err)
-	}
-	ureq.Header.Set("X-Goog-Upload-Offset", "0")
-	ureq.Header.Set("X-Goog-Upload-Command", "upload, finalize")
-	uresp, err := f.http.Do(ureq)
+	file, err := f.client.Files.Upload(ctx, bytes.NewReader(data), &genai.UploadFileConfig{
+		MIMEType:    mime,
+		DisplayName: name,
+	})
 	if err != nil {
 		return "", fmt.Errorf("gemini files: upload: %w", err)
 	}
-	defer uresp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(uresp.Body, 1<<20))
-	if err != nil {
-		return "", fmt.Errorf("gemini files: read upload response: %w", err)
-	}
-	if uresp.StatusCode/100 != 2 {
-		return "", geminiFilesError("upload", uresp.StatusCode, raw)
-	}
-	var fi struct {
-		File struct {
-			Name           string `json:"name"` // files/<id>
-			URI            string `json:"uri"`
-			State          string `json:"state"` // PROCESSING | ACTIVE | FAILED
-			ExpirationTime string `json:"expirationTime"`
-		} `json:"file"`
-	}
-	if err := json.Unmarshal(raw, &fi); err != nil {
-		return "", fmt.Errorf("gemini files: decode upload response: %w", err)
-	}
-	if fi.File.URI == "" {
+	if file.URI == "" {
 		return "", fmt.Errorf("gemini files: upload returned no file uri")
 	}
 
-	// 3. Large files (video especially) are processed asynchronously; poll
+	// Large files (video especially) are processed asynchronously; poll
 	// files.get until ACTIVE.
-	state, err := f.awaitActive(ctx, fi.File.Name, fi.File.State)
+	state, err := f.awaitActive(ctx, file.Name, file.State)
 	if err != nil {
 		return "", err
 	}
-	if state != "ACTIVE" {
-		return "", fmt.Errorf("gemini files: file %s is %s, not ACTIVE", fi.File.Name, state)
+	if state != genai.FileStateActive {
+		return "", fmt.Errorf("gemini files: file %s is %s, not ACTIVE", file.Name, state)
 	}
 
 	expiry := time.Now().Add(47 * time.Hour) // files auto-delete after 48h
-	if fi.File.ExpirationTime != "" {
-		if t, err := time.Parse(time.RFC3339, fi.File.ExpirationTime); err == nil {
-			expiry = t.Add(-time.Hour) // refresh with margin
-		}
+	if !file.ExpirationTime.IsZero() {
+		expiry = file.ExpirationTime.Add(-time.Hour) // refresh with margin
 	}
-	geminiCachePut(cacheKey, fi.File.URI, expiry)
-	return fi.File.URI, nil
+	geminiCachePut(cacheKey, file.URI, expiry)
+	return file.URI, nil
 }
 
 // awaitActive polls files.get while a file is PROCESSING (bounded).
-func (f *geminiFiles) awaitActive(ctx context.Context, name, state string) (string, error) {
-	for i := 0; state == "PROCESSING" && i < 20; i++ {
+func (f *geminiFiles) awaitActive(ctx context.Context, name string, state genai.FileState) (genai.FileState, error) {
+	for i := 0; state == genai.FileStateProcessing && i < 20; i++ {
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
 		case <-time.After(500 * time.Millisecond):
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.apiBase+"/"+name, nil)
-		if err != nil {
-			return "", fmt.Errorf("gemini files: build get: %w", err)
-		}
-		f.auth(req)
-		resp, err := f.http.Do(req)
+		file, err := f.client.Files.Get(ctx, name, nil)
 		if err != nil {
 			return "", fmt.Errorf("gemini files: poll: %w", err)
 		}
-		raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		resp.Body.Close()
-		if err != nil {
-			return "", fmt.Errorf("gemini files: poll read: %w", err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			return "", geminiFilesError("poll file", resp.StatusCode, raw)
-		}
-		var g struct {
-			State string `json:"state"`
-		}
-		if err := json.Unmarshal(raw, &g); err != nil {
-			return "", fmt.Errorf("gemini files: decode poll: %w", err)
-		}
-		state = g.State
+		state = file.State
 	}
 	return state, nil
-}
-
-func (f *geminiFiles) auth(req *http.Request) {
-	if f.key != "" {
-		req.Header.Set("x-goog-api-key", f.key)
-	}
-}
-
-// geminiFilesError renders a non-2xx without leaking the api key.
-func geminiFilesError(op string, status int, body []byte) error {
-	return fmt.Errorf("gemini files: %s: status %d: %s", op, status, strings.TrimSpace(string(body)))
 }

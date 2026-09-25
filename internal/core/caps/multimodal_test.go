@@ -34,7 +34,12 @@ func TestLLMChatResolvesAttachmentHandleToBase64(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		// A chunk the SDK can decode, then the terminator — `data: [DONE]`
+		// alone ends the stream without yielding an event, which the provider
+		// now reports. The assertion above is on the request body.
+		_, _ = w.Write([]byte(
+			`data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}` + "\n\n" +
+				"data: [DONE]\n\n"))
 	}))
 	defer srv.Close()
 

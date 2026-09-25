@@ -21,6 +21,12 @@
 // landed in the blob store; the message carries small part descriptors
 // (handles), never the bytes. Replies carrying attachments upload them via
 // multipart (sendPhoto/sendAudio/sendVideo/sendDocument).
+//
+// The Bot API itself is spoken through github.com/go-telegram/bot. The webhook
+// *receiver* is not: handleWebhook is hand-written so its status codes (405,
+// 503, 401, 403, 400, 200) and the order in which they are reached stay exactly
+// what README.md promises, and the body is decoded into this package's own
+// thin inbound types rather than the SDK's full models.
 package telegram
 
 import (
@@ -30,20 +36,49 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"mime/multipart"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/go-telegram/bot"
+	"github.com/go-telegram/bot/models"
 
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/router"
 	"agentflow/internal/core/session"
 	"agentflow/internal/drivers/httpd"
+)
+
+const (
+	// pollTimeout is the getUpdates long-poll window. The SDK derives the
+	// `timeout` parameter from it and expects the HTTP client to outlive it, so
+	// the driver's own client timeout is set well above this.
+	pollTimeout = 30 * time.Second
+
+	// callTimeout bounds one small Bot API call, uploadTimeout one that carries
+	// a file. Both bound a single attempt only — a rate-limit wait happens
+	// between attempts, outside the deadline.
+	callTimeout   = 15 * time.Second
+	uploadTimeout = 60 * time.Second
+
+	// rateLimitRetries is how many times a 429 is slept out before the call is
+	// given up on. Telegram's retry_after is its own estimate, so three waits
+	// ride out a throttled burst without stalling a reply for minutes.
+	rateLimitRetries = 3
+
+	// photoCaptionLimit is Telegram's caption length limit, in characters.
+	photoCaptionLimit = 1024
+
+	// defaultMaxMediaBytes caps a single ingest when the media policy sets no
+	// limit of its own.
+	defaultMaxMediaBytes = 8 << 20
 )
 
 // Driver is the Telegram channel driver. It implements gateway.Driver for
@@ -64,6 +99,14 @@ type Driver struct {
 	sink        router.Sink
 	log         *slog.Logger
 	client      *http.Client
+
+	// The SDK client is built on first use rather than in New: New must stay
+	// infallible (it installs the webhook handler and mints the secret), and
+	// tests construct a Driver literal with only the fields they need — so the
+	// wiring inputs above stay the seam and the client is derived from them.
+	botOnce sync.Once
+	bot     *bot.Bot
+	botErr  error
 }
 
 func New(name, token, agent, mode string, allowUsers []int64, path, publicURL, secretToken string, sink router.Sink, srv *httpd.Server, store media.Store, pol media.Policy, log *slog.Logger) *Driver {
@@ -187,12 +230,86 @@ func (d *Driver) startAuto(ctx context.Context) error {
 // polling exits via ctx cancellation. Method retained for the Driver surface.
 func (d *Driver) Stop(_ context.Context) {}
 
-func (d *Driver) apiURL(method string) string {
-	base := d.apiBase
-	if base == "" {
-		base = "https://api.telegram.org"
+// tg returns the SDK client, building it on first use. Construction is deferred
+// so that a Driver literal (the tests) can be handed to any method, and so that
+// a token the operator is still editing does not fail channel setup before the
+// first call.
+func (d *Driver) tg() (*bot.Bot, error) {
+	d.botOnce.Do(func() {
+		opts := []bot.Option{
+			// New calls getMe to validate the token unless told not to. The
+			// driver never needs the bot's own user, and a dead network at boot
+			// is not a reason to refuse to build the channel.
+			bot.WithSkipGetMe(),
+			// The long-poll window the SDK asks for comes from this timeout; the
+			// HTTP client handed alongside it must outlive it, so the two travel
+			// together and the tests' short-timeout client stays in charge.
+			bot.WithHTTPClient(pollTimeout, d.httpClient()),
+			// Nothing but messages carries anything this driver can act on, so
+			// getUpdates asks Telegram for nothing else.
+			bot.WithAllowedUpdates(bot.AllowedUpdates{"message"}),
+			// Handle updates inline, on the polling goroutine. The default is a
+			// goroutine per update, which would reorder a chat's messages under
+			// the router and let a flood of updates spawn unbounded goroutines.
+			bot.WithNotAsyncHandlers(),
+			// Polling failures (429, 5xx, network) belong in the channel's log
+			// with its driver/channel fields, not in the SDK's package-level one.
+			bot.WithErrorsHandler(func(err error) { d.log.Warn("telegram api error", "err", err) }),
+			// A polling update arrives as the SDK's model; handleUpdate speaks
+			// this package's own shape, which is also what handleWebhook decodes.
+			bot.WithDefaultHandler(func(_ context.Context, _ *bot.Bot, u *models.Update) {
+				d.handleUpdate(fromSDK(u))
+			}),
+		}
+		if base := d.apiBase; base != "" {
+			opts = append(opts, bot.WithServerURL(base))
+		}
+		d.bot, d.botErr = bot.New(d.token, opts...)
+	})
+	if d.botErr != nil {
+		return nil, fmt.Errorf("telegram: bot client: %w", d.botErr)
 	}
-	return base + "/bot" + d.token + "/" + method
+	return d.bot, nil
+}
+
+// httpClient is the client every Telegram request goes through, defaulting when
+// a driver was built without one.
+func (d *Driver) httpClient() *http.Client {
+	if d.client != nil {
+		return d.client
+	}
+	return &http.Client{Timeout: callTimeout}
+}
+
+// call runs one outbound Bot API call, sleeping out a 429 and trying again
+// while it lasts. The SDK parses retry_after into *bot.TooManyRequestsError but
+// only acts on it in its own polling loop, so without this a throttled channel
+// silently drops replies. errors.As is the wrapped-tolerant form of the SDK's
+// bot.IsTooManyRequestsError. timeout bounds one attempt; the wait between
+// attempts is deliberately outside it, since retry_after is usually longer than
+// one call's budget.
+func (d *Driver) call(method string, timeout time.Duration, fn func(context.Context) error) error {
+	for attempt := 0; ; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		err := fn(ctx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		var limited *bot.TooManyRequestsError
+		if !errors.As(err, &limited) || attempt >= rateLimitRetries {
+			return err
+		}
+		wait := time.Duration(limited.RetryAfter) * time.Second
+		if wait <= 0 {
+			// "Too many requests" with no window to respect; a second keeps the
+			// retry from becoming a spin.
+			wait = time.Second
+		}
+		d.log.Warn("telegram rate limited, backing off",
+			"method", method, "retry_after_s", int(wait.Seconds()), "attempt", attempt+1)
+		time.Sleep(wait)
+	}
 }
 
 // ensureNoWebhook clears any Telegram-side webhook before polling begins. A
@@ -220,48 +337,50 @@ func generateWebhookSecret() (string, error) {
 }
 
 // setWebhook registers hookURL with Telegram so updates are pushed there.
-// An empty URL clears the webhook (see deleteWebhook). drain is false so we
-// don't drop in-flight updates on the switch. When a secretToken is set it
-// is registered too, and Telegram then presents it on every delivery as the
-// X-Telegram-Bot-Api-Secret-Token header (verified in handleWebhook).
+// An empty URL clears the webhook (see deleteWebhook). drop_pending_updates is
+// left false — the SDK omits the field, which is the same thing to Telegram —
+// so a mode switch does not discard updates that were already in flight. When a
+// secretToken is set it is registered too, and Telegram then presents it on
+// every delivery as the X-Telegram-Bot-Api-Secret-Token header (verified in
+// handleWebhook). A 429 is slept out rather than failing the channel, since
+// webhook registration failing means no inbound at all.
 func (d *Driver) setWebhook(hookURL string) error {
-	body := map[string]any{
-		"url":             hookURL,
-		"allowed_updates": []string{"message"},
+	b, err := d.tg()
+	if err != nil {
+		return err
+	}
+	params := &bot.SetWebhookParams{
+		URL:            hookURL,
+		AllowedUpdates: []string{"message"},
 	}
 	if d.secretToken != "" {
-		body["secret_token"] = d.secretToken
+		params.SecretToken = d.secretToken
 	}
-	b, _ := json.Marshal(body)
-	return d.postAPI("setWebhook", b)
+	return d.call("setWebhook", callTimeout, func(ctx context.Context) error {
+		_, err := b.SetWebhook(ctx, params)
+		return err
+	})
 }
 
 // deleteWebhook clears any registered webhook URL so Telegram stops pushing.
+// drop_pending_updates is explicitly false (and the SDK then omits it, which
+// Telegram reads the same way): nothing already queued should be lost.
 func (d *Driver) deleteWebhook() error {
-	body, _ := json.Marshal(map[string]any{"drop_pending_updates": false})
-	return d.postAPI("deleteWebhook", body)
-}
-
-func (d *Driver) postAPI(method string, body []byte) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	b, err := d.tg()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.apiURL(method), bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return fmt.Errorf("%s: %d: %s", method, resp.StatusCode, b)
-	}
-	return nil
+	_, err = b.DeleteWebhook(ctx, &bot.DeleteWebhookParams{DropPendingUpdates: false})
+	return err
 }
 
+// --- inbound ---
+
+// update is one Telegram update, reduced to the parts this driver acts on. It
+// is decoded from the webhook request body and, for polling, converted from the
+// SDK's model by fromSDK.
 type update struct {
 	UpdateID int64      `json:"update_id"`
 	Message  *tgMessage `json:"message"`
@@ -282,29 +401,40 @@ type tgMessage struct {
 		Type string `json:"type"`
 	} `json:"chat"`
 	Photo []photoSize `json:"photo"`
-	Doc   *struct {
-		FileID   string `json:"file_id"`
-		FileName string `json:"file_name"`
-		MIME     string `json:"mime_type"`
-		FileSize int64  `json:"file_size"`
-	} `json:"document"`
-	Voice *struct {
-		FileID   string `json:"file_id"`
-		Duration int    `json:"duration"`
-		MIME     string `json:"mime_type"`
-	} `json:"voice"`
-	Audio *struct {
-		FileID   string `json:"file_id"`
-		FileName string `json:"file_name"`
-		MIME     string `json:"mime_type"`
-		FileSize int64  `json:"file_size"`
-	} `json:"audio"`
-	Video *struct {
-		FileID   string `json:"file_id"`
-		FileName string `json:"file_name"`
-		MIME     string `json:"mime_type"`
-		FileSize int64  `json:"file_size"`
-	} `json:"video"`
+	Doc   *document   `json:"document"`
+	Voice *voice      `json:"voice"`
+	Audio *audio      `json:"audio"`
+	Video *video      `json:"video"`
+}
+
+// The attachment shapes are named types rather than inline structs because both
+// inbound paths have to build one: the webhook decodes them and fromSDK maps
+// the SDK's models into them.
+type document struct {
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name"`
+	MIME     string `json:"mime_type"`
+	FileSize int64  `json:"file_size"`
+}
+
+type voice struct {
+	FileID   string `json:"file_id"`
+	Duration int    `json:"duration"`
+	MIME     string `json:"mime_type"`
+}
+
+type audio struct {
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name"`
+	MIME     string `json:"mime_type"`
+	FileSize int64  `json:"file_size"`
+}
+
+type video struct {
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name"`
+	MIME     string `json:"mime_type"`
+	FileSize int64  `json:"file_size"`
 }
 
 type photoSize struct {
@@ -314,63 +444,67 @@ type photoSize struct {
 	FileSize int64  `json:"file_size"`
 }
 
-type updatesResponse struct {
-	OK          bool     `json:"ok"`
-	Result      []update `json:"result"`
-	Description string   `json:"description"`
+// fromSDK maps one polling update onto the driver's own inbound shape. The
+// webhook path decodes that shape straight from the request body (its handler
+// is hand-written, the SDK's is not used), so polling converts here rather than
+// the driver growing a second inbound type — and with it a second path to the
+// allow-list check, media ingest and text extraction.
+func fromSDK(u *models.Update) update {
+	out := update{UpdateID: u.ID}
+	m := u.Message
+	if m == nil {
+		return out
+	}
+	msg := &tgMessage{
+		MessageID: int64(m.ID),
+		Text:      m.Text,
+		Caption:   m.Caption,
+	}
+	out.Message = msg
+	if m.From != nil {
+		msg.From.ID = m.From.ID
+		msg.From.Username = m.From.Username
+		msg.From.FirstName = m.From.FirstName
+	}
+	msg.Chat.ID = m.Chat.ID
+	msg.Chat.Type = string(m.Chat.Type)
+	for _, p := range m.Photo {
+		msg.Photo = append(msg.Photo, photoSize{
+			FileID:   p.FileID,
+			Width:    p.Width,
+			Height:   p.Height,
+			FileSize: int64(p.FileSize),
+		})
+	}
+	if doc := m.Document; doc != nil {
+		msg.Doc = &document{FileID: doc.FileID, FileName: doc.FileName, MIME: doc.MimeType, FileSize: doc.FileSize}
+	}
+	if v := m.Voice; v != nil {
+		msg.Voice = &voice{FileID: v.FileID, Duration: v.Duration, MIME: v.MimeType}
+	}
+	if a := m.Audio; a != nil {
+		msg.Audio = &audio{FileID: a.FileID, FileName: a.FileName, MIME: a.MimeType, FileSize: a.FileSize}
+	}
+	if v := m.Video; v != nil {
+		msg.Video = &video{FileID: v.FileID, FileName: v.FileName, MIME: v.MimeType, FileSize: v.FileSize}
+	}
+	return out
 }
 
 // --- polling mode ---
 
+// poll hands the getUpdates loop to the SDK: offset tracking, the long-poll
+// window and the 429 backoff all live in there now. It blocks until ctx is
+// done, which is why every caller runs it on its own goroutine.
 func (d *Driver) poll(ctx context.Context) {
+	b, err := d.tg()
+	if err != nil {
+		d.log.Error("telegram polling cannot start", "err", err)
+		return
+	}
 	d.log.Info("telegram polling started")
-	var offset int64
-	for ctx.Err() == nil {
-		updates, err := d.getUpdates(ctx, offset)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			d.log.Warn("getUpdates failed", "err", err)
-			select {
-			case <-time.After(3 * time.Second):
-			case <-ctx.Done():
-				return
-			}
-			continue
-		}
-		for _, u := range updates {
-			offset = u.UpdateID + 1
-			d.handleUpdate(u)
-		}
-	}
-}
-
-func (d *Driver) getUpdates(ctx context.Context, offset int64) ([]update, error) {
-	url := d.apiURL("getUpdates") +
-		"?timeout=30&offset=" + strconv.FormatInt(offset, 10) +
-		`&allowed_updates=["message"]`
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return nil, err
-	}
-	var ur updatesResponse
-	if err := json.Unmarshal(body, &ur); err != nil {
-		return nil, fmt.Errorf("bad getUpdates response: %w", err)
-	}
-	if !ur.OK {
-		return nil, fmt.Errorf("telegram api: %s", ur.Description)
-	}
-	return ur.Result, nil
+	b.Start(ctx)
+	d.log.Info("telegram polling stopped")
 }
 
 // --- webhook mode ---
@@ -505,7 +639,9 @@ func orDefault(s, def string) string {
 }
 
 // downloadFile fetches a Telegram file by id (getFile → file download URL)
-// and lands it in the blob store under the channel policy.
+// and lands it in the blob store under the channel policy. getFile goes through
+// the SDK; the bytes themselves do not, since the SDK exposes the download link
+// and nothing else.
 func (d *Driver) downloadFile(fileID, mime, name string, size int64) (media.Part, error) {
 	if mime == "" {
 		mime = "application/octet-stream"
@@ -515,54 +651,33 @@ func (d *Driver) downloadFile(fileID, mime, name string, size int64) (media.Part
 	}
 	limit := d.pol.MaxBytes
 	if limit <= 0 {
-		limit = 8 << 20
+		limit = defaultMaxMediaBytes
 	}
 	if size > 0 && size > limit {
 		return media.Part{}, fmt.Errorf("telegram: file %d bytes exceeds limit %d", size, limit)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	b, err := d.tg()
+	if err != nil {
+		return media.Part{}, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
 	defer cancel()
-	// getFile
-	furl := d.apiURL("getFile") + "?file_id=" + fileID
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, furl, nil)
-	if err != nil {
-		return media.Part{}, err
-	}
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return media.Part{}, err
-	}
-	var fr struct {
-		OK     bool `json:"ok"`
-		Result *struct {
-			FileID       string `json:"file_id"`
-			FileUniqueID string `json:"file_unique_id"`
-			FileSize     int64  `json:"file_size"`
-			FilePath     string `json:"file_path"`
-		} `json:"result"`
-		Description string `json:"description"`
-	}
-	err = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&fr)
-	resp.Body.Close()
-	if err != nil {
-		return media.Part{}, err
-	}
-	if !fr.OK || fr.Result == nil || fr.Result.FilePath == "" {
-		return media.Part{}, fmt.Errorf("getFile: %s", fr.Description)
-	}
 
-	// file download: {apiBase}/file/bot{token}/{file_path}
-	base := d.apiBase
-	if base == "" {
-		base = "https://api.telegram.org"
-	}
-	dlURL := base + "/file/bot" + d.token + "/" + fr.Result.FilePath
-	req, err = http.NewRequestWithContext(ctx, http.MethodGet, dlURL, nil)
+	f, err := b.GetFile(ctx, &bot.GetFileParams{FileID: fileID})
 	if err != nil {
 		return media.Part{}, err
 	}
-	resp, err = d.client.Do(req)
+	if f.FilePath == "" {
+		return media.Part{}, fmt.Errorf("getFile: no file_path for %s", fileID)
+	}
+	// The link is {apiBase}/file/bot{token}/{file_path}, so this follows the
+	// same server override getFile did.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.FileDownloadLink(f), nil)
+	if err != nil {
+		return media.Part{}, err
+	}
+	resp, err := d.httpClient().Do(req)
 	if err != nil {
 		return media.Part{}, err
 	}
@@ -589,69 +704,52 @@ func (d *Driver) Deliver(replyTo, text string, attachments []media.Part) error {
 	}
 	// Text with non-leading image attachments: send it as its own message
 	// first so nothing is silently lost (only sendPhoto takes a caption).
-	if text != "" && attachments[0].Type != "image" {
+	if text != "" && attachments[0].Type != partImage {
 		if err := d.sendText(replyTo, text); err != nil {
 			return err
 		}
 		text = ""
 	}
 	for i, att := range attachments {
-		method, field := sendMethodFor(att.Type)
 		caption := ""
-		if i == 0 && text != "" && method == "sendPhoto" {
+		if i == 0 && text != "" && att.Type == partImage {
 			caption = text
-			if len(caption) > 1024 {
-				caption = caption[:1024]
+			if len(caption) > photoCaptionLimit {
+				caption = caption[:photoCaptionLimit]
 			}
 		}
-		if err := d.uploadMedia(replyTo, method, field, att, caption); err != nil {
+		if err := d.uploadMedia(replyTo, att, caption); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func sendMethodFor(partType string) (method, fileField string) {
-	switch partType {
-	case "image":
-		return "sendPhoto", "photo"
-	case "audio":
-		return "sendAudio", "audio"
-	case "video":
-		return "sendVideo", "video"
-	default:
-		return "sendDocument", "document"
-	}
-}
+// partImage is the media class that maps to sendPhoto, the one method that
+// carries a caption.
+const partImage = "image"
 
 func (d *Driver) sendText(replyTo, text string) error {
-	body, _ := json.Marshal(map[string]any{
-		"chat_id": replyTo,
-		"text":    text,
+	return d.call("sendMessage", callTimeout, func(ctx context.Context) error {
+		b, err := d.tg()
+		if err != nil {
+			return err
+		}
+		_, err = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: replyTo, Text: text})
+		return err
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.apiURL("sendMessage"), bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("content-type", "application/json")
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return fmt.Errorf("sendMessage: %d: %s", resp.StatusCode, b)
-	}
-	return nil
 }
 
-// uploadMedia POSTs one attachment as multipart/form-data. Bytes come from
-// the blob store (handle) or inline base64 (data); URL-only parts are an
-// error — resolve or download them first.
-func (d *Driver) uploadMedia(replyTo, method, field string, att media.Part, caption string) error {
+// uploadMedia POSTs one attachment as multipart/form-data, through the send*
+// method that carries that class of part. Bytes come from the blob store
+// (handle) or inline base64 (data); URL-only parts are an error — resolve or
+// download them first.
+//
+// There is no file-field name to carry around any more: an SDK params struct
+// *is* one method and names its own file field, so sendMethodFor picks the
+// method and the switch below picks the struct that matches it.
+func (d *Driver) uploadMedia(replyTo string, att media.Part, caption string) error {
+	method := sendMethodFor(att.Type)
 	var payload []byte
 	switch {
 	case att.Handle != "" && d.store != nil:
@@ -661,7 +759,7 @@ func (d *Driver) uploadMedia(replyTo, method, field string, att media.Part, capt
 		}
 		payload = b
 	case att.Data != "":
-		b, err := base64Decode(att.Data)
+		b, err := base64.StdEncoding.DecodeString(att.Data)
 		if err != nil {
 			return fmt.Errorf("%s: bad base64: %w", method, err)
 		}
@@ -670,14 +768,6 @@ func (d *Driver) uploadMedia(replyTo, method, field string, att media.Part, capt
 		return fmt.Errorf("%s: attachment has no resolvable source (need handle or data)", method)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	var buf bytes.Buffer
-	w := multipart.NewWriter(&buf)
-	_ = w.WriteField("chat_id", replyTo)
-	if caption != "" {
-		_ = w.WriteField("caption", caption)
-	}
 	name := att.Name
 	if name == "" {
 		name = "file"
@@ -685,37 +775,40 @@ func (d *Driver) uploadMedia(replyTo, method, field string, att media.Part, capt
 			name += mimeExtension(att.MIME)
 		}
 	}
-	fw, err := w.CreateFormFile(field, name)
-	if err != nil {
+	return d.call(method, uploadTimeout, func(ctx context.Context) error {
+		b, err := d.tg()
+		if err != nil {
+			return err
+		}
+		upload := &models.InputFileUpload{Filename: name, Data: bytes.NewReader(payload)}
+		switch method {
+		case "sendPhoto":
+			_, err = b.SendPhoto(ctx, &bot.SendPhotoParams{ChatID: replyTo, Photo: upload, Caption: caption})
+		case "sendAudio":
+			_, err = b.SendAudio(ctx, &bot.SendAudioParams{ChatID: replyTo, Audio: upload, Caption: caption})
+		case "sendVideo":
+			_, err = b.SendVideo(ctx, &bot.SendVideoParams{ChatID: replyTo, Video: upload, Caption: caption})
+		default:
+			_, err = b.SendDocument(ctx, &bot.SendDocumentParams{ChatID: replyTo, Document: upload, Caption: caption})
+		}
 		return err
-	}
-	if _, err := fw.Write(payload); err != nil {
-		return err
-	}
-	if err := w.Close(); err != nil {
-		return err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.apiURL(method), &buf)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", w.FormDataContentType())
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return fmt.Errorf("%s: %d: %s", method, resp.StatusCode, b)
-	}
-	return nil
+	})
 }
 
-// base64Decode is std base64; used for inline data parts.
-func base64Decode(s string) ([]byte, error) {
-	return base64.StdEncoding.DecodeString(s)
+// sendMethodFor names the Bot API method a media class is sent with. The call
+// is dispatched on the returned name; this remains the one place the mapping is
+// written down, and the caption rule in Deliver turns on it.
+func sendMethodFor(partType string) string {
+	switch partType {
+	case partImage:
+		return "sendPhoto"
+	case "audio":
+		return "sendAudio"
+	case "video":
+		return "sendVideo"
+	default:
+		return "sendDocument"
+	}
 }
 
 // mimeExtension maps common MIME types to a sane fallback filename extension.

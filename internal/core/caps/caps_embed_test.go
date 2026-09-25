@@ -32,6 +32,11 @@ func TestEmbedHandlerResolvesHandleAndPassesOpts(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		body = string(b)
+		// The content type is load-bearing now. Go's sniffer labels this JSON
+		// fixture text/plain, and the official SDK refuses to decode a response
+		// whose content type is not JSON; the hand-rolled client decoded
+		// whatever it was handed.
+		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"data":[{"index":0,"embedding":[0.1]}],"usage":{"prompt_tokens":3}}`))
 	}))
 	defer srv.Close()

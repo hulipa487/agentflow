@@ -39,11 +39,11 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 
 | Domain | Providers |
 |---|---|
-| LLM | `anthropic` (Messages API), `openai` (Chat Completions + Embeddings), `openai-responses` (Responses API), `gemini` (Interactions API), `rerank` (cross-encoder rerank) — all pointed at compatible endpoints via `base_url` |
+| LLM | `anthropic` (Messages API), `openai` (Chat Completions + Embeddings), `openai-responses` (Responses API), `gemini` (Interactions API), `rerank` (cross-encoder rerank) — all pointed at compatible endpoints via `base_url`; the wire is the official provider SDK (`anthropic-sdk-go`, `openai-go`, `genai`) |
 | Storage | SQLite, Redis, MongoDB, PostgreSQL, in-memory volatile |
 | Media store | local filesystem (default), S3 / MinIO (hand-rolled SigV4, no AWS SDK) — content-addressed `media:<sha256>` handles |
 | File store | same content-addressed blob family (`files:` config, fs or S3-compatible incl. Cloudflare R2); snapshot metadata in the runtime sqlite `files_meta` table |
-| Vector | pgvector (cosine similarity), Qdrant, Redis |
+| Vector | pgvector (cosine similarity), Qdrant (gRPC; a `:6333` url port dials `:6334`), Redis |
 | Channels | webhook (sync reply with configurable `timeout`, or `async: true` fire-and-poll via `GET <path>result/<id>` / `callback_url`), GitHub webhook (`ghhook`), Telegram (polling + webhook + auto) |
 | Mail | IMAP fetch + SMTP send (in-process, cap `net.mail`) |
 | Shell | Docker, SSH |
@@ -128,7 +128,7 @@ models:
     server_tools: []                      # provider-native tools, e.g. [google_search] on gemini
 ```
 
-`provider` selects the request/response shape (`anthropic` | `openai` | `openai-responses` | `gemini` | `rerank`); `base_url` selects the host. `thinking` sets the model's default thinking level — one provider-neutral vocabulary (`off` | `low` | `medium` | `high` | `xhigh` | `max`) mapped per provider (Anthropic `budget_tokens`, OpenAI `reasoning_effort`, Gemini `thinking_budget`); overridable per call via `llm.chat` `opts.thinking`. Whatever reasoning content a provider sends is surfaced passively on the reply (`reply.thinking` text, `reply.thinking_blocks` raw blocks, `usage.reasoning` tokens); an Anthropic multi-round tool loop replays the blocks verbatim via `thinking_blocks` on the assistant turn. `server_tools` injects provider-native, server-side tools (e.g. Google Search grounding on `gemini`, `web_search` on `openai-responses`) that run inside the provider's completion.
+`provider` selects the request/response shape (`anthropic` | `openai` | `openai-responses` | `gemini` | `rerank`); `base_url` selects the host. `thinking` sets the model's default thinking level — one provider-neutral vocabulary (`off` | `low` | `medium` | `high` | `xhigh` | `max`) mapped per provider (Anthropic `budget_tokens`, OpenAI `reasoning_effort`, Gemini `thinking_level` + `thinking_summaries`); overridable per call via `llm.chat` `opts.thinking`. Whatever reasoning content a provider sends is surfaced passively on the reply (`reply.thinking` text, `reply.thinking_blocks` raw blocks, `usage.reasoning` tokens); an Anthropic multi-round tool loop replays the blocks verbatim via `thinking_blocks` on the assistant turn. `server_tools` injects provider-native, server-side tools (e.g. Google Search grounding on `gemini`, `web_search` on `openai-responses`) that run inside the provider's completion.
 
 The runtime ships as a standalone engine. Reference product apps built on top
 of agentflow — for example a full multi-agent orchestrator (main + expert +
@@ -168,6 +168,42 @@ agentflow/
 ```
 
 ## Upgrade notes
+
+- **The LLM providers now speak their vendors' official SDKs.** `anthropic`, `openai`,
+  `openai-responses`, `gemini` and embeddings are built on `anthropic-sdk-go`, `openai-go` and
+  `genai` instead of hand-rolled HTTP. Everything a loop can observe is unchanged: the same
+  providers, the same `base_url` contract, the same thinking levels, tool calls, usage accounting
+  (including cached and reasoning tokens), Anthropic thinking-block replay, and the whole
+  multimodal matrix — the `video_url`/`file_url` conventions, the MiniMax Anthropic video block,
+  the Responses video and audio items, and bare `server_tools` entries included. Those shapes have
+  no variant in the SDKs' typed request unions, so they are built with `param.Override` — the
+  SDKs' own raw-JSON escape hatch — rather than by hand-writing the request.
+
+  Three Gemini behaviours did change, each a limit of its SDK: `temperature` appears nowhere in
+  the Interactions models, so `llm.chat{temperature=...}` is refused by name on that provider (the
+  hand-rolled client sent an undocumented top-level field); `thinking: off` maps to `minimal`,
+  the lowest rung, because the level enum has no "off"; and a keyless model fails fast, since the
+  client refuses to build without an API key.
+
+- **Provider credentials come from the config, never the process environment.** The SDKs autoload
+  `OPENAI_API_KEY`, `OPENAI_ORG_ID`, `ANTHROPIC_API_KEY` and friends; the runtime now suppresses
+  that, because `api_key` is the only documented source (a literal or a `${VAR}`/`cred:` reference
+  the Manager expands). This restores the previous behaviour exactly: a model entry with no
+  `api_key` sends no credential at all. It matters most for an entry that leaves `api_key` empty
+  while pointing `base_url` at a third-party endpoint — it no longer forwards the deployment's
+  real provider key there.
+
+- **Qdrant is spoken to over gRPC, and the `url`'s port is read as a REST one.** The backend
+  used Qdrant's REST API and now uses the official gRPC client. `url` keeps its shape — and it
+  stays a URL, so `${QDRANT_URL}` and `http://host:6333` references are unchanged — but its port
+  is translated for the dial: an explicit `6333`, the REST default every deployment's URL
+  carries, becomes the gRPC default `6334`; any other explicit port is dialled as given, so a
+  gRPC proxy still works; a URL with no port gets `6334`. An `http` scheme dials plaintext and
+  `https` dials with TLS. A deployment that reached Qdrant through a REST-only proxy (or on a
+  non-default REST port) must point `url` at the gRPC listener instead. Everything else about
+  the backend is unchanged: `api_key`, `collection`, `dim`, `distance` and `timeout` mean what
+  they did, the points keep their deterministic ids, and an existing `agentflow` collection is
+  read and written as before.
 
 - **Safety profile references must resolve, and `profiles.safety` now applies.** An agent's
   `safety:` field accepted any string and resolved an unknown one to `safety.None` with no

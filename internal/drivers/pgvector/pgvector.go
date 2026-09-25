@@ -14,6 +14,10 @@ import (
 	"time"
 
 	"agentflow/internal/core/memory"
+	// pgvector.Vector implements driver.Valuer, returning the vector as a
+	// PostgreSQL text literal (e.g. "[1.0,2.0]"). The $n::vector casts below
+	// accept that text representation.
+	"github.com/pgvector/pgvector-go"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -113,7 +117,7 @@ func (h *Handle) Put(table, key string, value any, opts memory.PutOpts) error {
 		_, err = h.db.ExecContext(ctx,
 			`INSERT INTO vec_kv (table_name, key, value, embedding, updated_at) VALUES ($1, $2, $3, $4::vector, $5)
 			 ON CONFLICT (table_name, key) DO UPDATE SET value = EXCLUDED.value, embedding = EXCLUDED.embedding, updated_at = EXCLUDED.updated_at`,
-			table, key, b, floatSliceToVector(opts.Vector), now)
+			table, key, b, pgvector.NewVector(opts.Vector), now)
 		return err
 	}
 	// No embedding supplied: upsert the value and keep any existing
@@ -166,13 +170,12 @@ func (h *Handle) Query(table string, q memory.Query) (memory.Iterator, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	embStr := floatSliceToVector(q.Vector)
 	rows, err := h.db.QueryContext(ctx,
 		`SELECT key, value FROM vec_kv
 		 WHERE table_name = $1 AND embedding IS NOT NULL
 		 ORDER BY embedding <=> $2::vector
 		 LIMIT $3`,
-		table, embStr, k)
+		table, pgvector.NewVector(q.Vector), k)
 	if err != nil {
 		return nil, err
 	}
@@ -200,11 +203,3 @@ func scanKV(rows *sql.Rows) (memory.Record, error) {
 
 func (h *Handle) GC(table string, window int) error { return nil }
 func (h *Handle) Close() error                      { return h.db.Close() }
-
-func floatSliceToVector(v []float32) string {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return "[]"
-	}
-	return string(b)
-}

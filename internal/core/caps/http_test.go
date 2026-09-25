@@ -36,7 +36,15 @@ func recordBodyServer(t *testing.T, bodies *[][]byte) *httptest.Server {
 		*bodies = append(*bodies, b)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		// One chunk the SDK can decode, then the terminator. `data: [DONE]`
+		// alone ends the SSE stream without ever yielding an event, which the
+		// provider now reports as "stream closed before any event" rather than
+		// treating it as an empty reply the way the hand-rolled reader did.
+		// These tests assert on the request body, so the reply only has to be
+		// something the provider understands.
+		_, _ = w.Write([]byte(
+			`data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}` + "\n\n" +
+				"data: [DONE]\n\n"))
 	}))
 	t.Cleanup(srv.Close)
 	return srv

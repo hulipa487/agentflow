@@ -3,7 +3,6 @@ package telegram
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,6 +16,8 @@ type mockTG struct {
 	base           string
 	webhook        string
 	secrets        []string // secret_token values seen in setWebhook bodies
+	allowed        []string // allowed_updates values seen in setWebhook bodies
+	updates        string   // one raw getUpdates result, served once; empty = no updates
 	deletes        int
 	sets           int
 	getUpdatesHits int
@@ -30,25 +31,39 @@ func newMockTG(t *testing.T) *mockTG {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/botTEST/getUpdates", func(w http.ResponseWriter, r *http.Request) {
 		m.getUpdatesHits++
-		// return empty result list — polling stops via ctx
+		// serve the queued update once — polling stops via ctx
+		if upd := m.updates; upd != "" {
+			m.updates = ""
+			_, _ = w.Write([]byte(`{"ok":true,"result":[` + upd + `]}`))
+			return
+		}
 		_, _ = w.Write([]byte(`{"ok":true,"result":[]}`))
 	})
 	mux.HandleFunc("/botTEST/setWebhook", func(w http.ResponseWriter, r *http.Request) {
 		m.sets++
-		b, _ := io.ReadAll(r.Body)
-		var v map[string]any
-		_ = json.Unmarshal(b, &v)
-		if u, ok := v["url"].(string); ok {
-			m.webhook = u
-		}
-		if s, ok := v["secret_token"].(string); ok {
+		// The fields are unchanged, but the body is multipart/form-data now
+		// rather than the JSON this driver used to hand-roll: the SDK builds
+		// one form for every method. Reading the values off the form is what
+		// the assertions below still pin; the encoding is the SDK's business.
+		_ = r.ParseMultipartForm(1 << 20)
+		m.webhook = r.FormValue("url")
+		if s := r.FormValue("secret_token"); s != "" {
 			m.secrets = append(m.secrets, s)
+		}
+		if a := r.FormValue("allowed_updates"); a != "" {
+			var updates []string
+			if json.Unmarshal([]byte(a), &updates) == nil {
+				m.allowed = updates
+			}
 		}
 		if m.failSet {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		_, _ = w.Write([]byte(`{"ok":true}`))
+		// The SDK decodes the envelope's result into a bool and reports a
+		// missing one as a decode error, so the answer has to carry it; real
+		// Telegram always does.
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
 	})
 	mux.HandleFunc("/botTEST/deleteWebhook", func(w http.ResponseWriter, r *http.Request) {
 		m.deletes++
@@ -56,7 +71,7 @@ func newMockTG(t *testing.T) *mockTG {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		_, _ = w.Write([]byte(`{"ok":true}`))
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
 	})
 	m.srv = httptest.NewServer(mux)
 	t.Cleanup(m.srv.Close)
@@ -149,6 +164,9 @@ func TestAutoUnreachableFallsBackToPolling(t *testing.T) {
 	}
 }
 
+// TestSetDeleteWebhook also pins allowed_updates: Telegram defaults to sending
+// every update type, and only messages are handled, so the registration has to
+// keep asking for messages alone now that the SDK builds the request.
 func TestSetDeleteWebhook(t *testing.T) {
 	m := newMockTG(t)
 	d := &Driver{
@@ -166,6 +184,9 @@ func TestSetDeleteWebhook(t *testing.T) {
 	}
 	if m.sets != 1 || m.webhook != "https://example.com/wh/" {
 		t.Fatalf("set: sets=%d url=%q", m.sets, m.webhook)
+	}
+	if len(m.allowed) != 1 || m.allowed[0] != "message" {
+		t.Fatalf("setWebhook must ask for message updates only: %v", m.allowed)
 	}
 	if err := d.deleteWebhook(); err != nil {
 		t.Fatal(err)
@@ -220,6 +241,46 @@ func TestPollingModeDeletesStaleWebhook(t *testing.T) {
 	}
 	if m.deletes != 1 {
 		t.Fatalf("polling must clear a stale webhook first: deletes=%d", m.deletes)
+	}
+}
+
+// TestPollingDeliversUpdateToSink: polling is handed the SDK's own update model
+// and converts it, so it is the only path where a field can be dropped without
+// the webhook tests noticing — they decode the driver's shape straight from a
+// request body. The allow-list is left on, so a conversion that lost the sender
+// id would drop this message instead of delivering it.
+func TestPollingDeliversUpdateToSink(t *testing.T) {
+	m := newMockTG(t)
+	m.updates = `{"update_id":7,"message":{"message_id":1,"date":1,"text":"hello",` +
+		`"from":{"id":7,"is_bot":false,"username":"someone","first_name":"Some One"},` +
+		`"chat":{"id":99,"type":"private"}}}`
+	sink := &captureSink{}
+	d := &Driver{
+		name:    "telegram",
+		token:   "TEST",
+		agent:   "main",
+		mode:    "polling",
+		apiBase: m.base,
+		allow:   map[int64]bool{7: true},
+		sink:    sink,
+		log:     testLogger(),
+		client:  &http.Client{Timeout: 5 * time.Second},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := d.Start(ctx); err != nil {
+		t.Fatalf("polling start: %v", err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && len(sink.inbs) == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(sink.inbs) != 1 {
+		t.Fatalf("polling must deliver the update: %d", len(sink.inbs))
+	}
+	msg := sink.inbs[0].Message
+	if msg.Text != "hello" || msg.ReplyTo != "99" || msg.From != "user:telegram:7" {
+		t.Fatalf("converted update lost a field: %+v", msg)
 	}
 }
 
@@ -292,5 +353,85 @@ func TestAutoSetWebhookFailureDeletesAndPolls(t *testing.T) {
 	}
 	if m.getUpdatesHits == 0 {
 		t.Fatal("fallback must reach the poll loop")
+	}
+}
+
+// TestSetWebhookRetriesOnRateLimit: a 429 is Telegram asking to be called again
+// after a window, not a failure, so the driver sleeps the advertised
+// retry_after and retries. The SDK does this inside its own getUpdates loop but
+// leaves every other method to the caller, which is what call() exists for.
+//
+// The cost of this test is real: retry_after is in whole seconds, so the
+// shortest honest window still sleeps ~1s per 429.
+func TestSetWebhookRetriesOnRateLimit(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls <= 2 {
+			// Telegram's own answer, HTTP status and body together. The SDK
+			// keys on error_code in the body, not the status line.
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":1}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer srv.Close()
+
+	d := &Driver{
+		name:    "telegram",
+		token:   "TEST",
+		agent:   "main",
+		mode:    "polling",
+		path:    "/webhook/telegram/",
+		apiBase: srv.URL,
+		log:     testLogger(),
+		client:  &http.Client{Timeout: 5 * time.Second},
+	}
+	start := time.Now()
+	if err := d.setWebhook("https://example.com/wh/"); err != nil {
+		t.Fatalf("setWebhook: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("setWebhook made %d attempts; want 3 (two 429s, then success)", calls)
+	}
+	// Two 1s windows. The floor matters: a retry that returned immediately
+	// would hammer Telegram, which is what the window is for.
+	if elapsed := time.Since(start); elapsed < 2*time.Second {
+		t.Fatalf("setWebhook returned after %v; the retry_after window was not slept", elapsed)
+	}
+}
+
+// TestSetWebhookGivesUpAfterRateLimit: the backoff is bounded. Once the retries
+// are spent the 429 is surfaced rather than slept on forever, so a hard
+// throttle cannot wedge the caller.
+func TestSetWebhookGivesUpAfterRateLimit(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":1}}`))
+	}))
+	defer srv.Close()
+
+	d := &Driver{
+		name:    "telegram",
+		token:   "TEST",
+		agent:   "main",
+		mode:    "polling",
+		path:    "/webhook/telegram/",
+		apiBase: srv.URL,
+		log:     testLogger(),
+		client:  &http.Client{Timeout: 5 * time.Second},
+	}
+	err := d.setWebhook("https://example.com/wh/")
+	if err == nil {
+		t.Fatal("a permanently throttled setWebhook must fail rather than retry forever")
+	}
+	if !strings.Contains(err.Error(), "Too Many Requests") {
+		t.Fatalf("error %q does not surface the rate limit", err)
+	}
+	if calls != rateLimitRetries+1 {
+		t.Fatalf("made %d attempts; want %d (the initial call plus rateLimitRetries)", calls, rateLimitRetries+1)
 	}
 }

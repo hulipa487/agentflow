@@ -80,6 +80,9 @@ func TestGoogleSearchModelOverride(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		gotBody = string(b)
+		// The SDK decodes only a reply it can classify by content type; without
+		// this the 200 comes back as an unknown-content-type error.
+		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, googleOK)
 	}))
 	defer srv.Close()

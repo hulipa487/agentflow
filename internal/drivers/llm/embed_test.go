@@ -113,6 +113,12 @@ func embedOnceParts(t *testing.T, parts []media.Part, eo EmbedOpts) ([][]float32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		body = string(b)
+		// A real embeddings endpoint answers application/json. The official
+		// SDK checks the content type and refuses to decode a JSON body that
+		// arrives as anything else; the hand-rolled client simply decoded
+		// whatever it was given, so this mock used to get away without the
+		// header.
+		w.Header().Set("content-type", "application/json")
 		w.Write([]byte(`{"data":[{"index":0,"embedding":[0.1,0.2]}],"usage":{"prompt_tokens":7}}`))
 	}))
 	defer srv.Close()

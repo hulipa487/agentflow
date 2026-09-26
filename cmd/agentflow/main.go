@@ -1203,7 +1203,11 @@ func main() {
 	if routeRef == "" {
 		routeRef = "plugin:per_chat"
 	}
-	routeSrc, _, err := builtins.Resolve(routeRef)
+	// The second value is the route's hot-reload watch path: the plugins.dir
+	// shadow or file behind the ref, "" for an unshadowed builtin (the embedded
+	// handler has no file to poll). It is kept and handed to the reload watcher
+	// below — routing is policy, and policy is hot-reloadable here.
+	routeSrc, routeWatchPath, err := builtins.Resolve(routeRef)
 	if err != nil {
 		log.Error("route plugin resolve failed", "err", err)
 		os.Exit(1)
@@ -1422,6 +1426,13 @@ func main() {
 		promptSrc = &reload.PromptSource{Registry: promptReg, Files: promptFiles}
 	}
 	watcher := reload.New(sup, promptSrc, log)
+	// The route handler and the plugins.dir support chunks are policy too, and
+	// they are watched on the same terms as a loop: the route is swapped by
+	// rebuilding the router's service state (no session is involved — routing
+	// does not run in one), and a support chunk restarts every live session,
+	// because every session loads all of them.
+	watcher.SetRoute(&reload.RouteSource{Ref: routeRef, WatchPath: routeWatchPath, Apply: rtr.Reload})
+	watcher.SetSupport(&reload.SupportSource{Paths: builtins.SupportChunkPaths(), Reload: sup.ReloadAll})
 	watcher.Start()
 
 	// Metrics/admin: authenticated HTTP endpoint with health/readiness/metrics

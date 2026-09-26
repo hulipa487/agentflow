@@ -1,6 +1,14 @@
 // Package builtins ships the default plugins, embedded in the binary.
 // Builtins are plugins with the same contract as user plugins; a file
 // <plugins.dir>/<name>.lua shadows a builtin by name (see SetPluginDir).
+//
+// Every chunk this package hands out — embedded, shadowed, or read from a
+// path — has passed the prelude version gate (vm.CheckChunkVersion): it
+// declares the prelude API version it targets and that version is the one this
+// core provides. Resolve returns a refusal instead of source for a chunk that
+// does not, which is what stops a core upgrade from silently loading Lua
+// written against a different API. There is no compatibility window, by
+// design — see vm.PreludeVersion.
 package builtins
 
 import (
@@ -10,6 +18,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"agentflow/internal/vm"
 )
 
 //go:embed lua/per_chat.lua
@@ -93,9 +103,25 @@ func shadow(name string) (src, path string, ok bool) {
 	return string(b), p, true
 }
 
+// SupportChunkPaths returns the file backing each support chunk that
+// plugins.dir overrides, keyed by chunk name. Only a shadow has a path: an
+// embedded chunk has no file, so there is nothing on disk to watch. The
+// deployment's reload watcher polls these, which is what makes a shadowed
+// support chunk hot-reloadable rather than new-session-only.
+func SupportChunkPaths() map[string]string {
+	out := map[string]string{}
+	for _, name := range supportOrder {
+		if _, path, ok := shadow(name); ok {
+			out[name] = path
+		}
+	}
+	return out
+}
+
 // SupportChunks returns the support chunks loaded into every session state
-// before the loop plugin. A chunk shadowed in plugins.dir loads from disk
-// (and is re-read per spawn, so shadow edits take effect on new sessions).
+// before the loop plugin. A chunk shadowed in plugins.dir loads from disk (and
+// is re-read on every session start — the first one and each reload restart —
+// so a shadow edit takes effect on the next restart of every session).
 func SupportChunks() []string {
 	out := make([]string, 0, len(supportOrder))
 	for _, name := range supportOrder {
@@ -115,13 +141,29 @@ func SupportChunks() []string {
 // hot-reload ("" for unshadowed builtins): a file watches itself; a
 // directory is concatenated as its *.lua files in sorted name order and the
 // directory is watched as a whole.
+//
+// Every chunk returned has passed the prelude version gate, named in the error
+// by the path the chunk was read from. A directory is checked member by member,
+// not as the concatenation: only the first member's directive would lead the
+// joined source, so a support member written against an older prelude would be
+// invisible to a check on the result.
 func Resolve(ref string) (src string, watchPath string, err error) {
 	if name, ok := strings.CutPrefix(ref, "plugin:"); ok {
 		if _, found := sources[name]; !found {
 			return "", "", fmt.Errorf("unknown plugin %q (builtins are named plugin:<name>, e.g. plugin:per_chat)", ref)
 		}
 		if src, path, ok := shadow(name); ok {
+			if err := vm.CheckChunkVersion(path, src); err != nil {
+				return "", "", err
+			}
 			return src, path, nil
+		}
+		// The embedded chunk is checked like any other. A failure here is a
+		// broken build rather than a broken deployment — the conformance suite
+		// (TestPreludeContract) refuses to ship one — and it is better to
+		// refuse to start than to run a core whose own Lua is out of step.
+		if err := vm.CheckChunkVersion("builtin:"+name, sources[name]); err != nil {
+			return "", "", err
 		}
 		return sources[name], "", nil
 	}
@@ -133,6 +175,9 @@ func Resolve(ref string) (src string, watchPath string, err error) {
 		b, err := os.ReadFile(ref)
 		if err != nil {
 			return "", "", fmt.Errorf("read plugin %s: %w", ref, err)
+		}
+		if err := vm.CheckChunkVersion(ref, string(b)); err != nil {
+			return "", "", err
 		}
 		return string(b), ref, nil
 	}
@@ -149,9 +194,13 @@ func Resolve(ref string) (src string, watchPath string, err error) {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".lua") {
 			continue
 		}
-		b, err := os.ReadFile(ref + "/" + e.Name())
+		member := filepath.Join(ref, e.Name())
+		b, err := os.ReadFile(member)
 		if err != nil {
-			return "", "", fmt.Errorf("read %s/%s: %w", ref, e.Name(), err)
+			return "", "", fmt.Errorf("read %s: %w", member, err)
+		}
+		if err := vm.CheckChunkVersion(member, string(b)); err != nil {
+			return "", "", err
 		}
 		parts = append(parts, string(b))
 	}

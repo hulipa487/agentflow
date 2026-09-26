@@ -1,3 +1,4 @@
+-- af-prelude-version: 1
 -- plugin:token_budget — the default prompt.budget handler.
 --
 -- Loaded into every session state before the loop plugin (as the global

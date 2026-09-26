@@ -3,6 +3,7 @@ package reload
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -11,11 +12,21 @@ import (
 	"testing"
 	"time"
 
+	"agentflow/internal/builtins"
 	"agentflow/internal/core/gateway"
 	"agentflow/internal/core/pool"
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/supervisor"
+	"agentflow/internal/vm"
 )
+
+// directive is the prelude version line every Lua fixture has to carry: the
+// agent's loop is refused at boot and at reload without it, and the fixtures
+// here are reloaded rather than only read. Spelling it from vm.PreludeVersion
+// keeps a version bump from turning every fixture in this file red for a reason
+// that has nothing to do with what it tests — the chunks this repo ships spell
+// the number literally, and the conformance suite is what pins those.
+func directive() string { return fmt.Sprintf("-- af-prelude-version: %d\n", vm.PreludeVersion) }
 
 // syncBuf is a goroutine-safe log sink (the watcher polls on its own goroutine
 // while the test reads).
@@ -78,8 +89,8 @@ type dirLoop struct {
 func newDirLoop(t *testing.T, names ...string) *dirLoop {
 	t.Helper()
 	dir := t.TempDir()
-	writeMember(t, dir, "10-main.lua", "function loop() while true do session.inbox() end end\n")
-	writeMember(t, dir, "20-tools.lua", "-- tools member\n")
+	writeMember(t, dir, "10-main.lua", directive()+"function loop() while true do session.inbox() end end\n")
+	writeMember(t, dir, "20-tools.lua", directive()+"-- tools member\n")
 
 	logs := &syncBuf{}
 	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -594,7 +605,7 @@ func TestSharedInstructionsPathUpdatesEveryAgent(t *testing.T) {
 // TestUnchangedPathDoesNotReload: the same guard for a single-file loop.
 func TestUnchangedPathDoesNotReload(t *testing.T) {
 	shared := filepath.Join(t.TempDir(), "loop.lua")
-	if err := os.WriteFile(shared, []byte("function loop() end\n"), 0o600); err != nil {
+	if err := os.WriteFile(shared, []byte(directive()+"function loop() end\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -616,5 +627,379 @@ func TestUnchangedPathDoesNotReload(t *testing.T) {
 	time.Sleep(1200 * time.Millisecond)
 	if got := logs.String(); strings.Contains(got, "reload:") {
 		t.Fatalf("an untouched loop must not reload:\n%s", got)
+	}
+}
+
+// TestVersionMismatchKeepsRunningLoop: a reload whose chunk targets another
+// prelude version is refused, loudly, and the version already running keeps
+// serving. Gating the reload path is what makes the gate mean anything — this
+// is the path that swaps Lua under a live deployment, and a gate that ran only
+// at boot would let hot reload install exactly the chunk it exists to stop.
+//
+// The stale member is the second one on purpose. A directory loop concatenates
+// its members in sorted order, so only the first member's directive leads the
+// joined source; a check on the concatenation would read that one and wave the
+// whole loop through.
+func TestVersionMismatchKeepsRunningLoop(t *testing.T) {
+	fx := newDirLoop(t, "alpha")
+	stale := fmt.Sprintf("-- af-prelude-version: %d\n-- tools member\n", vm.PreludeVersion+1)
+
+	w := New(fx.sup, nil, fx.log)
+	w.Start()
+	defer w.Stop()
+
+	writeMember(t, fx.dir, "20-tools.lua", stale)
+	touch(t, filepath.Join(fx.dir, "20-tools.lua"))
+
+	waitFor(t, "the watcher to refuse the mismatched loop", 10*time.Second, func() bool {
+		// Error level, not Warn: a chunk written against another API is a
+		// contract violation, and the operator has a deploy to fix.
+		return loggedLine(fx.logs.String(), "level=ERROR", "reload: prelude version mismatch")
+	})
+
+	// The member is correct again. The refusal must not be sticky — the next
+	// edit reloads as any other edit would.
+	writeMember(t, fx.dir, "20-tools.lua", directive()+"-- tools member\n")
+	touch(t, filepath.Join(fx.dir, "20-tools.lua"))
+
+	waitFor(t, "the fixed loop to be accepted", 10*time.Second, func() bool {
+		return strings.Contains(fx.logs.String(), "reload: new version accepted")
+	})
+	// One acceptance, and it is the one after the fix: had the mismatched
+	// edit been swapped in, the loop would have restarted onto a chunk this
+	// core cannot serve and there would be two.
+	if n := countLogged(fx.logs.String(), "reload: new version accepted"); n != 1 {
+		t.Fatalf("%d loops accepted; want exactly the one written after the fix", n)
+	}
+}
+
+// routeFixture drives the route half of the watcher the way main wires it: the
+// default route ref (plugin:per_chat) shadowed by plugins.dir, the watch path
+// Resolve hands back for that shadow, and the sources the watcher was asked to
+// install. No supervisor is needed — the route runs in the router's service
+// state, not in a session — so this is the poll-and-apply path on its own.
+type routeFixture struct {
+	file    string
+	sup     *supervisor.Supervisor
+	logs    *syncBuf
+	log     *slog.Logger
+	w       *Watcher
+	mu      sync.Mutex
+	applied []string
+}
+
+var (
+	routeFirst  = directive() + "function loop() while true do session.inbox() end end -- v1\n"
+	routeSecond = directive() + "function loop() while true do session.inbox() end end -- v2\n"
+	routeBroken = directive() + "function loop() while true do this is not lua end\n"
+)
+
+func newRouteFixture(t *testing.T) *routeFixture {
+	t.Helper()
+	dir := t.TempDir()
+	// The shape the vision describes: the deployment's own routing, shadowing
+	// the builtin by name in plugins.dir.
+	file := filepath.Join(dir, "per_chat.lua")
+	if err := os.WriteFile(file, []byte(routeFirst), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	builtins.SetPluginDir(dir)
+	t.Cleanup(func() { builtins.SetPluginDir("") })
+
+	src, watch, err := builtins.Resolve("plugin:per_chat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if watch != file {
+		t.Fatalf("shadowed route watch path = %q, want %q", watch, file)
+	}
+	if src != routeFirst {
+		t.Fatalf("route source is not the shadow:\n%s", src)
+	}
+
+	logs := &syncBuf{}
+	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	sup := supervisor.New(map[string]*supervisor.AgentDef{}, gateway.NewRegistry(log), pool.New(1), nil, log)
+
+	fx := &routeFixture{file: file, sup: sup, logs: logs, log: log}
+	w := New(sup, nil, log)
+	w.SetRoute(&RouteSource{Ref: "plugin:per_chat", WatchPath: watch, Apply: fx.apply})
+	w.Start()
+	t.Cleanup(w.Stop)
+	fx.w = w
+	return fx
+}
+
+func (fx *routeFixture) apply(src string) {
+	fx.mu.Lock()
+	defer fx.mu.Unlock()
+	fx.applied = append(fx.applied, src)
+}
+
+func (fx *routeFixture) sources() []string {
+	fx.mu.Lock()
+	defer fx.mu.Unlock()
+	return append([]string(nil), fx.applied...)
+}
+
+func (fx *routeFixture) edit(t *testing.T, body string) {
+	t.Helper()
+	if err := os.WriteFile(fx.file, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	touch(t, fx.file)
+}
+
+// TestRouteReloadSwapsHandler: gateway.route now has a watch entry, so an edit
+// to the file behind it reaches the running router instead of waiting for a
+// restart. Routing is the one piece §5.2 assigns to proprietary Lua outright
+// ("gateway.route is ours"), and it was the one piece that could not be
+// hot-reloaded: the watch path Resolve returns was discarded at boot.
+func TestRouteReloadSwapsHandler(t *testing.T) {
+	fx := newRouteFixture(t)
+
+	// An untouched route must stay put: the mtime is seeded at Start.
+	time.Sleep(1200 * time.Millisecond)
+	if got := fx.sources(); len(got) != 0 {
+		t.Fatalf("an untouched route was applied %d times", len(got))
+	}
+
+	fx.edit(t, routeSecond)
+
+	waitFor(t, "the new route to be installed", 10*time.Second, func() bool {
+		return len(fx.sources()) == 1
+	})
+	if got := fx.sources()[0]; got != routeSecond {
+		t.Fatalf("applied source = %q, want the edited route", got)
+	}
+	if !loggedLine(fx.logs.String(), "reload: new route accepted", "file="+fx.file) {
+		t.Fatalf("route reload not logged with its file:\n%s", fx.logs.String())
+	}
+}
+
+// TestRouteCompileFailureKeepsRunningHandler: a broken route edit is refused
+// before it is applied, so the handler serving every inbound stays the one that
+// works. A typo must not take routing down for the whole deployment — the same
+// guarantee a loop file gets.
+func TestRouteCompileFailureKeepsRunningHandler(t *testing.T) {
+	fx := newRouteFixture(t)
+
+	fx.edit(t, routeBroken)
+
+	waitFor(t, "the bad route to be refused", 10*time.Second, func() bool {
+		return loggedLine(fx.logs.String(), "reload: route compile failed")
+	})
+	// Several more polls: the refusal must not turn into an accept.
+	time.Sleep(1200 * time.Millisecond)
+
+	if got := fx.sources(); len(got) != 0 {
+		t.Fatalf("a route that does not compile was installed: %q", got)
+	}
+	if strings.Contains(fx.logs.String(), "reload: new route accepted") {
+		t.Fatalf("a broken route was accepted:\n%s", fx.logs.String())
+	}
+}
+
+// TestUnshadowedRouteIsNotWatched: the default route ref with no plugins.dir
+// resolves to the embedded handler, which is not a file — Resolve reports no
+// watch path, so there is nothing to poll and no reload to make. This is the
+// one case a route edit still cannot reach, and it is the same rule a builtin
+// loop follows.
+func TestUnshadowedRouteIsNotWatched(t *testing.T) {
+	builtins.SetPluginDir("")
+	_, watch, err := builtins.Resolve("plugin:per_chat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if watch != "" {
+		t.Fatalf("an embedded builtin must have no watch path, got %q", watch)
+	}
+
+	logs := &syncBuf{}
+	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	sup := supervisor.New(map[string]*supervisor.AgentDef{}, gateway.NewRegistry(log), pool.New(1), nil, log)
+
+	applied := 0
+	w := New(sup, nil, log)
+	w.SetRoute(&RouteSource{Ref: "plugin:per_chat", WatchPath: watch, Apply: func(string) { applied++ }})
+	w.Start()
+	defer w.Stop()
+
+	time.Sleep(1200 * time.Millisecond)
+	if applied != 0 {
+		t.Fatal("an unshadowed builtin route was reloaded")
+	}
+	if strings.Contains(logs.String(), "reload: watching route") {
+		t.Fatalf("nothing should be watched for an embedded route:\n%s", logs.String())
+	}
+}
+
+// supportFixture is a deployment whose plugins.dir shadows one support chunk,
+// with one live session per agent. Each session's loop reports the marker the
+// chunk defines, so a test can see which version of the chunk a live session is
+// actually running — the thing GAP 2 was about.
+type supportFixture struct {
+	dir  string
+	file string
+	sup  *supervisor.Supervisor
+	logs *syncBuf
+	log  *slog.Logger
+}
+
+var (
+	chunkFirst  = directive() + "SUPPORT_MARK = \"v1\"\n"
+	chunkSecond = directive() + "SUPPORT_MARK = \"v2\"\n"
+)
+
+// markLoop reports the marker the shadowed chunk defines, on every turn.
+const markLoop = `function loop()
+  while true do
+    local m = session.inbox()
+    log.info("MARK:" .. tostring(SUPPORT_MARK))
+  end
+end
+`
+
+func newSupportFixture(t *testing.T, names ...string) *supportFixture {
+	t.Helper()
+	dir := t.TempDir()
+	file := filepath.Join(dir, "token_budget.lua")
+	if err := os.WriteFile(file, []byte(chunkFirst), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The shadow is what makes the chunk a file on disk at all: an embedded
+	// chunk has nothing to watch, which is why the deployment's plugins.dir is
+	// the whole watch surface here.
+	builtins.SetPluginDir(dir)
+	t.Cleanup(func() { builtins.SetPluginDir("") })
+
+	logs := &syncBuf{}
+	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	defs := map[string]*supervisor.AgentDef{}
+	for _, name := range names {
+		defs[name] = &supervisor.AgentDef{
+			Info:         &session.Info{Name: name, HistoryBudget: 100},
+			Capabilities: map[string]bool{},
+			Handlers:     map[string]session.OpHandler{},
+			LoopSrc:      markLoop,
+		}
+	}
+	sup := supervisor.New(defs, gateway.NewRegistry(log), pool.New(2), nil, log)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sup.Start(ctx)
+
+	fx := &supportFixture{dir: dir, file: file, sup: sup, logs: logs, log: log}
+	for _, name := range names {
+		if err := sup.Deliver(name, "k", session.Message{ID: "m1", Type: "user", From: "u", Text: "hi"}); err != nil {
+			t.Fatalf("deliver to %s: %v", name, err)
+		}
+	}
+	// Every session must have loaded the chunk (and reported it) before the
+	// test edits the file, or the edit races the first load.
+	for _, name := range names {
+		skey := "session=" + name + "|k"
+		waitFor(t, "session "+name+" to report its chunk", 10*time.Second, func() bool {
+			return loggedLine(logs.String(), "MARK:v1", skey)
+		})
+	}
+	return fx
+}
+
+// startWatcher polls the deployment's shadowed support chunks, applying a
+// change the way main wires it: every live session restarts.
+func (fx *supportFixture) startWatcher(t *testing.T) *Watcher {
+	t.Helper()
+	w := New(fx.sup, nil, fx.log)
+	w.SetSupport(&SupportSource{Paths: builtins.SupportChunkPaths(), Reload: fx.sup.ReloadAll})
+	w.Start()
+	t.Cleanup(w.Stop)
+	return w
+}
+
+func (fx *supportFixture) edit(t *testing.T, body string) {
+	t.Helper()
+	if err := os.WriteFile(fx.file, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	touch(t, fx.file)
+}
+
+// TestSupportChunkEditReachesLiveSessions: a plugins.dir edit to a support
+// chunk used to land only on the next new session — the chunks were re-read per
+// spawn and nothing told a running one to reload. Now the watcher polls the
+// shadow, and a change restarts every live session, which is where the new
+// chunk is loaded. The sessions are all of them: every session loads every
+// support chunk, so there is no per-agent reference to key a reload by.
+func TestSupportChunkEditReachesLiveSessions(t *testing.T) {
+	fx := newSupportFixture(t, "alpha", "beta")
+	fx.startWatcher(t)
+
+	fx.edit(t, chunkSecond)
+
+	waitFor(t, "the change to be applied", 10*time.Second, func() bool {
+		return loggedLine(fx.logs.String(), "reload: support chunks updated", "chunks=token_budget")
+	})
+	waitFor(t, "both sessions to restart", 10*time.Second, func() bool {
+		return len(agentsNamed(fx.logs.String(), "hot reload: restarting loop", "session=", "alpha", "beta")) == 2
+	})
+
+	// The restarted sessions must be running the new chunk, not merely
+	// restarted: a turn now reports v2.
+	for _, name := range []string{"alpha", "beta"} {
+		if err := fx.sup.Deliver(name, "k", session.Message{ID: "m2", Type: "user", From: "u", Text: "again"}); err != nil {
+			t.Fatalf("deliver to %s: %v", name, err)
+		}
+	}
+	for _, name := range []string{"alpha", "beta"} {
+		skey := "session=" + name + "|k"
+		waitFor(t, "session "+name+" to run the new chunk", 10*time.Second, func() bool {
+			return loggedLine(fx.logs.String(), "MARK:v2", skey)
+		})
+	}
+}
+
+// TestSupportChunkCompileFailureKeepsOldVersion: a broken chunk edit is refused
+// before any session is restarted, so live sessions keep running the version
+// already loaded — a typo in a support chunk cannot take sessions down.
+func TestSupportChunkCompileFailureKeepsOldVersion(t *testing.T) {
+	fx := newSupportFixture(t, "alpha")
+	fx.startWatcher(t)
+
+	fx.edit(t, "SUPPORT_MARK = \"v2\"\nfunction broken( end\n")
+
+	waitFor(t, "the bad chunk to be refused", 10*time.Second, func() bool {
+		return loggedLine(fx.logs.String(), "reload: support chunk compile failed", "chunk=token_budget")
+	})
+	time.Sleep(1200 * time.Millisecond)
+
+	if strings.Contains(fx.logs.String(), "reload: support chunks updated") {
+		t.Fatalf("a chunk that does not compile was applied:\n%s", fx.logs.String())
+	}
+	if strings.Contains(fx.logs.String(), "hot reload: restarting loop") {
+		t.Fatalf("sessions were restarted for a broken chunk:\n%s", fx.logs.String())
+	}
+
+	// The live session is still the one that works.
+	if err := fx.sup.Deliver("alpha", "k", session.Message{ID: "m2", Type: "user", From: "u", Text: "again"}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the session to keep running the old chunk", 10*time.Second, func() bool {
+		return countLogged(fx.logs.String(), "MARK:v1") >= 2
+	})
+}
+
+// TestUnchangedSupportChunkDoesNotReload: an untouched shadow stays quiet
+// across polls — the mtime is seeded at Start, so only a real edit restarts the
+// deployment's sessions.
+func TestUnchangedSupportChunkDoesNotReload(t *testing.T) {
+	fx := newSupportFixture(t, "alpha")
+	fx.startWatcher(t)
+
+	time.Sleep(1600 * time.Millisecond)
+
+	if strings.Contains(fx.logs.String(), "reload: support chunks updated") {
+		t.Fatalf("an untouched support chunk must not reload:\n%s", fx.logs.String())
 	}
 }

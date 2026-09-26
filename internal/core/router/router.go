@@ -10,6 +10,11 @@
 // store (see the route state section below) — and everything else about a
 // handler has to be a function of the message and the configuration. Two
 // instances routing the same message must reach the same session key.
+//
+// The handler is hot-reloadable, like a loop: the reload watcher polls the file
+// behind gateway.route and calls Reload, and the running state is rebuilt from
+// the new source at its next safe point. Routing is stateless, so the rebuild
+// loses nothing.
 package router
 
 import (
@@ -19,6 +24,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -47,7 +53,12 @@ type Router struct {
 	src     string
 	sup     *supervisor.Supervisor
 	mailbox chan Inbound
+	reload  chan struct{}
 	log     *slog.Logger
+
+	// mu guards src, which the reload watcher replaces on its own goroutine
+	// while the router goroutine reads it to build the next state.
+	mu sync.Mutex
 
 	// state is where route state lives. Nil — a deployment with no runtime
 	// store — leaves route.state.* unavailable, which the ops report rather
@@ -77,9 +88,34 @@ func New(src, triggersResp string, sup *supervisor.Supervisor, log *slog.Logger)
 		src:      src,
 		sup:      sup,
 		mailbox:  make(chan Inbound, 256),
+		reload:   make(chan struct{}, 1),
 		triggers: triggersResp,
 		log:      log.With("module", "router"),
 	}
+}
+
+// Reload replaces the route handler with a new source, applied at the state's
+// next safe point — the point where it parks on inbox, between messages, the
+// same place a loop reload lands. Routing is stateless (its memory is in route
+// state, in the shared store), so the state is simply rebuilt from the new
+// source and nothing is lost; a message already queued is routed by the new
+// handler. The source is not validated here: the reload watcher compile-checks
+// it and keeps the running handler if it does not compile.
+func (r *Router) Reload(src string) {
+	r.mu.Lock()
+	r.src = src
+	r.mu.Unlock()
+	select {
+	case r.reload <- struct{}{}:
+	default: // a rebuild is already pending; it reads the source set above
+	}
+}
+
+// source is the handler the next state is built from.
+func (r *Router) source() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.src
 }
 
 // SetStateStore installs the store route state lives in. main calls it once the
@@ -115,50 +151,77 @@ func (r *Router) Submit(in Inbound) {
 	}
 }
 
+// runOutcome is how one run of the route state ended.
+type runOutcome int
+
+const (
+	// runFinished: the handler returned. The state is rebuilt at once, as it
+	// always has been — a handler that returns is a misconfiguration, and
+	// routing must not sit idle for it.
+	runFinished runOutcome = iota
+	// runCrashed: the handler failed. Rebuilt after a pause, so a crash-looping
+	// handler cannot spin.
+	runCrashed
+	// runReloaded: a new source arrived. Rebuilt at once: the pause exists to
+	// damp crashes, and a reload is not one.
+	runReloaded
+)
+
 // Run drives the routing loop until ctx is done; crashes restart the state
-// (routing is stateless, so a fresh state loses nothing).
+// (routing is stateless, so a fresh state loses nothing). A reload from the
+// watcher restarts it the same way, from the new source, without the pause.
 func (r *Router) Run(ctx context.Context) {
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		if crashed := r.runOnce(ctx); crashed {
+		switch r.runOnce(ctx) {
+		case runCrashed:
 			r.log.Warn("router crashed; restarting in 1s")
 			select {
 			case <-ctx.Done():
 				return
 			case <-time.After(time.Second):
 			}
+		case runReloaded:
+			r.log.Info("router reloaded; rebuilding the route state")
 		}
 	}
 }
 
-func (r *Router) runOnce(ctx context.Context) bool {
+func (r *Router) runOnce(ctx context.Context) runOutcome {
 	st := vm.New(5_000_000)
 	defer st.Close()
 	if err := st.LoadBase(); err != nil {
 		r.log.Warn("prelude load failed", "err", err)
-		return true
+		return runCrashed
 	}
 	// The route handler's own surface, on top of the shared prelude: it exists
 	// only in this state, so an agent loop never reaches an op that is not its
 	// business.
 	if err := st.Eval("@route_state", routeStateLua); err != nil {
 		r.log.Warn("route state api load failed", "err", err)
-		return true
+		return runCrashed
 	}
 
-	status, msg := st.Start("loop", r.src)
+	// A signal already pending describes a source this state is about to be
+	// built from anyway — see source() below — so it is dropped here: a reload
+	// that landed before Run costs no rebuild.
+	select {
+	case <-r.reload:
+	default:
+	}
+	status, msg := st.Start("loop", r.source())
 	r.log.Info("router started")
 
 	for {
 		switch status {
 		case vm.Finished:
 			r.log.Info("router loop finished")
-			return false
+			return runFinished
 		case vm.Failed:
 			r.log.Warn("router loop error", "err", msg)
-			return true
+			return runCrashed
 		}
 
 		var op struct {
@@ -175,7 +238,7 @@ func (r *Router) runOnce(ctx context.Context) bool {
 		}
 		if err := json.Unmarshal([]byte(msg), &op); err != nil {
 			r.log.Warn("bad op from router lua", "err", err, "raw", msg)
-			return true
+			return runCrashed
 		}
 
 		resp := "true"
@@ -186,8 +249,14 @@ func (r *Router) runOnce(ctx context.Context) bool {
 			case in := <-r.mailbox:
 				b, _ := json.Marshal(map[string]any{"message": in.Message, "agent": in.Agent})
 				resp = string(b)
+			case <-r.reload:
+				// The safe point: the handler is parked here between messages,
+				// with no coroutine mid-turn, so the state can be torn down and
+				// rebuilt from the new source. An inbound queued behind the
+				// reload is routed by the new handler — it was never answered.
+				return runReloaded
 			case <-ctx.Done():
-				return false
+				return runFinished
 			}
 		case "deliver":
 			// Delivery failures are logged but don't fail the op: a bad agent

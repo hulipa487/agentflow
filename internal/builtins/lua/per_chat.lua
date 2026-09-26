@@ -1,3 +1,4 @@
+-- af-prelude-version: 1
 -- plugin:per_chat — the default gateway.route handler.
 --
 -- Runs in the router's service state (singleton), not in a session. One

@@ -345,6 +345,19 @@ func (s *Supervisor) ReloadAgent(name string) {
 	}
 }
 
+// ReloadAll restarts every live session of every agent. This is what a
+// deployment-wide change uses: the support chunks are loaded into every
+// session's Lua state, so there is no per-agent reference to key a reload by.
+// Like ReloadAgent it signals rather than waits — each session rebuilds at its
+// next safe point, so one that is mid-turn finishes it first.
+func (s *Supervisor) ReloadAll() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range s.sessions {
+		a.Reload()
+	}
+}
+
 // UnknownAgentError is returned when the router names an agent that isn't
 // configured — a broken route plugin, not a runtime failure.
 type UnknownAgentError struct{ Agent string }

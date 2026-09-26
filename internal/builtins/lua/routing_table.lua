@@ -1,3 +1,4 @@
+-- af-prelude-version: 1
 -- plugin:routing_table — default memory.write filter chain.
 --
 -- The chain receives the record written by the agent and returns a list of

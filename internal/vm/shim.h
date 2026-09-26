@@ -20,6 +20,10 @@ typedef struct afvm afvm;
 // instr_budget: interrupt-callback hits allowed per resume before the
 // script is killed (0 = unlimited).
 afvm* afvm_new(long instr_budget);
+// Set the state's total-allocation cap in bytes (0 = uncapped, the default).
+// Exceeding it fails allocations, which Luau raises as an out-of-memory
+// script error — the same death as exceeding the instruction budget.
+void  afvm_set_memcap(afvm* v, long cap);
 void  afvm_close(afvm* v);
 
 // Compile + execute a chunk (typically to define globals).

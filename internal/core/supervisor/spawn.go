@@ -79,12 +79,26 @@ func (s *Supervisor) Spawn(ctx context.Context, parent session.Identity, profile
 		return session.SpawnResult{}, fmt.Errorf("spawn profile %q: %w", profile, err)
 	}
 
+	// The child is a session like any other, so the per-tenant cap (E18)
+	// applies here too — the spawn boundary is the other place actors are
+	// created, and the child acts for the spawning turn's tenant.
+	tenant := session.PersonalUUIDFromCtx(ctx)
+	if tenant != "" && s.sessionCap > 0 {
+		s.mu.Lock()
+		atCap := s.countTenantLocked(tenant) >= s.sessionCap
+		s.mu.Unlock()
+		if atCap {
+			return session.SpawnResult{}, fmt.Errorf("tenant %s is at the live-session cap (%d); refusing to spawn", tenant, s.sessionCap)
+		}
+	}
+
 	a := session.New(skey, identity, info, s.gw, s, s.sched, s.users, tmpl.Safety, tmpl.Handlers, s.pool, s.log)
 	a.LoopFile = tmpl.LoopFile
 	a.LoopSrc = tmpl.LoopSrc
 	a.SupportSrcs = support
 	a.OnExit = s.onActorExit
 	a.Journal = s.EgressJournal
+	a.MemBudget = s.vmMemory
 
 	actorCtx, cancel := context.WithCancel(s.ctx)
 
@@ -99,6 +113,9 @@ func (s *Supervisor) Spawn(ctx context.Context, parent session.Identity, profile
 	}
 	s.sessions[skey] = a
 	s.cancels[skey] = cancel
+	if tenant != "" {
+		s.tenants[skey] = tenant
+	}
 	s.mu.Unlock()
 
 	go a.Run(actorCtx)

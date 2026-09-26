@@ -32,12 +32,43 @@ struct afvm {
     long budget;
     long budget_max;
     int  phase;     // 0 = running plugin chunk, 1 = running loop fn
+    // Memory accounting for the capped allocator (see af_alloc). memcap 0 =
+    // uncapped, which is how every state built before runtime.vm.memory_limit
+    // went live behaves.
+    long mem_used;
+    long memcap;
     // The loop function name. Sized well past anything a caller passes today
     // ("loop", from both the session actor and the router) — it was 64, and a
     // longer name was silently truncated by the snprintf in afvm_start, which
     // then reported "global '<truncated>' is not defined".
     char fn[128];
 };
+
+// ------------------------------------------------------------- allocator ---
+
+// af_alloc is the lua_Alloc the state is built with: plain malloc/realloc
+// semantics plus byte accounting against memcap. Over the cap, allocation
+// fails and Luau raises "out of memory" — a script error like any other, so
+// an oversized state dies under the same crash-restart rule as a runaway one
+// instead of taking the process with it. ud is the owning afvm, which outlives
+// every allocation made from its state (lua_close runs before free(v)).
+static void* af_alloc(void* ud, void* ptr, size_t osize, size_t nsize) {
+    afvm* v = (afvm*)ud;
+    if (nsize == 0) {
+        free(ptr);
+        if (ptr && v) v->mem_used -= (long)osize;
+        return nullptr;
+    }
+    long delta = (long)nsize;
+    if (ptr) delta -= (long)osize;
+    if (v && v->memcap > 0 && (long)v->mem_used + delta > v->memcap) {
+        return nullptr; // over the budget: fail the allocation, keep the books
+    }
+    void* out = realloc(ptr, nsize);
+    if (out && v) v->mem_used += delta;
+    // A failed realloc leaves the original block (and the books) untouched.
+    return out;
+}
 
 // ---------------------------------------------------------------- budget ---
 
@@ -101,8 +132,14 @@ static void open_libs(lua_State* L) {
 
 afvm* afvm_new(long instr_budget) {
     afvm* v = (afvm*)calloc(1, sizeof(afvm));
-    v->L = luaL_newstate();
+    // The state is built on the capped allocator from the start: swapping
+    // allocators under a live state is not a thing lua offers.
+    v->L = lua_newstate(af_alloc, v);
     v->budget = v->budget_max = instr_budget;
+    if (!v->L) {
+        free(v);
+        return nullptr;
+    }
 
     open_libs(v->L);
 
@@ -116,6 +153,12 @@ afvm* afvm_new(long instr_budget) {
     lua_pushcfunction(v->L, af_now, "__af_now");
     lua_setglobal(v->L, "__af_now");
     return v;
+}
+
+// Set the total-allocation cap for this state, in bytes. 0 = uncapped (the
+// default). May be called any time; the cap binds on the next allocation.
+void afvm_set_memcap(afvm* v, long cap) {
+    if (v) v->memcap = cap;
 }
 
 void afvm_close(afvm* v) {

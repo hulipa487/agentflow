@@ -51,6 +51,19 @@ func New(instrBudget int64) *State {
 	return &State{v: C.afvm_new(C.long(instrBudget))}
 }
 
+// SetMemoryCap caps the state's total allocation, in bytes (0 = uncapped, the
+// default). Exceeding it fails allocations, which Luau raises as an
+// out-of-memory script error — the same death as exceeding the instruction
+// budget, so an oversized state dies under the same crash-restart rule. It is
+// the engine's bound (E18's per-tenant VM budget is this cap times the
+// per-tenant session cap), not a Lua-visible setting, so it is set from the
+// host after New.
+func (s *State) SetMemoryCap(capBytes int64) {
+	if s.v != nil {
+		C.afvm_set_memcap(s.v, C.long(capBytes))
+	}
+}
+
 // Close destroys the state.
 func (s *State) Close() {
 	if s.v != nil {

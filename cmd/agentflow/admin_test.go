@@ -23,7 +23,6 @@ func TestWarnInertConfig(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
 	cfg := &config.Config{}
-	cfg.Runtime.VM.MemoryLimit = str("64m")
 	cfg.Runtime.VM.InstructionBudget = str("10m")
 	cfg.Runtime.Scheduler.Workers = &workers
 	cfg.Runtime.Reload.Watch = &visible
@@ -41,13 +40,19 @@ func TestWarnInertConfig(t *testing.T) {
 
 	out := buf.String()
 	for _, want := range []string{
-		"vm.memory_limit", "vm.instruction_budget", "scheduler.workers", "reload.watch",
+		"vm.instruction_budget", "scheduler.workers", "reload.watch",
 		"memory store collection", "memory store policy",
 		"tools.policy.write", "cost_level", "user_visible",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("nothing warned about %q; got:\n%s", want, out)
 		}
+	}
+	// vm.memory_limit used to be on the inert list; it is live now — the cap
+	// reaches every new session's Luau state — so it must warn NOTHING, and
+	// the absence of a warning is the assertion.
+	if strings.Contains(out, "memory_limit") {
+		t.Errorf("vm.memory_limit is live now but still warned as inert:\n%s", out)
 	}
 
 	// A config that sets none of them says nothing: the warnings must not fire

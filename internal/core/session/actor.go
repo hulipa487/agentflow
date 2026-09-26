@@ -536,6 +536,10 @@ type Actor struct {
 	SupportSrc  string   // extra chunk loaded before the plugin (plugin:token_budget)
 	SupportSrcs []string // support chunks loaded before the loop plugin
 	InstrBudget int64
+	// MemBudget caps the live Luau state's total allocation in bytes (0 =
+	// uncapped). Set by the supervisor from runtime.vm.memory_limit; with the
+	// per-tenant session cap it bounds each tenant's VM footprint (E18).
+	MemBudget int64
 
 	Mailbox chan Message
 
@@ -615,6 +619,9 @@ type DefUpdate struct {
 	LoopSrc      string
 	LoopFile     string
 }
+
+// pendingDef stages a DefUpdate for the actor goroutine to apply at the
+// restart the reload signal causes.
 
 // Define stages a def snapshot and signals a restart at the next safe point.
 // The sequencing is the semantics: the turn in flight finishes on the def it
@@ -743,6 +750,9 @@ func (a *Actor) runOnce(ctx context.Context) (crashed bool) {
 	}
 
 	st := vm.New(a.InstrBudget)
+	if a.MemBudget > 0 {
+		st.SetMemoryCap(a.MemBudget)
+	}
 	defer st.Close()
 	if err := st.LoadBase(); err != nil {
 		a.log.Warn("prelude load failed", "err", err)

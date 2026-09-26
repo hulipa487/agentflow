@@ -229,6 +229,18 @@ type Runtime struct {
 	Reload struct {
 		Watch *bool `yaml:"watch"`
 	} `yaml:"reload"`
+	// Limits are the per-tenant resource bounds (E18). Zero (the default)
+	// disables each bound — they are opt-in per deployment — but a hostile
+	// tenant (D14) makes the op-pool fairness unconditional: that one is not
+	// configurable, it is how the pool works now.
+	Limits struct {
+		// SessionsPerTenant caps live sessions per tenant, enforced at the
+		// supervisor's spawn boundary (routed first contact and agent.spawn).
+		SessionsPerTenant int `yaml:"sessions_per_tenant"`
+		// EgressPerMinute caps http.request and mail.send ops per tenant per
+		// minute. A fixed window resets each minute.
+		EgressPerMinute int `yaml:"egress_per_minute"`
+	} `yaml:"limits"`
 	Persistence string            `yaml:"persistence"` // e.g. sqlite://./data/agentflow.db
 	Admin       AdminConfig       `yaml:"admin"`
 	Identity    IdentityConfig    `yaml:"identity"`

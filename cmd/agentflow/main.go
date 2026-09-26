@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"os/signal"
 	"path/filepath"
 	"slices"
@@ -36,6 +37,7 @@ import (
 	"agentflow/internal/core/identity"
 	"agentflow/internal/core/inbox"
 	"agentflow/internal/core/lease"
+	"agentflow/internal/core/limits"
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/memory"
 	"agentflow/internal/core/metrics"
@@ -308,8 +310,7 @@ func main() {
 	tenReg := tenancy.New(rtStore, log)
 	memReg.SetPoolResolver(func(name string) (string, error) {
 		return tenReg.PoolUUIDByName(context.Background(), name)
-	})
-	// Per-call token detail in the ledger (the daily rollup is always written).
+	})	// Per-call token detail in the ledger (the daily rollup is always written).
 	usageEvents := cfg.Usage.UsageEvents()
 
 	// The log plane: the two append-only planes — the message journal and the
@@ -664,6 +665,22 @@ func main() {
 	// override is reported as unclaimed only when no loaded loop declares it.
 	toolWiring := caps.ToolWiring{LuaOverrides: luaOverrides, Prompts: promptReg, Log: log}
 	agentMemories := []memory.AgentMemory{}
+	// Per-tenant egress rate limit (E18): netguard restricts where an agent
+	// may connect, this restricts how often. Keyed on the personal uuid — the
+	// tenant — and shared by every agent's handlers in the process.
+	egressRate := &limits.Rate{Limit: cfg.Runtime.Limits.EgressPerMinute, Window: time.Minute}
+	limitEgress := func(h session.OpHandler) session.OpHandler {
+		if egressRate.Limit <= 0 {
+			return h
+		}
+		return func(ctx context.Context, op session.Op) (string, bool) {
+			if !egressRate.Allow(session.BillingUUIDFromCtx(ctx)) {
+				b, _ := json.Marshal("egress rate limit exceeded for this tenant; retry after the minute rolls over")
+				return string(b), false
+			}
+			return h(ctx, op)
+		}
+	}
 	// buildAgentDef resolves one configured agent into a supervisor
 	// definition. It is the single recipe for agent construction: the boot
 	// loop and the runtime registry (PUT /admin/api/agents/{name}, via the
@@ -770,10 +787,10 @@ func main() {
 			handlers[k] = h
 		}
 		for k, h := range gateOps(enforce, name, effectiveCaps, "net.http", caps.HTTPHandlers(log, credStore, netPolicy, filesMgr), &withheld) {
-			handlers[k] = h
+			handlers[k] = limitEgress(h)
 		}
 		for k, h := range gateOps(enforce, name, effectiveCaps, "net.mail", caps.MailHandlers(log, credStore), &withheld) {
-			handlers[k] = h
+			handlers[k] = limitEgress(h)
 		}
 		for k, h := range gateOps(enforce, name, effectiveCaps, "files", caps.FileHandlers(filesMgr, name), &withheld) {
 			handlers[k] = h
@@ -1056,6 +1073,16 @@ func main() {
 	}
 
 	sup = supervisor.New(defs, gw, opPool, shellMgr, log)
+	// Per-tenant resource bounds (E18). Both are opt-in: 0 disables. The op
+	// pool's fairness, the sharpest bound, is not here — it is how the pool
+	// works now, not a setting.
+	sup.SetSessionCap(cfg.Runtime.Limits.SessionsPerTenant)
+	if mem, err := parseByteSize(cfg.Runtime.VM.MemoryLimit); err != nil {
+		log.Error("runtime.vm.memory_limit is not a size", "value", *cfg.Runtime.VM.MemoryLimit, "err", err)
+		os.Exit(1)
+	} else if mem > 0 {
+		sup.SetVMMemory(mem)
+	}
 
 	// Session hub. A conversation runs on one instance at a time, and in a
 	// fleet any instance may receive its traffic — a webhook load-balanced
@@ -1654,9 +1681,9 @@ func loadConfigSource(cfgPath, configDir string, log *slog.Logger) (*config.Conf
 // Deleting one outright would turn an existing config into a parse error, since
 // decoding is strict — a boot failure for a setting that does nothing.
 func warnInertConfig(cfg *config.Config, log *slog.Logger) {
-	if v := cfg.Runtime.VM.MemoryLimit; v != nil {
-		log.Warn("runtime.vm.memory_limit has no effect: the Luau state has no allocator cap", "value", *v)
-	}
+	// (runtime.vm.memory_limit used to warn here: it was inert — the Luau
+	// state had no allocator cap. It is live now: main parses it and the
+	// supervisor stamps every new session's state with the cap.)
 	if v := cfg.Runtime.VM.InstructionBudget; v != nil {
 		log.Warn("runtime.vm.instruction_budget has no effect: the per-resume budget is fixed at 5,000,000", "value", *v)
 	}
@@ -2014,8 +2041,36 @@ func budgetWindow(a config.Agent) time.Duration {
 	return d
 }
 
-func memoryFromConfig(s config.Store) memory.Store {
-	ret := memory.Store{
+// parseByteSize reads a byte size as a config value: a plain byte count, or a
+// number with a b/kb/mb/gb (case-insensitive, binary multiples) suffix — the
+// spellings "64mb" and "1048576" both work. nil or "" means unset.
+func parseByteSize(v *string) (int64, error) {
+	if v == nil || strings.TrimSpace(*v) == "" {
+		return 0, nil
+	}
+	s := strings.TrimSpace(strings.ToLower(*v))
+	mult := int64(1)
+	switch {
+	case strings.HasSuffix(s, "gb"):
+		mult, s = 1<<30, strings.TrimSuffix(s, "gb")
+	case strings.HasSuffix(s, "mb"):
+		mult, s = 1<<20, strings.TrimSuffix(s, "mb")
+	case strings.HasSuffix(s, "kb"):
+		mult, s = 1<<10, strings.TrimSuffix(s, "kb")
+	case strings.HasSuffix(s, "b"):
+		s = strings.TrimSuffix(s, "b")
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("not a byte size: %q", *v)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("a byte size cannot be negative: %q", *v)
+	}
+	return n * mult, nil
+}
+
+func memoryFromConfig(s config.Store) memory.Store {	ret := memory.Store{
 		Backend:  s.Backend,
 		Table:    s.Table,
 		Window:   s.Window,

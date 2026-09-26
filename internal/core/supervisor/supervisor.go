@@ -6,6 +6,7 @@ package supervisor
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -84,6 +85,15 @@ type Supervisor struct {
 	// group proposal. See SetMembershipResolver / DeliverAs.
 	membershipResolver func(personalUUID, groupUUID string) (string, error)
 
+	// sessionCap is the per-tenant bound on live sessions (E18): 0 disables
+	// it. tenants maps a session key to the tenant its first message carried;
+	// a session serves the tenant it was spawned for.
+	sessionCap int
+	tenants    map[string]string
+	// vmMemory is the per-state allocation cap new sessions get (0 =
+	// uncapped). See SetVMMemory.
+	vmMemory int64
+
 	mu       sync.Mutex
 	sessions map[string]*session.Actor
 	cancels  map[string]context.CancelFunc
@@ -113,6 +123,7 @@ func New(defs map[string]*AgentDef, gw *gateway.Registry, p *pool.Pool, shellMgr
 		cancels:   map[string]context.CancelFunc{},
 		retired:   map[string]struct{}{},
 		templates: templates,
+		tenants:   map[string]string{},
 		requests:  request.New(),
 		log:       log.With("module", "supervisor"),
 	}
@@ -133,6 +144,26 @@ func (s *Supervisor) SetUserResolver(r session.UserResolver) { s.users = r }
 // Called by main; nil (the default) leaves every user on the agent's own model
 // and prompts.
 func (s *Supervisor) SetProfileSettings(p session.ProfileSettings) { s.profileSettings = p }
+
+// SetSessionCap sets the per-tenant bound on live sessions (E18): a tenant
+// whose sessions are all busy with it cannot spawn actors without bound. 0
+// (the default) disables the bound. Called by main from runtime.limits.
+func (s *Supervisor) SetSessionCap(n int) { s.sessionCap = n }
+
+// SetVMMemory sets the per-Luau-state allocation cap every new session gets
+// (runtime.vm.memory_limit, now live). 0 = uncapped. With the session cap it
+// bounds each tenant's VM footprint: cap × sessions_per_tenant.
+func (s *Supervisor) SetVMMemory(n int64) { s.vmMemory = n }
+
+// tenantOf is the tenant a message's turn acts for, from the core-stamped
+// provenance — the only authority, as everywhere. "" (unprovenanced) is
+// engine-internal traffic and is exempt from tenant bounds.
+func tenantOf(msg session.Message) string {
+	if p := msg.Provenance; p != nil && p.UserUUID != nil {
+		return *p.UserUUID
+	}
+	return ""
+}
 
 // Start fixes the context used for lazily spawned actors.
 func (s *Supervisor) Start(ctx context.Context) { s.ctx = ctx }
@@ -155,37 +186,7 @@ func (s *Supervisor) BootPersistent(ctx context.Context) {
 		if !def.Persistent || def.SpawnTemplate != nil {
 			continue
 		}
-		if s.hub != nil {
-			// The session key format is the one DeliverLocal builds below, and
-			// the one the hub keys its leases by: sessionhub.SessionKey.
-			claimed, err := s.hub.Claim(ctx, name+"|"+daemonKey)
-			if err != nil {
-				// A store that cannot answer is a store that cannot arbitrate.
-				// Starting the daemon anyway would risk a second copy of the
-				// conversation, so it is left to whoever can claim it.
-				s.log.Warn("persistent agent not booted: session claim failed", "agent", name, "err", err)
-				continue
-			}
-			if !claimed {
-				s.log.Info("persistent agent runs on another instance", "agent", name)
-				continue
-			}
-		}
-		msg := session.Message{
-			ID:   "boot:" + name,
-			Type: "boot",
-			From: "system:supervisor",
-			Ts:   time.Now().Unix(),
-			Provenance: &session.Provenance{
-				Kind:      "system",
-				Principal: "system:supervisor",
-			},
-		}
-		if err := s.DeliverLocal(name, daemonKey, msg); err != nil {
-			s.log.Warn("persistent agent boot failed", "agent", name, "err", err)
-			continue
-		}
-		s.log.Info("persistent agent booted", "agent", name)
+		s.bootPersistentOne(ctx, name, def)
 	}
 }
 
@@ -235,7 +236,7 @@ func (s *Supervisor) DeliverLocal(agent, key string, msg session.Message) error 
 	}
 	skey := agent + "|" + key
 
-	a, err := s.ensureSession(agent, skey, def)
+	a, err := s.ensureSession(agent, skey, def, tenantOf(msg))
 	if err != nil {
 		return err
 	}
@@ -264,11 +265,19 @@ func (s *Supervisor) DeliverLocal(agent, key string, msg session.Message) error 
 // The read happens outside the lock and the map is re-checked under it, so two
 // first contacts racing for the same session start one actor and both deliver
 // to it.
-func (s *Supervisor) ensureSession(agent, skey string, def *AgentDef) (*session.Actor, error) {
+//
+// tenant is the first message's tenant, for the per-tenant session cap (E18):
+// the one place actors are created is where the bound applies.
+func (s *Supervisor) ensureSession(agent, skey string, def *AgentDef, tenant string) (*session.Actor, error) {
 	s.mu.Lock()
 	if a, ok := s.sessions[skey]; ok {
 		s.mu.Unlock()
 		return a, nil
+	}
+	if tenant != "" && s.sessionCap > 0 && s.countTenantLocked(tenant) >= s.sessionCap {
+		s.mu.Unlock()
+		metrics.Inc("agentflow_session_cap_drops")
+		return nil, fmt.Errorf("tenant %s is at the live-session cap (%d); refusing to spawn another session", tenant, s.sessionCap)
 	}
 	s.mu.Unlock()
 
@@ -290,6 +299,7 @@ func (s *Supervisor) ensureSession(agent, skey string, def *AgentDef) (*session.
 	a.OnExit = s.onActorExit
 	a.SetProfileSettings(s.profileSettings)
 	a.Journal = s.EgressJournal
+	a.MemBudget = s.vmMemory
 	actorCtx, cancel := context.WithCancel(s.ctx)
 
 	s.mu.Lock()
@@ -302,10 +312,27 @@ func (s *Supervisor) ensureSession(agent, skey string, def *AgentDef) (*session.
 	}
 	s.sessions[skey] = a
 	s.cancels[skey] = cancel
+	if tenant != "" {
+		s.tenants[skey] = tenant
+	}
 	go a.Run(actorCtx)
 	metrics.Inc("agentflow_sessions_active")
 	s.log.Info("session spawned", "session", skey)
 	return a, nil
+}
+
+// countTenantLocked counts the live sessions attributed to one tenant.
+// Linear scan: the cap bounds the count, so the map never holds more rows
+// than sessions-per-tenant times tenants, and the scan runs once per spawn,
+// never per message. Caller holds mu.
+func (s *Supervisor) countTenantLocked(tenant string) int {
+	n := 0
+	for _, t := range s.tenants {
+		if t == tenant {
+			n++
+		}
+	}
+	return n
 }
 
 // StopSession terminates one actor without stopping the runtime. It is safe to
@@ -327,6 +354,7 @@ func (s *Supervisor) onActorExit(id session.Identity, reason session.EndReason) 
 	if ok && current.Identity.SessionID == id.SessionID {
 		delete(s.sessions, id.SessionID)
 		delete(s.cancels, id.SessionID)
+		delete(s.tenants, id.SessionID)
 		metrics.Add("agentflow_sessions_active", -1)
 		metrics.Inc("agentflow_children_died")
 		if s.retired != nil {

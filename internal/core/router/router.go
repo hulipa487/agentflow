@@ -239,6 +239,11 @@ func (r *Router) runOnce(ctx context.Context) runOutcome {
 			Agent   string          `json:"agent"`
 			Key     string          `json:"key"`
 			Message session.Message `json:"message"`
+			// IdentityGroup proposes that the turn act in a group context. It
+			// is a proposal only: DeliverAs validates the membership and
+			// stamps the derived uuid onto the message's provenance before the
+			// session sees it (§5.7).
+			IdentityGroup string `json:"identity_group"`
 			// route.state.set carries the handler's value through untouched and
 			// an optional lifetime in seconds.
 			Value      json.RawMessage `json:"value"`
@@ -269,7 +274,15 @@ func (r *Router) runOnce(ctx context.Context) runOutcome {
 		case "deliver":
 			// Delivery failures are logged but don't fail the op: a bad agent
 			// name must not crash-loop the (shared, singleton) router state.
-			if err := r.sup.Deliver(op.Agent, op.Key, op.Message); err != nil {
+			// A refused group proposal is the same: logged, and the message
+			// does not reach a session acting under an identity it lacks.
+			var err error
+			if op.IdentityGroup != "" {
+				err = r.sup.DeliverAs(op.Agent, op.Key, op.Message, op.IdentityGroup)
+			} else {
+				err = r.sup.Deliver(op.Agent, op.Key, op.Message)
+			}
+			if err != nil {
 				r.log.Warn("deliver failed", "agent", op.Agent, "key", op.Key, "err", err)
 			}
 		case "runtime.triggers":

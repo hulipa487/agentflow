@@ -246,3 +246,52 @@ func TestInheritsUserDefault(t *testing.T) {
 		t.Fatal("inherit_user: false must not inherit")
 	}
 }
+
+// TestActingIdentityGroupContext pins the group-context half of §7: the
+// engine-stamped membership uuid becomes the scope uuid and the scope prefix,
+// while the personal uuid stays billing and credentials. The stamp is engine
+// arithmetic — the deliver boundary derived it after validating membership —
+// so from this layer down it is trusted input, exactly like UserUUID.
+func TestActingIdentityGroupContext(t *testing.T) {
+	personal, membership := "person-1", "membership-1"
+	stamped := &Message{
+		From: "webhook:x",
+		Provenance: &Provenance{
+			Kind:           "channel",
+			UserUUID:       &personal,
+			MembershipUUID: &membership,
+		},
+	}
+	id, known := actingIdentityOf(stamped, true)
+	if !known {
+		t.Fatal("a stamped group message resolved unknown")
+	}
+	if id.Personal != personal {
+		t.Fatalf("personal = %q; the person never changes", id.Personal)
+	}
+	if id.Membership != membership {
+		t.Fatalf("membership = %q; want the stamped uuid", id.Membership)
+	}
+	if id.ScopePrefix != "user:"+membership {
+		t.Fatalf("scope prefix = %q; want user:<membership>", id.ScopePrefix)
+	}
+	if id.ScopeUUID() != membership {
+		t.Fatalf("scope uuid = %q; want the membership uuid", id.ScopeUUID())
+	}
+
+	// Billing follows the person even in group context — the ledger never
+	// fragments per group (F23).
+	ctx := WithActingIdentity(context.Background(), id)
+	if got := BillingUUIDFromCtx(ctx); got != personal {
+		t.Fatalf("billing uuid = %q; want the personal uuid", got)
+	}
+	if got := ScopePrefixFromCtx(ctx); got != "user:"+membership {
+		t.Fatalf("scope prefix from ctx = %q", got)
+	}
+
+	// An explicit empty membership stamp is known-none: personal context.
+	empty := ""
+	if id2, _ := actingIdentityOf(&Message{Provenance: &Provenance{Kind: "channel", UserUUID: &personal, MembershipUUID: &empty}}, true); id2.Membership != "" {
+		t.Fatalf("empty stamp produced membership %q", id2.Membership)
+	}
+}

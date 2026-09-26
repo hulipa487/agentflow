@@ -1083,6 +1083,20 @@ func main() {
 		hub.SetSessionTTL(d)
 	}
 	sup.SetHub(hub)
+	// Group-identity validation: the router proposes, the engine resolves.
+	// A proposal naming a group the sender is not active in is refused at the
+	// deliver boundary; an accepted one stamps the derived membership uuid
+	// onto the message's core-owned provenance (§5.7, A1).
+	sup.SetMembershipResolver(func(personalUUID, groupUUID string) (string, error) {
+		member, err := tenReg.IsMember(context.Background(), groupUUID, personalUUID)
+		if err != nil {
+			return "", err
+		}
+		if !member {
+			return "", fmt.Errorf("%s is not an active member of group %s", personalUUID, groupUUID)
+		}
+		return tenancy.MembershipUUID(personalUUID, groupUUID), nil
+	})
 	go hub.Drain(ctx)
 
 	// Shell handle reclaim. A session that ends reaps its own shells, but an
@@ -1529,6 +1543,7 @@ func main() {
 			},
 			Agents:     sup,
 			BuildAgent: buildAgentDef,
+			Tenancy:    tenReg,
 			Users: webui.UserDeps{
 				Identities: identReg,
 				Store:      rtStore,

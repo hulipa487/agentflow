@@ -79,6 +79,11 @@ type Supervisor struct {
 	// default, and every single-instance deployment — delivers everything here.
 	hub SessionRouter
 
+	// membershipResolver validates a router-proposed group identity and
+	// returns the derived membership uuid. Nil (the default) refuses every
+	// group proposal. See SetMembershipResolver / DeliverAs.
+	membershipResolver func(personalUUID, groupUUID string) (string, error)
+
 	mu       sync.Mutex
 	sessions map[string]*session.Actor
 	cancels  map[string]context.CancelFunc

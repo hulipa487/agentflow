@@ -80,6 +80,47 @@ func (s *Supervisor) UpsertAgent(name string, def *AgentDef) error {
 	return nil
 }
 
+// SetMembershipResolver installs the group-identity resolution the router's
+// group proposals go through: given a personal uuid and a group uuid it
+// reports whether the person is an active member and, if so, the derived
+// membership uuid. Wired from main with the tenancy registry; nil (the
+// default) refuses every group proposal — a runtime without tenancy has no
+// group context.
+func (s *Supervisor) SetMembershipResolver(fn func(personalUUID, groupUUID string) (string, error)) {
+	s.membershipResolver = fn
+}
+
+// DeliverAs delivers a message whose turn acts in a group: the router Lua
+// PROPOSES the group (from the chat's durable mode, B10), and the engine
+// VALIDATES it — the proposal is resolved through the membership resolver and
+// stamped onto the message's core-owned provenance, never taken from Lua
+// state. That is what core-stamped means here: validated here, not merely
+// trusted (A1, §5.7). The session key carries the raw group uuid, so a chat
+// that toggles moves to a different session rather than mixing scopes.
+func (s *Supervisor) DeliverAs(agent, key string, msg session.Message, groupUUID string) error {
+	if groupUUID == "" {
+		return s.DeliverLocal(agent, key, msg)
+	}
+	if s.membershipResolver == nil {
+		return fmt.Errorf("group context is not available on this runtime")
+	}
+	p := msg.Provenance
+	if p == nil || p.UserUUID == nil || *p.UserUUID == "" {
+		return fmt.Errorf("a group-proposed message carries no tenant stamp to validate against")
+	}
+	membership, err := s.membershipResolver(*p.UserUUID, groupUUID)
+	if err != nil {
+		// A proposal naming a group the sender does not belong to is refused
+		// at the boundary — the router bug or forgery fails here, before any
+		// scope resolves.
+		return fmt.Errorf("group identity refused: %w", err)
+	}
+	stamped := *p
+	stamped.MembershipUUID = &membership
+	msg.Provenance = &stamped
+	return s.DeliverLocal(agent, key, msg)
+}
+
 // RemoveAgent removes an agent at runtime. Live sessions hold the agent's
 // handlers, memory handles and a mailbox mid-turn, so removal refuses while
 // any exist unless force is set (E20). Returns how many sessions were

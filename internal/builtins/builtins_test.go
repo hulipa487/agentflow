@@ -34,7 +34,10 @@ func TestPluginDirShadowsBuiltin(t *testing.T) {
 	}
 
 	// SupportChunks carries the shadow in recency's position (3rd).
-	chunks := SupportChunks()
+	chunks, err := SupportChunks()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if chunks[2] != shadowSrc {
 		t.Fatalf("support chunk not shadowed:\n%s", chunks[2])
 	}
@@ -63,7 +66,11 @@ func TestNoPluginDirKeepsEmbedded(t *testing.T) {
 	if src != sources["recency"] || watch != "" {
 		t.Fatal("embedded builtin must resolve unwatched without plugins.dir")
 	}
-	if got := SupportChunks()[2]; got != sources["recency"] {
+	chunks, err := SupportChunks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := chunks[2]; got != sources["recency"] {
 		t.Fatal("support chunks must be embedded without plugins.dir")
 	}
 }
@@ -186,6 +193,56 @@ func TestVersionGateRefusesEveryRoute(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "ok.lua"), directive()+"function loop() end\n")
 	if _, _, err := Resolve(filepath.Join(dir, "ok.lua")); err != nil {
 		t.Fatalf("a chunk declaring this core's version was refused: %v", err)
+	}
+}
+
+// TestVersionGateCoversSupportChunks: the gate reaches the support chunks too,
+// shadowed or embedded. A support chunk is not a loop/route ref — nothing
+// resolves it — so SupportChunks is the only way one reaches a session, and a
+// shadow that skipped the gate there would be Lua running against an API it was
+// not written for, in every session of the deployment at once.
+func TestVersionGateCoversSupportChunks(t *testing.T) {
+	dir := t.TempDir()
+	SetPluginDir(dir)
+	defer SetPluginDir("")
+
+	// The unexceptional case first: no shadow, so the embedded chunks load.
+	if _, err := SupportChunks(); err != nil {
+		t.Fatalf("the embedded support chunks were refused: %v", err)
+	}
+
+	for _, c := range []struct{ name, src string }{
+		{"no declaration", "SUPPORT = 1\n"},
+		{"another version", "-- af-prelude-version: 0\nSUPPORT = 1\n"},
+		{"declared twice", "-- af-prelude-version: 1\n-- af-prelude-version: 2\nSUPPORT = 1\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			writeFile(t, filepath.Join(dir, "recency.lua"), c.src)
+			chunks, err := SupportChunks()
+			if err == nil {
+				t.Fatalf("a shadowed support chunk this core cannot serve was loaded (%d chunks)", len(chunks))
+			}
+			if !errors.Is(err, vm.ErrPreludeVersion) {
+				t.Fatalf("refusal does not wrap ErrPreludeVersion: %v", err)
+			}
+			if chunks != nil {
+				t.Fatalf("source returned alongside the refusal: %v", chunks)
+			}
+			// The refusal names the file the operator has to edit.
+			if !strings.Contains(err.Error(), filepath.Join(dir, "recency.lua")) {
+				t.Fatalf("refusal does not name the shadow: %v", err)
+			}
+		})
+	}
+
+	// The shadow was the only thing wrong: fix it and the chunks load again.
+	writeFile(t, filepath.Join(dir, "recency.lua"), directive()+"SUPPORT = 1\n")
+	chunks, err := SupportChunks()
+	if err != nil {
+		t.Fatalf("a shadow declaring this core's version was refused: %v", err)
+	}
+	if chunks[2] != directive()+"SUPPORT = 1\n" {
+		t.Fatalf("the accepted shadow is not the one that loaded:\n%s", chunks[2])
 	}
 }
 

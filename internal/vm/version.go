@@ -26,13 +26,29 @@ import (
 //     version in every Lua file is one atomic deploy, and a mismatch takes out
 //     routing for every tenant at once rather than shaving an edge off it.
 //
+// Those three say how a version is declared and enforced. What the version
+// *covers* is broader than the list of ops a chunk may call: it covers
+// everything a chunk can observe, including the shape of the values an op hands
+// back. The paragraph below is the rule; the message shape is the case that has
+// already moved once.
+//
 // Bump this for any change a chunk could observe: a builder renamed, an option
 // renamed on the wire, an op's response shape changed, a global added or
-// removed. Adding a builder is observable only by a chunk that uses it, but the
-// cost of bumping needlessly is one deploy and the cost of not bumping is a
-// customer's loop silently misbehaving, so: any edit to the prelude's surface
-// bumps the version. TestPreludeDeclaresItsVersion and the builtins conformance
-// suite (internal/builtins TestPreludeContract) are what keep that rule and the
+// removed. "A chunk could observe" includes the shape of the values an op hands
+// back, not just whether the op exists. The one that moves most is the message
+// a loop gets from session.inbox(): its field set, and the three-state
+// provenance.user_uuid inside it (absent, represented by a nil *string; known
+// empty, by a pointer to ""; or a tenant uuid), are as much a part of this
+// contract as the op list is. A loop reading a key that moved — the tenant used
+// to arrive as msg.payload.user_uuid — declares this version and passes the
+// gate, so the gate cannot catch that class of break on its own; the shape is
+// held still by TestInboxWireShape and TestInboxShapeReachesLua in
+// internal/core/session instead. Adding a builder is observable only by a chunk
+// that uses it, but the cost of bumping needlessly is one deploy and the cost
+// of not bumping is a customer's loop silently misbehaving, so: any edit to the
+// prelude's surface, or to the shape of what a loop is handed, bumps the
+// version. TestPreludeDeclaresItsVersion and the builtins conformance suite
+// (internal/builtins TestPreludeContract) are what keep that rule and the
 // literal in the prelude from drifting apart.
 const PreludeVersion = 1
 

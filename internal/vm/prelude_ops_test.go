@@ -71,7 +71,7 @@ func opFromLua(t *testing.T, body string) (Status, string) {
 	if err := st.LoadBase(); err != nil {
 		t.Fatal(err)
 	}
-	return st.Start("loop", body)
+	return st.Start("loop", "test chunk", directive()+body)
 }
 
 // builderTypes is every builder that yields an op directly, with the op type it

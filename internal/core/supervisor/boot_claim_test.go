@@ -54,7 +54,7 @@ func TestDaemonBootsOnlyOnTheInstanceThatClaimsIt(t *testing.T) {
 					Info:       &session.Info{Name: "daemon", HistoryBudget: 100},
 					Handlers:   map[string]session.OpHandler{"probe.record": probeHandler(recorded)},
 					Persistent: true,
-					LoopSrc: `function loop()
+					LoopSrc: directive() + `function loop()
   local msg = session.inbox()
   af.op({ type = "probe.record", text = msg.type })
 end`,

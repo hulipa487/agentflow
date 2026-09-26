@@ -57,7 +57,7 @@ func TestRouterAnswersRuntimeTriggers(t *testing.T) {
 	}
 
 	ch := make(chan string, 8)
-	r := New(`
+	r := New(directive()+`
 function loop()
   while true do
     local item = session.inbox()
@@ -161,7 +161,7 @@ func dropNulls(v any) any {
 // empty trigger list rather than erroring the op.
 func TestRouterTriggersDefaultsEmpty(t *testing.T) {
 	ch := make(chan string, 8)
-	r := New(`
+	r := New(directive()+`
 function loop()
   while true do
     local item = session.inbox()

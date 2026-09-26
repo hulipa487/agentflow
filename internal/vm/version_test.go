@@ -15,6 +15,41 @@ import (
 // that gates every chunk against a version the prelude does not admit to.
 var preludeAfVersionRE = regexp.MustCompile(`(?m)^af\.version\s*=\s*(\d+)\s*$`)
 
+// directive is the leading comment line every chunk the gate accepts declares.
+// A test chunk is a chunk: vm.State.Start refuses one without it exactly as it
+// refuses a session's loop, so fixtures declare it the way a shipped file does.
+func directive() string { return fmt.Sprintf("-- af-prelude-version: %d\n", PreludeVersion) }
+
+// TestStartRefusesAnUngatedSource is the in-memory path's gate. A loop a library
+// consumer hands to a session as raw source never passes through
+// builtins.Resolve, so this is the only place it can be stopped — and a source
+// that does go through Resolve is checked again here, which is harmless because
+// Resolve returns only what this same check accepted.
+func TestStartRefusesAnUngatedSource(t *testing.T) {
+	const name = "in-memory loop of session main|test"
+	body := "function loop() session.inbox() end\n"
+
+	refused := New(1_000_000)
+	defer refused.Close()
+	if err := refused.LoadBase(); err != nil {
+		t.Fatal(err)
+	}
+	if status, msg := refused.Start("loop", name, body); status != Failed {
+		t.Fatalf("an ungated in-memory source was loaded (status %v, msg %q); the gate does not reach the embedding path", status, msg)
+	} else if !strings.Contains(msg, name) || !strings.Contains(msg, "af-prelude-version") {
+		t.Fatalf("refusal is not the gate's: %q", msg)
+	}
+
+	accepted := New(1_000_000)
+	defer accepted.Close()
+	if err := accepted.LoadBase(); err != nil {
+		t.Fatal(err)
+	}
+	if status, msg := accepted.Start("loop", name, directive()+body); status != Yielded {
+		t.Fatalf("a source declaring this core's version was refused: status %v, msg %q", status, msg)
+	}
+}
+
 func TestPreludeDeclaresItsVersion(t *testing.T) {
 	m := preludeAfVersionRE.FindStringSubmatch(prelude)
 	if m == nil {

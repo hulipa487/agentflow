@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -11,7 +12,13 @@ import (
 
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/pool"
+	"agentflow/internal/vm"
 )
+
+// directive is the leading comment line every chunk has to declare. The loop
+// fixtures in this package are chunks: vm.State.Start refuses one that declares
+// nothing, so they go through this the way a shipped loop does.
+func directive() string { return fmt.Sprintf("-- af-prelude-version: %d\n", vm.PreludeVersion) }
 
 // Observations cross the Lua boundary through a fake gateway: loops report
 // outcomes with session.send, and pushes arrive as direct sends.
@@ -46,7 +53,7 @@ func newTestActor(t *testing.T, caps map[string]bool, gw Gateway, loopSrc string
 		Identity{SessionID: "main|test", Agent: "main", Capabilities: caps},
 		&Info{Name: "main", HistoryBudget: 100},
 		gw, nil, nil, nil, nil, map[string]OpHandler{}, pool.New(1), log)
-	a.LoopSrc = loopSrc
+	a.LoopSrc = directive() + loopSrc
 	ctx, cancel := context.WithCancel(context.Background())
 	go a.Run(ctx)
 	t.Cleanup(cancel)
@@ -117,7 +124,7 @@ func TestSessionExitTerminates(t *testing.T) {
 		Identity{SessionID: "worker|test", Agent: "worker", Capabilities: map[string]bool{}},
 		&Info{Name: "worker", HistoryBudget: 100},
 		gw, nil, nil, nil, nil, map[string]OpHandler{}, pool.New(1), log)
-	a.LoopSrc = `function loop() session.exit() end`
+	a.LoopSrc = directive() + `function loop() session.exit() end`
 
 	exits := make(chan EndReason, 4)
 	a.OnExit = func(id Identity, reason EndReason) { exits <- reason }
@@ -181,7 +188,7 @@ func newUserTestActor(t *testing.T, caps map[string]bool, gw Gateway, users User
 		Identity{SessionID: "main|test", Agent: "main", Capabilities: caps},
 		&Info{Name: "main", HistoryBudget: 100},
 		gw, nil, nil, users, nil, map[string]OpHandler{}, pool.New(1), log)
-	a.LoopSrc = loopSrc
+	a.LoopSrc = directive() + loopSrc
 	ctx, cancel := context.WithCancel(context.Background())
 	go a.Run(ctx)
 	t.Cleanup(cancel)

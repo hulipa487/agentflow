@@ -28,7 +28,7 @@ func TestRecencyTimeRecallUsesTheBackendsKind(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	status, msg := st.Start("loop", `return memory_recall_handler({
+	status, msg := st.Start("loop", "test chunk", directive()+`return memory_recall_handler({
   kind = "time", store = "dialogue",
   from = "2026-01-01T00:00:00Z", to = "2026-02-01T00:00:00Z" })`)
 	if status != Yielded {

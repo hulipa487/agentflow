@@ -224,7 +224,7 @@ func TestStatefulRouteHandlerAlternatesAgents(t *testing.T) {
 			return "true", true
 		}
 	}
-	loop := `function loop()
+	loop := directive() + `function loop()
   local msg = session.inbox()
   af.op({ type = "probe.record", text = msg.text })
 end`
@@ -245,7 +245,7 @@ end`
 	sup := supervisor.New(defs, gateway.NewRegistry(log), pool.New(2), nil, log)
 	sup.Start(ctx)
 
-	routeSrc := `
+	routeSrc := directive() + `
 function loop()
   while true do
     local item = session.inbox()

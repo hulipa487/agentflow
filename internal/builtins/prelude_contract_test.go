@@ -44,6 +44,18 @@ func directive() string { return fmt.Sprintf("-- af-prelude-version: %d\n", vm.P
 // repo's own six embedded chunks, which is what makes it a build check here and
 // a compatibility check there.
 //
+// The version covers more than the list of ops a chunk may call: it covers
+// everything a chunk can observe, including the shape of what an op hands back.
+// The one a loop meets on every turn is the message from session.inbox() — its
+// field set, and the three-state provenance.user_uuid inside it (absent vs ""
+// vs a uuid). That shape is part of this contract and has already moved under
+// loops once, when the tenant left msg.payload.user_uuid for the provenance
+// field, so it is pinned rather than described: TestInboxWireShape and
+// TestInboxShapeReachesLua in internal/core/session assert the exact bytes the
+// inbox op marshals and the keys a running loop decodes, at the seam where the
+// wire is produced. Those two fail this repo's build on any shape change, which
+// is what forces the version decision this gate enforces for every chunk.
+//
 // What it does NOT cover: whether the chunk uses an op that no longer exists.
 // That needs the chunk to run, and running a loop is not something a test can
 // do to arbitrary sources. The version declaration is the contract that stands

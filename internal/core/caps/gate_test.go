@@ -83,7 +83,7 @@ func TestGatedOpDeniesInsideALoop(t *testing.T) {
 		session.Identity{SessionID: "main|test", Agent: "writer", Capabilities: granted},
 		&session.Info{Name: "writer", HistoryBudget: 100},
 		gw, nil, nil, nil, nil, handlers, pool.New(1), discardLogger())
-	a.LoopSrc = `
+	a.LoopSrc = directive() + `
 function loop()
   local msg = session.inbox()
   local ok, res = pcall(http.get, "https://example.com")

@@ -66,7 +66,7 @@ func TestLLMChatResolvesAttachmentHandleToBase64(t *testing.T) {
 			"llm.chat": LLMHandlers(mgr, store)["llm.chat"],
 		},
 		pool.New(1), slog.New(slog.NewTextHandler(io.Discard, nil)))
-	a.LoopSrc = `
+	a.LoopSrc = directive() + `
 function loop()
   local msg = session.inbox()
   local parts = {}

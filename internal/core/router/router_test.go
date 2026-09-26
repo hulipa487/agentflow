@@ -2,12 +2,19 @@ package router
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
 
 	"agentflow/internal/core/session"
+	"agentflow/internal/vm"
 )
+
+// directive is the leading comment line every chunk has to declare. The route
+// fixtures here are chunks: vm.State.Start refuses one that declares nothing, so
+// they go through this the way a deployment's route handler does.
+func directive() string { return fmt.Sprintf("-- af-prelude-version: %d\n", vm.PreludeVersion) }
 
 func testLogger(t *testing.T) *slog.Logger {
 	t.Helper()
@@ -17,7 +24,7 @@ func testLogger(t *testing.T) *slog.Logger {
 // routeReporting is a route handler that names itself in the log for every
 // inbound it routes, so a test can tell which version of the handler answered.
 func routeReporting(marker string) string {
-	return `
+	return directive() + `
 function loop()
   while true do
     local item = session.inbox()

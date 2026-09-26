@@ -77,7 +77,28 @@ func (s *State) Eval(name, code string) error {
 
 // Start seals globals, loads the plugin chunk onto the loop thread, runs it
 // (top-level code may yield), then resumes the named global as the loop.
-func (s *State) Start(fn, code string) (Status, string) {
+//
+// name identifies the chunk in a version refusal, and is the file path where
+// there is one: it is what the operator is told to go and edit.
+//
+// The chunk is version-gated here as well as at builtins.Resolve, because this
+// is the one point a loop source is loaded into a VM. A source that never
+// passed through Resolve — an AgentDef's in-memory LoopSrc, a route source
+// handed straight to the router — reaches the engine no other way, so without
+// the check here the embedding path could run Lua written against a different
+// prelude. A source that did pass through Resolve is checked a second time,
+// which costs a scan of the leading comment block and can never disagree:
+// Resolve returns only what this same check accepted.
+//
+// A refusal is returned as Failed carrying the gate's own message, so a caller
+// that already has a Failed path — the session restart, the router rebuild —
+// treats it the way it treats a Lua error. That is deliberate: nothing here can
+// repair the chunk, and the alternative to failing loudly is running against an
+// API the chunk was not written for.
+func (s *State) Start(fn, name, code string) (Status, string) {
+	if err := CheckChunkVersion(name, code); err != nil {
+		return Failed, err.Error()
+	}
 	cfn := C.CString(fn)
 	defer C.free(unsafe.Pointer(cfn))
 	ccode := C.CString(code)

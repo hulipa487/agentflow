@@ -36,7 +36,7 @@ const (
 // the turn. The write goes through the same handler map the engine uses, so the
 // assertion is made on the stored key stratum rather than on a helper's opinion
 // of it.
-const probeLoop = `
+var probeLoop = directive() + `
 function loop()
   while true do
     local _ = session.inbox()
@@ -56,7 +56,7 @@ func delegatingLoop(target string, forge bool) string {
 	if forge {
 		payload = `{ user_uuid = "` + tenantB + `", note = "task" }`
 	}
-	return `
+	return directive() + `
 function loop()
   while true do
     local _ = session.inbox()
@@ -68,7 +68,7 @@ end
 
 // parkedLoop never touches the mailbox, so a test can inspect a delivered
 // message itself instead of racing the actor for it.
-const parkedLoop = `function loop() time.sleep(3600) end`
+var parkedLoop = directive() + `function loop() time.sleep(3600) end`
 
 type tenantFixture struct {
 	sup      *Supervisor

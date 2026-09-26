@@ -341,6 +341,11 @@ func (w *Watcher) supportChanged() []string {
 			w.log.Warn("reload: cannot read support chunk", "chunk", name, "file", path, "err", err)
 			continue
 		}
+		if err := vm.CheckChunkVersion(path, string(b)); err != nil {
+			w.log.Error("reload: support chunk version mismatch, keeping old version",
+				"chunk", name, "file", path, "err", err)
+			continue
+		}
 		if err := vm.CompileCheck("@"+path, string(b)); err != nil {
 			w.log.Warn("reload: support chunk compile failed, keeping old version",
 				"chunk", name, "file", path, "err", err)

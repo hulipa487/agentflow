@@ -655,21 +655,22 @@ func main() {
 	// override is reported as unclaimed only when no loaded loop declares it.
 	toolWiring := caps.ToolWiring{LuaOverrides: luaOverrides, Prompts: promptReg, Log: log}
 	agentMemories := []memory.AgentMemory{}
-	defs := map[string]*supervisor.AgentDef{}
-	for name, a := range cfg.Agents {
+	// buildAgentDef resolves one configured agent into a supervisor
+	// definition. It is the single recipe for agent construction: the boot
+	// loop and the runtime registry (PUT /admin/api/agents/{name}, via the
+	// webui's BuildAgent) both go through it, so an agent installed live is
+	// built exactly like a boot one.
+	buildAgentDef := func(name string, a config.Agent) (*supervisor.AgentDef, error) {
 		src, watchPath, err := builtins.Resolve(a.Loop)
 		if err != nil {
-			fields := []any{"agent", name, "err", err}
 			if h := loopHint(a.Loop, toolReg.Names(), builtins.Names()); h != "" {
-				fields = append(fields, "hint", h)
+				return nil, fmt.Errorf("loop %q: %w (hint: %s)", a.Loop, err, h)
 			}
-			log.Error("agent loop resolve failed", fields...)
-			os.Exit(1)
+			return nil, fmt.Errorf("loop %q: %w", a.Loop, err)
 		}
 		instrText, instrPrompt, err := resolveInstructions(a.Instructions, cfg.Prompts)
 		if err != nil {
-			log.Error("instructions read failed", "agent", name, "err", err)
-			os.Exit(1)
+			return nil, fmt.Errorf("instructions: %w", err)
 		}
 		instructions := &session.StringBox{}
 		instructions.Store(instrText)
@@ -688,8 +689,7 @@ func main() {
 			// name at bind time; stores opt into sharing with shared: true.
 			am, err := memReg.ResolveStoresFor(name, profile)
 			if err != nil {
-				log.Error("memory resolve failed", "agent", name, "err", err)
-				os.Exit(1)
+				return nil, fmt.Errorf("memory resolve: %w", err)
 			}
 			am.Write = mp.Write
 			am.Recall = mp.Recall
@@ -698,6 +698,17 @@ func main() {
 			am.Oversample = mp.Oversample
 			agentMemories = append(agentMemories, am)
 			amPtr = &am
+		}
+
+		// The model must exist where this builder's caller resolves models:
+		// the live manager covers both boot (seeded from models:) and the
+		// runtime registry (extended by model upserts). Like validate(), the
+		// check applies only to an agent that names a model — one that does
+		// not resolves "default" per call, and fails there if it is missing.
+		if a.Model != "" {
+			if _, err := llmMgr.Get(a.Model); err != nil {
+				return nil, err
+			}
 		}
 
 		effectiveCaps := capabilitySet(a.Capabilities)
@@ -786,7 +797,7 @@ func main() {
 
 		canContact := stringSet(a.CanContact)
 		safeDispatcher := resolveSafety(cfg, a.Safety)
-		defs[name] = &supervisor.AgentDef{
+		return &supervisor.AgentDef{
 			Info: &session.Info{
 				Name:          name,
 				Model:         a.Model,
@@ -812,7 +823,16 @@ func main() {
 			Capabilities:     effectiveCaps,
 			Safety:           safeDispatcher,
 			Persistent:       a.Persistent,
+		}, nil
+	}
+	defs := map[string]*supervisor.AgentDef{}
+	for name, a := range cfg.Agents {
+		def, err := buildAgentDef(name, a)
+		if err != nil {
+			log.Error("agent build failed", "agent", name, "err", err)
+			os.Exit(1)
 		}
+		defs[name] = def
 	}
 
 	// Resolve spawn profiles into supervisor templates. A spawn profile's
@@ -1492,6 +1512,8 @@ func main() {
 			Snapshot: func() ([]supervisor.SessionStatus, int, int) {
 				return sup.Snapshot()
 			},
+			Agents:     sup,
+			BuildAgent: buildAgentDef,
 			Users: webui.UserDeps{
 				Identities: identReg,
 				Store:      rtStore,

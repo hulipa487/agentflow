@@ -50,6 +50,15 @@ type Deps struct {
 	Version    string
 	StartedAt  time.Time
 
+	// Agents is the runtime agent registry, and BuildAgent resolves a
+	// configured agent into a supervisor definition with the same recipe
+	// boot uses — injected because that recipe closes over the memory, tool
+	// and metering wiring that lives in main. Either nil means the console
+	// was built without agent control; the routes answer 503 with a named
+	// reason instead of panicking.
+	Agents     *supervisor.Supervisor
+	BuildAgent func(name string, a config.Agent) (*supervisor.AgentDef, error)
+
 	// Instance identifies this process in a fleet: the lease owner id, which is
 	// how the console (and the lease table) tell one instance from another.
 	Instance string
@@ -159,6 +168,9 @@ func (u *UI) API() http.Handler {
 	mux.HandleFunc("POST /admin/api/models/{name}/test", u.handleModelTest)
 	mux.HandleFunc("POST /admin/api/models/persist", u.handleModelsPersist)
 	mux.HandleFunc("POST /admin/api/models/revert", u.handleModelsRevert)
+	mux.HandleFunc("GET /admin/api/agents", u.handleAgentsList)
+	mux.HandleFunc("PUT /admin/api/agents/{name}", u.handleAgentUpsert)
+	mux.HandleFunc("DELETE /admin/api/agents/{name}", u.handleAgentRemove)
 	mux.HandleFunc("GET /admin/api/config", u.handleConfigGet)
 	mux.HandleFunc("POST /admin/api/config/validate", u.handleConfigValidate)
 	mux.HandleFunc("POST /admin/api/config/save", u.handleConfigSave)

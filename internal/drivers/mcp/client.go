@@ -27,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"agentflow/internal/core/session"
 	"agentflow/internal/core/tools"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -158,10 +159,24 @@ func (c *Client) makeInvoker(toolName string) func(context.Context, map[string]a
 			return tools.ResultUnavailable("mcp:"+c.name+"/"+toolName,
 				fmt.Sprintf("mcp server %s is not running", c.name)), nil
 		}
-		res, err := c.session.CallTool(ctx, &mcpsdk.CallToolParams{
+		params := &mcpsdk.CallToolParams{
 			Name:      toolName,
 			Arguments: args,
-		})
+		}
+		// F24, defence in depth: the engine injects the acting identity from
+		// ctx — the same core-stamped provenance every op is scoped by — so a
+		// proprietary MCP service can attribute and scope its work without
+		// trusting anything from the Lua arguments. A loop cannot forge this:
+		// it never passes through tool arguments at all.
+		if id, ok := session.ActingFromCtx(ctx); ok {
+			params.Meta = mcpsdk.Meta{
+				"agentflow": map[string]string{
+					"personal": id.Personal,
+					"scope":    id.ScopeUUID(),
+				},
+			}
+		}
+		res, err := c.session.CallTool(ctx, params)
 		if err != nil {
 			// A failure to reach the server is reported as a structured result,
 			// not an error: the honest-degradation rule every tool follows.

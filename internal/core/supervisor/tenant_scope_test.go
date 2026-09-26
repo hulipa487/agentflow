@@ -102,7 +102,7 @@ func newTenantFixture(t *testing.T, workerInfo *session.Info, forge bool) *tenan
 	}
 
 	f := &tenantFixture{raw: raw, workerCh: make(chan string, 16)}
-	handlers := caps.StoreHandlers(&am, mgr)
+	handlers := caps.StoreHandlers(&am, mgr, nil)
 	handlers["probe.done"] = func(ctx context.Context, op session.Op) (string, bool) {
 		select {
 		case f.workerCh <- session.ScopeUUIDFromCtx(ctx):

@@ -5,15 +5,21 @@
 // read or write each other's rows even though they share a physical table.
 // The wrapper composes around any BackendHandle — drivers keep their contract
 // and no schema changes. Scoping is a StoreBinding property ("user" default,
-// "agent" opt-out); shared bindings are not wrapped at all.
+// "agent" opt-out, "pool:<uuid>" for a pool carve); shared bindings are not
+// wrapped at all.
 //
 // Scope model:
 //
 //	user:<uuid>   rows written by a channel-originated turn of that user
+//	              (the membership uuid in group context — disjoint from the
+//	              personal uuid by construction, so no group: tier exists)
 //	service       rows written by non-user contexts (agent hops, and any
 //	              engine context without a user stamp)
 //	agent         the "scope: agent" opt-out: one pool for the whole agent
 //	              (pre-isolation behavior, deliberately preserved)
+//	pool:<uuid>   a pool carve's rows — shared, and granted: every access
+//	              passes the grant check (the one new stratum and the one
+//	              new rule; stores only, never files or shells)
 //	(legacy)      rows written before isolation shipped: unprefixed, readable
 //	              by every session of the agent — pre-upgrade history is
 //	              definitionally shared, and is never written again
@@ -25,7 +31,9 @@
 //	maintenance   engine-fired (system/scheduler provenance — the nightly
 //	              distiller): reads ALL scopes with raw scope-visible keys,
 //	              writes are scope-explicit (the caller names the scope in the
-//	              key), and Scopes() enumerates the binding's user scopes
+//	              key), and Scopes() enumerates the binding's user scopes.
+//	              Naming a pool: scope still passes the grant check — it is
+//	              the one caller-named scope that is validated.
 package memory
 
 import (
@@ -43,6 +51,7 @@ const (
 	scopeService = "service"
 	scopeAgent   = "agent"
 	scopeUserPfx = "user:"
+	scopePoolPfx = "pool:"
 	oversampleK  = 4 // vector/text recall: fetch K*oversample, filter, trim
 )
 
@@ -90,25 +99,61 @@ func splitScopedKey(k string) (scope, key string, scoped bool) {
 	switch {
 	case head == scopeService || head == scopeAgent:
 		return head, rest, true
-	case strings.HasPrefix(head, scopeUserPfx) && len(head) > len(scopeUserPfx):
+	case strings.HasPrefix(head, scopeUserPfx) && len(head) > len(scopeUserPfx),
+		strings.HasPrefix(head, scopePoolPfx) && len(head) > len(scopePoolPfx):
+		// The pool stratum is recognized here or not at all: an unrecognized
+		// pool row parses as legacy, and legacy is admitted to every filtered
+		// read — which would make pooled rows world-readable.
 		return head, rest, true
 	}
 	return "", k, false
 }
 
+// PoolAuthorizer decides pool access — the (pool, tenant) grant half. It is
+// the only new enforcement rule the pool stratum adds, and it lives in this
+// file because enforcement is the engine's: an ACL enforced in Lua is
+// bypassable by any other loop, and an ACL checked by the caller is not
+// enforcement. Implemented by the tenancy registry.
+type PoolAuthorizer interface {
+	// AuthorizePool reports the granted mode ("rw" or "r") for (pool, agent,
+	// tenant), or ok=false when nothing grants this caller.
+	AuthorizePool(poolUUID, agent, tenantUUID string) (mode string, ok bool)
+}
+
+// PoolScope carries the pool rule's inputs beyond the scope prefix. The zero
+// value serves every non-pool store.
+type PoolScope struct {
+	UUID  string // the pool's uuid; scoping is "pool:"+UUID
+	Agent string // the binding's agent: the carve axis, resolved at bind time
+	Auth  PoolAuthorizer
+}
+
+// Caller is who is acting. ScopeUUID keys user-scoped strata — the membership
+// uuid in group context — while PersonalUUID is what pool grants key on:
+// grants belong to a tenant, a person, never to a scope the caller resolved.
+type Caller struct {
+	ScopeUUID    string
+	PersonalUUID string
+}
+
 // WrapScoped wraps h with scope enforcement for a non-shared binding.
-// scoping is the binding's configured scoping ("user" | "agent"); "" (shared
-// bindings) returns h untouched. userUUID is the ctx tenant ("" for service
-// contexts); it is only used in interactive mode.
-func WrapScoped(h BackendHandle, scoping string, mode ScopeMode, userUUID string) BackendHandle {
+// scoping is the binding's configured scoping: "user" (default), "agent", or
+// "pool:<uuid>" — the one new stratum, whose one rule is that every access
+// passes the pool grant check first (§5.7). "" (shared bindings) returns h
+// untouched. caller.ScopeUUID is the tenant for user-scoped strata;
+// caller.PersonalUUID is what the pool grant keys on.
+func WrapScoped(h BackendHandle, scoping string, mode ScopeMode, caller Caller, pool PoolScope) BackendHandle {
 	if scoping == "" {
 		return h
 	}
-	primary := scopeUserPfx + userUUID
+	primary := scopeUserPfx + caller.ScopeUUID
 	if scoping == scopeAgent {
 		primary = scopeAgent
 	}
-	return &scopedHandle{inner: h, scoping: scoping, mode: mode, primary: primary}
+	if strings.HasPrefix(scoping, scopePoolPfx) && len(scoping) > len(scopePoolPfx) {
+		primary = scoping
+	}
+	return &scopedHandle{inner: h, scoping: scoping, mode: mode, primary: primary, pool: pool, caller: caller}
 }
 
 // ScopeEnumerator is implemented by scoped handles (maintenance mode) so an
@@ -120,15 +165,66 @@ type ScopeEnumerator interface {
 
 type scopedHandle struct {
 	inner   BackendHandle
-	scoping string // "user" | "agent"
+	scoping string // "user" | "agent" | "pool:<uuid>"
 	mode    ScopeMode
-	primary string // user:<uuid> or agent — the interactive/agent stratum
+	primary string // user:<uuid>, agent, or pool:<uuid> — the binding's stratum
+	pool    PoolScope
+	caller  Caller
+}
+
+// isPool reports whether the binding's world is a pool carve.
+func (s *scopedHandle) isPool() bool {
+	return strings.HasPrefix(s.scoping, scopePoolPfx) && len(s.scoping) > len(scopePoolPfx)
+}
+
+func (s *scopedHandle) poolUUID() string { return strings.TrimPrefix(s.scoping, scopePoolPfx) }
+
+// namedPoolScope extracts the pool uuid a caller-named key or prefix starts
+// with, or "" when it names none.
+func namedPoolScope(k string) string {
+	if !strings.HasPrefix(k, scopePoolPfx) {
+		return ""
+	}
+	rest := k[len(scopePoolPfx):]
+	if i := strings.Index(rest, scopeSep); i >= 0 {
+		return rest[:i]
+	}
+	return rest
+}
+
+// authorizePool enforces the pool rule: a grant must cover (pool, agent,
+// tenant) with the mode the op needs. It runs before every op on a pool-bound
+// store and before any maintenance op that names a pool scope, in every mode
+// — there is no provenance that exempted from it.
+func (s *scopedHandle) authorizePool(poolUUID string, write bool) error {
+	if poolUUID == "" {
+		return fmt.Errorf("memory: pool scope %q names no pool", s.scoping)
+	}
+	if s.pool.Auth == nil {
+		return fmt.Errorf("memory: pool access requires a pool registry, which this runtime does not have")
+	}
+	mode, ok := s.pool.Auth.AuthorizePool(poolUUID, s.pool.Agent, s.caller.PersonalUUID)
+	if !ok {
+		return fmt.Errorf("memory: no grant on this pool for this tenant")
+	}
+	if write && mode != "rw" {
+		return fmt.Errorf("memory: the grant on this pool is read-only")
+	}
+	return nil
 }
 
 // strata returns the read strata in priority order. Maintenance reads
 // everything (nil = no filter). Legacy is always an implicit extra stratum
 // for filtered reads.
 func (s *scopedHandle) strata() []string {
+	if s.isPool() {
+		// The carve is a world of its own: its rows, service, and legacy.
+		// The caller's personal stratum is deliberately absent — reading
+		// through a pool must not widen into anyone's private rows, and the
+		// rule for user: scopes (your acting uuid must equal the scope uuid)
+		// cannot express a pool read at all.
+		return []string{s.primary, scopeService}
+	}
 	switch s.mode {
 	case ModeMaintenance:
 		return nil
@@ -148,6 +244,11 @@ func (s *scopedHandle) writeScope() string {
 	if s.mode == ModeMaintenance {
 		return ""
 	}
+	if s.isPool() {
+		// Interactive and service provenance alike write the carve: in a
+		// group every member writes into one shared pool (C13).
+		return s.primary
+	}
 	if s.mode == ModeService {
 		return scopeService
 	}
@@ -155,6 +256,22 @@ func (s *scopedHandle) writeScope() string {
 }
 
 func (s *scopedHandle) Put(table, key string, value any, opts PutOpts) error {
+	switch {
+	case s.mode == ModeMaintenance:
+		// Scope-explicit writes name their scope in the key. A user: head is
+		// this binding's own agent store — as before. A pool: head crosses a
+		// tenant boundary, so it is the one caller-named scope that is
+		// validated: the named pool must grant this caller r/w.
+		if p := namedPoolScope(key); p != "" {
+			if err := s.authorizePool(p, true); err != nil {
+				return err
+			}
+		}
+	case s.isPool():
+		if err := s.authorizePool(s.poolUUID(), true); err != nil {
+			return err
+		}
+	}
 	if ws := s.writeScope(); ws != "" {
 		key = scopedKey(ws, key)
 	}
@@ -163,7 +280,17 @@ func (s *scopedHandle) Put(table, key string, value any, opts PutOpts) error {
 
 func (s *scopedHandle) Get(table, key string) (any, bool, error) {
 	if s.mode == ModeMaintenance {
+		if p := namedPoolScope(key); p != "" {
+			if err := s.authorizePool(p, false); err != nil {
+				return nil, false, err
+			}
+		}
 		return s.inner.Get(table, key)
+	}
+	if s.isPool() {
+		if err := s.authorizePool(s.poolUUID(), false); err != nil {
+			return nil, false, err
+		}
 	}
 	// Priority order: each scoped stratum, then the legacy (unprefixed) key.
 	for _, stratum := range s.strata() {
@@ -176,7 +303,17 @@ func (s *scopedHandle) Get(table, key string) (any, bool, error) {
 
 func (s *scopedHandle) Delete(table, key string) error {
 	if s.mode == ModeMaintenance {
+		if p := namedPoolScope(key); p != "" {
+			if err := s.authorizePool(p, true); err != nil {
+				return err
+			}
+		}
 		return s.inner.Delete(table, key)
+	}
+	if s.isPool() {
+		if err := s.authorizePool(s.poolUUID(), true); err != nil {
+			return err
+		}
 	}
 	// Forget works regardless of which stratum holds the key.
 	for _, stratum := range s.strata() {
@@ -189,7 +326,17 @@ func (s *scopedHandle) Delete(table, key string) error {
 
 func (s *scopedHandle) Query(table string, q Query) (Iterator, error) {
 	if s.mode == ModeMaintenance {
+		if p := namedPoolScope(q.Prefix); p != "" {
+			if err := s.authorizePool(p, false); err != nil {
+				return nil, err
+			}
+		}
 		return s.inner.Query(table, q)
+	}
+	if s.isPool() {
+		if err := s.authorizePool(s.poolUUID(), false); err != nil {
+			return nil, err
+		}
 	}
 	switch q.Kind {
 	case "prefix":
@@ -282,7 +429,7 @@ func (s *scopedHandle) Scopes(table string) ([]string, error) {
 	seen := map[string]bool{}
 	for it.Next() {
 		scope, _, scoped := splitScopedKey(it.Record().Key)
-		if scoped && strings.HasPrefix(scope, scopeUserPfx) {
+		if scoped && (strings.HasPrefix(scope, scopeUserPfx) || strings.HasPrefix(scope, scopePoolPfx)) {
 			seen[scope] = true
 		}
 	}

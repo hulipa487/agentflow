@@ -108,7 +108,14 @@ type Registry struct {
 	backends  map[string]BackendHandle
 	config    map[string]BackendConfig
 	log       *slog.Logger
+	// poolResolver turns a config store's pool name into a pool uuid at bind
+	// time. Wired from the tenancy registry by main; nil means this runtime
+	// has no pools, and a store binding one fails to resolve.
+	poolResolver func(name string) (string, error)
 }
+
+// SetPoolResolver wires the pool-name → uuid lookup used at bind time.
+func (r *Registry) SetPoolResolver(fn func(name string) (string, error)) { r.poolResolver = fn }
 
 type BackendConfig struct {
 	Provider string
@@ -230,12 +237,15 @@ type Store struct {
 	Window     int
 	Retention  time.Duration
 	Requires   []string // provider features the backend must offer
-	// Shared opts the store into cross-agent sharing: its physical table is
-	// used as-is. Private stores (the default) are isolated per agent at bind
-	// time — see ResolveStoresFor.
-	Shared bool
+	// Pool binds the store to a named pool instead of a personal scope: rows
+	// live under the pool's carve (pool:<uuid>|key), and every access needs a
+	// grant. This is what replaced `shared: true` (§6.5) — nothing is
+	// fleet-wide any more, because a pool always has an owner and a grant
+	// list. The name resolves against the pool registry at bind time, so an
+	// unknown pool is a boot error, never a silent fallback.
+	Pool string
 	// Scope selects the isolation granularity of a private store ("user"
-	// default | "agent"); ignored on shared stores. See scope.go.
+	// default | "agent"); a bound Pool supersedes it.
 	Scope string
 }
 
@@ -246,9 +256,15 @@ type StoreBinding struct {
 	Window    int
 	Retention time.Duration
 	// Scoping is the store's configured scope granularity: "user" (default for
-	// private stores), "agent" (one pool across users), or "" for shared
-	// stores (not wrapped — see WrapScoped).
+	// private stores), "agent" (one pool across users), or "pool:<uuid>" for a
+	// pool carve (granted — see WrapScoped). "" is the old shared form, which
+	// config no longer admits; an unwrapped handle is what library consumers
+	// construct deliberately.
 	Scoping string
+	// Agent is the binding's owning agent — the carve axis of a pool grant.
+	Agent string
+	// PoolUUID is the resolved pool when Scoping is "pool:<uuid>".
+	PoolUUID string
 	// Features are the backend provider's capabilities ("kv", "vector",
 	// ...), resolved at bind time so loops can adapt (e.g. only embed for
 	// vector-capable stores).
@@ -271,11 +287,12 @@ type AgentMemory struct {
 }
 
 // ResolveStoresFor resolves a profile for one agent, isolating physical
-// tables: unless a store opts into sharing (Shared), its physical table is
-// prefixed with the agent name ("writer.dialogue"), so two agents on the same
-// memory profile never read or write each other's rows. The Tables map stays
-// keyed by the profile's table name — the name loops use — while the binding
-// carries the (possibly prefixed) physical table to the backend.
+// tables: a store is prefixed with the agent name ("writer.dialogue"), so two
+// agents on the same memory profile never read or write each other's rows.
+// Pool-bound stores keep that agent axis — the carve is per (pool, agent) —
+// and swap the key scope for the pool's. The Tables map stays keyed by the
+// profile's table name — the name loops use — while the binding carries the
+// (possibly prefixed) physical table to the backend.
 func (r *Registry) ResolveStoresFor(agent string, profile map[string]Store) (AgentMemory, error) {
 	out := AgentMemory{
 		Stores: map[string]StoreBinding{},
@@ -290,17 +307,30 @@ func (r *Registry) ResolveStoresFor(agent string, profile map[string]Store) (Age
 			return AgentMemory{}, err
 		}
 		table := s.Table
-		if !s.Shared && agent != "" {
+		if agent != "" {
 			table = agent + "." + s.Table
 		}
-		scoping := ""
-		if !s.Shared {
-			scoping = s.Scope
-			if scoping == "" {
-				scoping = "user"
-			}
+		scoping := s.Scope
+		if scoping == "" {
+			scoping = "user"
 		}
-		b := StoreBinding{Backend: s.Backend, Table: table, Window: s.Window, Retention: s.Retention, Features: r.Features(s.Backend), Scoping: scoping}
+		poolUUID := ""
+		if s.Pool != "" {
+			// The (pool, agent) half of the grant is known at bind time, so a
+			// misconfigured carve fails here, at boot or at agent install —
+			// the way checkRequires fails a store whose backend lacks a
+			// feature it declared.
+			if r.poolResolver == nil {
+				return AgentMemory{}, fmt.Errorf("memory store %q binds pool %q, but no pool registry is wired on this runtime", sname, s.Pool)
+			}
+			u, err := r.poolResolver(s.Pool)
+			if err != nil {
+				return AgentMemory{}, fmt.Errorf("memory store %q: %w", sname, err)
+			}
+			poolUUID = u
+			scoping = scopePoolPfx + u
+		}
+		b := StoreBinding{Backend: s.Backend, Table: table, Window: s.Window, Retention: s.Retention, Features: r.Features(s.Backend), Scoping: scoping, Agent: agent, PoolUUID: poolUUID}
 		out.Stores[sname] = b
 		out.Tables[s.Table] = b
 	}

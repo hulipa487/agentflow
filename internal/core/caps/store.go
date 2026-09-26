@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"agentflow/internal/core/memory"
@@ -12,7 +13,9 @@ import (
 )
 
 // StoreHandlers returns store op handlers bound to one agent's memory profile.
-func StoreHandlers(am *memory.AgentMemory, mgr *memory.Manager) map[string]session.OpHandler {
+// auth, when nil, denies every pool-scoped access with a named error — a
+// runtime without a pool registry has no pools.
+func StoreHandlers(am *memory.AgentMemory, mgr *memory.Manager, auth memory.PoolAuthorizer) map[string]session.OpHandler {
 	fail := func(err error) (string, bool) {
 		b, _ := json.Marshal(err.Error())
 		return string(b), false
@@ -29,7 +32,9 @@ func StoreHandlers(am *memory.AgentMemory, mgr *memory.Manager) map[string]sessi
 	// identity (see memory.ModeOf), so a channel session can only ever read its
 	// own scope, service rows, and pre-upgrade legacy rows. The scope uuid — not
 	// the personal uuid — is what keys the stratum: in group context the two are
-	// different uuids and only one of them is isolated per (person, group).
+	// different uuids and only one of them is isolated per (person, group). The
+	// personal uuid is what pool grants key on, so it rides along for the pool
+	// rule — the only rule that crosses a tenant boundary inside the store.
 	resolve := func(ctx context.Context, table string) (memory.BackendHandle, memory.StoreBinding, error) {
 		if am == nil {
 			return nil, memory.StoreBinding{}, fmt.Errorf("agent has no memory profile")
@@ -39,7 +44,17 @@ func StoreHandlers(am *memory.AgentMemory, mgr *memory.Manager) map[string]sessi
 			return nil, memory.StoreBinding{}, err
 		}
 		scope := session.ScopeUUIDFromCtx(ctx)
-		h = memory.WrapScoped(h, bind.Scoping, memory.ModeOf(session.ProvenanceKindFromCtx(ctx), scope), scope)
+		personal := session.PersonalUUIDFromCtx(ctx)
+		poolScope := memory.PoolScope{}
+		if strings.HasPrefix(bind.Scoping, "pool:") {
+			poolScope = memory.PoolScope{
+				UUID:  bind.PoolUUID,
+				Agent: bind.Agent,
+				Auth:  auth,
+			}
+		}
+		h = memory.WrapScoped(h, bind.Scoping, memory.ModeOf(session.ProvenanceKindFromCtx(ctx), scope),
+			memory.Caller{ScopeUUID: scope, PersonalUUID: personal}, poolScope)
 		return h, bind, nil
 	}
 

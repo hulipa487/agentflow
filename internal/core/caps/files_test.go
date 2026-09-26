@@ -53,7 +53,7 @@ func TestFileHandlersScopeIsolation(t *testing.T) {
 	m := testFileManager(t)
 	h := FileHandlers(m, "writer")
 	ctx := context.Background()
-	u1 := session.WithUserUUID(ctx, "u1")
+	u1 := session.WithPersonalIdentity(ctx, "u1")
 
 	resp, ok := h["files.put"](u1, session.Op{Type: "files.put", Project: "p", Path: "a.txt", Content: "hello"})
 	decodeOK(t, resp, ok)
@@ -64,7 +64,7 @@ func TestFileHandlersScopeIsolation(t *testing.T) {
 	}
 
 	// Another user cannot see u1's tree.
-	u2 := session.WithUserUUID(ctx, "u2")
+	u2 := session.WithPersonalIdentity(ctx, "u2")
 	resp, ok = h["files.list"](u2, session.Op{Type: "files.list", Project: "p"})
 	if got := decodeOK(t, resp, ok)["entries"].([]any); len(got) != 0 {
 		t.Fatalf("cross-user leak: %+v", got)
@@ -87,7 +87,7 @@ func TestFileHandlersScopeIsolation(t *testing.T) {
 func TestFileHandlersSnapshots(t *testing.T) {
 	m := testFileManager(t)
 	h := FileHandlers(m, "writer")
-	ctx := session.WithUserUUID(context.Background(), "u1")
+	ctx := session.WithPersonalIdentity(context.Background(), "u1")
 
 	h["files.put"](ctx, session.Op{Type: "files.put", Project: "p", Path: "a.txt", Content: "v1"})
 	resp, ok := h["files.commit"](ctx, session.Op{Type: "files.commit", Project: "p", CommitMsg: "first"})
@@ -110,7 +110,7 @@ func TestFileHandlersSnapshots(t *testing.T) {
 func TestFileHandlersScratch(t *testing.T) {
 	m := testFileManager(t)
 	h := FileHandlers(m, "writer")
-	ctx := session.WithUserUUID(context.Background(), "u1")
+	ctx := session.WithPersonalIdentity(context.Background(), "u1")
 
 	resp, ok := h["files.scratch.put"](ctx, session.Op{Type: "files.scratch.put", Owner: "sess:A", Path: "tmp.txt", Content: "temp"})
 	decodeOK(t, resp, ok)
@@ -203,7 +203,7 @@ end
 	}
 
 	// The put landed under the inbound sender's user scope.
-	u1ctx := session.WithUserUUID(context.Background(), "u1")
+	u1ctx := session.WithPersonalIdentity(context.Background(), "u1")
 	entries, err := m.List(u1ctx, "user:u1", "proj", "")
 	if err != nil || len(entries) != 1 {
 		t.Fatalf("bridge write must land in the user scope: %+v err %v", entries, err)
@@ -215,7 +215,7 @@ end
 func TestFileHandlersPutByHandle(t *testing.T) {
 	m := testFileManager(t)
 	h := FileHandlers(m, "main")
-	ctx := session.WithUserUUID(context.Background(), "u1")
+	ctx := session.WithPersonalIdentity(context.Background(), "u1")
 
 	// Seed a blob via a normal put, then re-point another path at its handle.
 	resp, ok := h["files.put"](ctx, session.Op{Type: "files.put", Project: "p", Path: "orig.txt", Content: "v1"})

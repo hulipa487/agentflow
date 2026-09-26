@@ -518,7 +518,7 @@ func TestHTTPAuthInjectsHeader(t *testing.T) {
 
 	creds := seededStore(t, "u_oscar", "weather", "api_key", "sk-test-123")
 	h := HTTPHandlers(discardLogger(), creds, permissive, nil)
-	ctx := session.WithUserUUID(context.Background(), "u_oscar")
+	ctx := session.WithPersonalIdentity(context.Background(), "u_oscar")
 
 	resp, ok := h["http.request"](ctx, session.Op{
 		Type: "http.request",
@@ -554,7 +554,7 @@ func TestHTTPAuthNoUserFails(t *testing.T) {
 func TestHTTPAuthUnknownServiceFails(t *testing.T) {
 	creds := seededStore(t, "u_oscar", "weather", "api_key", "sk-test-123")
 	h := HTTPHandlers(discardLogger(), creds, permissive, nil)
-	ctx := session.WithUserUUID(context.Background(), "u_oscar")
+	ctx := session.WithPersonalIdentity(context.Background(), "u_oscar")
 
 	_, ok := h["http.request"](ctx, session.Op{
 		Type: "http.request",
@@ -577,7 +577,7 @@ func TestHTTPAuthTenantIsolation(t *testing.T) {
 
 	creds := seededStore(t, "u_a", "weather", "api_key", "sk-a")
 	h := HTTPHandlers(discardLogger(), creds, permissive, nil)
-	ctx := session.WithUserUUID(context.Background(), "u_b")
+	ctx := session.WithPersonalIdentity(context.Background(), "u_b")
 
 	_, ok := h["http.request"](ctx, session.Op{
 		Type: "http.request",
@@ -602,7 +602,7 @@ func TestHTTPAuthRedactedOnError(t *testing.T) {
 
 	creds := seededStore(t, "u_oscar", "weather", "api_key", "super-secret-value-xyz")
 	h := HTTPHandlers(discardLogger(), creds, permissive, nil)
-	ctx := session.WithUserUUID(context.Background(), "u_oscar")
+	ctx := session.WithPersonalIdentity(context.Background(), "u_oscar")
 
 	resp, ok := h["http.request"](ctx, session.Op{
 		Type:    "http.request",

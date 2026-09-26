@@ -25,9 +25,11 @@ func StoreHandlers(am *memory.AgentMemory, mgr *memory.Manager) map[string]sessi
 		return string(b), true
 	}
 	// resolve binds the table and wraps it with scope enforcement for private
-	// stores: the mode comes from the ctx provenance kind + user stamp (see
-	// memory.ModeOf), so a channel session can only ever read its own scope,
-	// service rows, and pre-upgrade legacy rows.
+	// stores: the mode comes from the ctx provenance kind + the turn's SCOPE
+	// identity (see memory.ModeOf), so a channel session can only ever read its
+	// own scope, service rows, and pre-upgrade legacy rows. The scope uuid — not
+	// the personal uuid — is what keys the stratum: in group context the two are
+	// different uuids and only one of them is isolated per (person, group).
 	resolve := func(ctx context.Context, table string) (memory.BackendHandle, memory.StoreBinding, error) {
 		if am == nil {
 			return nil, memory.StoreBinding{}, fmt.Errorf("agent has no memory profile")
@@ -36,7 +38,8 @@ func StoreHandlers(am *memory.AgentMemory, mgr *memory.Manager) map[string]sessi
 		if err != nil {
 			return nil, memory.StoreBinding{}, err
 		}
-		h = memory.WrapScoped(h, bind.Scoping, memory.ModeOf(session.ProvenanceKindFromCtx(ctx), session.UserUUIDFromCtx(ctx)), session.UserUUIDFromCtx(ctx))
+		scope := session.ScopeUUIDFromCtx(ctx)
+		h = memory.WrapScoped(h, bind.Scoping, memory.ModeOf(session.ProvenanceKindFromCtx(ctx), scope), scope)
 		return h, bind, nil
 	}
 

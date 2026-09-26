@@ -59,11 +59,36 @@ func getVal(t *testing.T, h map[string]session.OpHandler, ctx context.Context, k
 }
 
 func userCtx(uuid string) context.Context {
-	return session.WithUserUUID(context.Background(), uuid)
+	return session.WithPersonalIdentity(context.Background(), uuid)
 }
 
 func maintCtx() context.Context {
 	return session.WithProvenanceKind(context.Background(), "scheduler")
+}
+
+// rawTable reads every row of the store with its scope prefix intact, through
+// the maintenance context that is allowed to see all of them. Tests assert on
+// these keys because the stratum a row landed in IS the scope decision — the
+// thing a wrapper's own reader would happily hide.
+func rawTable(t *testing.T, h map[string]session.OpHandler) map[string]string {
+	t.Helper()
+	resp, ok := h["store.query"](maintCtx(), session.Op{Type: "store.query", Query: memory.Query{Kind: "all", Table: "t"}})
+	if !ok {
+		t.Fatalf("maintenance query failed: %s", resp)
+	}
+	var result map[string]any
+	if err := json.Unmarshal([]byte(resp), &result); err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]string{}
+	recs, _ := result["records"].([]any)
+	for _, r := range recs {
+		m, _ := r.(map[string]any)
+		k, _ := m["key"].(string)
+		v, _ := m["value"].(string)
+		out[k] = v
+	}
+	return out
 }
 
 // TestStoreScopeWire: the engine-enforced boundary end to end through the op
@@ -196,5 +221,44 @@ func TestStoreScopesSharedDenied(t *testing.T) {
 	h := StoreHandlers(&am, mgr)
 	if _, ok := h["store.scopes"](maintCtx(), session.Op{Type: "store.scopes", Table: "t"}); ok {
 		t.Fatal("shared-binding store.scopes must be denied")
+	}
+}
+
+// TestStoreReadDoesNotWidenWriteScope is §4.2 #2 at the store: an interactive
+// turn READS wider than it may WRITE (its own scope, the service stratum, and
+// legacy rows), and reading one of those wider rows must not carry the write
+// into the stratum it came from. A write that followed the read would promote a
+// per-turn value into shared state — which, for a turn that inherited a tenant
+// over a hop, is the same failure one step along: one tenant's read becoming
+// the fleet's row.
+func TestStoreReadDoesNotWidenWriteScope(t *testing.T) {
+	h := scopedStoreTest(t)
+	u1 := userCtx("u1")
+
+	// A row in the shared service stratum, written by a context with no tenant.
+	putVal(t, h, context.Background(), "note", "fleet")
+	// A pre-isolation legacy row, reachable by every session of the agent.
+	putVal(t, h, maintCtx(), "old-note", "legacy")
+
+	// u1 may read both — that is the documented interactive read set.
+	for _, tc := range []struct{ key, want string }{{"note", "fleet"}, {"old-note", "legacy"}} {
+		if v, ok := getVal(t, h, u1, tc.key); !ok || v != tc.want {
+			t.Fatalf("u1 must read %s, got %q ok=%v", tc.key, v, ok)
+		}
+	}
+
+	// Writing them back stays in u1's own scope.
+	putVal(t, h, u1, "note", "mine")
+	putVal(t, h, u1, "old-note", "mine")
+
+	raw := rawTable(t, h)
+	if raw["service|note"] != "fleet" {
+		t.Fatalf("reading a service row must not move the write into the service stratum: %v", raw)
+	}
+	if raw["old-note"] != "legacy" {
+		t.Fatalf("reading a legacy row must not overwrite it in place: %v", raw)
+	}
+	if raw["user:u1|note"] != "mine" || raw["user:u1|old-note"] != "mine" {
+		t.Fatalf("both writes must land in the writer's own scope: %v", raw)
 	}
 }

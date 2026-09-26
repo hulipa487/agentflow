@@ -792,6 +792,7 @@ func main() {
 				Prompts:            promptReg,
 				Extras:             a.Extras,
 				Credentials:        a.Credentials,
+				InheritUser:        a.InheritUser,
 			},
 			LoopFile:         watchPath,
 			LoopSrc:          src,
@@ -955,6 +956,7 @@ func main() {
 				Prompts:            promptReg,
 				Extras:             p.Extras,
 				Credentials:        p.Credentials,
+				InheritUser:        p.InheritUser,
 			},
 		}
 		defs["__spawn__"+pname] = &supervisor.AgentDef{
@@ -1237,10 +1239,15 @@ func main() {
 			if ts == 0 {
 				ts = time.Now().Unix()
 			}
-			// The identity sink stamps the profile behind the message; an
-			// unregistered handle stamps an empty one, which is what the audit
-			// view needs to tell personal traffic from anonymous traffic.
-			userUUID, _ := msg.Payload["user_uuid"].(string)
+			// The identity sink stamps the profile behind the message on the
+			// core-owned provenance; an unregistered handle stamps an empty one,
+			// which is what the audit view needs to tell personal traffic from
+			// anonymous traffic. Read from the provenance, never from the payload:
+			// a hop's payload is rebuilt from the caller's Lua table.
+			userUUID := ""
+			if msg.Provenance != nil && msg.Provenance.UserUUID != nil {
+				userUUID = *msg.Provenance.UserUUID
+			}
 			if err := journalSink.RecordMessage(ctx, runtime.JournalEntry{
 				ID:          msg.ID,
 				Ts:          ts,

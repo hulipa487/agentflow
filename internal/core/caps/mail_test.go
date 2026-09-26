@@ -110,7 +110,7 @@ func TestMailAuthNotEnabled(t *testing.T) {
 func TestMailAuthNoUser(t *testing.T) {
 	creds := seededStore(t, "u1", "imap", "password", "pw")
 	h := MailHandlers(discardLogger(), creds)
-	// No WithUserUUID on the context.
+	// No acting identity on the context.
 	_, ok := h["mail.imap.fetch"](context.Background(), session.Op{
 		Type:     "mail.imap.fetch",
 		MailHost: "imap.example.com",

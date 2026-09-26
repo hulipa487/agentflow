@@ -13,8 +13,9 @@ import (
 )
 
 // Send delivers a core-stamped asynchronous agent message after resolving and
-// authorizing the requested address. Source identity comes from the actor, not
-// from any Lua-controlled payload.
+// authorizing the requested address. Source identity — the sender agent and the
+// tenant to hand down the chain — comes from the actor's stamped context, not
+// from any Lua-controlled payload; a payload key claiming a user is ignored.
 func (s *Supervisor) Send(ctx context.Context, source session.Identity, raw string, payload map[string]any) error {
 	if !source.Capabilities["agent.send"] {
 		return fmt.Errorf("agent %q lacks agent.send capability", source.Agent)
@@ -78,6 +79,7 @@ func (s *Supervisor) Reply(ctx context.Context, source session.Identity, request
 			Principal: "agent:" + source.Agent,
 			Parent:    source.ParentID,
 			RequestID: requestID,
+			UserUUID:  tenantStamp(ctx),
 		},
 	}
 	if !s.requests.Resolve(requestID, source.Agent, msg) {
@@ -199,7 +201,7 @@ func (s *Supervisor) deliverAgentMessage(ctx context.Context, source session.Ide
 			if !source.CanContact[agentName] && agentName != source.Agent {
 				return fmt.Errorf("agent %q may not contact %q", source.Agent, agentName)
 			}
-			msg := newAgentMessage(source, agentName, payload, requestID)
+			msg := newAgentMessage(ctx, source, agentName, payload, requestID)
 			return s.Deliver(agentName, key, msg)
 		}
 		if dst.Session != source.SessionID && !source.CanContact[target.Identity.Agent] && target.Identity.ParentID != source.SessionID {
@@ -211,13 +213,13 @@ func (s *Supervisor) deliverAgentMessage(ctx context.Context, source session.Ide
 		return fmt.Errorf("unsupported address kind %q", dst.Kind)
 	}
 
-	msg := newAgentMessage(source, targetAgent, payload, requestID)
+	msg := newAgentMessage(ctx, source, targetAgent, payload, requestID)
 	return s.Deliver(targetAgent, targetKey, msg)
 }
 
 // newAgentMessage builds the core-stamped agent message delivered to a target
 // agent. Source identity comes from the actor, never from Lua payloads.
-func newAgentMessage(source session.Identity, targetAgent string, payload map[string]any, requestID string) session.Message {
+func newAgentMessage(ctx context.Context, source session.Identity, targetAgent string, payload map[string]any, requestID string) session.Message {
 	return session.Message{
 		ID:      newMessageID(),
 		Type:    "agent",
@@ -231,8 +233,30 @@ func newAgentMessage(source session.Identity, targetAgent string, payload map[st
 			Principal: "agent:" + source.Agent,
 			Parent:    source.ParentID,
 			RequestID: requestID,
+			UserUUID:  tenantStamp(ctx),
 		},
 	}
+}
+
+// tenantStamp is the tenant a delegation hop carries: the sending turn's own
+// tenant, taken from its core-stamped acting identity and never from the
+// payload (which the supervisor rebuilds from the caller's Lua table, so a loop
+// controls it — §4.2 #4). Handing the tenant down the chain is what keeps a
+// fleet serving one tenant from writing into the fleet-wide service stratum.
+//
+// The three states are preserved, because they are load-bearing at the far end:
+// an unstamped turn yields nil (unknown), so the receiver may still resolve the
+// sender address; a turn known to have no tenant — an unlinked handle, or an
+// agent that opted out with inherit_user: false — yields an explicit "" so the
+// receiver cannot fall back either. It can only ever pass on the tenant it was
+// given; nothing here can widen one, so the chain attenuates.
+func tenantStamp(ctx context.Context) *string {
+	id, known := session.ActingFromCtx(ctx)
+	if !known {
+		return nil
+	}
+	tenant := id.Personal
+	return &tenant
 }
 
 func newMessageID() string { return "ag-" + uuid.NewString() }

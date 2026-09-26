@@ -98,7 +98,7 @@ data: [DONE]
 		Ledger: ledger,
 	})
 	chat := h["llm.chat"]
-	ctx := session.WithUserUUID(context.Background(), p.UserID)
+	ctx := session.WithPersonalIdentity(context.Background(), p.UserID)
 	// MaxTokens pins the reservation estimate to 100, so the arithmetic is
 	// about the quota rather than the default 4096-token guess.
 	op := session.Op{
@@ -162,7 +162,7 @@ func TestQuotaIgnoresTrafficWithoutAUser(t *testing.T) {
 		t.Fatalf("traffic with no user must pass: %s", resp)
 	}
 	// The same call attributed to a user would be refused.
-	ctx := session.WithUserUUID(context.Background(), "u_someone")
+	ctx := session.WithPersonalIdentity(context.Background(), "u_someone")
 	if resp, ok := h["llm.chat"](ctx, op); ok {
 		t.Fatalf("a user-attributed call over the limit must be refused: %s", resp)
 	}

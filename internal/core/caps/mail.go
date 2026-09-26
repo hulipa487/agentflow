@@ -48,8 +48,9 @@ func MailHandlers(log *slog.Logger, creds *credentials.Store) map[string]session
 		return string(b), true
 	}
 
-	// resolvePassword fetches the password from the cred store for the user in
-	// ctx. Errors never include the secret itself.
+	// resolvePassword fetches the password from the cred store for the CREDENTIAL
+	// identity in ctx — always the person, never the group membership uuid. Errors
+	// never include the secret itself.
 	resolvePassword := func(ctx context.Context, auth *session.CredentialRef) (string, error) {
 		if auth == nil || auth.Service == "" {
 			return "", fmt.Errorf("mail: auth={service=...} is required")
@@ -57,7 +58,7 @@ func MailHandlers(log *slog.Logger, creds *credentials.Store) map[string]session
 		if creds == nil {
 			return "", fmt.Errorf("mail: auth=%q but credentials are not enabled", auth.Service)
 		}
-		uuid := session.UserUUIDFromCtx(ctx)
+		uuid := session.CredentialUUIDFromCtx(ctx)
 		if uuid == "" {
 			return "", fmt.Errorf("mail: auth=%q but no user in context", auth.Service)
 		}

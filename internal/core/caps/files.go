@@ -13,17 +13,18 @@ import (
 
 // FileHandlers exposes the user-scoped file store as session op handlers,
 // gated by the "files" capability at assembly time (see Gate). Scope is
-// engine-resolved per call: "user:<uuid>" when the turn is channel-originated
-// (the actor stamps the tenant UUID into ctx), otherwise "agent:<agent>". A
-// loop can never name another scope. Bytes never cross the bridge: put takes
-// content (or base64 data), read returns the handle + metadata. A nil manager
-// (file store disabled at boot, e.g. unresolvable S3 credentials) makes every
-// op fail honestly instead of panicking.
+// engine-resolved per call: the turn's resolved scope prefix ("user:<uuid>")
+// when it has a user scope — the personal uuid, or the group membership uuid in
+// group context — otherwise "agent:<agent>". A loop can never name another
+// scope. Bytes never cross the bridge: put takes content (or base64 data), read
+// returns the handle + metadata. A nil manager (file store disabled at boot,
+// e.g. unresolvable S3 credentials) makes every op fail honestly instead of
+// panicking.
 func FileHandlers(m *files.Manager, agent string) map[string]session.OpHandler {
 	disabled := m == nil
 	scope := func(ctx context.Context) string {
-		if u := session.UserUUIDFromCtx(ctx); u != "" {
-			return "user:" + u
+		if p := session.ScopePrefixFromCtx(ctx); p != "" {
+			return p
 		}
 		return "agent:" + agent
 	}

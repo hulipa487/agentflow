@@ -149,7 +149,7 @@ func newTestShellProvider(name string) *testShellProvider {
 func TestShellSpawnCheckoutMaterializes(t *testing.T) {
 	fm := testFileManager(t)
 	// Seed a project under user u1's scope and commit it.
-	fctx := session.WithUserUUID(context.Background(), "u1")
+	fctx := session.WithPersonalIdentity(context.Background(), "u1")
 	if _, err := fm.Put(fctx, "user:u1", "proj", "src/main.go", strings.NewReader("package main"), "text/plain"); err != nil {
 		t.Fatal(err)
 	}

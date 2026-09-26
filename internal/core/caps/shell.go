@@ -30,9 +30,12 @@ func ShellHandlers(mgr *shell.Manager, fm *files.Manager, agent string) map[stri
 		}
 		return string(b), true
 	}
+	// Scope is the turn's resolved scope prefix (the personal uuid, or the group
+	// membership uuid in group context); a turn with no user scope falls back to
+	// the whole agent. A loop can never name it.
 	scope := func(ctx context.Context) string {
-		if u := session.UserUUIDFromCtx(ctx); u != "" {
-			return "user:" + u
+		if p := session.ScopePrefixFromCtx(ctx); p != "" {
+			return p
 		}
 		return "agent:" + agent
 	}

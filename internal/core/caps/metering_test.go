@@ -56,7 +56,7 @@ func TestMeteringAttributesToTheContextUser(t *testing.T) {
 	u := usageCounts{Input: 10, Output: 2, Cached: 4}
 
 	mt.record(context.Background(), session.Op{Model: "m"}, "chat", u, true)
-	mt.record(session.WithUserUUID(context.Background(), "u_1"), session.Op{Model: "m"}, "chat", u, true)
+	mt.record(session.WithPersonalIdentity(context.Background(), "u_1"), session.Op{Model: "m"}, "chat", u, true)
 
 	if len(rec.got) != 2 {
 		t.Fatalf("expected two records, got %d", len(rec.got))

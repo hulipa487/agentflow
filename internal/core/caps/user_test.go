@@ -64,7 +64,7 @@ func ctxForUser(id string) context.Context {
 	if id == "" {
 		return context.Background()
 	}
-	return session.WithUserUUID(context.Background(), id)
+	return session.WithPersonalIdentity(context.Background(), id)
 }
 
 // call runs one op and decodes its object response, failing the test on a

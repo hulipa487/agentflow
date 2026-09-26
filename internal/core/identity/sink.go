@@ -7,6 +7,7 @@ import (
 
 	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/router"
+	"agentflow/internal/core/session"
 )
 
 // linkCommand is the in-channel command that carries a link code. Only
@@ -22,14 +23,21 @@ const linkCommand = "/link"
 //     when the handle is linked, else "user:<identity>" — a stable handle id,
 //     never the raw channel string, so the audit trail is uniform.
 //   - To:   "" → "agent:<bound agent>" (the agent the channel is configured for)
-//   - Payload: adds "user_uuid" (the scope stamp; empty for an unlinked
-//     handle), "identity_id", "registered", "trust" and "native_from".
+//   - Provenance.UserUUID: the tenant stamp (core-stamped; empty for an
+//     unlinked handle), which is what the actor resolves a turn's acting
+//     identity from. It is deliberately NOT written into the payload: the
+//     supervisor rebuilds a hop's payload from the caller's Lua table, so
+//     anything there is forgeable and must not decide a scope (§4.2 #4).
+//   - Payload: adds "identity_id", "registered", "trust" and "native_from".
 //
 // The scope stamp is the *profile* id, so a person's memory, files and
 // credentials follow them across every linked channel. For an unlinked handle
-// it is deliberately empty: the actor then stamps no user on the context and
-// the turn runs in the shared service stratum, which is what keeps an
-// unclaimed handle from accumulating personal history.
+// it is deliberately the empty string — an explicit "no tenant", not an absent
+// one: the actor then stamps no user on the context and the turn runs in the
+// shared service stratum, which is what keeps an unclaimed handle from
+// accumulating personal history. It must stay distinguishable from "nobody
+// stamped this", because only the latter falls back to the sender address, and
+// an unlinked handle's address carries the handle id.
 //
 // The native Channel/ReplyTo are left intact so session.send (reply to the
 // current inbound) still works without any change. Failures to resolve are
@@ -94,17 +102,25 @@ func (s *Sink) Submit(in router.Inbound) {
 	}
 	in.Message.From = "user:" + from
 	in.Message.To = "agent:" + in.Agent
+	// The tenant stamp lives on the PROVENANCE — core-owned, and the only place
+	// the actor resolves an acting identity from. An unlinked handle stamps an
+	// explicit empty, which means "no tenant" rather than "unknown", so the
+	// actor does not fall back to the handle id in From.
+	tenant := res.UserID
+	if in.Message.Provenance == nil {
+		in.Message.Provenance = &session.Provenance{Kind: "channel", Principal: "user:" + from}
+	}
+	in.Message.Provenance.UserUUID = &tenant
 	if in.Message.Payload == nil {
 		in.Message.Payload = map[string]any{}
 	}
 	// Copy to avoid mutating a payload map the driver may still hold; the
 	// driver's payload is small and this is the inbound hot path, so a shallow
 	// copy is enough. We only add keys, never overwrite existing ones.
-	p := make(map[string]any, len(in.Message.Payload)+6)
+	p := make(map[string]any, len(in.Message.Payload)+4)
 	for k, v := range in.Message.Payload {
 		p[k] = v
 	}
-	p["user_uuid"] = res.UserID // "" = unregistered: no personal scope
 	p["identity_id"] = res.IdentityID
 	p["registered"] = res.Registered()
 	p["trust"] = res.Trust

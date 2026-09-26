@@ -117,12 +117,14 @@ func HTTPHandlers(log *slog.Logger, creds *credentials.Store, policy netguard.Po
 			// Resolve an `auth` credential reference into a request header. The
 			// loop only names the service; the secret is fetched from the store
 			// (encrypted at rest) and injected here, so it never crosses the
-			// Lua bridge and lands in the same headers map redactErr scrubs.
+			// Lua bridge and lands in the same headers map redactErr scrubs. The
+			// lookup is keyed by the CREDENTIAL identity — always the person: a
+			// tenant's API keys are per person, not per (person, group).
 			if op.Auth != nil && op.Auth.Service != "" {
 				if creds == nil {
 					return fail(fmt.Errorf("http.request: auth=%q but credentials are not enabled", op.Auth.Service))
 				}
-				uuid := session.UserUUIDFromCtx(ctx)
+				uuid := session.CredentialUUIDFromCtx(ctx)
 				if uuid == "" {
 					return fail(fmt.Errorf("http.request: auth=%q but no user in context", op.Auth.Service))
 				}

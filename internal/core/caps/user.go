@@ -65,6 +65,13 @@ type UserHandlers struct {
 }
 
 // Handlers returns the user.* op handlers.
+//
+// Every op here resolves the CREDENTIAL identity — the person, never the group
+// membership uuid. A profile, its handles, its quota and its ledger are all
+// per person: in group context the turn still belongs to the same human, and
+// the group's shared storage is reached through a pool, not through this
+// surface. That is why user.usage reports one person's day even when they are
+// acting in a group (F23: the ledger is the billing mechanism).
 func (o UserHandlers) Handlers() map[string]session.OpHandler {
 	fail := func(err error) (string, bool) {
 		b, _ := json.Marshal(err.Error())
@@ -82,7 +89,7 @@ func (o UserHandlers) Handlers() map[string]session.OpHandler {
 	return map[string]session.OpHandler{
 		// user.current -> {registered, id, display_name, identities}
 		"user.current": func(ctx context.Context, op session.Op) (string, bool) {
-			u := session.UserUUIDFromCtx(ctx)
+			u := session.CredentialUUIDFromCtx(ctx)
 			if u == "" || o.Profile == nil {
 				return okJSON(map[string]any{"registered": false})
 			}
@@ -100,7 +107,7 @@ func (o UserHandlers) Handlers() map[string]session.OpHandler {
 
 		// user.usage -> today's tokens for the caller, with their quota standing
 		"user.usage": func(ctx context.Context, op session.Op) (string, bool) {
-			u := session.UserUUIDFromCtx(ctx)
+			u := session.CredentialUUIDFromCtx(ctx)
 			if u == "" {
 				return okJSON(map[string]any{"registered": false})
 			}
@@ -150,7 +157,7 @@ func (o UserHandlers) Handlers() map[string]session.OpHandler {
 				return fail(fmt.Errorf("service is required"))
 			}
 			present := false
-			if u := session.UserUUIDFromCtx(ctx); u != "" && o.HasCredential != nil {
+			if u := session.CredentialUUIDFromCtx(ctx); u != "" && o.HasCredential != nil {
 				present = o.HasCredential(u, service)
 			}
 			return okJSON(map[string]any{"service": service, "present": present})

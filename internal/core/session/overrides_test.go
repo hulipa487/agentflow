@@ -56,7 +56,7 @@ func TestAgentInfoCarriesPerUserOverrides(t *testing.T) {
 	}
 
 	a.SetProfileSettings(stubSettings{model: "premium", instructions: "Speak Cantonese."})
-	ctx := WithUserUUID(bg, "u_1")
+	ctx := WithPersonalIdentity(bg, "u_1")
 	got = infoOf(t, a, ctx)
 	if got["model"] != "premium" {
 		t.Fatalf("model = %v, want the profile's", got["model"])
@@ -80,7 +80,7 @@ func TestAgentInfoCarriesPerUserOverrides(t *testing.T) {
 	// A lookup that fails leaves the agent's own values in place: a profile
 	// read must never fail a person's turn.
 	a.SetProfileSettings(stubSettings{err: errors.New("identity store unreachable")})
-	got = infoOf(t, a, WithUserUUID(bg, "u_1"))
+	got = infoOf(t, a, WithPersonalIdentity(bg, "u_1"))
 	if got["model"] != "base-model" || got["instructions"] != "You are a helpful bot." {
 		t.Fatalf("a failed lookup must fall back to the agent's values: %v", got)
 	}

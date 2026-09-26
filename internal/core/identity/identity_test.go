@@ -533,6 +533,17 @@ func inbound(from, channel string) router.Inbound {
 	}
 }
 
+// stampedTenant reads the core-stamped tenant off a message's provenance.
+// present is false when nothing was stamped at all (the unknown state, which is
+// what the actor falls back to the sender address for); a present-but-empty
+// stamp means "known to have no tenant".
+func stampedTenant(m session.Message) (string, bool) {
+	if m.Provenance == nil || m.Provenance.UserUUID == nil {
+		return "", false
+	}
+	return *m.Provenance.UserUUID, true
+}
+
 func TestSinkStampsRegisteredScope(t *testing.T) {
 	r := newTestRegistry(t)
 	r.SetAutoClaim(true)
@@ -544,9 +555,9 @@ func TestSinkStampsRegisteredScope(t *testing.T) {
 		t.Fatalf("inner got %d events, want 1", len(cap.got))
 	}
 	out := cap.got[0]
-	scope, _ := out.Message.Payload["user_uuid"].(string)
-	if scope == "" {
-		t.Fatal("auto-claimed handle should stamp a scope")
+	scope, present := stampedTenant(out.Message)
+	if !present || scope == "" {
+		t.Fatalf("auto-claimed handle should stamp a scope on the provenance, got %q present=%v", scope, present)
 	}
 	if out.Message.From != "user:"+scope {
 		t.Fatalf("From=%q want user:%s", out.Message.From, scope)
@@ -566,11 +577,18 @@ func TestSinkStampsRegisteredScope(t *testing.T) {
 	if out.Message.Channel != "telegram" || out.Message.ReplyTo != "12345" {
 		t.Fatalf("reply path clobbered: channel=%q reply_to=%q", out.Message.Channel, out.Message.ReplyTo)
 	}
+	// Identity never travels in the payload: the supervisor rebuilds a hop's
+	// payload from the caller's Lua table, so a payload stamp would be
+	// loop-forgeable (§4.2 #4).
+	if _, leaked := out.Message.Payload["user_uuid"]; leaked {
+		t.Fatal("identity must not be written into the payload")
+	}
 }
 
-// The unregistered case is the security-relevant one: the payload must say so
-// explicitly, because the actor treats a present-but-empty user_uuid as "no
-// scope" rather than falling back to the sender string.
+// The unregistered case is the security-relevant one: the stamp must say so
+// explicitly, because the actor treats a present-but-empty tenant as "no scope"
+// rather than falling back to the sender string — and the sender string here is
+// the handle's stable identity id, which must never become a scope uuid.
 func TestSinkStampsNoScopeWhenUnregistered(t *testing.T) {
 	r := newTestRegistry(t)
 	cap := newCapture()
@@ -578,12 +596,12 @@ func TestSinkStampsNoScopeWhenUnregistered(t *testing.T) {
 	sink.Submit(inbound("user:telegram:123", "telegram"))
 
 	out := cap.got[0]
-	scope, present := out.Message.Payload["user_uuid"]
+	scope, present := stampedTenant(out.Message)
 	if !present {
-		t.Fatal("user_uuid must be present even when empty, so the actor does not fall back to From")
+		t.Fatal("the tenant stamp must be present even when empty, so the actor does not fall back to From")
 	}
-	if s, _ := scope.(string); s != "" {
-		t.Fatalf("unregistered handle must stamp an empty scope, got %q", s)
+	if scope != "" {
+		t.Fatalf("unregistered handle must stamp an empty tenant, got %q", scope)
 	}
 	if reg, _ := out.Message.Payload["registered"].(bool); reg {
 		t.Error("registered flag should be false")
@@ -611,7 +629,7 @@ func TestSinkUsesProfileScopeAfterLink(t *testing.T) {
 	if len(cap.got) != 2 {
 		t.Fatalf("inner got %d events, want 2", len(cap.got))
 	}
-	scope, _ := cap.got[1].Message.Payload["user_uuid"].(string)
+	scope, _ := stampedTenant(cap.got[1].Message)
 	if scope != p.UserID {
 		t.Fatalf("linked handle must stamp the profile after a cache hit was possible: got %q want %q", scope, p.UserID)
 	}

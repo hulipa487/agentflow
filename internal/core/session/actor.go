@@ -34,6 +34,27 @@ type Provenance struct {
 	Principal string `json:"principal"`
 	Parent    string `json:"parent,omitempty"`
 	RequestID string `json:"request_id,omitempty"`
+
+	// UserUUID is the tenant a message belongs to, as the core resolved it.
+	// It is THREE-STATE, and the distinction is load-bearing:
+	//
+	//	nil       unknown — nothing stamped it (a producer with no tenant in
+	//	          scope: a boot/scheduler/system message). Only in this state
+	//	          does the sender-address fallback apply.
+	//	""        known-empty — the core resolved this message and it belongs to
+	//	          no tenant: an unlinked handle, or a hop from a turn that had no
+	//	          tenant. It must NOT fall back to the sender address, or an
+	//	          unlinked handle's identity id would become a scope uuid.
+	//	"<uuid>"  the tenant (a profile id).
+	//
+	// A nil pointer is omitted from JSON while an explicit "" is not, so the
+	// three states survive the fleet's serialization path intact.
+	//
+	// This field — never Message.Payload — is where identity is authoritative.
+	// The supervisor rebuilds a hop's payload from the caller's Lua table, so
+	// anything carried there is Lua-reachable and forgeable; reading the tenant
+	// from the payload would let a loop mint another tenant's scope (§4.2 #4).
+	UserUUID *string `json:"user_uuid,omitempty"`
 }
 
 // Identity is the runtime-owned authority attached to an actor's operations.
@@ -344,6 +365,23 @@ type Info struct {
 	Extras map[string]any
 	// Credentials is the credential.get allow-list (empty = no access).
 	Credentials []string
+	// InheritUser is this agent's tenant-inheritance policy across a delegation
+	// hop, configured as `inherit_user` (nil = inherit, the default). See
+	// InheritsUser.
+	InheritUser *bool
+}
+
+// InheritsUser reports whether this agent takes the tenant that arrives with a
+// delegation hop (an agent message). Opt-out is explicit — `inherit_user:
+// false` — and the zero value means inherit, so an Info built without the field
+// (tests, builtin loops) keeps the propagation fix on rather than silently
+// switching it off. An agent that opts out still sees the person talking to it
+// directly: this governs hops, not channel turns.
+func (i *Info) InheritsUser() bool {
+	if i == nil || i.InheritUser == nil {
+		return true
+	}
+	return *i.InheritUser
 }
 
 // StringBox is a race-free string cell (this toolchain's sync/atomic lacks
@@ -771,7 +809,7 @@ func (a *Actor) dispatchBlocking(ctx context.Context, op Op, current *Message) (
 
 func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (string, bool) {
 	ctx = WithOwner(ctx, a.Name)
-	ctx = WithUserUUID(ctx, userFromMessage(current))
+	ctx = a.stampIdentity(ctx, current)
 	ctx = WithSessionKey(ctx, a.Identity.SessionID)
 	ctx = WithProvenanceKind(ctx, provenanceKindOf(current))
 	op.Owner = a.Identity.SessionID
@@ -926,7 +964,7 @@ func (a *Actor) egress(ctx context.Context, channel, replyTo, text string, attac
 				Agent:       a.Identity.Agent,
 				Channel:     channel,
 				ReplyTo:     replyTo,
-				UserUUID:    UserUUIDFromCtx(ctx),
+				UserUUID:    PersonalUUIDFromCtx(ctx),
 				Text:        text,
 				Attachments: attachments,
 				InReplyTo:   inReplyTo,
@@ -1033,7 +1071,7 @@ func (a *Actor) infoJSON(ctx context.Context) string {
 	// model explicitly on a single call still gets the model it asked for, and
 	// the agent's own model stays visible as agent_model.
 	var overrideModel, overrideInstructions string
-	if u := UserUUIDFromCtx(ctx); u != "" && a.profileSettings != nil {
+	if u := PersonalUUIDFromCtx(ctx); u != "" && a.profileSettings != nil {
 		if m, added, err := a.profileSettings.Settings(ctx, u); err == nil {
 			overrideModel, overrideInstructions = m, added
 		}
@@ -1077,15 +1115,28 @@ func layerInstructions(base, added string) string {
 	}
 }
 
-// opContext stamps the per-turn facts an op handler reads: the tenant user the
-// turn belongs to, the session key, and the provenance kind. The registered
+// opContext stamps the per-turn facts an op handler reads: the tenant the turn
+// belongs to, the session key, and the provenance kind. The registered
 // handlers get it through the default branch, and the few ops the actor serves
 // itself — agent.info — call it directly, so both paths agree on what a handler
 // can see.
 func (a *Actor) opContext(ctx context.Context, current *Message) context.Context {
-	ctx = WithUserUUID(ctx, userFromMessage(current))
+	ctx = a.stampIdentity(ctx, current)
 	ctx = WithSessionKey(ctx, a.Identity.SessionID)
 	return WithProvenanceKind(ctx, provenanceKindOf(current))
+}
+
+// stampIdentity stamps the turn's acting identity, derived from the inbound
+// message's core-stamped provenance (never from the payload — see
+// actingIdentityOf) and this agent's inherit_user policy. A message whose
+// provenance says nothing at all leaves no identity on the context: that is the
+// third state, unknown, as opposed to a turn known to have no tenant.
+func (a *Actor) stampIdentity(ctx context.Context, current *Message) context.Context {
+	id, known := actingIdentityOf(current, a.Info.InheritsUser())
+	if !known {
+		return ctx
+	}
+	return WithActingIdentity(ctx, id)
 }
 
 // SetProfileSettings installs the per-user override lookup. Called by the
@@ -1203,26 +1254,111 @@ func ShellFromCtx(ctx context.Context) map[string]any {
 	return v
 }
 
-type userKeyType struct{}
-
-var userKey userKeyType
-
-// WithUserUUID returns a context carrying the current tenant's user UUID.
-// It is stamped by the actor from the core-owned inbound message (never from
-// Lua), so handlers can resolve per-tenant credentials without trusting the
-// loop. Empty when no inbound user is in scope (e.g. proactive scheduler ops).
-func WithUserUUID(ctx context.Context, userUUID string) context.Context {
-	return context.WithValue(ctx, userKey, userUUID)
+// ActingIdentity is the tenant identity of one turn, stamped by the actor at
+// dispatch from the inbound message's core-stamped provenance — never from Lua
+// (§7). One string used to do three jobs; in group context they part company,
+// so a consumer must name the one it means and the accessors below are the only
+// way to read it.
+type ActingIdentity struct {
+	// Personal is the person's own uuid — the profile behind the turn. It keys
+	// the credential store and the usage ledger, both of which are per person.
+	Personal string
+	// Membership is the group-context uuid, membership_uuid(U, G), when the turn
+	// acts in a group; "" in personal context. It is the scope uuid there and is
+	// recorded for attribution, but is never billed on.
+	Membership string
+	// ScopePrefix is the resolved scope prefix for this turn ("user:<uuid>"), or
+	// "" when the turn has no user scope at all. Scope sites use it verbatim
+	// rather than rebuilding it, so group context reaches them unchanged.
+	ScopePrefix string
 }
 
-// UserUUIDFromCtx extracts the user UUID injected by WithUserUUID.
-func UserUUIDFromCtx(ctx context.Context) string {
-	if ctx == nil {
-		return ""
+// ScopeUUID is the uuid scope resolution keys on: the person's own uuid
+// normally, the membership uuid in group context. The two spaces are disjoint
+// by construction (§5.6 consequence 1), which is what removes the need for a
+// separate group: scope tier.
+func (id ActingIdentity) ScopeUUID() string {
+	if id.Membership != "" {
+		return id.Membership
 	}
-	v := ctx.Value(userKey)
-	s, _ := v.(string)
-	return s
+	return id.Personal
+}
+
+type actingKeyType struct{}
+
+var actingKey actingKeyType
+
+// WithActingIdentity returns a context carrying the turn's acting identity. It
+// is stamped by the actor from the core-owned inbound message, so a handler
+// resolves a scope or a credential from something a loop cannot mint.
+func WithActingIdentity(ctx context.Context, id ActingIdentity) context.Context {
+	return context.WithValue(ctx, actingKey, id)
+}
+
+// WithPersonalIdentity returns a context carrying a personal-context acting
+// identity for one user uuid: that person is the scope, the billing identity
+// and the credential identity at once. It is the shorthand for the case that
+// exists today (no group context yet).
+func WithPersonalIdentity(ctx context.Context, userUUID string) context.Context {
+	return WithActingIdentity(ctx, PersonalIdentity(userUUID))
+}
+
+// PersonalIdentity builds the personal-context acting identity of one user.
+func PersonalIdentity(userUUID string) ActingIdentity {
+	if userUUID == "" {
+		return ActingIdentity{}
+	}
+	return ActingIdentity{Personal: userUUID, ScopePrefix: "user:" + userUUID}
+}
+
+// ActingFromCtx returns the acting identity stamped at dispatch. ok is false
+// when none was stamped at all — unknown, which is a different thing from a
+// stamped identity that carries no uuid (known-empty: an unlinked handle).
+func ActingFromCtx(ctx context.Context) (ActingIdentity, bool) {
+	if ctx == nil {
+		return ActingIdentity{}, false
+	}
+	id, ok := ctx.Value(actingKey).(ActingIdentity)
+	return id, ok
+}
+
+// ScopeUUIDFromCtx returns the uuid the memory, file and shell scopes key on.
+// A scope site must name this one and not the person: in group context they are
+// different uuids, and only the scope uuid is isolated per (person, group).
+func ScopeUUIDFromCtx(ctx context.Context) string {
+	id, _ := ActingFromCtx(ctx)
+	return id.ScopeUUID()
+}
+
+// BillingUUIDFromCtx returns the uuid the usage ledger and the quota are keyed
+// by. It is always the personal uuid: group context must not fragment the
+// ledger, because the ledger is the billing mechanism (F23).
+func BillingUUIDFromCtx(ctx context.Context) string {
+	id, _ := ActingFromCtx(ctx)
+	return id.Personal
+}
+
+// CredentialUUIDFromCtx returns the uuid the credential store is keyed by, and
+// the person the user.* surface reports on. Always the personal uuid: a
+// tenant's API keys are per person, not per (person, group).
+func CredentialUUIDFromCtx(ctx context.Context) string {
+	id, _ := ActingFromCtx(ctx)
+	return id.Personal
+}
+
+// PersonalUUIDFromCtx returns the person behind the turn. It is the identity
+// for person-level surfaces that are neither billing nor credentials: the
+// per-user profile overrides, and the tenant attribution on an audit record.
+func PersonalUUIDFromCtx(ctx context.Context) string {
+	id, _ := ActingFromCtx(ctx)
+	return id.Personal
+}
+
+// ScopePrefixFromCtx returns the resolved scope prefix ("user:<uuid>"), or ""
+// when the turn has no user scope.
+func ScopePrefixFromCtx(ctx context.Context) string {
+	id, _ := ActingFromCtx(ctx)
+	return id.ScopePrefix
 }
 
 type sessionKeyType struct{}
@@ -1289,26 +1425,38 @@ func provenanceKindOf(m *Message) string {
 	return m.Provenance.Kind
 }
 
-// userFromMessage recovers the user scope from an inbound message. An explicit
-// "user_uuid" payload key wins even when empty: the identity sink sets it to
-// "" for a handle that is not linked to a profile, and that must mean "no user
-// scope" rather than falling back to the sender string. Only when the key is
-// absent — an identity-disabled runtime, or the sink's fail-open path — does
-// the From address supply the scope.
-func userFromMessage(m *Message) string {
+// actingIdentityOf derives a turn's acting identity from its inbound message.
+//
+// The message's core-stamped provenance is the ONLY authority. The payload is
+// rebuilt from the caller's Lua table at every hop, so resolving identity from
+// it would let a loop mint another tenant's scope — the forgery hole §4.2 #4
+// names. The sender address is consulted only when the provenance says nothing
+// at all: that is a message that never passed the identity layer (an
+// identity-disabled runtime, whose drivers address a person as "user:<handle>").
+//
+// An explicit empty stamp means known-empty and never falls back: an unlinked
+// handle's stable identity id lives in that same "user:" address form, and
+// treating it as a tenant would give every anonymous handle a scope.
+//
+// inheritUser false makes an agent refuse a tenant that arrived over an agent
+// hop (`inherit_user: false`). The person talking to that agent directly still
+// reaches it; a delegating agent's tenant does not.
+func actingIdentityOf(m *Message, inheritUser bool) (ActingIdentity, bool) {
 	if m == nil {
-		return ""
+		return ActingIdentity{}, false
 	}
-	if v, ok := m.Payload["user_uuid"]; ok {
-		s, _ := v.(string)
-		return s
+	if p := m.Provenance; p != nil && p.UserUUID != nil {
+		if p.Kind == "agent" && !inheritUser {
+			return ActingIdentity{}, true
+		}
+		return PersonalIdentity(*p.UserUUID), true
 	}
 	if from := m.From; from != "" {
-		if u := strings.TrimPrefix(from, "user:"); u != from && u != "" {
-			return u
+		if u, ok := strings.CutPrefix(from, "user:"); ok && u != "" {
+			return PersonalIdentity(u), true
 		}
 	}
-	return ""
+	return ActingIdentity{}, false
 }
 
 // isConfirmRequest checks whether a response JSON encodes a needs_confirm=true result.

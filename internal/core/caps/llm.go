@@ -255,7 +255,7 @@ func (mt Metering) reserveQuota(ctx context.Context, amount int64) (*accounting.
 	if mt.Quota == nil {
 		return nil, nil
 	}
-	lease, err := mt.Quota.Reserve(ctx, session.UserUUIDFromCtx(ctx), amount)
+	lease, err := mt.Quota.Reserve(ctx, session.BillingUUIDFromCtx(ctx), amount)
 	if err == nil {
 		return lease, nil
 	}
@@ -331,15 +331,18 @@ func replyUsage(resp string) (usageCounts, bool) {
 	return u, u.Input+u.Output > 0
 }
 
-// record writes one ledger row. Attribution comes from the context's user
-// stamp, so a channel turn is charged to its user and engine-fired work lands
-// in the shared service bucket rather than on somebody's account.
+// record writes one ledger row. Attribution comes from the context's BILLING
+// identity — always the person, never the group membership uuid: a group
+// context must not fragment the ledger, because the ledger is the billing
+// mechanism (F23). So a channel turn is charged to its user, a delegated turn
+// to the tenant that delegated, and engine-fired work lands in the shared
+// service bucket rather than on somebody's account.
 func (mt Metering) record(ctx context.Context, op session.Op, kind string, u usageCounts, ok bool) {
 	if mt.Ledger == nil {
 		return
 	}
 	rec := runtime.UsageRecord{
-		UserID:     session.UserUUIDFromCtx(ctx),
+		UserID:     session.BillingUUIDFromCtx(ctx),
 		Agent:      mt.Agent,
 		Model:      op.Model,
 		Kind:       kind,

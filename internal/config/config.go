@@ -574,6 +574,10 @@ type SpawnProfile struct {
 	Capabilities []string        `yaml:"capabilities"`
 	CanContact   []string        `yaml:"can_contact"`
 	Credentials  []string        `yaml:"credentials"` // credential.get allow-list for spawned children
+	// InheritUser mirrors agents.<name>.inherit_user for a spawned child: false
+	// runs the child in the service stratum whatever tenant delegated to it.
+	// Absent means inherit.
+	InheritUser *bool `yaml:"inherit_user"`
 	// Extras is the spawn profile's deployment-specific data (a pm options
 	// block, a workflow name, a goal{...}), surfaced read-only to a spawned
 	// child's loop by agent.config() with secret references rendered opaque.
@@ -873,6 +877,15 @@ type Agent struct {
 	// Credentials is the allow-list of engine-wide credential names this
 	// agent may fetch with credential.get(). Empty or missing = no access.
 	Credentials []string `yaml:"credentials"`
+	// InheritUser decides whether this agent takes the tenant of a message that
+	// arrived over a delegation hop (another agent's agent.send/agent.request).
+	// nil (absent) means inherit, which is what keeps a fleet working for one
+	// tenant on that tenant's own scope instead of the fleet-wide service
+	// stratum. Inherit is the default because the alternative — an agent that
+	// silently runs tenant-less — is the isolation bug, not the opt-out.
+	// `inherit_user: false` runs the agent in the service stratum regardless of
+	// who delegated to it; the person talking to it directly still reaches it.
+	InheritUser *bool `yaml:"inherit_user"`
 	// Extras carries deployment-specific profile data (a pm options block, a
 	// workflow name, a goal{type, success_signal, max_turns, on_goal_met}...)
 	// surfaced read-only to the loop via agent.config(). Secret references

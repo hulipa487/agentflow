@@ -103,7 +103,7 @@ func TestToolSchemaVMRoundTrip(t *testing.T) {
 		session.Identity{SessionID: "main|test", Agent: "main", Capabilities: map[string]bool{"llm.chat": true}},
 		&session.Info{Name: "main", HistoryBudget: 100},
 		gw, nil, nil, nil, nil, handlers, pool.New(1), log)
-	a.LoopSrc = `
+	a.LoopSrc = directive() + `
 function loop()
   local msg = session.inbox()
   local defs = tools.list()

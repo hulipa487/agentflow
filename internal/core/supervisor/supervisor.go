@@ -230,30 +230,10 @@ func (s *Supervisor) DeliverLocal(agent, key string, msg session.Message) error 
 	}
 	skey := agent + "|" + key
 
-	s.mu.Lock()
-	a, ok := s.sessions[skey]
-	if !ok {
-		identity := session.Identity{
-			SessionID:    skey,
-			Agent:        agent,
-			CanContact:   def.CanContact,
-			Capabilities: def.Capabilities,
-		}
-		a = session.New(skey, identity, def.Info, s.gw, s, s.sched, s.users, def.Safety, def.Handlers, s.pool, s.log)
-		a.LoopFile = def.LoopFile
-		a.LoopSrc = def.LoopSrc
-		a.SupportSrcs = builtins.SupportChunks()
-		a.OnExit = s.onActorExit
-		a.SetProfileSettings(s.profileSettings)
-		a.Journal = s.EgressJournal
-		actorCtx, cancel := context.WithCancel(s.ctx)
-		s.sessions[skey] = a
-		s.cancels[skey] = cancel
-		go a.Run(actorCtx)
-		metrics.Inc("agentflow_sessions_active")
-		s.log.Info("session spawned", "session", skey)
+	a, err := s.ensureSession(agent, skey, def)
+	if err != nil {
+		return err
 	}
-	s.mu.Unlock()
 
 	select {
 	case a.Mailbox <- msg:
@@ -261,6 +241,66 @@ func (s *Supervisor) DeliverLocal(agent, key string, msg session.Message) error 
 	case <-s.ctx.Done():
 		return s.ctx.Err()
 	}
+}
+
+// ensureSession returns the live session for skey, starting one from def if
+// there is none yet.
+//
+// The support chunks are read and version-gated here, before the session
+// exists, and a refusal refuses the session: it has no earlier version of the
+// chunks to keep, because it has never run, so the only other thing a refusal
+// could mean is a session whose loop is missing the support chunks it was
+// written against — the silent downgrade the gate exists to prevent. The error
+// goes back to whoever delivered: at boot that is the boot push, which logs it
+// (BootPersistent) while the sessions that already exist keep serving, and at
+// first contact it is the channel's delivery, which fails rather than running
+// half a runtime.
+//
+// The read happens outside the lock and the map is re-checked under it, so two
+// first contacts racing for the same session start one actor and both deliver
+// to it.
+func (s *Supervisor) ensureSession(agent, skey string, def *AgentDef) (*session.Actor, error) {
+	s.mu.Lock()
+	if a, ok := s.sessions[skey]; ok {
+		s.mu.Unlock()
+		return a, nil
+	}
+	s.mu.Unlock()
+
+	support, err := builtins.SupportChunks()
+	if err != nil {
+		return nil, err
+	}
+
+	identity := session.Identity{
+		SessionID:    skey,
+		Agent:        agent,
+		CanContact:   def.CanContact,
+		Capabilities: def.Capabilities,
+	}
+	a := session.New(skey, identity, def.Info, s.gw, s, s.sched, s.users, def.Safety, def.Handlers, s.pool, s.log)
+	a.LoopFile = def.LoopFile
+	a.LoopSrc = def.LoopSrc
+	a.SupportSrcs = support
+	a.OnExit = s.onActorExit
+	a.SetProfileSettings(s.profileSettings)
+	a.Journal = s.EgressJournal
+	actorCtx, cancel := context.WithCancel(s.ctx)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, ok := s.sessions[skey]; ok {
+		// Lost the race: the actor built above was never started, so its
+		// context is the only thing to release.
+		cancel()
+		return existing, nil
+	}
+	s.sessions[skey] = a
+	s.cancels[skey] = cancel
+	go a.Run(actorCtx)
+	metrics.Inc("agentflow_sessions_active")
+	s.log.Info("session spawned", "session", skey)
+	return a, nil
 }
 
 // StopSession terminates one actor without stopping the runtime. It is safe to

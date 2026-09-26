@@ -162,7 +162,7 @@ func TestFilesOpsLuaBridge(t *testing.T) {
 		session.Identity{SessionID: "main|test", Agent: "main", Capabilities: map[string]bool{"files": true}},
 		&session.Info{Name: "main", HistoryBudget: 100},
 		gw, nil, nil, nil, nil, handlers, pool.New(4), log)
-	a.LoopSrc = `
+	a.LoopSrc = directive() + `
 function loop()
   local msg = session.inbox()
   local p = files.put("proj", "hello.txt", "hi there")

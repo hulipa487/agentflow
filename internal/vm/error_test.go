@@ -15,7 +15,7 @@ func luaErrorAfterYield(t *testing.T, raise string) (Status, string) {
 	if err := st.LoadBase(); err != nil {
 		t.Fatal(err)
 	}
-	if status, msg := st.Start("loop", "session.inbox()\n"+raise+"\n"); status != Yielded {
+	if status, msg := st.Start("loop", "test chunk", directive()+"session.inbox()\n"+raise+"\n"); status != Yielded {
 		t.Fatalf("expected the chunk to yield an op first, got %v: %s", status, msg)
 	}
 	return st.Resume(`{"ok":true}`, true)

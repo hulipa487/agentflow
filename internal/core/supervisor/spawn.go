@@ -67,10 +67,22 @@ func (s *Supervisor) Spawn(ctx context.Context, parent session.Identity, profile
 		Capabilities: childCaps,
 	}
 
+	// Support chunks are read and version-gated before the child exists at all.
+	// A refusal has to refuse the spawn: the child has no earlier version of
+	// them to keep — it has never run — so the choice is between a child that
+	// runs them and one that does not, and running a session without the chunks
+	// its loop was written against is the silent downgrade the gate exists to
+	// prevent. The error reaches the parent's spawn op, which is where a spawn
+	// profile that cannot be served belongs.
+	support, err := builtins.SupportChunks()
+	if err != nil {
+		return session.SpawnResult{}, fmt.Errorf("spawn profile %q: %w", profile, err)
+	}
+
 	a := session.New(skey, identity, info, s.gw, s, s.sched, s.users, tmpl.Safety, tmpl.Handlers, s.pool, s.log)
 	a.LoopFile = tmpl.LoopFile
 	a.LoopSrc = tmpl.LoopSrc
-	a.SupportSrcs = builtins.SupportChunks()
+	a.SupportSrcs = support
 	a.OnExit = s.onActorExit
 	a.Journal = s.EgressJournal
 

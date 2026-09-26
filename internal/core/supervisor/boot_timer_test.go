@@ -39,7 +39,7 @@ func TestBootPersistentSpawnsDaemon(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	gw := gateway.NewRegistry(log)
 	recorded := make(chan string, 2)
-	loop := `function loop()
+	loop := directive() + `function loop()
   local msg = session.inbox()
   af.op({ type = "probe.record", text = msg.type })
 end`
@@ -88,7 +88,7 @@ func TestTimerMessagesCarryTimerID(t *testing.T) {
 		"tick": {
 			Info:     &session.Info{Name: "tick", HistoryBudget: 100},
 			Handlers: map[string]session.OpHandler{"probe.record": probeHandler(recorded)},
-			LoopSrc: `function loop()
+			LoopSrc: directive() + `function loop()
   scheduler.every(0.1)
   scheduler.every(0.17)
   while true do

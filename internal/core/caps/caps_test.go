@@ -3,6 +3,7 @@ package caps
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -15,7 +16,13 @@ import (
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/tools"
 	"agentflow/internal/drivers/llm"
+	"agentflow/internal/vm"
 )
+
+// directive is the leading comment line every chunk has to declare. The loop
+// fixtures here are chunks: vm.State.Start refuses one that declares nothing,
+// so a fixture goes through this the way a shipped loop does.
+func directive() string { return fmt.Sprintf("-- af-prelude-version: %d\n", vm.PreludeVersion) }
 
 func TestStoreHandlers(t *testing.T) {
 	reg := memory.NewRegistry()

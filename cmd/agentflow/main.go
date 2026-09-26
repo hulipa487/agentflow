@@ -127,6 +127,16 @@ func main() {
 	// by name — wire it before the first builtins.Resolve below.
 	builtins.SetPluginDir(cfg.Plugins.Dir)
 
+	// Every session loads the support chunks into its Lua state before its loop,
+	// so they are policy exactly as a loop is, and a chunk this core cannot
+	// serve is refused at boot for the same reason a loop is: the deployment
+	// stops here, loudly, instead of coming up and failing session by session
+	// against an API its Lua was not written for. See builtins.SupportChunks.
+	if _, err := builtins.SupportChunks(); err != nil {
+		log.Error("support chunk refused", "err", err)
+		os.Exit(1)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

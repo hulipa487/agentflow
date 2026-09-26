@@ -73,7 +73,7 @@ func TestThinkingSurvivesTheLuaBridge(t *testing.T) {
 		session.Identity{SessionID: "main|test", Agent: "main", Capabilities: map[string]bool{"llm.chat": true}},
 		&session.Info{Name: "main", HistoryBudget: 100},
 		gw, nil, nil, nil, nil, handlers, pool.New(1), log)
-	a.LoopSrc = `
+	a.LoopSrc = directive() + `
 function loop()
   local msg = session.inbox()
   local ok, reply = pcall(llm.chat, { { role = "user", content = "hi" } }, { thinking = "xhigh" })
@@ -136,7 +136,7 @@ func TestThinkingCaptureSurvivesTheLuaBridge(t *testing.T) {
 		session.Identity{SessionID: "main|test", Agent: "main", Capabilities: map[string]bool{"llm.chat": true}},
 		&session.Info{Name: "main", HistoryBudget: 100},
 		gw, nil, nil, nil, nil, handlers, pool.New(1), log)
-	a.LoopSrc = `
+	a.LoopSrc = directive() + `
 function loop()
   local msg = session.inbox()
   local ok, reply = pcall(llm.chat, { { role = "user", content = "hi" } })
@@ -222,7 +222,7 @@ data: {"type":"message_stop"}
 		session.Identity{SessionID: "main|test", Agent: "main", Capabilities: map[string]bool{"llm.chat": true}},
 		&session.Info{Name: "main", HistoryBudget: 100},
 		gw, nil, nil, nil, nil, handlers, pool.New(1), log)
-	a.LoopSrc = `
+	a.LoopSrc = directive() + `
 function loop()
   local msg = session.inbox()
   local ok1, r1 = pcall(llm.chat, { { role = "user", content = "q" } }, { thinking = "low" })

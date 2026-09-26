@@ -94,7 +94,7 @@ func newDirLoop(t *testing.T, names ...string) *dirLoop {
 
 	logs := &syncBuf{}
 	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	loopSrc := "function loop() while true do session.inbox() end end"
+	loopSrc := directive() + "function loop() while true do session.inbox() end end"
 
 	defs := map[string]*supervisor.AgentDef{}
 	for _, name := range names {
@@ -213,7 +213,7 @@ func newPromptFixture(t *testing.T, names ...string) *promptFixture {
 			},
 			Capabilities: map[string]bool{},
 			Handlers:     map[string]session.OpHandler{},
-			LoopSrc:      "function loop() while true do session.inbox() end end",
+			LoopSrc:      directive() + "function loop() while true do session.inbox() end end",
 		}
 	}
 
@@ -852,7 +852,7 @@ var (
 )
 
 // markLoop reports the marker the shadowed chunk defines, on every turn.
-const markLoop = `function loop()
+var markLoop = directive() + `function loop()
   while true do
     local m = session.inbox()
     log.info("MARK:" .. tostring(SUPPORT_MARK))
@@ -967,7 +967,7 @@ func TestSupportChunkCompileFailureKeepsOldVersion(t *testing.T) {
 	fx := newSupportFixture(t, "alpha")
 	fx.startWatcher(t)
 
-	fx.edit(t, "SUPPORT_MARK = \"v2\"\nfunction broken( end\n")
+	fx.edit(t, directive()+"SUPPORT_MARK = \"v2\"\nfunction broken( end\n")
 
 	waitFor(t, "the bad chunk to be refused", 10*time.Second, func() bool {
 		return loggedLine(fx.logs.String(), "reload: support chunk compile failed", "chunk=token_budget")
@@ -979,6 +979,39 @@ func TestSupportChunkCompileFailureKeepsOldVersion(t *testing.T) {
 	}
 	if strings.Contains(fx.logs.String(), "hot reload: restarting loop") {
 		t.Fatalf("sessions were restarted for a broken chunk:\n%s", fx.logs.String())
+	}
+
+	// The live session is still the one that works.
+	if err := fx.sup.Deliver("alpha", "k", session.Message{ID: "m2", Type: "user", From: "u", Text: "again"}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the session to keep running the old chunk", 10*time.Second, func() bool {
+		return countLogged(fx.logs.String(), "MARK:v1") >= 2
+	})
+}
+
+// TestSupportChunkVersionMismatchKeepsOldVersion: a chunk written against
+// another prelude version is refused by the WATCHER, before any session is
+// restarted. The load-point gate would catch it anyway — a session refuses it
+// and keeps what it already had — but only after restarting every live session
+// for a chunk that was never going to load, which is disruption with no upside.
+func TestSupportChunkVersionMismatchKeepsOldVersion(t *testing.T) {
+	fx := newSupportFixture(t, "alpha")
+	fx.startWatcher(t)
+
+	stale := fmt.Sprintf("-- af-prelude-version: %d\nSUPPORT_MARK = \"v2\"\n", vm.PreludeVersion+1)
+	fx.edit(t, stale)
+
+	waitFor(t, "the mismatched chunk to be refused", 10*time.Second, func() bool {
+		return loggedLine(fx.logs.String(), "reload: support chunk version mismatch", "chunk=token_budget")
+	})
+	time.Sleep(1200 * time.Millisecond)
+
+	if strings.Contains(fx.logs.String(), "reload: support chunks updated") {
+		t.Fatalf("a chunk targeting another API version was applied:\n%s", fx.logs.String())
+	}
+	if strings.Contains(fx.logs.String(), "hot reload: restarting loop") {
+		t.Fatalf("sessions were restarted for a chunk that cannot be loaded:\n%s", fx.logs.String())
 	}
 
 	// The live session is still the one that works.

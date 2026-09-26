@@ -286,7 +286,7 @@ func TestHTTPGuardRefusalReachesTheLoop(t *testing.T) {
 		session.Identity{SessionID: "main|test", Agent: "main", Capabilities: map[string]bool{"net.http": true}},
 		&session.Info{Name: "main", HistoryBudget: 100},
 		gw, nil, nil, nil, nil, handlers, pool.New(1), discardLogger())
-	a.LoopSrc = `
+	a.LoopSrc = directive() + `
 function loop()
   local msg = session.inbox()
   local ok, res = pcall(http.request, { url = "http://169.254.169.254/latest/meta-data/" })

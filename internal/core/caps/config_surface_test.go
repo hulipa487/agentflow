@@ -61,7 +61,7 @@ func runConfigLoop(t *testing.T, loopSrc string, info *session.Info, store *cred
 	a := session.New("main|test",
 		session.Identity{SessionID: "main|test", Agent: "main", Capabilities: map[string]bool{}},
 		info, gw, nil, nil, nil, nil, handlers, pool.New(1), log)
-	a.LoopSrc = loopSrc
+	a.LoopSrc = directive() + loopSrc
 	a.Journal = func(rec session.EgressRecord) { gw.record(rec) }
 
 	ctx, cancel := context.WithCancel(context.Background())

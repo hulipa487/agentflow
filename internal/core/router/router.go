@@ -211,7 +211,15 @@ func (r *Router) runOnce(ctx context.Context) runOutcome {
 	case <-r.reload:
 	default:
 	}
-	status, msg := st.Start("loop", r.source())
+	// The handler is version-gated at load (vm.State.Start). In a deployment
+	// every route source reaches here through builtins.Resolve — at boot — or
+	// through the reload watcher, which gates it too, so the check is a second
+	// look at a source this core has already accepted. It is not redundant: a
+	// route source handed straight to New by an embedder has passed through
+	// neither, and it is the same source an agent's loop is, so it is refused on
+	// the same terms. The name is generic because routing is a deployment's one
+	// handler and the router holds no ref for it.
+	status, msg := st.Start("loop", "route handler", r.source())
 	r.log.Info("router started")
 
 	for {

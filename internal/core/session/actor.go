@@ -627,19 +627,27 @@ func (a *Actor) Run(ctx context.Context) {
 	}
 }
 
-func (a *Actor) loadSource() (string, error) {
+// loadSource returns the loop source to run and the name a version refusal
+// should carry: the path for a loop that lives on disk, so the log line names
+// the file to edit, and the session for one handed over in memory, where the
+// session key is all an operator has to go on.
+//
+// The in-memory source is gated where it enters the VM, not here — see
+// vm.State.Start — so that a loop a library consumer sets directly is refused
+// on the same terms as one read from a path.
+func (a *Actor) loadSource() (name, src string, err error) {
 	if a.LoopFile != "" {
 		// LoopFile may be a directory (a multi-module loop); builtins.Resolve
 		// handles both file and directory, concatenating a directory's *.lua
 		// members in sorted order. For a plain file it reads the file.
 		src, _, err := builtins.Resolve(a.LoopFile)
-		return src, err
+		return a.LoopFile, src, err
 	}
-	return a.LoopSrc, nil
+	return "in-memory loop of " + a.Name, a.LoopSrc, nil
 }
 
 func (a *Actor) runOnce(ctx context.Context) (crashed bool) {
-	src, err := a.loadSource()
+	name, src, err := a.loadSource()
 	if err != nil {
 		a.log.Warn("cannot read loop plugin", "err", err)
 		return true
@@ -650,7 +658,28 @@ func (a *Actor) runOnce(ctx context.Context) (crashed bool) {
 	// them only at spawn meant a plugins.dir shadow edited while a session ran
 	// could never reach it — the reload watcher's signal arrives as a restart,
 	// and the restart re-read the value captured at spawn.
-	a.SupportSrcs = builtins.SupportChunks()
+	//
+	// The read is version-gated, and a refusal keeps the chunks this session
+	// already has rather than failing the restart: a shadow edited into a
+	// version this core cannot serve is a bad edit on disk, and the rule for one
+	// of those is that it never takes a live session down — the same rule the
+	// reload watcher applies when it refuses a loop edit and keeps the running
+	// version (see internal/core/reload). The set kept here is itself the
+	// product of a gate: a session that exists was built from chunks that
+	// passed, at spawn or at an earlier restart, so falling back to them is
+	// running a version this core does serve, not silently loading a different
+	// one. A refusal with nothing to fall back on is the one case that cannot
+	// keep anything — the loop would then run without the support chunks it
+	// expects — so that session does not start.
+	if srcs, err := builtins.SupportChunks(); err != nil {
+		if len(a.SupportSrcs) == 0 && a.SupportSrc == "" {
+			a.log.Error("support chunk refused and no earlier version is loaded to keep; not starting without it", "err", err)
+			return true
+		}
+		a.log.Error("support chunk refused; keeping the version already loaded", "err", err)
+	} else {
+		a.SupportSrcs = srcs
+	}
 
 	st := vm.New(a.InstrBudget)
 	defer st.Close()
@@ -671,7 +700,7 @@ func (a *Actor) runOnce(ctx context.Context) (crashed bool) {
 		}
 	}
 
-	status, msg := st.Start("loop", src)
+	status, msg := st.Start("loop", name, src)
 	a.log.Info("loop started")
 	var current Message // inbound message being processed; replies go here
 

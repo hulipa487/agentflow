@@ -113,7 +113,7 @@ func (fx *toolDefFixture) startAs(t *testing.T, agentSet *tools.AgentSet, loopSr
 		gw, nil, nil, nil, nil,
 		ToolHandlers(agentSet, ToolWiring{LuaOverrides: fx.lua, Prompts: fx.prompts, Log: fx.log}),
 		pool.New(1), fx.log)
-	a.LoopSrc = loopSrc
+	a.LoopSrc = directive() + loopSrc
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

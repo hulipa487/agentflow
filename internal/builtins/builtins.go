@@ -6,9 +6,11 @@
 // path — has passed the prelude version gate (vm.CheckChunkVersion): it
 // declares the prelude API version it targets and that version is the one this
 // core provides. Resolve returns a refusal instead of source for a chunk that
-// does not, which is what stops a core upgrade from silently loading Lua
-// written against a different API. There is no compatibility window, by
-// design — see vm.PreludeVersion.
+// does not, and SupportChunks — the other way a chunk leaves this package, for
+// the chunks every session loads before its loop — returns one too, which is
+// what stops a core upgrade from silently loading Lua written against a
+// different API. There is no compatibility window, by design — see
+// vm.PreludeVersion.
 package builtins
 
 import (
@@ -119,19 +121,35 @@ func SupportChunkPaths() map[string]string {
 }
 
 // SupportChunks returns the support chunks loaded into every session state
-// before the loop plugin. A chunk shadowed in plugins.dir loads from disk (and
-// is re-read on every session start — the first one and each reload restart —
-// so a shadow edit takes effect on the next restart of every session).
-func SupportChunks() []string {
+// before the loop plugin, or a prelude version refusal for one this core cannot
+// serve. A chunk shadowed in plugins.dir loads from disk (and is re-read on
+// every session start — the first one and each reload restart — so a shadow
+// edit takes effect on the next restart of every session).
+//
+// The gate is applied here as well as in Resolve because a support chunk is not
+// a loop/route ref: nothing resolves it, so this call is the only way one
+// reaches a session, and a version refusal has to come out of here or it does
+// not exist for them. The embedded chunks are checked too — the package doc's
+// promise covers everything this package hands out, and a shadow is not the
+// only way a chunk can be wrong: a core upgrade moves the embedded chunks with
+// it, and a build whose own Lua is out of step should refuse to load rather
+// than run.
+//
+// The name in a refusal is what the operator sees: the shadow's path, or the
+// same "builtin:<name>" spelling Resolve uses for an embedded chunk.
+func SupportChunks() ([]string, error) {
 	out := make([]string, 0, len(supportOrder))
 	for _, name := range supportOrder {
-		if src, _, ok := shadow(name); ok {
-			out = append(out, src)
-			continue
+		src, path, ok := shadow(name)
+		if !ok {
+			src, path = sources[name], "builtin:"+name
 		}
-		out = append(out, sources[name])
+		if err := vm.CheckChunkVersion(path, src); err != nil {
+			return nil, err
+		}
+		out = append(out, src)
 	}
-	return out
+	return out, nil
 }
 
 // Resolve turns a loop/route reference into Lua source. "plugin:<name>"

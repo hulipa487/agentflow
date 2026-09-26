@@ -2,6 +2,7 @@ package triggers
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -14,7 +15,13 @@ import (
 	"agentflow/internal/core/pool"
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/supervisor"
+	"agentflow/internal/vm"
 )
+
+// directive is the leading comment line every chunk has to declare. The loop
+// fixtures here are chunks: vm.State.Start refuses one that declares nothing,
+// so they go through this the way a shipped loop does.
+func directive() string { return fmt.Sprintf("-- af-prelude-version: %d\n", vm.PreludeVersion) }
 
 // TestConfigDirEveryTriggerReachesItsAgent is the end-to-end check for engine
 // scheduling: a -configdir deployment whose triggers/tick.yaml declares
@@ -65,7 +72,7 @@ triggers:
 			Info:         &session.Info{Name: "worker", HistoryBudget: 100},
 			Capabilities: map[string]bool{},
 			Handlers:     map[string]session.OpHandler{},
-			LoopSrc: `function loop()
+			LoopSrc: directive() + `function loop()
   while true do
     local msg = session.inbox()
     log.info("GOT type=" .. tostring(msg.type)
@@ -172,7 +179,7 @@ triggers:
 			Info:         &session.Info{Name: "spawn:pm", HistoryBudget: 100},
 			Capabilities: map[string]bool{},
 			Handlers:     map[string]session.OpHandler{},
-			LoopSrc: `function loop()
+			LoopSrc: directive() + `function loop()
   while true do
     local msg = session.inbox()
     log.info("CHILD type=" .. tostring(msg.type) .. " id=" .. tostring(msg.id)

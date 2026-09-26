@@ -821,7 +821,7 @@ func (a *Actor) dispatchBlocking(ctx context.Context, op Op, current *Message) (
 		resp string
 		ok   bool
 	}
-	resCh := pool.Call(a.pool, func() result {
+	resCh := pool.CallKeyed(a.pool, a.fairnessKey(current), func() result {
 		r, ok := a.execBlocking(ctx, op, current)
 		return result{r, ok}
 	})
@@ -1166,6 +1166,20 @@ func (a *Actor) stampIdentity(ctx context.Context, current *Message) context.Con
 		return ctx
 	}
 	return WithActingIdentity(ctx, id)
+}
+
+// fairnessKey is the op-pool fairness key for a turn: the tenant's personal
+// uuid, so every op a person's fleet issues shares one queue and one turn of
+// the pool's rotation. Group context still keys on the personal uuid — the
+// pool isolates tenants, not scopes, and billing already follows the person.
+// "" (no tenant: unknown or known-empty identity) rides the shared queue.
+func (a *Actor) fairnessKey(current *Message) string {
+	inherit := true
+	if a.Info != nil {
+		inherit = a.Info.InheritsUser()
+	}
+	id, _ := actingIdentityOf(current, inherit)
+	return id.Personal
 }
 
 // SetProfileSettings installs the per-user override lookup. Called by the
@@ -1567,7 +1581,7 @@ func (a *Actor) doConfirm(ctx context.Context, op Op, current *Message, respJSON
 		resp string
 		ok   bool
 	}
-	resCh := pool.Call(a.pool, func() result {
+	resCh := pool.CallKeyed(a.pool, a.fairnessKey(current), func() result {
 		r, o := a.execBlocking(ctx, op, current)
 		return result{r, o}
 	})

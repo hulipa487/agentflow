@@ -22,6 +22,7 @@ import (
 	"agentflow/internal/core/credentials"
 	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/supervisor"
+	"agentflow/internal/core/tenancy"
 	"agentflow/internal/drivers/llm"
 )
 
@@ -56,7 +57,7 @@ type Deps struct {
 	// and metering wiring that lives in main. Either nil means the console
 	// was built without agent control; the routes answer 503 with a named
 	// reason instead of panicking.
-	Agents     *supervisor.Supervisor
+	Agents    *supervisor.Supervisor
 	BuildAgent func(name string, a config.Agent) (*supervisor.AgentDef, error)
 
 	// Instance identifies this process in a fleet: the lease owner id, which is
@@ -73,6 +74,10 @@ type Deps struct {
 	// journal (both live in the runtime store), the quota, and the file store.
 	// Each nil handle degrades with a named reason rather than a blank answer.
 	Users UserDeps
+
+	// Tenancy is the groups/pools/grants registry. Nil means the console was
+	// built without tenancy; those routes answer 503 with a named reason.
+	Tenancy *tenancy.Registry
 }
 
 // UI is the console. Static serves the SPA (unauthenticated — it is inert
@@ -171,6 +176,18 @@ func (u *UI) API() http.Handler {
 	mux.HandleFunc("GET /admin/api/agents", u.handleAgentsList)
 	mux.HandleFunc("PUT /admin/api/agents/{name}", u.handleAgentUpsert)
 	mux.HandleFunc("DELETE /admin/api/agents/{name}", u.handleAgentRemove)
+	mux.HandleFunc("GET /admin/api/groups", u.handleGroupsList)
+	mux.HandleFunc("POST /admin/api/groups", u.handleGroupCreate)
+	mux.HandleFunc("GET /admin/api/groups/{id}", u.handleGroupGet)
+	mux.HandleFunc("POST /admin/api/groups/{id}/members", u.handleGroupAddMember)
+	mux.HandleFunc("DELETE /admin/api/groups/{id}/members/{user}", u.handleGroupRemoveMember)
+	mux.HandleFunc("PUT /admin/api/groups/{id}/master", u.handleGroupSetMaster)
+	mux.HandleFunc("DELETE /admin/api/groups/{id}", u.handleGroupDisband)
+	mux.HandleFunc("GET /admin/api/pools", u.handlePoolsList)
+	mux.HandleFunc("POST /admin/api/pools", u.handlePoolCreate)
+	mux.HandleFunc("GET /admin/api/pools/{id}/grants", u.handlePoolGrants)
+	mux.HandleFunc("PUT /admin/api/pools/{id}/grants", u.handlePoolSetGrant)
+	mux.HandleFunc("DELETE /admin/api/pools/{id}/grants", u.handlePoolRemoveGrant)
 	mux.HandleFunc("GET /admin/api/config", u.handleConfigGet)
 	mux.HandleFunc("POST /admin/api/config/validate", u.handleConfigValidate)
 	mux.HandleFunc("POST /admin/api/config/save", u.handleConfigSave)

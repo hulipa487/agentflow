@@ -55,6 +55,14 @@ type Provenance struct {
 	// anything carried there is Lua-reachable and forgeable; reading the tenant
 	// from the payload would let a loop mint another tenant's scope (§4.2 #4).
 	UserUUID *string `json:"user_uuid,omitempty"`
+
+	// MembershipUUID is the group-context uuid for a turn acting in a group:
+	// derived by the engine from (personal, group) AFTER it validated the
+	// membership — the router Lua proposes the group, the engine resolves and
+	// stamps it here, validated rather than trusted (A1). Same three-state
+	// semantics as UserUUID. When set, the acting identity's scope is
+	// user:<membership_uuid> and ScopeUUID() prefers it.
+	MembershipUUID *string `json:"membership_uuid,omitempty"`
 }
 
 // Identity is the runtime-owned authority attached to an actor's operations.
@@ -1545,7 +1553,16 @@ func actingIdentityOf(m *Message, inheritUser bool) (ActingIdentity, bool) {
 		if p.Kind == "agent" && !inheritUser {
 			return ActingIdentity{}, true
 		}
-		return PersonalIdentity(*p.UserUUID), true
+		id := PersonalIdentity(*p.UserUUID)
+		// Group context: the engine stamped a validated membership uuid. The
+		// scope uuid becomes the membership uuid and the scope prefix follows
+		// it — the personal uuid stays billing and credentials (§7). An empty
+		// stamp is known-none and is ignored, like the UserUUID "" state.
+		if p.MembershipUUID != nil && *p.MembershipUUID != "" {
+			id.Membership = *p.MembershipUUID
+			id.ScopePrefix = "user:" + *p.MembershipUUID
+		}
+		return id, true
 	}
 	if from := m.From; from != "" {
 		if u, ok := strings.CutPrefix(from, "user:"); ok && u != "" {

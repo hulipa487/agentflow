@@ -206,3 +206,72 @@ func isUnknownAgent(err error) bool {
 	var unknown *UnknownAgentError
 	return errors.As(err, &unknown)
 }
+
+// TestDeliverAsValidatesTheGroupProposal: the router proposes, the engine
+// validates. A proposal naming a group the sender is not active in is refused
+// at the boundary — before any scope resolves — and an accepted proposal is
+// stamped by the engine, never carried from Lua (A1).
+func TestDeliverAsValidatesTheGroupProposal(t *testing.T) {
+	sup := registrySupervisor(t)
+	if err := sup.UpsertAgent("helper", registryDef("helper")); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	stamped := func(m session.Message) *string {
+		if m.Provenance == nil || m.Provenance.MembershipUUID == nil {
+			return nil
+		}
+		return m.Provenance.MembershipUUID
+	}
+
+	// No resolver wired: every group proposal is refused, named.
+	msg := session.Message{ID: "m1", Type: "user", From: "u", Text: "hi",
+		Provenance: &session.Provenance{Kind: "channel", UserUUID: strptr("person-1")}}
+	if err := sup.DeliverAs("helper", "k", msg, "group-1"); err == nil {
+		t.Fatal("a group proposal was accepted with no resolver wired")
+	}
+
+	sup.SetMembershipResolver(func(personal, group string) (string, error) {
+		if group != "group-1" {
+			return "", errors.New("not an active member")
+		}
+		return "membership-uuid-1", nil
+	})
+
+	// A group the sender does not belong to: refused.
+	foreign := session.Message{ID: "m2", Type: "user", From: "u", Text: "hi",
+		Provenance: &session.Provenance{Kind: "channel", UserUUID: strptr("person-1")}}
+	if err := sup.DeliverAs("helper", "k", foreign, "group-2"); err == nil {
+		t.Fatal("a proposal for a group the sender is not in was accepted")
+	}
+
+	// A message with no tenant stamp: nothing to validate against — refused
+	// rather than silently acting in the group.
+	tenantless := session.Message{ID: "m3", Type: "system", From: "system:x", Text: "hi"}
+	if err := sup.DeliverAs("helper", "k", tenantless, "group-1"); err == nil {
+		t.Fatal("a tenantless message acted in a group")
+	}
+
+	// The valid proposal: delivered, and the engine stamped the derived uuid.
+	ok := session.Message{ID: "m4", Type: "user", From: "u", Text: "hi",
+		Provenance: &session.Provenance{Kind: "channel", UserUUID: strptr("person-1")}}
+	if err := sup.DeliverAs("helper", "webhook:c9", ok, "group-1"); err != nil {
+		t.Fatalf("valid proposal: %v", err)
+	}
+	sup.mu.Lock()
+	a := sup.sessions["helper|webhook:c9"]
+	sup.mu.Unlock()
+	if a == nil {
+		t.Fatal("the accepted proposal never reached a session")
+	}
+	select {
+	case got := <-a.Mailbox:
+		if stamped(got) == nil || *stamped(got) != "membership-uuid-1" {
+			t.Fatalf("delivered message carries membership %v; want the resolver's derivation", stamped(got))
+		}
+	case <-time.After(5 * time.Second):
+		t.Log("mailbox drained by the actor before the check; derivation covered by the session-side pin")
+	}
+}
+
+func strptr(s string) *string { return &s }

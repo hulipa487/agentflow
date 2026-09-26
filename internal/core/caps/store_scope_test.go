@@ -33,7 +33,7 @@ func scopedStoreTest(t *testing.T) map[string]session.OpHandler {
 			"t": {Backend: "v", Table: "t", Scoping: "user"},
 		},
 	}
-	return StoreHandlers(&am, mgr)
+	return StoreHandlers(&am, mgr, nil)
 }
 
 func putVal(t *testing.T, h map[string]session.OpHandler, ctx context.Context, key, val string) {
@@ -218,7 +218,7 @@ func TestStoreScopesSharedDenied(t *testing.T) {
 			"t": {Backend: "v", Table: "t"}, // Scoping "" — shared
 		},
 	}
-	h := StoreHandlers(&am, mgr)
+	h := StoreHandlers(&am, mgr, nil)
 	if _, ok := h["store.scopes"](maintCtx(), session.Op{Type: "store.scopes", Table: "t"}); ok {
 		t.Fatal("shared-binding store.scopes must be denied")
 	}

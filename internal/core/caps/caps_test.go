@@ -36,7 +36,7 @@ func TestStoreHandlers(t *testing.T) {
 	am := memory.AgentMemory{
 		Tables: map[string]memory.StoreBinding{"t": {Backend: "test", Table: "t"}},
 	}
-	h := StoreHandlers(&am, mgr)
+	h := StoreHandlers(&am, mgr, nil)
 
 	op := session.Op{Type: "store.put", Table: "t", Key: "k1", Value: map[string]any{"x": 1}, TTL: 0}
 	resp, ok := h["store.put"](context.Background(), op)

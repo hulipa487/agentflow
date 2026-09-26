@@ -2,6 +2,8 @@ package memory
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -100,33 +102,42 @@ func TestPerAgentTableIsolation(t *testing.T) {
 	}
 }
 
-// TestSharedStoreOptIn: a store with shared: true binds the unprefixed table
-// for every agent — a deliberate cross-agent knowledge base.
-func TestSharedStoreOptIn(t *testing.T) {
+// TestPoolStoreBindingResolvesByName: a pool-bound store keeps the agent-axis
+// table prefix and resolves the pool's uuid into its scoping at bind time —
+// the (pool, agent) half of the carve, known at bind. An unknown pool name is
+// a bind error, which is what makes a misconfigured carve fail at boot.
+func TestPoolStoreBindingResolvesByName(t *testing.T) {
 	reg := openMemRegistry(t)
+	resolved := ""
+	reg.SetPoolResolver(func(name string) (string, error) {
+		if name == "proj-x" {
+			resolved = "pool-uuid-1"
+			return resolved, nil
+		}
+		return "", fmt.Errorf("pool %q does not exist", name)
+	})
 	profile := map[string]Store{
-		"kb": {Backend: "main_db", Table: "kb", Shared: true},
+		"kb": {Backend: "main_db", Table: "kb", Pool: "proj-x"},
 	}
 	a, err := reg.ResolveStoresFor("writer", profile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := reg.ResolveStoresFor("librarian", profile)
-	if err != nil {
-		t.Fatal(err)
+	if a.Stores["kb"].Table != "writer.kb" {
+		t.Fatalf("a pool store keeps the agent axis: %q", a.Stores["kb"].Table)
 	}
-	if a.Tables["kb"].Table != "kb" || b.Tables["kb"].Table != "kb" {
-		t.Fatalf("shared store must bind the physical table as-is: %q / %q",
-			a.Tables["kb"].Table, b.Tables["kb"].Table)
+	if a.Stores["kb"].Scoping != "pool:pool-uuid-1" || a.Stores["kb"].PoolUUID != "pool-uuid-1" {
+		t.Fatalf("binding scoping = %q, uuid = %q; want the resolved pool", a.Stores["kb"].Scoping, a.Stores["kb"].PoolUUID)
 	}
 
-	h, _ := reg.Handle("main_db")
-	if err := h.Put(a.Tables["kb"].Table, "fact-1", "shared fact", PutOpts{}); err != nil {
-		t.Fatal(err)
+	// An unknown pool is a boot error, never a silent fallback.
+	_, err = reg.ResolveStoresFor("writer", map[string]Store{
+		"kb": {Backend: "main_db", Table: "kb", Pool: "no-such-pool"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "no-such-pool") {
+		t.Fatalf("unknown pool = %v; want a bind error naming it", err)
 	}
-	if v, found, _ := h.Get(b.Tables["kb"].Table, "fact-1"); !found || v != "shared fact" {
-		t.Fatal("shared store must be visible to every agent")
-	}
+	_ = resolved
 }
 
 // TestResolveStoresUnscoped: an empty agent (no identity) binds tables as-is —

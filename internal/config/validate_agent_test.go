@@ -100,3 +100,41 @@ func TestValidateAgentRejectsBrokenReferences(t *testing.T) {
 		t.Fatalf("can_contact to a configured agent refused: %v", err)
 	}
 }
+
+// The store-isolation rules: shared: is refused with its migration (it was
+// the multi-tenant footgun — §6.5), a pool binding takes no scope, and pool
+// names must be key-safe. These run deployment-wide over every profile, not
+// only where an agent references a store.
+func TestValidateStoreScoping(t *testing.T) {
+	shared := true
+	refused := Store{Backend: "main_db", Table: "kb", Shared: &shared}
+	err := validateStoreScoping("test", "profile", "kb", refused)
+	if err == nil || !strings.Contains(err.Error(), "no longer supported") {
+		t.Fatalf("shared: true = %v; want the migration refusal", err)
+	}
+
+	err = validateStoreScoping("test", "profile", "kb", Store{
+		Backend: "main_db", Table: "kb", Pool: "proj-x", Scope: "user",
+	})
+	if err == nil || !strings.Contains(err.Error(), "both pool and scope") {
+		t.Fatalf("pool + scope = %v", err)
+	}
+
+	err = validateStoreScoping("test", "profile", "kb", Store{
+		Backend: "main_db", Table: "kb", Pool: "bad|name",
+	})
+	if err == nil || !strings.Contains(err.Error(), "pool name") {
+		t.Fatalf("an unsafe pool name = %v (| would corrupt grant row keys)", err)
+	}
+
+	if err := validateStoreScoping("test", "profile", "kb", Store{
+		Backend: "main_db", Table: "kb", Pool: "proj-x",
+	}); err != nil {
+		t.Fatalf("a well-formed pool binding refused: %v", err)
+	}
+	if err := validateStoreScoping("test", "profile", "kb", Store{
+		Backend: "main_db", Table: "kb", Scope: "agent",
+	}); err != nil {
+		t.Fatalf("scope: agent refused: %v", err)
+	}
+}

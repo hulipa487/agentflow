@@ -30,7 +30,7 @@ func openOne(t *testing.T) memory.BackendHandle {
 }
 
 func wrap(h memory.BackendHandle, scoping string, mode memory.ScopeMode, user string) memory.BackendHandle {
-	return memory.WrapScoped(h, scoping, mode, user)
+	return memory.WrapScoped(h, scoping, mode, memory.Caller{ScopeUUID: user, PersonalUUID: user}, memory.PoolScope{})
 }
 
 func mustPut(t *testing.T, h memory.BackendHandle, key string, val string) {
@@ -197,7 +197,7 @@ func TestAgentScoping(t *testing.T) {
 func TestSharedUnwrapped(t *testing.T) {
 	raw := openOne(t)
 	svc := wrap(raw, "user", memory.ModeService, "")
-	shared := memory.WrapScoped(raw, "", memory.ModeInteractive, "u1")
+	shared := memory.WrapScoped(raw, "", memory.ModeInteractive, memory.Caller{ScopeUUID: "u1", PersonalUUID: "u1"}, memory.PoolScope{})
 	mustPut(t, shared, "kb:x", "v")
 	if _, ok := mustGet(t, svc, "kb:x"); !ok {
 		t.Fatal("shared store writes must be raw (visible to service contexts)")

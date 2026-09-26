@@ -51,6 +51,7 @@ import (
 	"agentflow/internal/core/sessionhub"
 	"agentflow/internal/core/storedb"
 	"agentflow/internal/core/supervisor"
+	"agentflow/internal/core/tenancy"
 	"agentflow/internal/core/tools"
 	"agentflow/internal/core/triggers"
 	"agentflow/internal/core/users"
@@ -300,6 +301,14 @@ func main() {
 		log.Error("runtime store failed", "err", err)
 		os.Exit(1)
 	}
+	// The tenancy registry: groups, memberships, pools, grants. It lives in
+	// the runtime store because it is core operational state — the memory
+	// scope layer enforces what it records, so it must exist wherever the
+	// engine does (§8: pools + ACL, groups).
+	tenReg := tenancy.New(rtStore, log)
+	memReg.SetPoolResolver(func(name string) (string, error) {
+		return tenReg.PoolUUIDByName(context.Background(), name)
+	})
 	// Per-call token detail in the ledger (the daily rollup is always written).
 	usageEvents := cfg.Usage.UsageEvents()
 
@@ -751,7 +760,7 @@ func main() {
 		for k, h := range gateOps(enforce, name, effectiveCaps, "llm.chat", llmHandlers, &withheld) {
 			handlers[k] = h
 		}
-		for k, h := range gateOps(enforce, name, effectiveCaps, "memory", caps.StoreHandlers(amPtr, memMgr), &withheld) {
+		for k, h := range gateOps(enforce, name, effectiveCaps, "memory", caps.StoreHandlers(amPtr, memMgr, tenReg), &withheld) {
 			handlers[k] = h
 		}
 		for k, h := range gateOps(enforce, name, effectiveCaps, "tools", caps.ToolHandlers(agentSet, toolWiring), &withheld) {
@@ -921,7 +930,7 @@ func main() {
 		for k, h := range gateOps(enforce, pname, profileCaps, "llm.chat", llmHandlers, &withheld) {
 			handlers[k] = h
 		}
-		for k, h := range gateOps(enforce, pname, profileCaps, "memory", caps.StoreHandlers(amPtr, memMgr), &withheld) {
+		for k, h := range gateOps(enforce, pname, profileCaps, "memory", caps.StoreHandlers(amPtr, memMgr, tenReg), &withheld) {
 			handlers[k] = h
 		}
 		for k, h := range gateOps(enforce, pname, profileCaps, "tools", caps.ToolHandlers(agentSet, toolWiring), &withheld) {
@@ -1116,6 +1125,12 @@ func main() {
 			log.Warn("expired row sweep failed", "err", err)
 		} else if n > 0 {
 			log.Info("expired rows reclaimed", "rows", n)
+		}
+		// Tenancy cascade: groups whose disband retention elapsed are gone
+		// (SweepExpired above); their memberships, reverse indexes, pools and
+		// grants follow (B7x).
+		if err := tenReg.Sweep(ctx); err != nil {
+			log.Warn("tenancy sweep failed", "err", err)
 		}
 	}
 	singleton(ctx, "rows-sweep", sweepRows)
@@ -1986,12 +2001,12 @@ func budgetWindow(a config.Agent) time.Duration {
 
 func memoryFromConfig(s config.Store) memory.Store {
 	ret := memory.Store{
-		Backend:    s.Backend,
-		Table:      s.Table,
-		Window:     s.Window,
-		Requires:   s.Requires,
-		Shared:     s.Shared,
-		Scope:      s.Scope,
+		Backend:  s.Backend,
+		Table:    s.Table,
+		Window:   s.Window,
+		Requires: s.Requires,
+		Scope:    s.Scope,
+		Pool:     s.Pool,
 	}
 	if s.Retention != "" {
 		// Validated at config load, so this cannot fail here. It used to be

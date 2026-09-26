@@ -533,17 +533,24 @@ type Store struct {
 	Window     int      `yaml:"window"`
 	Requires   []string `yaml:"requires"`
 	Policy     *string  `yaml:"policy"`
-	// Shared opts the store into cross-agent sharing (a deliberate knowledge
-	// base). Private stores (the default) are isolated per agent: the
-	// physical table is prefixed with the agent name at bind time. Existing
-	// deployments that rely on implicit cross-agent sharing must set this.
-	Shared bool `yaml:"shared"`
+	// Shared is parsed so a config that still carries it fails validation with
+	// the migration instead of being silently reinterpreted: `shared: true`
+	// published a tenant's rows to every tenant with nothing enforcing
+	// anything — reasonable for a single-tenant engine, a footgun in
+	// multi-tenant SaaS. Its replacement is a named pool: `pool: <name>`
+	// (below), where the pool is the isolation boundary. Both may not be set.
+	Shared *bool `yaml:"shared"`
 	// Scope selects the isolation granularity of a private store: "user"
 	// (default) scopes rows per user at the key level — channel-originated
 	// turns read and write only their own scope, service contexts, and
 	// pre-upgrade rows; "agent" keeps one pool for the whole agent across
-	// users (pre-isolation behavior). Ignored on shared stores.
+	// users (pre-isolation behavior). A bound Pool supersedes it.
 	Scope string `yaml:"scope"`
+	// Pool binds the store to a named shared pool (created through the
+	// tenancy admin API before the engine boots agents against it): rows live
+	// under the pool's carve, and every access needs a grant — r/w or
+	// r-only, per (pool, agent, tenant). The name must resolve at boot.
+	Pool string `yaml:"pool"`
 }
 
 // ShellProfile defines defaults for shell.spawn.
@@ -1134,6 +1141,35 @@ func validateMemoryRetention(path string, c *Config) error {
 	return nil
 }
 
+// poolNameRe keeps pool names key-safe: the name lives in tenancy row keys
+// and in grant rows, whose separator is "|".
+var poolNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+// validateStoreScoping checks one store's isolation config: the `shared:`
+// flag is refused with its migration (it was the multi-tenant footgun — one
+// flag published a tenant's rows to every tenant), a pool binding takes no
+// scope of its own, and pool names must be key-safe.
+func validateStoreScoping(path, owner, sname string, s Store) error {
+	if s.Shared != nil && *s.Shared {
+		return fmt.Errorf("%s: %s store %q sets shared: true, which is no longer supported — it published rows to every tenant with nothing enforcing anything. Bind the store to a named pool instead (pool: <name>, created via the tenancy admin API); the pool is the isolation boundary", path, owner, sname)
+	}
+	if s.Pool != "" {
+		if s.Scope != "" {
+			return fmt.Errorf("%s: %s store %q sets both pool and scope — a pool-bound store does not take a scope; the pool is the isolation boundary", path, owner, sname)
+		}
+		if !poolNameRe.MatchString(s.Pool) {
+			return fmt.Errorf("%s: %s store %q: pool name %q must be 1-64 chars of letters, digits or . _ -", path, owner, sname, s.Pool)
+		}
+		return nil
+	}
+	switch s.Scope {
+	case "", "user", "agent":
+	default:
+		return fmt.Errorf("%s: %s store %q: unsupported scope %q (want user or agent)", path, owner, sname, s.Scope)
+	}
+	return nil
+}
+
 // validateSafetyProfiles rejects a safety reference the engine cannot resolve.
 // Every branch of resolveSafety that is not "", "none" or "default" needs a
 // profiles.safety entry, and every filter named inside one needs to be a filter
@@ -1278,6 +1314,27 @@ func validate(path string, c *Config) error {
 	// expires" while looking configured.
 	if err := validateMemoryRetention(path, c); err != nil {
 		return err
+	}
+
+	// Store isolation: the shared: refusal and the pool-binding rules, over
+	// every declared profile and the built-in preset — a store a profile
+	// declares but no agent references is still refused, because a boot that
+	// tolerates it would silently reinterpret it if an agent picked it up.
+	scopingCheck := func(label string, stores map[string]Store) error {
+		for sname, s := range stores {
+			if err := validateStoreScoping(path, label, sname, s); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := scopingCheck("built-in memory profile", DefaultMemoryProfile().Stores); err != nil {
+		return err
+	}
+	for pname, p := range c.Profiles.Memory {
+		if err := scopingCheck(fmt.Sprintf("memory profile %q", pname), p.Stores); err != nil {
+			return err
+		}
 	}
 
 	// Safety profile names. An unknown one used to resolve to safety.None with
@@ -1712,10 +1769,8 @@ func (c *Config) ValidateAgent(name string, a Agent, path string) error {
 			if _, ok := c.Memory.Backends[store.Backend]; !ok {
 				return fmt.Errorf("%s: agent %q store %q references unknown backend %q", path, name, sname, store.Backend)
 			}
-			switch store.Scope {
-			case "", "user", "agent":
-			default:
-				return fmt.Errorf("%s: agent %q store %q: unsupported scope %q (want user or agent)", path, name, sname, store.Scope)
+			if err := validateStoreScoping(path, name, sname, store); err != nil {
+				return err
 			}
 		}
 	}

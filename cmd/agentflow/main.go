@@ -557,16 +557,21 @@ func main() {
 	tools.RegisterShellBuiltins(toolReg, shellMgr)
 	mcpClients := map[string]*mcp.Client{}
 	for sname, s := range cfg.MCP.Servers {
-		if s.URL != "" && s.Command == "" {
-			// The config declares a transport the driver does not have: mcp is
-			// stdio only, and the url/token fields are parsed but never read.
-			// Without this the run falls through to exec.Command("") and reports
-			// a start failure that names the wrong cause.
-			log.Warn("mcp server declares a url; the http transport is not implemented — only stdio (command) servers run",
-				"server", sname, "url", s.URL)
-			continue
+		// url selects the Streamable HTTP transport, command the stdio one;
+		// config validation already rejects a server declaring neither. A
+		// server declaring both is a config mistake rather than a real
+		// either/or, so it is called out rather than silently resolved.
+		var c *mcp.Client
+		var err error
+		switch {
+		case s.URL != "":
+			if s.Command != "" {
+				log.Warn("mcp server declares both url and command; using the url (Streamable HTTP)", "server", sname)
+			}
+			c, err = mcp.NewHTTPClient(sname, s.URL, s.Token, log)
+		default:
+			c, err = mcp.NewClient(sname, s.Command, s.Args, log)
 		}
-		c, err := mcp.NewClient(sname, s.Command, s.Args, log)
 		if err != nil {
 			log.Warn("mcp server failed", "server", sname, "err", err)
 			continue

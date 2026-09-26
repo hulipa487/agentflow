@@ -898,7 +898,7 @@ plugins:      { ... }   # plugin dir, capability ceiling</code></pre>
     - agent.send
     - agent.request
   enforce_capabilities: true    # default; false restores pre-enforcement behavior</code></pre>
-  <p><code>plugins.dir</code> also <strong>shadows builtins by name</strong>: a file <code>&lt;dir&gt;/&lt;name&gt;.lua</code> (e.g. <code>./plugins/recency.lua</code>) replaces the embedded builtin of that name everywhere — loop/route refs (<code>loop: plugin:recency</code>, including the hot-reload watch path) and the support chunks loaded into every session. Shadowed support chunks are re-read from disk at each session spawn, so edits take effect on new sessions without a restart.</p>
+  <p><code>plugins.dir</code> also <strong>shadows builtins by name</strong>: a file <code>&lt;dir&gt;/&lt;name&gt;.lua</code> (e.g. <code>./plugins/recency.lua</code>) replaces the embedded builtin of that name everywhere — loop/route refs (<code>loop: plugin:recency</code>, including the hot-reload watch path) and the support chunks loaded into every session. The shadow files are watched: a shadowed support chunk is re-read at every session start (the first one and each reload restart), and an edit restarts every live session, so it takes effect without a process restart. An unshadowed chunk is embedded and has no file to edit.</p>
 
   <h3><code>triggers</code> — scheduled and event tasks</h3>
   <pre><code>triggers:                       # top-level, or triggers/*.yaml in a -configdir
@@ -1213,7 +1213,7 @@ end</code></pre>
     <li>The standard library includes base, coroutine, table, string, math, bit32, utf8, and buffer. <code>io</code> and <code>debug</code> are not available, and neither is the real <code>os</code> library: the prelude provides exactly <code>os.env</code>, <code>os.time</code>, and <code>os.date</code> (all UTC — there is no local timezone in the sandbox).</li>
     <li>Raw network access from Lua is only through <code>http.request</code> and the <code>mail.*</code> ops. There is no socket library. The HTTP paths — this op and the <code>builtin:fetch</code> tool — refuse private, loopback, link-local and reserved destinations in the dialer, so a URL is not enough to reach the host's own network; see the <code>net</code> block. <code>mail.*</code> is <em>not</em> covered by that guard and still dials whatever host the loop names.</li>
     <li>All values crossing the bridge are JSON-encoded. Tables must be serializable; functions and userdata cannot cross.</li>
-    <li>Plugins are hot-reloadable when <code>runtime.reload.watch</code> is true. Edits to a loop file or instructions file restart the session coroutine from scratch on the next turn.</li>
+    <li>Plugins are hot-reloadable: the reload watcher always runs (<code>runtime.reload.watch</code> has no effect). An edit to a loop file or an instructions file restarts the session coroutine from scratch on the next turn; an edit to the file behind <code>gateway.route</code> rebuilds the router's state between messages (routing runs there, not in a session), and an edit to a shadowed support chunk restarts every live session, which is where the new chunk is loaded. None of them needs a process restart, and none of them is applied if the new version does not compile — the version already running stays in place.</li>
   </ul>
 
   <h3>Practical examples</h3>

@@ -607,6 +607,13 @@ func (a *Actor) runOnce(ctx context.Context) (crashed bool) {
 		return true
 	}
 
+	// Support chunks are re-read here for the same reason the loop source is
+	// resolved here: a restart is where a change on disk is picked up. Reading
+	// them only at spawn meant a plugins.dir shadow edited while a session ran
+	// could never reach it — the reload watcher's signal arrives as a restart,
+	// and the restart re-read the value captured at spawn.
+	a.SupportSrcs = builtins.SupportChunks()
+
 	st := vm.New(a.InstrBudget)
 	defer st.Close()
 	if err := st.LoadBase(); err != nil {

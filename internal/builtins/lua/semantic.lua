@@ -1,3 +1,4 @@
+-- af-prelude-version: 1
 -- plugin:semantic — embedding-based memory.recall handler.
 --
 -- Selected by `recall: plugin:semantic` on the agent's memory profile; the

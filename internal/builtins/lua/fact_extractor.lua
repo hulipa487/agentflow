@@ -1,3 +1,4 @@
+-- af-prelude-version: 1
 -- plugin:fact_extractor — cheap after_turn tap that extracts facts.
 --
 -- Called as fact_extractor_turn(turn) after the assistant reply is sent.

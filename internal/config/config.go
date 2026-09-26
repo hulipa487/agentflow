@@ -1287,33 +1287,7 @@ func validate(path string, c *Config) error {
 		return err
 	}
 
-	allowedCaps := map[string]bool{}
-	for _, cap := range c.Plugins.AllowCapabilities {
-		allowedCaps[cap] = true
-	}
-	// If the global ceiling is empty, be permissive for backward compat.
-	if len(allowedCaps) == 0 {
-		for _, cap := range DefaultCapabilities {
-			allowedCaps[cap] = true
-		}
-		allowedCaps["scheduler"] = true
-		allowedCaps["shell.exec"] = true
-		allowedCaps["gateway"] = true
-		allowedCaps["vector"] = true
-		allowedCaps["store.raw"] = true
-		allowedCaps["agent.spawn"] = true
-		allowedCaps["agent.request"] = true
-		allowedCaps["channel.push"] = true
-		allowedCaps["net.mail"] = true
-		allowedCaps["files"] = true
-		allowedCaps["users"] = true
-		// session.state is a persistence surface (a durable per-session
-		// scratchpad in the shared store), so it is not handed out by default —
-		// but it has to be declarable. It was missing from this set, so an
-		// agent that followed caps/sessionstate.go's own instruction and listed
-		// it in capabilities failed the boot instead.
-		allowedCaps["session.state"] = true
-	}
+	allowedCaps := c.allowedCapabilitySet()
 
 	for name, a := range c.Agents {
 		if a.Loop == "" {
@@ -1324,79 +1298,8 @@ func validate(path string, c *Config) error {
 				return fmt.Errorf("%s: agent %q references unknown model %q", path, name, a.Model)
 			}
 		}
-		if a.HistoryBudget <= 0 {
-			a.HistoryBudget = 6000
-		}
-		caps := a.Capabilities
-		if len(caps) == 0 {
-			caps = DefaultCapabilities
-		}
-		for _, cap := range caps {
-			if !allowedCaps[cap] {
-				return fmt.Errorf("%s: agent %q capability %q not in plugins.allow_capabilities", path, name, cap)
-			}
-		}
-		if a.Shell != "" {
-			if !allowedCaps["shell.exec"] {
-				return fmt.Errorf("%s: agent %q uses shell but lacks shell.exec capability", path, name)
-			}
-			if c.Profiles.Shell != nil {
-				if _, ok := c.Profiles.Shell[a.Shell]; !ok {
-					return fmt.Errorf("%s: agent %q references unknown shell profile %q", path, name, a.Shell)
-				}
-				if err := validateShellProfile(path, name, a.Shell, c.Profiles.Shell[a.Shell]); err != nil {
-					return err
-				}
-			} else {
-				return fmt.Errorf("%s: agent %q references unknown shell profile %q", path, name, a.Shell)
-			}
-		}
-		if a.Memory.IsInline || a.Memory.Profile != "" {
-			if !allowedCaps["memory"] {
-				return fmt.Errorf("%s: agent %q uses memory but lacks memory capability", path, name)
-			}
-			if a.Memory.Profile == "conversational" {
-				continue
-			}
-			// Resolve the store set: a named profiles.memory reference or an
-			// inline profile. Either way, every store's backend must exist.
-			stores := a.Memory.Inline.Stores
-			if !a.Memory.IsInline {
-				mp, ok := c.Profiles.Memory[a.Memory.Profile]
-				if !ok {
-					return fmt.Errorf("%s: agent %q references unknown memory profile %q", path, name, a.Memory.Profile)
-				}
-				stores = mp.Stores
-			}
-			for sname, store := range stores {
-				if _, ok := c.Memory.Backends[store.Backend]; !ok {
-					return fmt.Errorf("%s: agent %q store %q references unknown backend %q", path, name, sname, store.Backend)
-				}
-				switch store.Scope {
-				case "", "user", "agent":
-				default:
-					return fmt.Errorf("%s: agent %q store %q: unsupported scope %q (want user or agent)", path, name, sname, store.Scope)
-				}
-			}
-		}
-		if len(a.Skills) > 0 {
-			if !allowedCaps["tools"] {
-				return fmt.Errorf("%s: agent %q has skills but lacks tools capability", path, name)
-			}
-		}
-		// can_contact targets must resolve to a configured agent or a spawn
-		// profile. Default-deny ACLs are enforced at runtime; this only
-		// rejects broken references at boot.
-		for _, target := range a.CanContact {
-			if _, ok := c.Agents[target]; ok {
-				continue
-			}
-			if c.Profiles.Agent != nil {
-				if _, ok := c.Profiles.Agent[target]; ok {
-					continue
-				}
-			}
-			return fmt.Errorf("%s: agent %q can_contact target %q is neither a configured agent nor a spawn profile", path, name, target)
+		if err := c.ValidateAgent(name, a, path); err != nil {
+			return err
 		}
 	}
 
@@ -1712,6 +1615,129 @@ func validate(path string, c *Config) error {
 		}
 	}
 
+	return nil
+}
+
+// allowedCapabilitySet is the global capability ceiling: the configured
+// plugins.allow_capabilities, or the permissive backward-compatible default
+// set when the ceiling is empty.
+func (c *Config) allowedCapabilitySet() map[string]bool {
+	allowedCaps := map[string]bool{}
+	for _, cap := range c.Plugins.AllowCapabilities {
+		allowedCaps[cap] = true
+	}
+	// If the global ceiling is empty, be permissive for backward compat.
+	if len(allowedCaps) == 0 {
+		for _, cap := range DefaultCapabilities {
+			allowedCaps[cap] = true
+		}
+		allowedCaps["scheduler"] = true
+		allowedCaps["shell.exec"] = true
+		allowedCaps["gateway"] = true
+		allowedCaps["vector"] = true
+		allowedCaps["store.raw"] = true
+		allowedCaps["agent.spawn"] = true
+		allowedCaps["agent.request"] = true
+		allowedCaps["channel.push"] = true
+		allowedCaps["net.mail"] = true
+		allowedCaps["files"] = true
+		allowedCaps["users"] = true
+		// session.state is a persistence surface (a durable per-session
+		// scratchpad in the shared store), so it is not handed out by default —
+		// but it has to be declarable. It was missing from this set, so an
+		// agent that followed caps/sessionstate.go's own instruction and listed
+		// it in capabilities failed the boot instead.
+		allowedCaps["session.state"] = true
+	}
+	return allowedCaps
+}
+
+// ValidateAgent checks one agent definition against this config — the same
+// rules the boot-time validate applies to every entry of agents:. The
+// runtime agent registry (PUT /admin/api/agents/{name}) runs it before
+// building the definition, so an agent installed live is held to exactly the
+// standard a boot one is. Model existence is the caller's check: boot
+// validates against the file's models:, the registry against the live model
+// manager, which a runtime model upsert may have extended. `a` is taken by
+// value and defaults applied to it are not written back — mirroring the
+// range-loop copy in validate.
+func (c *Config) ValidateAgent(name string, a Agent, path string) error {
+	allowedCaps := c.allowedCapabilitySet()
+
+	if a.HistoryBudget <= 0 {
+		a.HistoryBudget = 6000
+	}
+	caps := a.Capabilities
+	if len(caps) == 0 {
+		caps = DefaultCapabilities
+	}
+	for _, cap := range caps {
+		if !allowedCaps[cap] {
+			return fmt.Errorf("%s: agent %q capability %q not in plugins.allow_capabilities", path, name, cap)
+		}
+	}
+	if a.Shell != "" {
+		if !allowedCaps["shell.exec"] {
+			return fmt.Errorf("%s: agent %q uses shell but lacks shell.exec capability", path, name)
+		}
+		if c.Profiles.Shell != nil {
+			if _, ok := c.Profiles.Shell[a.Shell]; !ok {
+				return fmt.Errorf("%s: agent %q references unknown shell profile %q", path, name, a.Shell)
+			}
+			if err := validateShellProfile(path, name, a.Shell, c.Profiles.Shell[a.Shell]); err != nil {
+				return err
+			}
+		} else {
+			return fmt.Errorf("%s: agent %q references unknown shell profile %q", path, name, a.Shell)
+		}
+	}
+	if a.Memory.IsInline || a.Memory.Profile != "" {
+		if !allowedCaps["memory"] {
+			return fmt.Errorf("%s: agent %q uses memory but lacks memory capability", path, name)
+		}
+		if a.Memory.Profile == "conversational" {
+			return nil
+		}
+		// Resolve the store set: a named profiles.memory reference or an
+		// inline profile. Either way, every store's backend must exist.
+		stores := a.Memory.Inline.Stores
+		if !a.Memory.IsInline {
+			mp, ok := c.Profiles.Memory[a.Memory.Profile]
+			if !ok {
+				return fmt.Errorf("%s: agent %q references unknown memory profile %q", path, name, a.Memory.Profile)
+			}
+			stores = mp.Stores
+		}
+		for sname, store := range stores {
+			if _, ok := c.Memory.Backends[store.Backend]; !ok {
+				return fmt.Errorf("%s: agent %q store %q references unknown backend %q", path, name, sname, store.Backend)
+			}
+			switch store.Scope {
+			case "", "user", "agent":
+			default:
+				return fmt.Errorf("%s: agent %q store %q: unsupported scope %q (want user or agent)", path, name, sname, store.Scope)
+			}
+		}
+	}
+	if len(a.Skills) > 0 {
+		if !allowedCaps["tools"] {
+			return fmt.Errorf("%s: agent %q has skills but lacks tools capability", path, name)
+		}
+	}
+	// can_contact targets must resolve to a configured agent or a spawn
+	// profile. Default-deny ACLs are enforced at runtime; this only rejects
+	// broken references at install time.
+	for _, target := range a.CanContact {
+		if _, ok := c.Agents[target]; ok {
+			continue
+		}
+		if c.Profiles.Agent != nil {
+			if _, ok := c.Profiles.Agent[target]; ok {
+				continue
+			}
+		}
+		return fmt.Errorf("%s: agent %q can_contact target %q is neither a configured agent nor a spawn profile", path, name, target)
+	}
 	return nil
 }
 

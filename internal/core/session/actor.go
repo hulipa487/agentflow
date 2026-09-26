@@ -559,6 +559,10 @@ type Actor struct {
 	// blocked waiting for the next inbox). Read by the supervisor's status
 	// snapshot for the TUI; written only by the actor goroutine.
 	busy atomic.Bool
+
+	// pendingDef stages a def snapshot pushed by the runtime agent registry;
+	// applied on the actor goroutine at the top of runOnce (applyDefAtRestart).
+	pendingDef atomic.Pointer[DefUpdate]
 }
 
 func New(name string, identity Identity, info *Info, gw Gateway, agents AgentService, sched SchedulerService, users UserResolver, safe *safety.Dispatcher, handlers map[string]OpHandler, p *pool.Pool, log *slog.Logger) *Actor {
@@ -586,6 +590,54 @@ func (a *Actor) Reload() {
 	case a.reload <- struct{}{}:
 	default: // already pending
 	}
+}
+
+// DefUpdate is a full snapshot of the def-derived pieces of a session — what
+// the runtime agent registry pushes into live sessions when an agent is
+// replaced. The loop source is included for agents whose loop has no file
+// behind it: a file-backed loop is re-read from disk at the restart this
+// triggers and what the file says wins (hot reload covers policy that has a
+// file behind it), but an in-memory loop has no truth beyond the def.
+type DefUpdate struct {
+	Info         *Info
+	Handlers     map[string]OpHandler
+	Safety       *safety.Dispatcher
+	CanContact   map[string]bool
+	Capabilities map[string]bool
+	LoopSrc      string
+	LoopFile     string
+}
+
+// Define stages a def snapshot and signals a restart at the next safe point.
+// The sequencing is the semantics: the turn in flight finishes on the def it
+// resolved with, and the next turn runs the new one — E19's "applies when the
+// session is graced or idle", using the actor's park points as the grace.
+// The fields themselves are swapped on the actor's own goroutine (see
+// applyDefAtRestart), which is what makes them race-free without locking
+// every read; Define only stages and signals.
+func (a *Actor) Define(u DefUpdate) {
+	a.pendingDef.Store(&u)
+	a.Reload()
+}
+
+// applyDefAtRestart consumes a staged DefUpdate at the top of runOnce — on
+// the actor goroutine, before the loop source is loaded, so a restart runs
+// the new def end to end and never a mix. Two Defines between parks coalesce
+// into one restart; the last snapshot wins, which is sound because a
+// snapshot is complete.
+func (a *Actor) applyDefAtRestart() {
+	p := a.pendingDef.Swap(nil)
+	if p == nil {
+		return
+	}
+	u := *p
+	a.Info = u.Info
+	a.handlers = u.Handlers
+	a.safety = u.Safety
+	a.Identity.CanContact = u.CanContact
+	a.Identity.Capabilities = u.Capabilities
+	a.LoopSrc = u.LoopSrc
+	a.LoopFile = u.LoopFile
 }
 
 // Busy reports whether the actor is actively processing a message rather than
@@ -647,6 +699,7 @@ func (a *Actor) loadSource() (name, src string, err error) {
 }
 
 func (a *Actor) runOnce(ctx context.Context) (crashed bool) {
+	a.applyDefAtRestart()
 	name, src, err := a.loadSource()
 	if err != nil {
 		a.log.Warn("cannot read loop plugin", "err", err)

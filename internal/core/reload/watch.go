@@ -426,6 +426,13 @@ func (w *Watcher) updatePromptInstructions(key, text string) {
 // outside-a-session sentinels above: a path shared by several owners is tracked
 // separately for each of them, so one owner's poll cannot consume another's
 // change.
+//
+// A (owner, path) pair never seen before is seeded, not reported: it arrives
+// when an agent was registered after Start — a runtime upsert — so there is
+// no previous state to have changed from. Boot-time agents were all seeded in
+// Start, so this only fires for the registry's additions; without it, the
+// zero-value mtime would read as a change and every live session of a
+// just-upserted agent would take a pointless restart.
 func (w *Watcher) changed(agent, path string) bool {
 	key := watchKey{agent, path}
 	fi, err := os.Stat(path)
@@ -433,11 +440,10 @@ func (w *Watcher) changed(agent, path string) bool {
 		return false
 	}
 	if !fi.IsDir() {
-		if fi.ModTime().Equal(w.mtimes[key]) {
-			return false
-		}
-		w.mtimes[key] = fi.ModTime()
-		return true
+		prev, seen := w.mtimes[key]
+		mtime := fi.ModTime()
+		w.mtimes[key] = mtime
+		return seen && !mtime.Equal(prev)
 	}
 	names, err := dirMembers(path)
 	if err != nil {

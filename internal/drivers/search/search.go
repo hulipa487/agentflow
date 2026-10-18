@@ -36,6 +36,7 @@ type WebResult struct {
 	Content   string  `json:"content,omitempty"`
 	Published string  `json:"published,omitempty"`
 	Score     float64 `json:"score,omitempty"`
+	Engine    string  `json:"engine,omitempty"`
 }
 
 // Result is a normalized search response.
@@ -93,6 +94,11 @@ func (s *Set) Search(ctx context.Context, engine string, req Request) (string, *
 		return name, nil, err
 	}
 	res.Engine = name
+	for i := range res.Results {
+		if res.Results[i].Engine == "" {
+			res.Results[i].Engine = name
+		}
+	}
 	return name, res, nil
 }
 

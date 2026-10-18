@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"agentflow/internal/core/session"
 	"agentflow/internal/drivers/search"
@@ -47,19 +49,107 @@ func RegisterBuiltins(r *Registry, searcher *search.Set) {
 			query, _ := args["query"].(string)
 			req := search.Request{Query: query}
 			req.Count = argCount(args["count"])
-			engine, _ := args["engine"].(string)
-			used, res, err := searcher.Search(ctx, engine, req)
-			if err != nil {
-				return nil, fmt.Errorf("builtin:web_search: %w", err)
+
+			// Check for parallel multi-engine search:
+			var engineList []string
+			if rawEngines, ok := args["engines"].([]any); ok {
+				for _, e := range rawEngines {
+					if s, ok := e.(string); ok && strings.TrimSpace(s) != "" {
+						engineList = append(engineList, strings.TrimSpace(s))
+					}
+				}
+			} else if engineStr, ok := args["engine"].(string); ok && strings.Contains(engineStr, ",") {
+				for _, s := range strings.Split(engineStr, ",") {
+					if trimmed := strings.TrimSpace(s); trimmed != "" {
+						engineList = append(engineList, trimmed)
+					}
+				}
 			}
+
+			// Single engine fallback if no multi-engine list provided
+			if len(engineList) <= 1 {
+				singleEng := ""
+				if len(engineList) == 1 {
+					singleEng = engineList[0]
+				} else {
+					singleEng, _ = args["engine"].(string)
+				}
+				used, res, err := searcher.Search(ctx, singleEng, req)
+				if err != nil {
+					return nil, fmt.Errorf("builtin:web_search: %w", err)
+				}
+				return map[string]any{
+					"ok":           true,
+					"tool":         "builtin:web_search",
+					"engine":       used,
+					"query":        res.Query,
+					"count":        len(res.Results),
+					"results":      res.Results,
+					"time_cost_ms": res.TimeCostMs,
+				}, nil
+			}
+
+			// Parallel multi-engine search: 40s timeout budget
+			searchTimeout := 40 * time.Second
+			if tSec := argCount(args["timeout"]); tSec > 0 {
+				searchTimeout = time.Duration(tSec) * time.Second
+			}
+			searchCtx, searchCancel := context.WithTimeout(ctx, searchTimeout)
+			defer searchCancel()
+
+			type engineResult struct {
+				engine  string
+				results []search.WebResult
+				err     error
+			}
+
+			resultsChan := make(chan engineResult, len(engineList)+1)
+			var wg sync.WaitGroup
+
+			for _, eng := range engineList {
+				wg.Add(1)
+				go func(targetEngine string) {
+					defer wg.Done()
+					used, res, err := searcher.Search(searchCtx, targetEngine, req)
+					if err != nil {
+						// Fallback: if google_search fails or is unavailable, try ollama
+						if targetEngine == "google_search" {
+							if usedOllama, oRes, oErr := searcher.Search(searchCtx, "ollama", req); oErr == nil && oRes != nil {
+								resultsChan <- engineResult{engine: usedOllama, results: oRes.Results}
+								return
+							}
+						}
+						resultsChan <- engineResult{engine: targetEngine, err: err}
+						return
+					}
+					resultsChan <- engineResult{engine: used, results: res.Results}
+				}(eng)
+			}
+
+			wg.Wait()
+			close(resultsChan)
+
+			var allResults []search.WebResult
+			var unresponsive []string
+			var enginesUsed []string
+
+			for r := range resultsChan {
+				if r.err != nil {
+					unresponsive = append(unresponsive, r.engine)
+				} else {
+					enginesUsed = append(enginesUsed, r.engine)
+					allResults = append(allResults, r.results...)
+				}
+			}
+
 			return map[string]any{
-				"ok":           true,
-				"tool":         "builtin:web_search",
-				"engine":       used,
-				"query":        res.Query,
-				"count":        len(res.Results),
-				"results":      res.Results,
-				"time_cost_ms": res.TimeCostMs,
+				"ok":                   true,
+				"tool":                 "builtin:web_search",
+				"engines":              enginesUsed,
+				"unresponsive_engines": unresponsive,
+				"query":                req.Query,
+				"count":                len(allResults),
+				"results":              allResults,
 			}, nil
 		},
 	})

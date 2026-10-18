@@ -47,15 +47,20 @@ func newXSearch(cfg config.SearchEngine) (*xSearch, error) {
 	return &xSearch{apiKey: cfg.APIKey, baseURL: base, model: model, http: &http.Client{Timeout: cfg.TimeoutD()}}, nil
 }
 
+type xReasoning struct {
+	Effort string `json:"effort"`
+}
+
 type xSearchRequest struct {
-	Model string `json:"model"`
-	Input []struct {
+	Model     string      `json:"model"`
+	Input     []struct {
 		Role    string `json:"role"`
 		Content string `json:"content"`
 	} `json:"input"`
-	Tools []struct {
+	Tools     []struct {
 		Type string `json:"type"`
 	} `json:"tools"`
+	Reasoning *xReasoning `json:"reasoning,omitempty"`
 }
 
 // xSearchResponse mirrors the Responses API: output_text is the convenience
@@ -101,7 +106,10 @@ func (x *xSearch) Search(ctx context.Context, req Request) (*Result, error) {
 		count = 10
 	}
 
-	body := xSearchRequest{Model: x.model}
+	body := xSearchRequest{
+		Model:     x.model,
+		Reasoning: &xReasoning{Effort: "low"},
+	}
 	body.Input = append(body.Input, struct {
 		Role    string `json:"role"`
 		Content string `json:"content"`

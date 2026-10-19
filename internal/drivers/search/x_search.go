@@ -20,7 +20,7 @@ const defaultXSearchURL = "https://api.x.ai/v1/responses"
 
 // defaultXSearchModel is the tool-capable model this engine uses unless
 // config overrides it (SearchEngine.Model).
-const defaultXSearchModel = "grok-4.6"
+const defaultXSearchModel = "grok-4.3"
 
 // xSearch is a Searcher backed by xAI's x_search tool. Like google_search it
 // returns a synthesis plus citations rather than raw index hits, so the first

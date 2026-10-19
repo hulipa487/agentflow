@@ -27,19 +27,29 @@ GOHOSTARCH:= $(shell go env GOHOSTARCH)
 # and a native target triple). Linux uses the system gcc; macOS uses clang++.
 # TARGET is only meaningful for zig (its -target flag); the native toolchains
 # build for the host without one.
+TARGET_OS ?= $(GOHOSTOS)
+
 ifeq ($(GOHOSTOS),windows)
-  CC      := zig cc
-  CXX     := zig c++
-  AR      := zig ar
-  # zig's -target uses x86_64/aarch64, not Go's amd64/arm64.
-  ZIG_ARCH := amd64
-  ifeq ($(GOHOSTARCH),amd64)
-    ZIG_ARCH := x86_64
-  else ifeq ($(GOHOSTARCH),arm64)
-    ZIG_ARCH := aarch64
+  ifeq ($(TARGET_OS),linux)
+    CC       := zig cc -target x86_64-linux-gnu
+    CXX      := zig c++ -target x86_64-linux-gnu
+    AR       := zig ar
+    CXXFLAGS += -target x86_64-linux-gnu -include stdlib.h
+    GOENV    := GOOS=linux GOARCH=amd64 CGO_ENABLED=1 CC="zig cc -target x86_64-linux-gnu" CXX="zig c++ -target x86_64-linux-gnu"
+  else
+    CC       := zig cc
+    CXX      := zig c++
+    AR       := zig ar
+    # zig's -target uses x86_64/aarch64, not Go's amd64/arm64.
+    ZIG_ARCH := amd64
+    ifeq ($(GOHOSTARCH),amd64)
+      ZIG_ARCH := x86_64
+    else ifeq ($(GOHOSTARCH),arm64)
+      ZIG_ARCH := aarch64
+    endif
+    CXXFLAGS += -target $(ZIG_ARCH)-windows-gnu -include stdlib.h
+    GOENV    := CGO_ENABLED=1 CC="zig cc" CXX="zig c++"
   endif
-  CXXFLAGS += -target $(ZIG_ARCH)-windows-gnu
-  GOENV   := CGO_ENABLED=1 CC="zig cc" CXX="zig c++"
 else ifeq ($(GOHOSTOS),linux)
   CC      := cc
   CXX     := c++

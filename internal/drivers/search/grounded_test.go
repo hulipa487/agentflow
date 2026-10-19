@@ -144,7 +144,7 @@ func TestXSearch(t *testing.T) {
 	if gotAuth != "Bearer x123" {
 		t.Fatalf("auth header: %q", gotAuth)
 	}
-	if !strings.Contains(gotBody, `"model":"grok-4.6"`) || !strings.Contains(gotBody, `"type":"x_search"`) {
+	if !strings.Contains(gotBody, `"model":"grok-4.3"`) || !strings.Contains(gotBody, `"type":"x_search"`) {
 		t.Fatalf("request body: %s", gotBody)
 	}
 	// Synthesis + 2 deduped citations.

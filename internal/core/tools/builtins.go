@@ -50,6 +50,16 @@ func RegisterBuiltins(r *Registry, searcher *search.Set) {
 			req := search.Request{Query: query}
 			req.Count = argCount(args["count"])
 
+			// Check for per-engine tailored queries:
+			queriesMap := map[string]string{}
+			if qm, ok := args["queries"].(map[string]any); ok {
+				for k, v := range qm {
+					if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+						queriesMap[k] = strings.TrimSpace(s)
+					}
+				}
+			}
+
 			// Check for parallel multi-engine search:
 			var engineList []string
 			if rawEngines, ok := args["engines"].([]any); ok {
@@ -74,7 +84,11 @@ func RegisterBuiltins(r *Registry, searcher *search.Set) {
 				} else {
 					singleEng, _ = args["engine"].(string)
 				}
-				used, res, err := searcher.Search(ctx, singleEng, req)
+				singleReq := req
+				if customQuery, ok := queriesMap[singleEng]; ok && customQuery != "" {
+					singleReq.Query = customQuery
+				}
+				used, res, err := searcher.Search(ctx, singleEng, singleReq)
 				if err != nil {
 					return nil, fmt.Errorf("builtin:web_search: %w", err)
 				}
@@ -110,11 +124,15 @@ func RegisterBuiltins(r *Registry, searcher *search.Set) {
 				wg.Add(1)
 				go func(targetEngine string) {
 					defer wg.Done()
-					used, res, err := searcher.Search(searchCtx, targetEngine, req)
+					engineReq := req
+					if customQuery, ok := queriesMap[targetEngine]; ok && customQuery != "" {
+						engineReq.Query = customQuery
+					}
+					used, res, err := searcher.Search(searchCtx, targetEngine, engineReq)
 					if err != nil {
 						// Fallback: if google_search fails or is unavailable, try ollama
 						if targetEngine == "google_search" {
-							if usedOllama, oRes, oErr := searcher.Search(searchCtx, "ollama", req); oErr == nil && oRes != nil {
+							if usedOllama, oRes, oErr := searcher.Search(searchCtx, "ollama", engineReq); oErr == nil && oRes != nil {
 								resultsChan <- engineResult{engine: usedOllama, results: oRes.Results}
 								return
 							}

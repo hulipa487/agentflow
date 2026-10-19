@@ -27,10 +27,11 @@ const defaultXSearchModel = "grok-4.3"
 // WebResult carries the answer in Content and the rest are cited sources
 // (mostly x.com post URLs).
 type xSearch struct {
-	apiKey  string
-	baseURL string
-	model   string
-	http    *http.Client
+	apiKey    string
+	baseURL   string
+	model     string
+	reasoning string
+	http      *http.Client
 }
 
 func newXSearch(cfg config.SearchEngine) (*xSearch, error) {
@@ -45,7 +46,11 @@ func newXSearch(cfg config.SearchEngine) (*xSearch, error) {
 	if model == "" {
 		model = defaultXSearchModel
 	}
-	return &xSearch{apiKey: cfg.APIKey, baseURL: base, model: model, http: &http.Client{Timeout: cfg.TimeoutD()}}, nil
+	reasoning := strings.TrimSpace(cfg.Reasoning)
+	if reasoning == "" {
+		reasoning = "low"
+	}
+	return &xSearch{apiKey: cfg.APIKey, baseURL: base, model: model, reasoning: reasoning, http: &http.Client{Timeout: cfg.TimeoutD()}}, nil
 }
 
 type xReasoning struct {
@@ -73,8 +78,12 @@ type xSearchResponse struct {
 	Output     []struct {
 		Type    string `json:"type"`
 		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
+			Type        string `json:"type"`
+			Text        string `json:"text"`
+			Annotations []struct {
+				Type string `json:"type"`
+				URL  string `json:"url"`
+			} `json:"annotations"`
 		} `json:"content"`
 	} `json:"output"`
 	Citations []json.RawMessage `json:"citations"`
@@ -109,7 +118,7 @@ func (x *xSearch) Search(ctx context.Context, req Request) (*Result, error) {
 
 	body := xSearchRequest{
 		Model:     x.model,
-		Reasoning: &xReasoning{Effort: "low"},
+		Reasoning: &xReasoning{Effort: x.reasoning},
 	}
 	body.Input = append(body.Input, struct {
 		Role    string `json:"role"`
@@ -166,6 +175,37 @@ func (x *xSearch) Search(ctx context.Context, req Request) (*Result, error) {
 
 	seen := map[string]bool{}
 	citations := []WebResult{}
+
+	// 1. Native Responses API annotations
+	for _, item := range xr.Output {
+		for _, c := range item.Content {
+			for _, a := range c.Annotations {
+				u := strings.TrimSpace(a.URL)
+				if u == "" || seen[u] {
+					continue
+				}
+				seen[u] = true
+				title := u
+				if strings.Contains(u, "x.com/") || strings.Contains(u, "twitter.com/") {
+					parts := strings.Split(u, "/")
+					for i, p := range parts {
+						if (p == "x.com" || p == "twitter.com") && i+1 < len(parts) {
+							user := parts[i+1]
+							if user != "i" && user != "status" {
+								title = fmt.Sprintf("Post by @%s on X", user)
+							} else {
+								title = "Post on X (Twitter)"
+							}
+							break
+						}
+					}
+				}
+				citations = append(citations, WebResult{Title: title, URL: u, Site: hostOf(u)})
+			}
+		}
+	}
+
+	// 2. Top-level citations
 	for _, raw := range xr.Citations {
 		u := citationURL(raw)
 		if u == "" || seen[u] {
@@ -190,7 +230,7 @@ func (x *xSearch) Search(ctx context.Context, req Request) (*Result, error) {
 		citations = append(citations, WebResult{Title: title, URL: u, Site: hostOf(u)})
 	}
 
-	// Fallback: If top-level citations were empty, parse any inline X/Twitter status URLs from answer
+	// 3. Fallback: Parse any inline X/Twitter status URLs from answer
 	if len(citations) == 0 && answer != "" {
 		re := regexp.MustCompile(`https?://(?:x\.com|twitter\.com)/([A-Za-z0-9_]+)/(?:status|statuses)/\d+`)
 		matches := re.FindAllStringSubmatch(answer, -1)

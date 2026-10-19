@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"agentflow/internal/config"
@@ -171,7 +172,41 @@ func (x *xSearch) Search(ctx context.Context, req Request) (*Result, error) {
 			continue
 		}
 		seen[u] = true
-		citations = append(citations, WebResult{Title: u, URL: u, Site: hostOf(u)})
+		title := u
+		if strings.Contains(u, "x.com/") || strings.Contains(u, "twitter.com/") {
+			parts := strings.Split(u, "/")
+			for i, p := range parts {
+				if (p == "x.com" || p == "twitter.com") && i+1 < len(parts) {
+					user := parts[i+1]
+					if user != "i" && user != "status" {
+						title = fmt.Sprintf("Post by @%s on X", user)
+					} else {
+						title = "Post on X (Twitter)"
+					}
+					break
+				}
+			}
+		}
+		citations = append(citations, WebResult{Title: title, URL: u, Site: hostOf(u)})
+	}
+
+	// Fallback: If top-level citations were empty, parse any inline X/Twitter status URLs from answer
+	if len(citations) == 0 && answer != "" {
+		re := regexp.MustCompile(`https?://(?:x\.com|twitter\.com)/([A-Za-z0-9_]+)/(?:status|statuses)/\d+`)
+		matches := re.FindAllStringSubmatch(answer, -1)
+		for _, m := range matches {
+			if len(m) > 0 {
+				u := m[0]
+				if !seen[u] {
+					seen[u] = true
+					title := "Post on X (Twitter)"
+					if len(m) > 1 && m[1] != "i" && m[1] != "status" {
+						title = fmt.Sprintf("Post by @%s on X", m[1])
+					}
+					citations = append(citations, WebResult{Title: title, URL: u, Site: hostOf(u)})
+				}
+			}
+		}
 	}
 
 	out := &Result{Query: query, Results: make([]WebResult, 0, len(citations)+1)}

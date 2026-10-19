@@ -767,7 +767,8 @@ type SearchEngine struct {
 	BaseURL string `yaml:"base_url"` // optional endpoint override
 	Timeout string `yaml:"timeout"`  // per-request bound; default 30s
 	Site    string `yaml:"site"`     // stackoverflow engine: any StackExchange site (default "stackoverflow")
-	Model   string `yaml:"model"`    // google_search (default gemini-3.8-flash), x_search (default grok-4.6): grounding model
+	Model     string `yaml:"model"`     // google_search (default gemini-3.8-flash), x_search (default grok-4.6): grounding model
+	Reasoning string `yaml:"reasoning"` // x_search (default low; supports none, low, medium, high)
 }
 
 // TimeoutD parses Timeout with a sane default.

@@ -116,10 +116,12 @@ func (g *googleSearch) Search(ctx context.Context, req Request) (*Result, error)
 	}
 
 	input := interactions.NewInteractionsInput(query)
+	level := interactions.ThinkingLevelLow
 	body := operations.NewCreateInteractionRequestBody(interactions.CreateModelInteraction{
-		Model: interactions.Model(g.model),
-		Input: &input,
-		Tools: []interactions.Tool{interactions.NewTool(interactions.GoogleSearch{})},
+		Model:            interactions.Model(g.model),
+		Input:            &input,
+		Tools:            []interactions.Tool{interactions.NewTool(interactions.GoogleSearch{})},
+		GenerationConfig: &interactions.GenerationConfig{ThinkingLevel: &level},
 	})
 	// One attempt: the engine reports a failure to its caller rather than
 	// sitting on the SDK's default four-attempt backoff.

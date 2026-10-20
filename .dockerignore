@@ -1,0 +1,11 @@
+.git
+.gitignore
+.zcode
+agentflow
+agentflow.exe
+build
+data
+internal/vm/lib
+agentflow.schema.json
+*.db
+*.out

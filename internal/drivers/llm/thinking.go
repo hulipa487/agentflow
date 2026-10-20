@@ -106,7 +106,7 @@ var openaiEffort = map[Thinking]string{
 // which is how the API is asked to return the thought summaries the caller
 // reads back (the old include_thoughts flag).
 var geminiThinkingLevel = map[Thinking]interactions.ThinkingLevel{
-	ThinkingOff:    interactions.ThinkingLevelLow,
+	ThinkingOff:    interactions.ThinkingLevelMinimal,
 	ThinkingLow:    interactions.ThinkingLevelLow,
 	ThinkingMedium: interactions.ThinkingLevelMedium,
 	ThinkingHigh:   interactions.ThinkingLevelHigh,

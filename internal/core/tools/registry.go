@@ -27,6 +27,11 @@ type ToolSpec struct {
 	UserVisible  bool
 	Autonomous   bool
 
+	// RequiresCapability, when set, hides the tool from an agent that does not
+	// hold that capability. It is how builtin:fetch and declarative HTTP tools
+	// stay behind net.http rather than being reachable through `tools` alone.
+	RequiresCapability string
+
 	// Invoke runs the tool. It should return a table that serializes to JSON.
 	Invoke func(ctx context.Context, args map[string]any) (any, error)
 }
@@ -349,6 +354,24 @@ type AgentSet struct {
 	// Visible is the rule this set was filtered by, re-exported so the
 	// Lua-declared tools can be filtered by the same one.
 	Visible ToolVisibility
+}
+
+// RequireCapabilities returns a copy of the set with tools whose
+// RequiresCapability the agent does not hold removed. The declared-tool
+// visibility rule (Visible) is preserved so Lua tools are filtered the same way.
+func (s *AgentSet) RequireCapabilities(granted map[string]bool) *AgentSet {
+	if s == nil {
+		return nil
+	}
+	out := &AgentSet{Registry: s.Registry, Visible: s.Visible, ByName: map[string]ToolSpec{}}
+	for _, t := range s.Tools {
+		if t.RequiresCapability != "" && !granted[t.RequiresCapability] {
+			continue
+		}
+		out.Tools = append(out.Tools, t)
+		out.ByName[t.Name] = t
+	}
+	return out
 }
 
 // Expose computes the tools available to an agent given its skills, the global

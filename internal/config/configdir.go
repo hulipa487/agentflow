@@ -314,10 +314,15 @@ func rebaseConfigPaths(dir string, c *Config) {
 	}
 	c.Gateway.Route = rebasePath(dir, c.Gateway.Route)
 	c.Runtime.Persistence = rebasePersistence(dir, c.Runtime.Persistence)
-	c.Runtime.Identity.Persistence = rebasePath(dir, c.Runtime.Identity.Persistence)
-	c.Runtime.Credentials.Path = rebasePath(dir, c.Runtime.Credentials.Path)
+	c.Runtime.Cluster.Persistence = rebasePersistence(dir, c.Runtime.Cluster.Persistence)
+	c.Runtime.Identity.Persistence = rebasePersistence(dir, c.Runtime.Identity.Persistence)
+	c.Runtime.Credentials.Path = rebasePersistence(dir, c.Runtime.Credentials.Path)
+	c.Runtime.LogPlane.Persistence = rebasePersistence(dir, c.Runtime.LogPlane.Persistence)
 	c.Media.Dir = rebasePath(dir, c.Media.Dir)
 	c.Plugins.Dir = rebasePath(dir, c.Plugins.Dir)
+	for name, p := range c.Packages {
+		c.Packages[name] = rebasePath(dir, p)
+	}
 	for name, b := range c.Memory.Backends {
 		if b.Provider != "sqlite" || b.Config == nil {
 			continue
@@ -342,18 +347,25 @@ func rebasePath(base, p string) string {
 	// rebased into a path, so the failure names it as an unknown plugin and can
 	// say what to write — instead of reporting a missing file at
 	// <configdir>/builtin:per_chat, which is where rebasing it would look.
-	if strings.HasPrefix(p, "plugin:") || strings.HasPrefix(p, "builtin:") {
+	if strings.HasPrefix(p, "plugin:") || strings.HasPrefix(p, "builtin:") || strings.HasPrefix(p, "package:") {
 		return p
 	}
 	return filepath.Join(base, p)
 }
 
-// rebasePersistence rebases the path part of a sqlite:// reference, keeping
-// the scheme prefix intact.
+// rebasePersistence rebases the path part of a local store target, keeping its
+// scheme. sqlite:// and file:// name local files; any other scheme (a
+// PostgreSQL DSN, for example) is an address, not a path, and must pass
+// through untouched.
 func rebasePersistence(base, p string) string {
-	const prefix = "sqlite://"
-	if rest, ok := strings.CutPrefix(p, prefix); ok {
-		return prefix + rebasePath(base, rest)
+	if p == "" || filepath.IsAbs(p) {
+		return p
+	}
+	if scheme, rest, ok := strings.Cut(p, "://"); ok {
+		if scheme != "sqlite" && scheme != "file" {
+			return p
+		}
+		return scheme + "://" + rebasePath(base, rest)
 	}
 	return rebasePath(base, p)
 }

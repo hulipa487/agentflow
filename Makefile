@@ -67,8 +67,15 @@ endif
 # Output binary. On Windows you may want: make BIN=agentflow.exe
 BIN     ?= agentflow
 
-# Config used by `make run` (your local instance config; gitignored)
-CONFIG  ?= config.yaml
+# Release stamp. Ordinary builds say "dev"; a tag or dirty checkout is visible
+# in `agentflow version` and the web console.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS := -X main.version=$(VERSION)
+
+# Config used by `make run` (your local instance config; gitignored). Prefer
+# the filename the binary defaults to, but keep the historical config.yaml
+# working for existing checkouts.
+CONFIG  ?= $(if $(wildcard agentflow.yaml),agentflow.yaml,config.yaml)
 
 # ---- Luau static library ---------------------------------------------------
 LUAU    := third_party/luau
@@ -122,12 +129,17 @@ luau: $(LIB)
 # Prerequisites beyond the static lib: every Go source (the prelude is one),
 # the module files, and the cgo shim. Without these a Go-only change reports
 # nothing-to-do and hands out the stale binary.
+# Embedded assets count as sources: a change to a builtin Lua chunk, the
+# prelude or the console SPA is compiled into the binary by go:embed, and
+# without these a Lua-only edit reports nothing-to-do and hands out a stale
+# binary.
 GOSRC := $(shell find cmd internal -name '*.go' 2>/dev/null) \
+	$(shell find internal/builtins/lua internal/webui/static -type f 2>/dev/null) \
 	internal/vm/shim.cpp internal/vm/shim.h \
 	go.mod go.sum
 
 $(BIN): $(LIB) $(GOSRC)
-	$(GOENV) go build -o $(BIN) ./cmd/agentflow
+	$(GOENV) go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN) ./cmd/agentflow
 
 all: $(BIN)
 
@@ -142,8 +154,37 @@ test:
 vet:
 	$(GOENV) go vet ./...
 
+# Format/check only files touched by this working tree. The repository's
+# baseline predates the current gofmt (it has many untouched files the tool
+# would rewrite), so a repo-wide -w would bury a real change in formatting
+# noise.
+CHANGED_GO := $(shell git diff --name-only HEAD -- '*.go'; git ls-files --others --exclude-standard '*.go')
+
+fmt:
+	@files="$(CHANGED_GO)"; \
+	if [ -n "$$files" ]; then gofmt -w $$files; fi
+
+fmt-check:
+	@files="$(CHANGED_GO)"; \
+	if [ -z "$$files" ]; then exit 0; fi; \
+	out="$$(gofmt -l $$files)"; \
+	if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
+
+check: vet test
+
+schema: $(BIN)
+	./$(BIN) config schema > agentflow.schema.json
+	@echo "wrote agentflow.schema.json"
+
+loop-check: $(BIN)
+	./$(BIN) loop check examples/loops/echo.lua
+	./$(BIN) loop test examples/scenarios/echo.yaml
+
+docker:
+	docker build -t agentflow:$(VERSION) .
+
 clean:
 	rm -rf $(OBJ) $(LIB) $(BIN) $(BIN).exe
 
 
-.PHONY: all luau build run test vet clean
+.PHONY: all luau build run test vet fmt fmt-check check schema loop-check docker clean

@@ -20,8 +20,8 @@ import (
 	"agentflow/internal/config"
 	"agentflow/internal/core/address"
 	"agentflow/internal/core/media"
-	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/memory"
+	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/pool"
 	"agentflow/internal/core/safety"
 	"agentflow/internal/vm"
@@ -72,6 +72,9 @@ type Identity struct {
 	ParentID     string
 	CanContact   map[string]bool
 	Capabilities map[string]bool
+	// PushSameTenant refuses session.push_user targets other than the current
+	// turn's tenant. It is a deployment policy, set by the supervisor.
+	PushSameTenant bool
 }
 
 // Message is the unified mailbox envelope (user/timer/agent/confirm/system).
@@ -286,6 +289,25 @@ type SchedulerService interface {
 	After(owner string, delaySec float64) (string, error)
 	Cron(owner string, expr string) (string, error)
 	Cancel(owner string, timerID string) error
+}
+
+// SchedulerScope is the core-stamped identity a timer fires under. A timer is
+// not a maintenance context: it runs as the tenant (and group membership) of
+// the turn that scheduled it. Engine-configured triggers are the privileged
+// path and keep the "scheduler" provenance kind.
+type SchedulerScope struct {
+	UserUUID       *string
+	MembershipUUID *string
+	Principal      string
+}
+
+// ScopedSchedulerService is the provenance-aware half. The actor prefers it
+// when the injected scheduler implements it; the old interface remains for
+// tests and embedders, and its timers fire tenant-less rather than privileged.
+type ScopedSchedulerService interface {
+	EveryScoped(owner string, intervalSec float64, scope SchedulerScope) (string, error)
+	AfterScoped(owner string, delaySec float64, scope SchedulerScope) (string, error)
+	CronScoped(owner string, expr string, scope SchedulerScope) (string, error)
 }
 
 // Gateway is the egress half of the channel registry. Attachments carry
@@ -549,6 +571,13 @@ type Actor struct {
 	// journal an audit trail.
 	Journal EgressJournalFunc
 
+	// Tracer, when set, receives execution events (turn/op/reply/safety) for
+	// an observing console. Set by the supervisor; loops cannot touch it.
+	Tracer Tracer
+	// TracePayloads includes message, reply and result text in trace events.
+	// Metadata (op type, model, duration, tokens, errors) is always emitted.
+	TracePayloads bool
+
 	gw     Gateway
 	agents AgentService
 	sched  SchedulerService
@@ -782,15 +811,30 @@ func (a *Actor) runOnce(ctx context.Context) (crashed bool) {
 			return false
 		case vm.Failed:
 			a.log.Warn("loop error", "err", msg)
+			a.trace(TraceEvent{Kind: "error", Err: truncateTrace(msg)})
 			return true
 		}
 
 		var op Op
 		if err := json.Unmarshal([]byte(msg), &op); err != nil {
 			a.log.Warn("bad op from lua", "err", err, "raw", msg)
+			a.trace(TraceEvent{Kind: "error", Err: truncateTrace(err.Error())})
 			return true
 		}
 		a.log.Debug("op dispatch", "op", op.Type, "model", op.Model, "tool", op.Tool, "blocking", blockingOps[op.Type])
+
+		// Loop machinery is not traced as a step: inbox marks the turn
+		// boundary itself, and the rest are not observable work.
+		traced := op.Type != "inbox" && op.Type != "sleep" && op.Type != "log" && op.Type != "session.exit"
+		turn := current.ID
+		if traced {
+			ev := TraceEvent{Kind: "op.start", Op: op.Type, Tool: op.Tool, Model: op.Model, Turn: turn, Messages: len(op.Messages)}
+			if a.TracePayloads {
+				ev.Text = truncateTrace(traceOpPayload(op))
+			}
+			a.trace(ev)
+		}
+		started := time.Now()
 
 		var resp string
 		var ok, proceed bool
@@ -799,6 +843,17 @@ func (a *Actor) runOnce(ctx context.Context) (crashed bool) {
 			resp, ok, proceed = a.dispatchBlocking(ctx, op, &current)
 		} else {
 			resp, ok, proceed = a.dispatchInline(ctx, op, &current)
+		}
+		if traced {
+			ev := TraceEvent{
+				Op: op.Type, Tool: op.Tool, Model: op.Model, Turn: turn,
+				DurationMS: time.Since(started).Milliseconds(), Messages: len(op.Messages),
+			}
+			traceOpEnd(&ev, resp, ok)
+			if a.TracePayloads && resp != "" {
+				ev.Text = truncateTrace(resp)
+			}
+			a.trace(ev)
 		}
 		if !proceed {
 			return false // shutdown or reload
@@ -823,6 +878,11 @@ func (a *Actor) runOnce(ctx context.Context) (crashed bool) {
 func (a *Actor) dispatchInline(ctx context.Context, op Op, current *Message) (resp string, ok, proceed bool) {
 	switch op.Type {
 	case "inbox":
+		// Parking on the inbox is where a turn ends: the loop has finished
+		// answering and asked for the next message.
+		if current != nil && current.ID != "" {
+			a.trace(TraceEvent{Kind: "turn.end", Turn: current.ID})
+		}
 		m, goOn := a.waitInbox(ctx)
 		if !goOn {
 			return "", false, false
@@ -838,11 +898,18 @@ func (a *Actor) dispatchInline(ctx context.Context, op Op, current *Message) (re
 				a.log.Info("safety ingress dropped message", "reason", res.Reason)
 				metrics.Inc("agentflow_safety_drops")
 				m.Text = "" // loop sees an empty message, not the original
+				a.trace(TraceEvent{Kind: "safety", Op: "ingress", Turn: m.ID, Err: res.Reason})
 			} else if res.Text != m.Text {
 				m.Text = res.Text
+				a.trace(TraceEvent{Kind: "safety", Op: "ingress", Turn: m.ID, OK: true, Err: "rewritten"})
 			}
 		}
 		*current = m
+		ev := TraceEvent{Kind: "turn.start", Turn: m.ID, Messages: 1}
+		if a.TracePayloads {
+			ev.Text = truncateTrace(m.Text)
+		}
+		a.trace(ev)
 		r, _ := jsonString(m)
 		return r, true, true
 
@@ -901,6 +968,7 @@ func (a *Actor) dispatchBlocking(ctx context.Context, op Op, current *Message) (
 		return res.resp, res.ok, true
 	case <-a.reload:
 		a.log.Info("hot reload: restarting loop")
+		a.trace(TraceEvent{Kind: "reload"})
 		return "", false, false
 	case <-ctx.Done():
 		return "", false, false
@@ -948,6 +1016,11 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 		if err != nil || addr.Kind != address.User {
 			return `"session.push_user requires a user:<uuid> address"`, false
 		}
+		if a.Identity.PushSameTenant {
+			if me := PersonalUUIDFromCtx(ctx); me != addr.User {
+				return `"session.push_user target is outside the current tenant"`, false
+			}
+		}
 		channel, replyTo, ok := a.users.LookupUser(addr.User)
 		if !ok {
 			return `"unknown user"`, false
@@ -990,9 +1063,17 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 		}
 	}
 	if a.sched != nil {
+		scope := schedulerScopeFromCtx(ctx)
+		scoped, _ := a.sched.(ScopedSchedulerService)
 		switch op.Type {
 		case "scheduler.every":
-			id, err := a.sched.Every(a.Name, op.Interval)
+			var id string
+			var err error
+			if scoped != nil {
+				id, err = scoped.EveryScoped(a.Name, op.Interval, scope)
+			} else {
+				id, err = a.sched.Every(a.Name, op.Interval)
+			}
 			if err != nil {
 				r, _ := jsonString(err.Error())
 				return r, false
@@ -1000,7 +1081,13 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 			r, _ := jsonString(map[string]any{"id": id})
 			return r, true
 		case "scheduler.after":
-			id, err := a.sched.After(a.Name, op.Delay)
+			var id string
+			var err error
+			if scoped != nil {
+				id, err = scoped.AfterScoped(a.Name, op.Delay, scope)
+			} else {
+				id, err = a.sched.After(a.Name, op.Delay)
+			}
 			if err != nil {
 				r, _ := jsonString(err.Error())
 				return r, false
@@ -1008,7 +1095,13 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 			r, _ := jsonString(map[string]any{"id": id})
 			return r, true
 		case "scheduler.cron":
-			id, err := a.sched.Cron(a.Name, op.Cron)
+			var id string
+			var err error
+			if scoped != nil {
+				id, err = scoped.CronScoped(a.Name, op.Cron, scope)
+			} else {
+				id, err = a.sched.Cron(a.Name, op.Cron)
+			}
 			if err != nil {
 				r, _ := jsonString(err.Error())
 				return r, false
@@ -1082,6 +1175,7 @@ func (a *Actor) egress(ctx context.Context, channel, replyTo, text string, attac
 			a.log.Info("safety egress dropped reply", "reason", res.Reason)
 			metrics.Inc("agentflow_safety_drops")
 			journal("blocked_safety", res.Reason)
+			a.trace(TraceEvent{Kind: "safety", Op: "egress", Turn: inReplyTo, Err: res.Reason})
 			return `"reply blocked by safety filter"`, false
 		}
 		text = res.Text
@@ -1090,11 +1184,17 @@ func (a *Actor) egress(ctx context.Context, channel, replyTo, text string, attac
 		if err := a.gw.Send(channel, replyTo, text, attachments); err != nil {
 			a.log.Warn("egress failed", "err", err)
 			journal("failed", err.Error())
+			a.trace(TraceEvent{Kind: "reply", Turn: inReplyTo, Err: err.Error()})
 			r, _ := jsonString(err.Error())
 			return r, false
 		}
 	}
 	journal("delivered", "")
+	ev := TraceEvent{Kind: "reply", Turn: inReplyTo, OK: true}
+	if a.TracePayloads {
+		ev.Text = truncateTrace(text)
+	}
+	a.trace(ev)
 	return "true", true
 }
 
@@ -1517,6 +1617,28 @@ func MaintenanceFromCtx(ctx context.Context) bool {
 		return true
 	}
 	return false
+}
+
+// schedulerScopeFromCtx captures the turn's identity at timer-registration
+// time. A timer created by a tenant runs as that tenant; a timer created by a
+// tenantless service turn stays known-empty. It never becomes a maintenance
+// context just because it fired later.
+func schedulerScopeFromCtx(ctx context.Context) SchedulerScope {
+	scope := SchedulerScope{Principal: "system:scheduler"}
+	id, ok := ActingFromCtx(ctx)
+	if !ok {
+		return scope
+	}
+	u := id.Personal
+	scope.UserUUID = &u
+	if id.Membership != "" {
+		m := id.Membership
+		scope.MembershipUUID = &m
+	}
+	if key := SessionKeyFromCtx(ctx); key != "" {
+		scope.Principal = "session:" + key
+	}
+	return scope
 }
 
 type provenanceKeyType struct{}

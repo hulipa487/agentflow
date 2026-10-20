@@ -60,11 +60,12 @@ func (s *Supervisor) Spawn(ctx context.Context, parent session.Identity, profile
 	info.Capabilities = keysOf(childCaps)
 
 	identity := session.Identity{
-		SessionID:    skey,
-		Agent:        agentName,
-		ParentID:     parent.SessionID,
-		CanContact:   childContact,
-		Capabilities: childCaps,
+		SessionID:      skey,
+		Agent:          agentName,
+		ParentID:       parent.SessionID,
+		CanContact:     childContact,
+		Capabilities:   childCaps,
+		PushSameTenant: s.pushSameTenant,
 	}
 
 	// Support chunks are read and version-gated before the child exists at all.

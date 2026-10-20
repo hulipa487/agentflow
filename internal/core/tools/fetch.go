@@ -68,7 +68,8 @@ func RegisterFetchBuiltins(r *Registry, c *fetch.Client, log *slog.Logger, fm *f
 				"description": "Scratch file name: the response body also lands in this session's files scratch space (readable via files.scratch.read). Bytes never enter the model context.",
 			},
 		}, []string{"url"}),
-		Autonomous: true,
+		Autonomous:         true,
+		RequiresCapability: "net.http",
 		Invoke: func(ctx context.Context, args map[string]any) (any, error) {
 			if c == nil {
 				return ResultUnavailable("builtin:fetch", "The fetch client is not configured."), nil

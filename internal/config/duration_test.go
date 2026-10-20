@@ -45,12 +45,12 @@ func TestParseEvery(t *testing.T) {
 // looked configured and did nothing at all.
 func TestParseRetention(t *testing.T) {
 	good := map[string]time.Duration{
-		"30d":      30 * 24 * time.Hour,
-		"1d":       24 * time.Hour,
-		"12h":      12 * time.Hour,
-		" 30d ":    30 * 24 * time.Hour,
-		"forever":  0,
-		"FOREVER":  0,
+		"30d":       30 * 24 * time.Hour,
+		"1d":        24 * time.Hour,
+		"12h":       12 * time.Hour,
+		" 30d ":     30 * 24 * time.Hour,
+		"forever":   0,
+		"FOREVER":   0,
 		"  forever": 0,
 	}
 	for in, want := range good {

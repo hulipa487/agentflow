@@ -1,0 +1,16 @@
+version: "1"
+
+runtime:
+  persistence: sqlite://./data/agentflow.db
+
+gateway:
+  listen: ":8080"
+  channels:
+    - name: local
+      type: webhook
+      agent: echo
+      path: /webhook/local/
+
+agents:
+  echo:
+    loop: ./loops/echo.lua

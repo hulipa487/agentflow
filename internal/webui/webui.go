@@ -16,11 +16,13 @@ import (
 	"io/fs"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"agentflow/internal/config"
 	"agentflow/internal/core/credentials"
 	"agentflow/internal/core/metrics"
+	"agentflow/internal/core/studio"
 	"agentflow/internal/core/supervisor"
 	"agentflow/internal/core/tenancy"
 	"agentflow/internal/drivers/llm"
@@ -28,9 +30,6 @@ import (
 
 //go:embed static
 var staticFS embed.FS
-
-//go:embed docs
-var docsFS embed.FS
 
 // Deps are the runtime handles the console needs. All are wired in main; Creds
 // and Logs may be nil (credentials disabled / log tail off).
@@ -41,15 +40,15 @@ type Deps struct {
 	// rather than one file, so the Config tab and the model persist/revert
 	// paths — all of which swap a single file — report a named reason instead
 	// of editing the wrong one.
-	ConfigDir  string
-	Cfg        *config.Config
-	Models     *llm.Manager
-	History    *metrics.History
-	Creds      *credentials.Store
-	Logs       *LogRing
-	Snapshot   func() ([]supervisor.SessionStatus, int, int)
-	Version    string
-	StartedAt  time.Time
+	ConfigDir string
+	Cfg       *config.Config
+	Models    *llm.Manager
+	History   *metrics.History
+	Creds     *credentials.Store
+	Logs      *LogRing
+	Snapshot  func() ([]supervisor.SessionStatus, int, int)
+	Version   string
+	StartedAt time.Time
 
 	// Agents is the runtime agent registry, and BuildAgent resolves a
 	// configured agent into a supervisor definition with the same recipe
@@ -57,7 +56,7 @@ type Deps struct {
 	// and metering wiring that lives in main. Either nil means the console
 	// was built without agent control; the routes answer 503 with a named
 	// reason instead of panicking.
-	Agents    *supervisor.Supervisor
+	Agents     *supervisor.Supervisor
 	BuildAgent func(name string, a config.Agent) (*supervisor.AgentDef, error)
 
 	// Instance identifies this process in a fleet: the lease owner id, which is
@@ -78,12 +77,28 @@ type Deps struct {
 	// Tenancy is the groups/pools/grants registry. Nil means the console was
 	// built without tenancy; those routes answer 503 with a named reason.
 	Tenancy *tenancy.Registry
+
+	// Studio is the standalone app's engine side (trace rings + playground
+	// correlation); Workspace is where its builder persists agents. Nil means
+	// /admin/api/studio answers 503 with a named reason.
+	Studio        *studio.Broker
+	Workspace     *studio.Workspace
+	Channels      *studio.Channels
+	StudioCatalog func() studio.Catalog
 }
 
 // UI is the console. Static serves the SPA (unauthenticated — it is inert
 // without the API); API serves /admin/api/* and must be mounted with auth.
 type UI struct {
 	deps Deps
+
+	// studioApplied is the definition the builder applied live, per agent.
+	// The boot config in Deps.Cfg is a snapshot from startup, so without this
+	// a reload after Apply would show the pre-edit definition. It is
+	// process-local on purpose: a restart falls back to the config or the
+	// persisted fragment, which is the truth at that point.
+	mu            sync.Mutex
+	studioApplied map[string]config.Agent
 }
 
 func New(d Deps) *UI { return &UI{deps: d} }
@@ -120,44 +135,6 @@ func (u *UI) Static() http.Handler {
 			w.Header().Set("Content-Type", "text/css; charset=utf-8")
 		}
 		// The SPA is per-deployment and never cached across versions.
-		w.Header().Set("Cache-Control", "no-store")
-		_, _ = w.Write(b)
-	})
-}
-
-// Docs serves the embedded documentation site at /docs/. Like Static, it is
-// unauthenticated (documentation is not sensitive) and path-whitelisted.
-func (u *UI) Docs() http.Handler {
-	sub, err := fs.Sub(docsFS, "docs")
-	if err != nil {
-		panic(err)
-	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := strings.TrimPrefix(r.URL.Path, "/docs/")
-		if path == "" || path == "docs" {
-			path = "index.html"
-		}
-		switch path {
-		case "index.html", "css/styles.css", "js/nav.js", "openapi/users.yaml":
-		default:
-			http.NotFound(w, r)
-			return
-		}
-		b, err := fs.ReadFile(sub, path)
-		if err != nil {
-			http.NotFound(w, r)
-			return
-		}
-		switch {
-		case strings.HasSuffix(path, ".html"):
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		case strings.HasSuffix(path, ".js"):
-			w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-		case strings.HasSuffix(path, ".css"):
-			w.Header().Set("Content-Type", "text/css; charset=utf-8")
-		case strings.HasSuffix(path, ".yaml"):
-			w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
-		}
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = w.Write(b)
 	})
@@ -202,6 +179,26 @@ func (u *UI) API() http.Handler {
 	mux.HandleFunc("PUT /admin/api/users/{id}/settings", u.handleUserSettings)
 	mux.HandleFunc("POST /admin/api/users/{id}/unlink", u.handleUserUnlink)
 	mux.HandleFunc("POST /admin/api/users/invites", u.handleInviteIssue)
+	mux.HandleFunc("GET /admin/api/users/{id}/export", u.handleUserExport)
+	mux.HandleFunc("DELETE /admin/api/users/{id}", u.handleUserDelete)
+	mux.HandleFunc("GET /admin/api/usage", u.handleUsage)
+
+	// Studio (standalone builder/playground/trace app).
+	mux.HandleFunc("GET /admin/api/studio/catalog", u.handleStudioCatalog)
+	mux.HandleFunc("GET /admin/api/studio/agents", u.handleStudioAgents)
+	mux.HandleFunc("GET /admin/api/studio/agents/{name}", u.handleStudioAgentGet)
+	mux.HandleFunc("POST /admin/api/studio/agents/validate", u.handleStudioValidate)
+	mux.HandleFunc("PUT /admin/api/studio/agents/{name}", u.handleStudioAgentPut)
+	mux.HandleFunc("DELETE /admin/api/studio/agents/{name}", u.handleStudioAgentDelete)
+	mux.HandleFunc("POST /admin/api/studio/chat", u.handleStudioChat)
+	mux.HandleFunc("GET /admin/api/studio/threads", u.handleStudioThreads)
+	mux.HandleFunc("POST /admin/api/studio/threads/{thread}/stop", u.handleStudioStopThread)
+	mux.HandleFunc("GET /admin/api/studio/trace/{agent}/{thread}", u.handleStudioTrace)
+	mux.HandleFunc("GET /admin/api/studio/channels", u.handleStudioChannels)
+	mux.HandleFunc("POST /admin/api/studio/channels/validate", u.handleStudioChannelValidate)
+	mux.HandleFunc("POST /admin/api/studio/channels", u.handleStudioChannelCreate)
+	mux.HandleFunc("PUT /admin/api/studio/channels/{index}", u.handleStudioChannelPut)
+	mux.HandleFunc("DELETE /admin/api/studio/channels/{index}", u.handleStudioChannelDelete)
 	return mux
 }
 

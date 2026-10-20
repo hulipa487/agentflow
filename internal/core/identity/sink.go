@@ -48,8 +48,9 @@ type Sink struct {
 	reg   *Registry
 	log   *slog.Logger
 
-	mu    sync.Mutex
-	reply func(channel, replyTo, text string)
+	mu                 sync.Mutex
+	reply              func(channel, replyTo, text string)
+	rejectUnregistered bool
 }
 
 // NewSink wraps an inner router sink with identity resolution.
@@ -65,6 +66,13 @@ func (s *Sink) SetReply(fn func(channel, replyTo, text string)) {
 	s.reply = fn
 	s.mu.Unlock()
 }
+
+// SetRejectUnregistered drops inbound traffic from handles that are not linked
+// to a profile. It is the operator's opt-in for closing the anonymous
+// service-stratum bypass; the default keeps the historical allow behavior.
+// Link commands are still processed, because /link is how an unregistered
+// handle becomes registered.
+func (s *Sink) SetRejectUnregistered(v bool) { s.rejectUnregistered = v }
 
 func (s *Sink) say(in router.Inbound, text string) {
 	s.mu.Lock()
@@ -94,6 +102,16 @@ func (s *Sink) Submit(in router.Inbound) {
 			s.completeLink(in, res, native, code)
 			return
 		}
+	}
+	if s.rejectUnregistered && !res.Registered() {
+		metrics.Inc("agentflow_unregistered_rejected")
+		s.log.Info("unregistered inbound rejected", "channel", in.Channel, "native", native)
+		msg := "This channel requires a linked account. Register, then send /link <code> to connect this handle."
+		if !res.Linkable {
+			msg = "This deployment requires registration before it can answer on this channel."
+		}
+		s.say(in, msg)
+		return
 	}
 
 	from := res.IdentityID

@@ -47,6 +47,7 @@ import (
 	"strings"
 	"time"
 
+	"agentflow/internal/builtins"
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/supervisor"
 	"agentflow/internal/vm"
@@ -83,6 +84,15 @@ type SupportSource struct {
 	Reload func()
 }
 
+// PackageSource is the deployment's Lua packages: directories whose source is
+// concatenated into every loop that imports them. A package edit is wider than
+// a loop edit — any session importing it must restart — so Reload is the same
+// "restart every live session" signal the support chunks use.
+type PackageSource struct {
+	Paths  []string
+	Reload func()
+}
+
 // routeOwner and supportOwner are the watchKey owners for the two pieces of
 // policy that run outside a session, and so have no agent name to be keyed by.
 // Both start with NUL, which a config agent name (a YAML key) cannot contain:
@@ -108,12 +118,13 @@ type watchKey struct {
 
 // Watcher polls file mtimes (no fsnotify dependency).
 type Watcher struct {
-	sup     *supervisor.Supervisor
-	prompts *PromptSource
-	route   *RouteSource
-	support *SupportSource
-	log     *slog.Logger
-	mtimes  map[watchKey]time.Time
+	sup      *supervisor.Supervisor
+	prompts  *PromptSource
+	route    *RouteSource
+	support  *SupportSource
+	packages *PackageSource
+	log      *slog.Logger
+	mtimes   map[watchKey]time.Time
 	// members is the set of *.lua member paths last seen for a directory loop,
 	// per (agent, dir). A member's mtime cannot report its own disappearance —
 	// it is simply absent from the next readdir — so the set is what makes a
@@ -124,7 +135,11 @@ type Watcher struct {
 	// the update fans out to every agent that reads it.
 	promptMtimes map[string]time.Time
 	promptBad    map[string]bool
-	stop         chan struct{}
+	// pkgStamp fingerprints every file under the package directories: a
+	// package is a tree, so adding a file, editing a member, or editing the
+	// manifest all count.
+	pkgStamp string
+	stop     chan struct{}
 }
 
 func New(sup *supervisor.Supervisor, prompts *PromptSource, log *slog.Logger) *Watcher {
@@ -149,6 +164,9 @@ func (w *Watcher) SetRoute(r *RouteSource) { w.route = r }
 // before Start, for the same reason as SetRoute.
 func (w *Watcher) SetSupport(s *SupportSource) { w.support = s }
 
+// SetPackages registers the deployment's Lua package directories.
+func (w *Watcher) SetPackages(p *PackageSource) { w.packages = p }
+
 func (w *Watcher) Start() {
 	for name, def := range w.sup.Agents() {
 		for _, p := range []string{def.LoopFile, def.InstructionsPath} {
@@ -164,6 +182,10 @@ func (w *Watcher) Start() {
 	for name, path := range w.supportPaths() {
 		w.seedPath(supportOwner+name, path)
 		w.log.Info("reload: watching support chunk", "chunk", name, "file", path)
+	}
+	if w.packages != nil && len(w.packages.Paths) > 0 {
+		w.pkgStamp = packageFingerprint(w.packages.Paths)
+		w.log.Info("reload: watching Lua packages", "dirs", len(w.packages.Paths))
 	}
 	w.seedPrompts()
 	go w.loop()
@@ -265,6 +287,7 @@ func (w *Watcher) poll() {
 	// serves every inbound, and every session loads every support chunk.
 	w.pollRoute()
 	w.pollSupport()
+	w.pollPackages()
 	for name, def := range w.sup.Agents() {
 		if def.LoopFile != "" && w.changed(name, def.LoopFile) {
 			w.reloadLoop(name, def.LoopFile)
@@ -272,6 +295,42 @@ func (w *Watcher) poll() {
 		if def.InstructionsPath != "" && w.changed(name, def.InstructionsPath) {
 			w.reloadInstructions(name, def)
 		}
+	}
+}
+
+// packageFingerprint walks every package directory and combines the path,
+// mtime and size of each file. It is deliberately content-agnostic: a package
+// is shared source, and any member or manifest edit should restart the
+// sessions that import it.
+func packageFingerprint(dirs []string) string {
+	var b strings.Builder
+	for _, dir := range dirs {
+		_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info == nil || info.IsDir() {
+				return nil
+			}
+			fmt.Fprintf(&b, "%s:%d:%d;", path, info.ModTime().UnixNano(), info.Size())
+			return nil
+		})
+	}
+	return b.String()
+}
+
+// pollPackages restarts live sessions when a package tree changes. A package
+// is expanded into every importing loop at load time, so there is no narrower
+// unit to reload without tracking which session imported what.
+func (w *Watcher) pollPackages() {
+	if w.packages == nil || len(w.packages.Paths) == 0 {
+		return
+	}
+	stamp := packageFingerprint(w.packages.Paths)
+	if stamp == w.pkgStamp {
+		return
+	}
+	w.pkgStamp = stamp
+	w.log.Info("reload: Lua package updated, restarting sessions")
+	if w.packages.Reload != nil {
+		w.packages.Reload()
 	}
 }
 
@@ -289,7 +348,7 @@ func (w *Watcher) pollRoute() {
 	if !w.changed(routeOwner, w.route.WatchPath) {
 		return
 	}
-	src, err := readLoop(w.route.WatchPath)
+	src, _, err := builtins.Resolve(w.route.WatchPath)
 	if err != nil {
 		w.log.Warn("reload: cannot read route", "route", w.route.Ref, "file", w.route.WatchPath, "err", err)
 		return
@@ -480,7 +539,11 @@ func (w *Watcher) changed(agent, path string) bool {
 }
 
 func (w *Watcher) reloadLoop(agent, path string) {
-	src, err := readLoop(path)
+	// Resolve, not a bare file read: a loop may import a Lua package, and the
+	// compile check must see the same source the actor will load. A broken
+	// package therefore keeps the running loop instead of letting a reload
+	// through that fails on the next restart.
+	src, _, err := builtins.Resolve(path)
 	if err != nil {
 		// A version refusal is not a typo to be retried: the file on disk
 		// targets a prelude this core does not provide, and loading it would

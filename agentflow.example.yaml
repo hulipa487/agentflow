@@ -1,0 +1,260 @@
+# AgentFlow example configuration.
+#
+# Copy it to the name the runtime discovers:
+#
+#   cp agentflow.example.yaml agentflow.yaml
+#   ./agentflow validate
+#   ./agentflow
+#
+# Or point at this file directly, from any directory:
+#
+#   ./agentflow validate -config path/to/agentflow.example.yaml
+#   ./agentflow -config path/to/agentflow.example.yaml -log-level debug -no-tui
+#
+# Relative paths resolve against this file's directory, not the shell's
+# working directory, so the two commands above behave the same.
+#
+# The example boots with no external services. The `assistant` agent points at
+# an OpenAI-compatible local endpoint (Ollama by default); that model is only
+# contacted when a turn needs it. The `echo` agent and the webhook channel work
+# immediately:
+#
+#   curl -X POST localhost:8080/webhook/local/ \
+#        -d '{"from":"alice","text":"hello"}'
+#
+# Connect the AgentFlow Studio desktop app (the sibling agentflow-studio
+# repository) to http://127.0.0.1:9090 with the admin token. The browser
+# operator console is at /; `-no-console` serves the API without its static
+# files, and `/docs` now answers 410 because the documentation lives in Studio.
+#
+# Run `agentflow help` for commands and flags. The optional sections at the
+# bottom are comments: uncomment only what your deployment has.
+
+version: "1"
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+# `provider` selects the wire shape; `base_url` selects the host. api_key may
+# be empty for a keyless local endpoint. ${VAR:-default} expands at load.
+models:
+  default:
+    provider: openai
+    model: llama3.1
+    base_url: http://127.0.0.1:11434/v1   # Ollama / vLLM / LiteLLM / OpenRouter
+    # Keep secrets out of tracked config; export this variable or point at a
+    # credential-store entry with cred:<service>.
+    api_key: ${OPENAI_API_KEY:-}
+    timeout: 90s
+    retry: 1
+    # thinking: medium                      # off | low | medium | high | xhigh | max
+    # server_tools: []                      # provider-native tools (e.g. google_search on gemini)
+
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
+runtime:
+  persistence: sqlite://./data/agentflow.db
+
+  admin:
+    # listen: 127.0.0.1:9090
+    # Local-only transport for Studio on this machine. Set tcp: false to
+    # remove the HTTP listener; the bearer token is still required.
+    socket: '\\.\pipe\agentflow-admin'   # Windows named pipe
+    # socket: /run/agentflow/admin.sock      # Unix domain socket
+    tcp: false
+    # Named operator tokens have the same authority as ADMIN_TOKEN and are
+    # attributed in the X-Operator header/logs.
+    # operators: { alice: "${ALICE_ADMIN_TOKEN}" }
+    # CORS is only for browser clients of the API (the native Studio app sends
+    # the token directly and needs no entry). Exact origins only; "*" is
+    # refused. Vite's two spellings are different origins.
+    # cors_origins: ["http://127.0.0.1:5173", "http://localhost:5173"]
+
+  # Op-pool size. An explicit -workers flag overrides this; unset uses 8.
+  scheduler:
+    workers: 8
+
+  studio:
+    enabled: true
+    workspace: ""             # default: <config dir>/studio
+    trace_events: 2000        # per-session trace ring
+    trace_sessions: 200       # session rings retained
+    trace_payloads: false     # true also captures message/reply text
+    chat_timeout: 120s
+
+  limits:
+    sessions_per_tenant: 50   # 0 disables
+    egress_per_minute: 60     # http.request + mail.send, per tenant
+
+  timezone_offset_hours: 0    # cron triggers; every: is unaffected
+
+# Audit journal: every inbound and outbound message. 0 keeps forever.
+audit:
+  enabled: true
+  retention_days: 90
+
+# ---------------------------------------------------------------------------
+# Memory
+# ---------------------------------------------------------------------------
+memory:
+  backends:
+    main_db:
+      provider: sqlite
+      config:
+        path: ./data/agentflow.db
+
+profiles:
+  memory:
+    assistant:
+      stores:
+        dialogue: { backend: main_db, table: dialogue }
+        facts:    { backend: main_db, table: facts }
+      write: [plugin:routing_table]
+      recall: plugin:recency
+      # To share this store deliberately, bind it to a named pool created via
+      # the tenancy admin API: { backend: main_db, table: dialogue, pool: team }
+      # `shared: true` is a boot error.
+
+  # Safety profiles select the core-owned filter chain. "default" and "none"
+  # are built in; this one shows the shape.
+  safety:
+    strict:
+      filters: [source-attribution, signal-gate, steady-directive, support-offer, affect-guard]
+
+# ---------------------------------------------------------------------------
+# Agents
+# ---------------------------------------------------------------------------
+# `agents:` may be omitted entirely. The runtime then boots as an admin/Studio
+# control plane (with a warning) so the first agent can be created from Studio.
+agents:
+  # A conversational agent with memory. Needs the model above to be reachable.
+  assistant:
+    loop: ./examples/loops/chat.lua
+    model: default
+    instructions: ./examples/prompts/assistant.md
+    memory: assistant
+    safety: strict
+    history_budget: 6000
+    capabilities: [llm.chat, memory, tools]
+    skills: [builtin:fetch]
+    budget:
+      tokens_per_day: 100000
+
+  # No model needed: replies with what it received.
+  echo:
+    loop: ./examples/loops/echo.lua
+    capabilities: [tools]
+
+# ---------------------------------------------------------------------------
+# Gateway
+# ---------------------------------------------------------------------------
+gateway:
+  # Routing is Lua. The builtin per_chat handler keys a session per chat and
+  # supports the /group <uuid> toggle; replace it with plugin:<name> or a path.
+  route: plugin:per_chat
+  listen: 127.0.0.1:8080
+  # Required for telegram mode: webhook (the provider must reach this URL).
+  # public_url: https://agentflow.example.com
+  channels:
+    - type: webhook
+      name: local
+      path: /webhook/local/       # must end in "/"
+      agent: echo
+      timeout: 55s
+    # - type: telegram
+    #   name: tg
+    #   agent: assistant
+    #   token: ${TELEGRAM_BOT_TOKEN}
+    #   mode: polling              # polling | webhook | auto
+    #   allow_users: []
+    #
+    # - type: ghhook
+    #   name: github
+    #   agent: assistant
+    #   path: /webhook/github/
+    #   secret: ${GITHUB_WEBHOOK_SECRET}
+    #
+    # Bridge adapter: the runtime POSTs replies to deliver_url, signed with
+    # `secret`; `token` is the outbound bearer token for your adapter.
+    # - type: bridge
+    #   name: teams
+    #   agent: assistant
+    #   path: /bridge/teams/
+    #   deliver_url: https://bridge.example.com/deliver
+    #   secret: ${BRIDGE_SECRET}
+    #   token: ${BRIDGE_TOKEN}
+
+# ---------------------------------------------------------------------------
+# Scheduled triggers (engine-fired; no agent scheduler needed)
+# ---------------------------------------------------------------------------
+# triggers:
+#   - name: daily-digest
+#     cron: "0 9 * * *"            # matched in runtime.timezone_offset_hours
+#     target: { profile: assistant }
+#     payload: { task: digest }
+#   - name: heartbeat
+#     every: 15m
+#     target: { profile: echo }
+#     payload: { event: heartbeat }
+
+# ---------------------------------------------------------------------------
+# Optional surfaces (commented: each needs its own backend or key)
+# ---------------------------------------------------------------------------
+# runtime:
+#   identity: { enabled: true }              # profiles + per-user scopes
+#   users: { enabled: true, cors_origins: ["http://127.0.0.1:3000"] }
+#   credentials: { enabled: true }           # needs CREDENTIALS_MASTER_KEY
+#   log_plane: { persistence: ./data/log }   # JSONL journal + usage, per UTC day
+#   cluster:
+#     persistence: postgres://user:pass@host/db   # fleet lease + session inbox
+
+# usage:
+#   events: true                             # per-call detail (default off)
+#   retention_days: 30
+
+# prompts:
+#   assistant: { file: ./examples/prompts/assistant.md }   # shared prompt registry
+
+# Declarative HTTP tools need no Go code. Each becomes http:<name>; add that
+# name to an agent's `skills` list to expose it to the model.
+# tools:
+#   http:
+#     - name: crm_lookup
+#       description: Look up a customer by email address.
+#       method: GET
+#       url: https://api.example.com/v1/customers
+#       query: { email: "{email}" }
+#       auth: { service: crm }        # credential store / cred:<service>
+#       params:
+#         type: object
+#         properties:
+#           email: { type: string, description: Customer email address. }
+#         required: [email]
+#       response: customer
+#       timeout: 15s
+#   policy:
+#     default: all
+#     forbidden: [builtin:shell.exec]
+#     overrides:
+#       builtin:fetch:
+#         description: "Fetch a URL and return its text."
+
+# plugins:
+#   dir: ./plugins            # shadow builtin loops by name
+#   enforce_capabilities: true
+
+# packages:
+#   shared: ./packages/shared # Lua source packages; -- af-import: shared
+#
+# Config-directory layout (preferred for larger deployments):
+#
+#   agentflow -config ./deploy          # directory, not a file
+#   deploy/system.yaml                  # runtime, models, memory, gateway
+#   deploy/channels.yaml                # gateway.channels
+#   deploy/profiles/*.yaml              # one agent per file; spawn: true = template
+#   deploy/loops/, deploy/prompts/      # paths relative to deploy/
+#
+# The deprecated -configdir DIR flag is an alias for -config DIR.
+#
+# Each optional surface above needs its own backend or environment variable.

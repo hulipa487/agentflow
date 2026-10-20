@@ -1,0 +1,7 @@
+version: "1"
+
+runtime:
+  persistence: sqlite://./data/agentflow.db
+
+gateway:
+  listen: ":8080"

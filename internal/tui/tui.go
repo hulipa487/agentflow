@@ -47,6 +47,11 @@ type Source struct {
 	Metrics func() map[string]int64
 	// Spark returns recent samples for one counter, oldest first.
 	Spark func(name string) []int64
+	// Quit is called once when the dashboard exits for any reason: a key
+	// press, Stop, or the program ending on its own. The terminal is in raw
+	// mode while the TUI runs, so ctrl+c arrives as a keystroke rather than
+	// SIGINT; without this hook the engine would outlive its only UI.
+	Quit func()
 }
 
 // Model is the Bubbletea model for the dashboard.
@@ -63,6 +68,7 @@ type Model struct {
 	width  int
 	height int
 	prog   *tea.Program
+	quit   sync.Once
 }
 
 const maxLogs = 200
@@ -152,6 +158,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c", "esc":
+			m.requestQuit()
 			return m, tea.Quit
 		}
 	case tea.WindowSizeMsg:
@@ -172,6 +179,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m *Model) requestQuit() {
+	m.quit.Do(func() {
+		if m.src.Quit != nil {
+			m.src.Quit()
+		}
+	})
 }
 
 // Palette mirrors the web UIs' shared tokens (internal/webui/static/shared/

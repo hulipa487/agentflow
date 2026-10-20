@@ -1,0 +1,9 @@
+agent: package_demo
+loop: ../loops/package_demo.lua
+packages:
+  greeting: ../packages/greeting
+messages:
+  - from: alice
+    text: Taylor
+expect:
+  - "hello, Taylor"

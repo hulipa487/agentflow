@@ -188,11 +188,11 @@ func (u *UI) handlePoolCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Name         string `json:"name"`
-		Creator      string `json:"creator"`
-		OwnerTenant  string `json:"owner_tenant"`
-		OwnerGroup   string `json:"owner_group"`
-		RetentionDays int   `json:"retention_days"`
+		Name          string `json:"name"`
+		Creator       string `json:"creator"`
+		OwnerTenant   string `json:"owner_tenant"`
+		OwnerGroup    string `json:"owner_group"`
+		RetentionDays int    `json:"retention_days"`
 	}
 	if !decodeBody(w, r, &body) {
 		return

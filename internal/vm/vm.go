@@ -11,7 +11,7 @@ package vm
 #cgo CFLAGS: -I${SRCDIR}/../../third_party/luau/Common/include
 #cgo CFLAGS: -I${SRCDIR}/../../third_party/luau/Ast/include
 #cgo CFLAGS: -I${SRCDIR}/../../third_party/luau/Compiler/include
-#cgo CXXFLAGS: -I${SRCDIR}
+#cgo CXXFLAGS: -std=c++17 -I${SRCDIR}
 #cgo CXXFLAGS: -I${SRCDIR}/../../third_party/luau/VM/include
 #cgo CXXFLAGS: -I${SRCDIR}/../../third_party/luau/Common/include
 #cgo CXXFLAGS: -I${SRCDIR}/../../third_party/luau/Ast/include

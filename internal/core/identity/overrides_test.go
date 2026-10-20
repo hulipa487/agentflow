@@ -109,6 +109,8 @@ func TestSettingsSourceCachesAndExpires(t *testing.T) {
 		t.Fatalf("set: %v", err)
 	}
 	src := NewSettingsSource(r, 40*time.Millisecond)
+	now := time.Now()
+	src.now = func() time.Time { return now }
 	ctx := context.Background()
 
 	if m, _, err := src.Settings(ctx, p.UserID); err != nil || m != model {
@@ -120,10 +122,14 @@ func TestSettingsSourceCachesAndExpires(t *testing.T) {
 	if err := r.SetOverrides(p.UserID, &other, nil); err != nil {
 		t.Fatalf("set again: %v", err)
 	}
+	// Advance a fake clock instead of sleeping: a real store round-trip can
+	// outlast a tight window on a slow runner, which says nothing about the
+	// cache.
+	now = now.Add(39 * time.Millisecond)
 	if m, _, _ := src.Settings(ctx, p.UserID); m != model {
 		t.Fatalf("the cache should still answer with the old value, got %q", m)
 	}
-	time.Sleep(60 * time.Millisecond)
+	now = now.Add(2 * time.Millisecond)
 	if m, _, err := src.Settings(ctx, p.UserID); err != nil || m != other {
 		t.Fatalf("after the window the new value should be read: %q err=%v", m, err)
 	}
@@ -147,11 +153,13 @@ func TestSettingsSourceFallsBackToTheLastKnownValue(t *testing.T) {
 		t.Fatalf("set: %v", err)
 	}
 	src := NewSettingsSource(r, time.Millisecond)
+	now := time.Now()
+	src.now = func() time.Time { return now }
 	ctx := context.Background()
 	if m, _, err := src.Settings(ctx, p.UserID); err != nil || m != model {
 		t.Fatalf("first read: %q err=%v", m, err)
 	}
-	time.Sleep(5 * time.Millisecond)
+	now = now.Add(2 * time.Millisecond)
 	// The store goes away, which is what an unreachable database looks like.
 	if err := r.Close(); err != nil {
 		t.Fatalf("close: %v", err)

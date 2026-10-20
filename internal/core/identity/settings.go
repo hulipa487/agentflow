@@ -21,8 +21,11 @@ const maxCachedSettings = 10_000
 // with a short cache: the session asks on every loop turn, and the answer is
 // almost always "nothing".
 type SettingsSource struct {
-	reg   *Registry
-	ttl   time.Duration
+	reg *Registry
+	ttl time.Duration
+	// now is time.Now outside tests. The cache window is short enough that a
+	// test advancing a fake clock is both faster and steadier than sleeping.
+	now   func() time.Time
 	mu    sync.Mutex
 	cache map[string]cachedSettings
 }
@@ -38,7 +41,7 @@ func NewSettingsSource(reg *Registry, ttl time.Duration) *SettingsSource {
 	if ttl <= 0 {
 		ttl = DefaultSettingsTTL
 	}
-	return &SettingsSource{reg: reg, ttl: ttl, cache: map[string]cachedSettings{}}
+	return &SettingsSource{reg: reg, ttl: ttl, now: time.Now, cache: map[string]cachedSettings{}}
 }
 
 // Settings reports a profile's model and instruction overrides. It implements
@@ -51,7 +54,7 @@ func (s *SettingsSource) Settings(ctx context.Context, userID string) (model, in
 	if s == nil || s.reg == nil || userID == "" {
 		return "", "", nil
 	}
-	now := time.Now()
+	now := s.now()
 	s.mu.Lock()
 	hit, ok := s.cache[userID]
 	s.mu.Unlock()

@@ -130,7 +130,7 @@ func TestManagerUnknownProvider(t *testing.T) {
 // reachable (e.g. CI without Docker Desktop).
 func TestDockerPersistsStateAcrossCalls(t *testing.T) {
 	if !dockerAvailable() {
-		t.Skip("docker daemon not reachable; skipping persistent-shell integration test")
+		t.Skip("no Linux-capable docker daemon; skipping persistent-shell integration test")
 	}
 	p := NewDockerProvider(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ctx := context.Background()
@@ -165,7 +165,7 @@ func TestDockerPersistsStateAcrossCalls(t *testing.T) {
 // this covers Docker itself.
 func TestDockerContainerIsAttachableFromARecord(t *testing.T) {
 	if !dockerAvailable() {
-		t.Skip("docker daemon not reachable; skipping the attach integration test")
+		t.Skip("no Linux-capable docker daemon; skipping the attach integration test")
 	}
 	p := NewDockerProvider(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ctx := context.Background()
@@ -222,18 +222,22 @@ func TestDockerAttachRefusesARecordWithNoContainer(t *testing.T) {
 	// attached. Gated on a daemon: without one the docker call fails for a
 	// different reason, and the assertion would pass for the wrong one.
 	if !dockerAvailable() {
-		t.Skip("docker daemon not reachable; skipping the unreachable-container case")
+		t.Skip("no Linux-capable docker daemon; skipping the unreachable-container case")
 	}
 	if _, err := p.Attach(Record{ID: "h-1", Container: "no-such-container"}); err == nil {
 		t.Fatal("a container that does not exist must not attach")
 	}
 }
 
-// dockerAvailable reports whether the docker CLI can reach a daemon. Used only
-// to gate the one-shot integration test; cheap to call once per test run.
+// These tests run Linux images. A daemon in Windows-containers mode answers
+// `docker version` happily but cannot pull alpine, so ask the engine which OS
+// it serves rather than merely whether the CLI can reach one.
 func dockerAvailable() bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "docker", "version", "--format", "{{.Server.Version}}")
-	return cmd.Run() == nil
+	out, err := exec.CommandContext(ctx, "docker", "info", "--format", "{{.OSType}}").Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == "linux"
 }

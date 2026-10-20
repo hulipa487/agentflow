@@ -58,11 +58,11 @@ runtime:
 
   admin:
     # listen: 127.0.0.1:9090
-    # Local-only transport for Studio on this machine. Set tcp: false to
-    # remove the HTTP listener; the bearer token is still required.
-    socket: '\\.\pipe\agentflow-admin'   # Windows named pipe
-    # socket: /run/agentflow/admin.sock      # Unix domain socket
-    tcp: false
+    # Local-only transport for Studio on this machine. To drop the HTTP
+    # listener, set tcp: false and name the platform's socket instead; the
+    # bearer token is required either way:
+    #   Windows: socket: '\\.\pipe\agentflow-admin'
+    #   Unix:    socket: /run/agentflow/admin.sock
     # Named operator tokens have the same authority as ADMIN_TOKEN and are
     # attributed in the X-Operator header/logs.
     # operators: { alice: "${ALICE_ADMIN_TOKEN}" }

@@ -58,11 +58,18 @@ jobs:
       - name: Build
         shell: bash
         run: make BIN=agentflow.exe
+      - name: Vet
+        shell: bash
+        run: make vet
       - name: Test
         shell: bash
         run: make test
+      - name: Config schema
+        shell: bash
+        run: ./agentflow.exe config schema > /dev/null
       - name: Loop checks
         shell: bash
         run: |
           ./agentflow.exe loop check examples/loops/echo.lua
           ./agentflow.exe loop test examples/scenarios/echo.yaml
+          ./agentflow.exe loop test examples/scenarios/package.yaml

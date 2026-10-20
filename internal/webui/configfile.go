@@ -194,7 +194,7 @@ func (u *UI) handleConfigSave(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, fmt.Sprintf("does not validate: %v", err))
 		return
 	}
-	if err := validateThenSwap(path, []byte(req.Raw)); err != nil {
+	if err := config.ValidateAndSwap(path, []byte(req.Raw)); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}

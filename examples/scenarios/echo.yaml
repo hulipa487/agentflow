@@ -1,0 +1,7 @@
+agent: echo
+loop: ../loops/echo.lua
+messages:
+  - from: alice
+    text: hello
+expect:
+  - "echo: hello"

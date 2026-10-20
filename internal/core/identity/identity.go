@@ -72,6 +72,11 @@ var channelDefaults = map[string]ChannelTraits{
 	oidcChannel: {Trust: TrustVerified}, // a login, not an address: nothing to deliver to
 	"webhook":   {Trust: TrustAsserted, Deliverable: false, Linkable: false},
 	"ghhook":    {Trust: TrustSystem, Deliverable: false, Linkable: false},
+	// A bridge adapter is trusted to relay the platform's identity, but it is
+	// not a per-user proof: handle linking still needs the in-channel
+	// challenge. Delivery is possible because the adapter owns the outbound
+	// endpoint.
+	"bridge": {Trust: TrustAsserted, Deliverable: true, Linkable: true},
 }
 
 // oidcChannel is the pseudo-channel an external identity provider's logins bind
@@ -551,6 +556,30 @@ func (r *Registry) Update(userID string, displayName, email *string, tokensPerDa
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("no such profile %q", userID)
+	}
+	return nil
+}
+
+// Delete removes a profile and everything in the identity store that hangs off
+// it: its handles, API tokens, and outstanding link challenges. It is
+// idempotent. Memory rows, file metadata, credentials, usage and the audit
+// journal live in other stores and are removed by their own deletion paths;
+// this method deliberately does not reach across those boundaries.
+func (r *Registry) Delete(userID string) error {
+	if userID == "" {
+		return fmt.Errorf("identity: user id is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, stmt := range []string{
+		`DELETE FROM user_tokens WHERE user_id = ?`,
+		`DELETE FROM link_challenges WHERE user_id = ?`,
+		`DELETE FROM identities WHERE user_id = ?`,
+		`DELETE FROM profiles WHERE user_id = ?`,
+	} {
+		if _, err := r.st.Exec(ctx, stmt, userID); err != nil {
+			return fmt.Errorf("identity: delete %s: %w", userID, err)
+		}
 	}
 	return nil
 }

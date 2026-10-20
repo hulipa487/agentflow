@@ -246,6 +246,48 @@ func TestVersionGateCoversSupportChunks(t *testing.T) {
 	}
 }
 
+// TestPerChatRoutesWithoutDurableMode: the first message of a new chat has no
+// stored group mode, and router.state.get answers nil for it. A second
+// json.decode over that nil crashed the router on every new chat; the route
+// must reach deliver and park for the next message instead.
+func TestPerChatRoutesWithoutDurableMode(t *testing.T) {
+	SetPluginDir("")
+	src, _, err := Resolve("plugin:per_chat")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	st := vm.New(5_000_000)
+	defer st.Close()
+	if err := st.LoadBase(); err != nil {
+		t.Fatal(err)
+	}
+
+	// One inbound, a state miss, a deliver, then an error that stops the
+	// otherwise-infinite route loop. The bridge is stubbed after the prelude,
+	// before the route chunk runs.
+	stub := directive() + `
+local calls = 0
+function session.inbox()
+  calls = calls + 1
+  if calls > 1 then error("stop-loop", 0) end
+  return { message = { id = "m1", type = "user", from = "alice", channel = "webhook" }, agent = "echo" }
+end
+af.op = function(req)
+  if req.type == "router.state.get" then return nil end
+  if req.type == "deliver" then return true end
+  return nil
+end
+`
+	if err := st.Eval("@route-stub", stub); err != nil {
+		t.Fatal(err)
+	}
+	status, msg := st.Start("loop", "@per_chat", src)
+	if status != vm.Failed || !strings.Contains(msg, "stop-loop") {
+		t.Fatalf("route did not survive the missing mode and reach its next inbox: status=%v msg=%q", status, msg)
+	}
+}
+
 func writeFile(t *testing.T, path, body string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {

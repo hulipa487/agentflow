@@ -1,7 +1,10 @@
 package webui
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
@@ -29,6 +32,12 @@ type UserDeps struct {
 	Journal    runtime.Journal
 	Quota      *accounting.Quota
 	Files      *files.Manager
+	// Purge removes the runtime-store rows attributed to one profile (usage,
+	// journal, file metadata). It is separate from Store so a test or an
+	// embedder can wire the read planes without granting deletion.
+	Purge interface {
+		DeleteUserData(ctx context.Context, userID string) error
+	}
 }
 
 func (u *UI) usersAvailable(w http.ResponseWriter) bool {
@@ -249,5 +258,137 @@ func (u *UI) handleInviteIssue(w http.ResponseWriter, r *http.Request) {
 		"invite":     code,
 		"expires_in": "168h",
 		"hint":       "the user redeems this at POST /v1/users/register with {\"invite\": \"...\"}",
+	})
+}
+
+// handleUsage is the deployment-wide accounting view for one UTC day. The
+// per-user page already answers "what did this person spend"; this is the
+// tenant aggregation an operator or a billing export needs.
+func (u *UI) handleUsage(w http.ResponseWriter, r *http.Request) {
+	if u.deps.Users.Store == nil {
+		writeErr(w, http.StatusServiceUnavailable, "the usage ledger is not wired on this instance")
+		return
+	}
+	day := r.URL.Query().Get("day")
+	if day == "" {
+		day = runtime.DayKey(time.Now())
+	}
+	rows, err := u.deps.Users.Store.UsageDaily(day)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var input, output, calls int64
+	for _, row := range rows {
+		input += row.Input
+		output += row.Output
+		calls += row.Calls
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"day":     day,
+		"rows":    rows,
+		"totals":  map[string]int64{"input": input, "output": output, "billable": input + output, "calls": calls},
+		"tenants": len(rows),
+	})
+}
+
+// handleUserExport returns everything the engine can attribute to one profile
+// as a single JSON document. It is the export half of tenant lifecycle; the
+// delete endpoint is the other half.
+func (u *UI) handleUserExport(w http.ResponseWriter, r *http.Request) {
+	if !u.usersAvailable(w) {
+		return
+	}
+	id := r.PathValue("id")
+	p, ok, err := u.deps.Users.Identities.Get(id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !ok {
+		writeErr(w, http.StatusNotFound, "no such profile")
+		return
+	}
+	out := map[string]any{"exported_at": time.Now().UTC().Format(time.RFC3339), "profile": p}
+	if u.deps.Users.Store != nil {
+		if history, err := u.deps.Users.Store.UsageHistory(id, 90); err == nil {
+			out["usage_history"] = history
+		}
+	}
+	if u.deps.Users.Events != nil {
+		if events, err := u.deps.Users.Events.UsageEvents(id, time.Now().AddDate(0, 0, -90), 5000); err == nil {
+			out["usage_events"] = events
+		}
+	}
+	if u.deps.Users.Journal != nil {
+		if audit, err := u.deps.Users.Journal.ListMessages(r.Context(), runtime.JournalFilter{UserUUID: id, Limit: 5000}); err == nil {
+			out["audit"] = audit
+		}
+	}
+	if u.deps.Users.Files != nil {
+		if projects, err := u.deps.Users.Files.Projects(r.Context(), "user:"+id); err == nil {
+			out["projects"] = projects
+		}
+	}
+	if u.deps.Creds != nil {
+		if refs, err := u.deps.Creds.List(r.Context(), id); err == nil {
+			out["credentials"] = refs
+		}
+	}
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="agentflow-user-%s.json"`, id))
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleUserDelete is the destructive half of tenant lifecycle. It requires an
+// explicit confirm value so a mistyped URL cannot erase an account, and it
+// removes the profile, handles, tokens, credentials, usage, journal and file
+// metadata. Memory rows follow their store's retention; content-addressed
+// blobs are reclaimed by the file GC once no tree references them.
+func (u *UI) handleUserDelete(w http.ResponseWriter, r *http.Request) {
+	if !u.usersAvailable(w) {
+		return
+	}
+	id := r.PathValue("id")
+	confirm := r.URL.Query().Get("confirm")
+	if confirm != id && confirm != "true" {
+		writeErr(w, http.StatusBadRequest, "refusing to delete: pass ?confirm="+id)
+		return
+	}
+	if _, ok, err := u.deps.Users.Identities.Get(id); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	} else if !ok {
+		writeErr(w, http.StatusNotFound, "no such profile")
+		return
+	}
+	// Remove the data first and the identity last: if a store refuses, the
+	// profile is still there and the operator can retry, rather than a deleted
+	// account whose data survived.
+	if u.deps.Users.Purge != nil {
+		if err := u.deps.Users.Purge.DeleteUserData(r.Context(), id); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	if u.deps.Creds != nil {
+		if err := u.deps.Creds.DeleteUser(r.Context(), id); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	if err := u.deps.Users.Identities.Delete(id); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	operator := r.Header.Get("X-Operator")
+	if operator == "" {
+		operator = "admin-token"
+	}
+	slog.Info("tenant deleted", "user_id", id, "operator", operator)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"deleted": id,
+		"note":    "memory rows follow their store retention; content-addressed blobs are reclaimed by the file GC",
 	})
 }

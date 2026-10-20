@@ -38,6 +38,14 @@ type Store interface {
 	// password must not be.
 	Path() string
 	Close() error
+
+	// DeleteUserData removes every row this store attributes to one profile:
+	// the token ledger rollups and detail, the audit journal, and the
+	// user-scoped file metadata (working trees, commits, refs). Content-
+	// addressed blobs are left for the file GC, which reclaims them once no
+	// commit tree references them. It is the storage half of tenant deletion;
+	// identity rows and credentials are removed by their own stores.
+	DeleteUserData(ctx context.Context, userID string) error
 }
 
 // Journal is the core-owned audit trail: every inbound message (at the router)

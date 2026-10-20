@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -176,5 +177,33 @@ func TestTruncateIsRuneWidthAware(t *testing.T) {
 	}
 	if !strings.HasSuffix(got, "…") {
 		t.Errorf("expected ellipsis terminator: %q", got)
+	}
+}
+
+// The dashboard runs the terminal in raw mode, so ctrl+c never becomes SIGINT.
+// Every quit key must therefore cancel the process context through Source.Quit
+// exactly once, or the engine survives the only UI that could stop it.
+func TestQuitKeysCancelEngine(t *testing.T) {
+	keys := map[string]tea.KeyMsg{
+		"ctrl+c": {Type: tea.KeyCtrlC},
+		"esc":    {Type: tea.KeyEsc},
+		"q":      {Type: tea.KeyRunes, Runes: []rune{'q'}},
+	}
+	for name, key := range keys {
+		t.Run(name, func(t *testing.T) {
+			calls := 0
+			m := New(Source{Quit: func() { calls++ }})
+			if _, cmd := m.Update(key); cmd == nil {
+				t.Fatalf("%s returned no quit command", name)
+			}
+			if calls != 1 {
+				t.Fatalf("Quit called %d times, want 1", calls)
+			}
+			// A repeated key while the program drains must not shut down twice.
+			m.Update(key)
+			if calls != 1 {
+				t.Fatalf("Quit called %d times after repeat, want 1", calls)
+			}
+		})
 	}
 }

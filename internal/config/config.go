@@ -3,8 +3,7 @@
 //
 // The file is environment-expanded (${VAR}, ${VAR:-default}) before parsing,
 // and parsed strictly: an unknown key is a boot error. The config reference is
-// the "Full Config Reference" section of the embedded documentation site
-// (internal/webui/docs/index.html, served at /docs/).
+// the Configuration page in the AgentFlow Studio documentation.
 package config
 
 import (
@@ -12,9 +11,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -50,6 +51,11 @@ type Config struct {
 	Triggers []Trigger         `yaml:"triggers"` // configdir layout; declarative task data for loops
 	Prompts  map[string]Prompt `yaml:"prompts"`
 	Plugins  Plugins           `yaml:"plugins"`
+	// Packages names deployable Lua source packages, each a directory with an
+	// optional manifest.yaml and *.lua files. A loop imports one with
+	// "-- af-import: <name>" (or is set to "package:<name>" directly). Package
+	// code is version-gated and concatenated before the importing chunk.
+	Packages map[string]string `yaml:"packages"`
 }
 
 // Prompt is one registry entry. Exactly one of File, Inline, or Text must be
@@ -204,21 +210,16 @@ func (u UsageConfig) UsageRetention() int {
 
 // Runtime contains instance-wide tuning and persistence.
 type Runtime struct {
-	// These four keys are parsed so a configuration that sets them keeps
-	// booting, and nothing reads them. They are pointers precisely so "unset"
-	// is distinguishable from "set to the zero value", which is the only thing
-	// they are now used for: main warns once per key that is actually present.
+	// Pointers distinguish "unset" from an explicit zero. vm.memory_limit and
+	// scheduler.workers are live: the first caps each Luau state, the second is
+	// the op-pool size unless -workers overrides it.
 	//
-	// They are kept rather than deleted because decodeStrict uses
+	// vm.instruction_budget and reload.watch do nothing. They are parsed so a
+	// configuration that sets them keeps booting, and main warns when one is
+	// present. They are kept rather than deleted because decodeStrict uses
 	// KnownFields(true), so removing a field turns an existing config into a
 	// parse error — a boot failure for a setting that does nothing. Removing
 	// them for real is a release note, not a silent change.
-	//
-	// What they claimed to do, and what is true:
-	//   vm.memory_limit        no allocator cap exists in the Luau shim
-	//   vm.instruction_budget  the per-resume budget is fixed at 5,000,000
-	//   scheduler.workers      the op pool size is the -workers flag
-	//   reload.watch           the reload watcher always runs
 	VM struct {
 		MemoryLimit       *string `yaml:"memory_limit"`
 		InstructionBudget *string `yaml:"instruction_budget"`
@@ -243,6 +244,7 @@ type Runtime struct {
 	} `yaml:"limits"`
 	Persistence string            `yaml:"persistence"` // e.g. sqlite://./data/agentflow.db
 	Admin       AdminConfig       `yaml:"admin"`
+	Studio      StudioConfig      `yaml:"studio"`
 	Identity    IdentityConfig    `yaml:"identity"`
 	Users       UsersConfig       `yaml:"users"`
 	Credentials CredentialsConfig `yaml:"credentials"`
@@ -273,6 +275,19 @@ type CredentialsConfig struct {
 	Enabled      bool   `yaml:"enabled"`
 	Path         string `yaml:"path"`           // sqlite path or postgres DSN; "" = follow runtime.persistence
 	MasterKeyEnv string `yaml:"master_key_env"` // env var holding the master key; default "CREDENTIALS_MASTER_KEY"
+	// EngineWide controls credential.get(), the raw-secret op. Empty/"allow"
+	// preserves the historical behavior (an agent's credentials allow-list is
+	// the only gate); "maintenance" restricts it to engine-fired turns, so a
+	// tenant turn cannot read an engine-wide secret even if the agent lists it.
+	// The normal per-tenant path is auth={service=...} on http.request and
+	// tools.http, which never returns a value to Lua.
+	EngineWide string `yaml:"engine_wide"`
+}
+
+// EngineWideMaintenance reports whether credential.get() is restricted to
+// maintenance contexts.
+func (c CredentialsConfig) EngineWideMaintenance() bool {
+	return strings.EqualFold(strings.TrimSpace(c.EngineWide), "maintenance")
 }
 
 // LogPlaneConfig is where the append-only planes live: the message journal and
@@ -349,6 +364,68 @@ func (c ClusterConfig) ClusterPollInterval() time.Duration {
 // AdminConfig configures the metrics/admin HTTP endpoint.
 type AdminConfig struct {
 	Listen string `yaml:"listen"` // default 127.0.0.1:9090 (loopback only)
+	// Socket adds a local-only admin listener: a unix domain socket path on
+	// Unix, or a named pipe such as \.\pipegentflow-admin on Windows.
+	// It is intended for Studio/admin clients on the same machine; the bearer
+	// token is still required. Empty disables it.
+	Socket string `yaml:"socket"`
+	// TCP is the loopback HTTP listener above. nil means enabled; set false to
+	// run the admin plane only on Socket. At least one transport must remain.
+	TCP *bool `yaml:"tcp"`
+	// CORSOrigins is the allow-list for browser clients of the admin API. The
+	// standalone Studio app is the reason it exists: it runs on its own origin
+	// and authenticates with the bearer token, so its origin must be named
+	// here. Empty (the default) keeps the admin API same-origin only.
+	CORSOrigins []string `yaml:"cors_origins"`
+	// Operators adds named admin bearer tokens (name -> token). Every one has
+	// the same authority as ADMIN_TOKEN, but actions are attributed to the
+	// name in the request's operator header and logs, so a shared break-glass
+	// token is no longer the only audit identity. Token values may be env
+	// references or cred:<service>; they are resolved at boot.
+	Operators map[string]string `yaml:"operators"`
+}
+
+// namedPipePrefix is the Windows named pipe namespace.
+const namedPipePrefix = `\\.\pipe\`
+
+// TCPEnabled reports whether the admin HTTP listener is enabled.
+func (c AdminConfig) TCPEnabled() bool { return c.TCP == nil || *c.TCP }
+
+// StudioConfig configures the admin API that backs the standalone Studio app
+// (agent builder, playground, trace). The app itself is a separate process;
+// these settings size the runtime side.
+type StudioConfig struct {
+	// Enabled gates /admin/api/studio. nil (absent) means enabled — the API is
+	// inert without the admin token, and disabling it only removes the app.
+	Enabled *bool `yaml:"enabled"`
+	// Workspace is the directory a single-file deployment writes studio loops
+	// and prompts under. Empty means <config dir>/studio.
+	Workspace string `yaml:"workspace"`
+	// TraceEvents bounds each session's in-memory trace ring (default 2000).
+	TraceEvents int `yaml:"trace_events"`
+	// TraceSessions bounds how many session rings are retained (default 200).
+	TraceSessions int `yaml:"trace_sessions"`
+	// TracePayloads includes message and reply text in trace events. Off by
+	// default: metadata (op, model, duration, tokens, errors) is always kept.
+	TracePayloads bool `yaml:"trace_payloads"`
+	// ChatTimeout is how long one playground turn may take (default 120s).
+	ChatTimeout string `yaml:"chat_timeout"`
+}
+
+// IsEnabled reports whether the studio API is on (the default).
+func (s StudioConfig) IsEnabled() bool { return s.Enabled == nil || *s.Enabled }
+
+// Timeout parses ChatTimeout, falling back to 120s. Malformed values are a
+// boot error in validate.
+func (s StudioConfig) Timeout() time.Duration {
+	if s.ChatTimeout == "" {
+		return 120 * time.Second
+	}
+	d, err := time.ParseDuration(s.ChatTimeout)
+	if err != nil {
+		return 120 * time.Second
+	}
+	return d
 }
 
 // IdentityConfig configures the optional user-identity layer. When disabled
@@ -391,6 +468,22 @@ type UsersConfig struct {
 	// identity provider. Login — passwords, OAuth, MFA, session lifetimes and
 	// revocation — lives there; the engine only verifies what it is handed.
 	OIDC *OIDCConfig `yaml:"oidc"`
+	// Unregistered selects what happens to a channel handle that is not linked
+	// to a profile: "allow" (default) keeps it in the shared service stratum,
+	// "reject" drops the inbound and asks the person to link/register. Reject
+	// closes the anonymous quota/egress/session-cap bypass, at the cost of
+	// refusing first contact until the account exists.
+	Unregistered string `yaml:"unregistered"`
+	// PushSameTenant makes session.push_user refuse a target other than the
+	// current turn's tenant. The default (false) preserves deployments whose
+	// agents notify users across tenants as an operator service; a multi-tenant
+	// chat product should set it true.
+	PushSameTenant bool `yaml:"push_same_tenant"`
+}
+
+// RejectUnregistered reports whether unlinked handles are refused.
+func (u UsersConfig) RejectUnregistered() bool {
+	return strings.EqualFold(strings.TrimSpace(u.Unregistered), "reject")
 }
 
 // OIDCConfig describes the identity provider whose tokens this deployment
@@ -478,6 +571,27 @@ type Model struct {
 	// entry into the request body. The values are provider-specific strings,
 	// keeping the runtime generic.
 	ServerTools []string `yaml:"server_tools,omitempty"`
+	// KeySource selects whose key a request carries. "" or "config" (the
+	// default) sends api_key. "user" ignores api_key and sends the acting
+	// user's own key, which the runtime's per-user key resolver fetches from
+	// the credential store under Credential. That makes each person's calls
+	// bill to their own provider account. There is no fallback to an operator
+	// key: a call with no user in context, or a user with no key, fails.
+	KeySource string `yaml:"key_source,omitempty"`
+	// Credential names the credential-store service holding a key_source:user
+	// model's per-user key. Defaults to "llm_key".
+	Credential string `yaml:"credential,omitempty"`
+}
+
+// UserKeyed reports whether this model takes the acting user's own key.
+func (m Model) UserKeyed() bool { return m.KeySource == "user" }
+
+// CredentialService is the credential-store service of a user-keyed model.
+func (m Model) CredentialService() string {
+	if m.Credential == "" {
+		return "llm_key"
+	}
+	return m.Credential
 }
 
 func (m Model) TimeoutD() time.Duration {
@@ -643,6 +757,54 @@ type MCPServer struct {
 // Tools policy and overrides.
 type Tools struct {
 	Policy ToolsPolicy `yaml:"policy"`
+	// HTTP declares model-visible tools backed by an external HTTP API. They
+	// are registered as http:<name>; no Go code is needed per integration.
+	HTTP []HTTPTool `yaml:"http"`
+}
+
+// HTTPTool is one declarative REST tool. It is the YAML/Lua-free counterpart of
+// a tool.def wrapper: the runtime owns request construction, credential
+// resolution, address guarding, response caps and the model schema.
+type HTTPTool struct {
+	Name        string `yaml:"name"`
+	Description string `yaml:"description,omitempty"`
+	Method      string `yaml:"method"`
+	URL         string `yaml:"url"`
+	// Query maps a query parameter name to a template. A template is either
+	// "{arg}" (the argument value, URL-escaped) or literal text with embedded
+	// {arg} placeholders.
+	Query map[string]string `yaml:"query,omitempty"`
+	// Headers are static request headers. Secrets belong in auth:, not here:
+	// header values are compiled into the tool definition and visible to the
+	// operator.
+	Headers map[string]string `yaml:"headers,omitempty"`
+	// Body maps JSON body keys to templates. With no body mapping, a non-GET
+	// request sends the model's arguments as the JSON body.
+	Body map[string]any `yaml:"body,omitempty"`
+	// Params is the JSON Schema the model sees. It defaults to a permissive
+	// object so a tool without a declared schema is still callable.
+	Params map[string]any `yaml:"params,omitempty"`
+	// Response optionally selects a value from a JSON response using a dotted
+	// path (e.g. "customer.id" or "items[0].name"). Empty returns the raw body
+	// with status and truncation metadata.
+	Response string `yaml:"response,omitempty"`
+	// Auth names a per-tenant credential service to inject as a header. The
+	// value is resolved at call time and never appears in the model context.
+	Auth *HTTPAuth `yaml:"auth,omitempty"`
+	// Timeout is a Go duration (default 30s, capped at 120s).
+	Timeout string `yaml:"timeout,omitempty"`
+	// MaxBytes caps the response body (default 1 MiB, capped at 10 MiB).
+	MaxBytes int64 `yaml:"max_bytes,omitempty"`
+	// Hosts, when set, is an allow-list of hostnames (exact or *.suffix) the
+	// tool may call, in addition to the engine-wide address guard.
+	Hosts []string `yaml:"hosts,omitempty"`
+	// NeedsConfirm asks the user before the tool runs.
+	NeedsConfirm *bool `yaml:"needs_confirm,omitempty"`
+}
+
+// HTTPAuth is a credential reference for a declarative HTTP tool.
+type HTTPAuth struct {
+	Service string `yaml:"service"`
 }
 
 type ToolsPolicy struct {
@@ -763,10 +925,10 @@ type Search struct {
 // SearchEngine is one backend's connection config. BaseURL overrides the
 // driver's default endpoint (testing / proxy); Timeout bounds each request.
 type SearchEngine struct {
-	APIKey  string `yaml:"api_key"`  // doubao, ollama, google_search, x_search: required; stackoverflow, github: optional (lifts the anonymous quota)
-	BaseURL string `yaml:"base_url"` // optional endpoint override
-	Timeout string `yaml:"timeout"`  // per-request bound; default 30s
-	Site    string `yaml:"site"`     // stackoverflow engine: any StackExchange site (default "stackoverflow")
+	APIKey    string `yaml:"api_key"`   // doubao, ollama, google_search, x_search: required; stackoverflow, github: optional (lifts the anonymous quota)
+	BaseURL   string `yaml:"base_url"`  // optional endpoint override
+	Timeout   string `yaml:"timeout"`   // per-request bound; default 30s
+	Site      string `yaml:"site"`      // stackoverflow engine: any StackExchange site (default "stackoverflow")
 	Model     string `yaml:"model"`     // google_search (default gemini-3.8-flash), x_search (default grok-4.6): grounding model
 	Reasoning string `yaml:"reasoning"` // x_search (default low; supports none, low, medium, high)
 }
@@ -922,7 +1084,7 @@ type Gateway struct {
 
 type Channel struct {
 	Name   string `yaml:"name"`
-	Type   string `yaml:"type"` // webhook | telegram | ghhook
+	Type   string `yaml:"type"` // webhook | telegram | ghhook | bridge
 	Mode   string `yaml:"mode"` // telegram: polling (default) | webhook | auto
 	Agent  string `yaml:"agent"`
 	Path   string `yaml:"path"` // route mounted on the shared server, e.g. /webhook/<chan>/<uuid>/
@@ -942,6 +1104,10 @@ type Channel struct {
 	// 202 + a job id immediately; the reply is collected via
 	// GET <path>result/<id> or POSTed to a caller-supplied callback_url.
 	Async bool `yaml:"async"`
+	// DeliverURL is the bridge adapter's outbound endpoint. Set for
+	// type: bridge; the adapter translates the neutral reply into the
+	// platform's API call.
+	DeliverURL string `yaml:"deliver_url"`
 }
 
 // ChannelMedia gates inbound media on a channel. Media is opt-in: with no
@@ -1029,10 +1195,11 @@ func Load(path string) (*Config, error) {
 	if err := validate(path, &c); err != nil {
 		return nil, err
 	}
-	// Prompt file: paths resolve relative to the config file (a bare relative
-	// path is joined with the file's directory), then the text is read. Direct
-	// instructions: paths keep their existing CWD-relative behavior.
-	rebasePromptFiles(filepath.Dir(path), &c)
+	// Every relative path in a single-file config resolves against that file's
+	// directory, exactly as it does in a config directory. Without this, the
+	// same config validated when the CLI changed into its directory and failed
+	// at boot when the engine was started from elsewhere.
+	rebaseConfigPaths(filepath.Dir(path), &c)
 	if err := resolvePrompts(&c); err != nil {
 		return nil, err
 	}
@@ -1065,17 +1232,6 @@ func ComputeEpoch(files ...string) string {
 		h.Write([]byte{0})
 	}
 	return hex.EncodeToString(h.Sum(nil))[:12]
-}
-
-// rebasePromptFiles makes base the resolution base for relative prompt file:
-// paths, leaving absolute paths untouched.
-func rebasePromptFiles(base string, c *Config) {
-	for name, p := range c.Prompts {
-		if p.File != "" && !filepath.IsAbs(p.File) {
-			p.File = filepath.Join(base, p.File)
-		}
-		c.Prompts[name] = p
-	}
 }
 
 // resolvePrompts fills each registry entry's Content with its resolved text:
@@ -1214,13 +1370,72 @@ func validateSafetyProfiles(path string, c *Config) error {
 	return nil
 }
 
-func validate(path string, c *Config) error {
-	if len(c.Agents) == 0 {
-		return fmt.Errorf("%s: no agents defined", path)
+// validateHTTPTools checks the declarative tools.http block. These tools are
+// model-visible and reach the network, so names, URLs, timeouts and response
+// caps are all validated at boot rather than failing on a turn.
+func validateHTTPTools(path string, c *Config) error {
+	seen := map[string]bool{}
+	for i, t := range c.Tools.HTTP {
+		label := fmt.Sprintf("tools.http[%d]", i)
+		if t.Name == "" {
+			return fmt.Errorf("%s: %s: name is required", path, label)
+		}
+		for _, r := range t.Name {
+			if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
+				return fmt.Errorf("%s: %s: name %q may contain only letters, digits and . _ -", path, label, t.Name)
+			}
+		}
+		if seen[t.Name] {
+			return fmt.Errorf("%s: %s: duplicate tool name %q", path, label, t.Name)
+		}
+		seen[t.Name] = true
+		if t.URL == "" {
+			return fmt.Errorf("%s: %s: url is required", path, label)
+		}
+		u, err := url.Parse(t.URL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("%s: %s: url must be an absolute http(s) URL (got %q)", path, label, t.URL)
+		}
+		method := strings.ToUpper(strings.TrimSpace(t.Method))
+		switch method {
+		case "", "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS":
+		default:
+			return fmt.Errorf("%s: %s: unsupported method %q", path, label, t.Method)
+		}
+		if t.Params != nil {
+			if typ, _ := t.Params["type"].(string); typ != "" && typ != "object" {
+				return fmt.Errorf("%s: %s: params must be a JSON object schema (got type %q)", path, label, typ)
+			}
+		}
+		if t.Timeout != "" {
+			d, err := time.ParseDuration(t.Timeout)
+			if err != nil || d <= 0 || d > 120*time.Second {
+				return fmt.Errorf("%s: %s: timeout must be a positive duration up to 120s (got %q)", path, label, t.Timeout)
+			}
+		}
+		if t.MaxBytes < 0 || t.MaxBytes > 10<<20 {
+			return fmt.Errorf("%s: %s: max_bytes must be between 0 and 10485760", path, label)
+		}
+		if t.Auth != nil && t.Auth.Service == "" {
+			return fmt.Errorf("%s: %s: auth.service is required when auth is set", path, label)
+		}
+		for _, h := range t.Hosts {
+			if strings.TrimSpace(h) == "" || strings.Contains(h, "/") || strings.Contains(h, "://") {
+				return fmt.Errorf("%s: %s: hosts entries must be bare hostnames (got %q)", path, label, h)
+			}
+		}
 	}
-	// (runtime.scheduler.workers used to be defaulted to 8 here. Nothing ever
-	// read it — the op pool size is the -workers flag — so the default existed
-	// only to fill a field that had no effect. It is now a presence flag.)
+	return nil
+}
+
+func validate(path string, c *Config) error {
+	// An empty deployment is legal: the engine comes up as an admin/Studio
+	// control plane and the first agent can be created there. Channels and
+	// triggers that name an agent still fail below, so "no agents" cannot hide
+	// a reference to one that does not exist.
+	// runtime.scheduler.workers is not defaulted here: main treats unset as
+	// "use the -workers flag", so writing 8 here would make the flag's default
+	// look like an explicit config choice.
 	if c.Runtime.Persistence == "" {
 		c.Runtime.Persistence = "sqlite://./data/agentflow.db"
 	}
@@ -1247,6 +1462,7 @@ func validate(path string, c *Config) error {
 	for key, raw := range map[string]string{
 		"runtime.cluster.session_ttl":   c.Runtime.Cluster.SessionTTL,
 		"runtime.cluster.poll_interval": c.Runtime.Cluster.PollInterval,
+		"runtime.studio.chat_timeout":   c.Runtime.Studio.ChatTimeout,
 	} {
 		if raw == "" {
 			continue
@@ -1257,6 +1473,47 @@ func validate(path string, c *Config) error {
 		}
 		if d <= 0 {
 			return fmt.Errorf("%s: %s must be positive", path, key)
+		}
+	}
+	// Studio trace bounds size in-memory rings. Negative is meaningless, and
+	// an unbounded value is a memory hazard; zero means the built-in default.
+	if n := c.Runtime.Studio.TraceEvents; n < 0 || n > 100_000 {
+		return fmt.Errorf("%s: runtime.studio.trace_events must be between 0 and 100000", path)
+	}
+	if n := c.Runtime.Studio.TraceSessions; n < 0 || n > 10_000 {
+		return fmt.Errorf("%s: runtime.studio.trace_sessions must be between 0 and 10000", path)
+	}
+	if !c.Runtime.Admin.TCPEnabled() && strings.TrimSpace(c.Runtime.Admin.Socket) == "" {
+		return fmt.Errorf("%s: runtime.admin.tcp is false but no runtime.admin.socket is configured", path)
+	}
+	if sock := strings.TrimSpace(c.Runtime.Admin.Socket); sock != "" {
+		if runtime.GOOS == "windows" {
+			if !strings.HasPrefix(sock, namedPipePrefix) {
+				return fmt.Errorf("%s: runtime.admin.socket on Windows must be a named pipe like %sagentflow-admin (got %q)", path, namedPipePrefix, sock)
+			}
+		} else if strings.HasPrefix(sock, namedPipePrefix) {
+			return fmt.Errorf("%s: runtime.admin.socket %q is a Windows named pipe; use a filesystem socket path on this platform", path, sock)
+		}
+	}
+	// CORS origins are exact origins, never a wildcard: the admin API carries
+	// the bearer token, and "*" here would let any page on the machine read it
+	// back out of a response.
+	for _, origin := range c.Runtime.Admin.CORSOrigins {
+		if origin == "*" {
+			return fmt.Errorf("%s: runtime.admin.cors_origins: \"*\" is refused; name the exact origin (e.g. http://127.0.0.1:5173)", path)
+		}
+		u, err := url.Parse(origin)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
+			(u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+			return fmt.Errorf("%s: runtime.admin.cors_origins: %q is not an origin like http://127.0.0.1:5173", path, origin)
+		}
+	}
+	for name, token := range c.Runtime.Admin.Operators {
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("%s: runtime.admin.operators: an operator name is empty", path)
+		}
+		if strings.TrimSpace(token) == "" {
+			return fmt.Errorf("%s: runtime.admin.operators.%s: token is empty", path, name)
 		}
 	}
 	// Every store target is parsed here, once, so that a scheme this build has
@@ -1283,6 +1540,11 @@ func validate(path string, c *Config) error {
 	}
 	if c.Runtime.Credentials.Enabled && c.CredentialsMasterKeyEnv() == "" {
 		return fmt.Errorf("%s: runtime.credentials.enabled requires master_key_env to name the env var holding the master key", path)
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Runtime.Credentials.EngineWide)) {
+	case "", "allow", "maintenance":
+	default:
+		return fmt.Errorf("%s: runtime.credentials.engine_wide %q is not a mode (want \"allow\", \"maintenance\", or unset)", path, c.Runtime.Credentials.EngineWide)
 	}
 
 	// Prompt registry: each entry names exactly one source, and every reference
@@ -1319,6 +1581,20 @@ func validate(path string, c *Config) error {
 	case "", "all", "none":
 	default:
 		return fmt.Errorf("%s: tools.policy.default %q is not a policy (want \"all\", \"none\", or unset)", path, c.Tools.Policy.Default)
+	}
+	if err := validateHTTPTools(path, c); err != nil {
+		return err
+	}
+	for name, dir := range c.Packages {
+		if name == "" || strings.ContainsAny(name, " \t/:|") {
+			return fmt.Errorf("%s: packages: %q is not a valid package name", path, name)
+		}
+		if dir == "" {
+			return fmt.Errorf("%s: packages.%s: dir is required", path, name)
+		}
+		// Existence is checked when a loop resolves its imports, after a
+		// configdir has rebased the path onto its own directory. Checking here
+		// would test a relative path against the process CWD instead.
 	}
 
 	// Memory store retention. This runs over every declared profile AND the
@@ -1424,75 +1700,8 @@ func validate(path string, c *Config) error {
 		}
 	}
 
-	seenPaths := map[string]string{} // path -> channel name, for collision detection
-	for i, ch := range c.Gateway.Channels {
-		if ch.Agent == "" {
-			return fmt.Errorf("%s: channel #%d (%s) has no agent", path, i, ch.Type)
-		}
-		if _, ok := c.Agents[ch.Agent]; !ok {
-			return fmt.Errorf("%s: channel %q references unknown agent %q", path, ch.Name, ch.Agent)
-		}
-		switch ch.Type {
-		case "webhook":
-			// path defaults are applied by the driver; here we only require that
-			// any explicit path ends in "/" so the subtree match covers the UUID.
-			if ch.Path != "" && !strings.HasSuffix(ch.Path, "/") {
-				return fmt.Errorf("%s: webhook channel %q path must end with / (got %q)", path, ch.Name, ch.Path)
-			}
-			if ch.Timeout != "" {
-				d, err := time.ParseDuration(ch.Timeout)
-				if err != nil || d <= 0 {
-					return fmt.Errorf("%s: webhook channel %q has invalid timeout %q (use e.g. \"120s\")", path, ch.Name, ch.Timeout)
-				}
-			}
-		case "ghhook":
-			if ch.Path != "" && !strings.HasSuffix(ch.Path, "/") {
-				return fmt.Errorf("%s: ghhook channel %q path must end with / (got %q)", path, ch.Name, ch.Path)
-			}
-			// The GitHub webhook secret is what makes an event trustworthy: the
-			// signature is the only thing distinguishing a real delivery from
-			// anyone who found the path. It may be a lazy reference (${VAR} /
-			// cred:<service>); an unresolvable one skips the channel at
-			// construction with a warning, which is safe — the alternative was
-			// running it unauthenticated.
-			if ch.Secret == "" {
-				return fmt.Errorf("%s: ghhook channel %q has no secret; set secret (the GitHub webhook secret) — an unauthenticated ghhook accepts any event", path, ch.Name)
-			}
-		case "telegram":
-			// Token presence is not validated here: the token may be a lazy
-			// secret reference (${VAR} / cred:<service>) resolved at channel
-			// construction, and an unresolvable one skips the channel with a
-			// warning rather than failing the boot.
-			if ch.Mode == "" {
-				ch.Mode = "polling"
-			}
-			if ch.Mode != "polling" && ch.Mode != "webhook" && ch.Mode != "auto" {
-				return fmt.Errorf("%s: telegram channel %q has unsupported mode %q (use polling, webhook, or auto)", path, ch.Name, ch.Mode)
-			}
-			if ch.Mode == "webhook" && c.Gateway.PublicURL == "" {
-				return fmt.Errorf("%s: telegram channel %q webhook mode requires gateway.public_url", path, ch.Name)
-			}
-			if ch.Path != "" && !strings.HasSuffix(ch.Path, "/") {
-				return fmt.Errorf("%s: telegram channel %q path must end with / (got %q)", path, ch.Name, ch.Path)
-			}
-		default:
-			return fmt.Errorf("%s: unsupported channel type %q (channel %q)", path, ch.Type, ch.Name)
-		}
-		// media policy sanity: max_bytes must be positive when set; an allow
-		// list with no patterns is the same as media disabled (allowed, but
-		// flag obvious mistakes like a negative ceiling).
-		if ch.Media.MaxBytes < 0 {
-			return fmt.Errorf("%s: channel %q media.max_bytes must be >= 0", path, ch.Name)
-		}
-		// path collision check — the shared mux panics on dupes, but a config
-		// error is friendlier and names both colliding channels.
-		key := ch.Path
-		if key != "" {
-			if prev, dup := seenPaths[key]; dup {
-				return fmt.Errorf("%s: channels %q and %q mount the same path %q", path, prev, ch.Name, key)
-			}
-			seenPaths[key] = ch.Name
-		}
+	if err := validateChannelList(path, c, c.Gateway.Channels); err != nil {
+		return err
 	}
 
 	for name, m := range c.Models {
@@ -1507,6 +1716,20 @@ func validate(path string, c *Config) error {
 		case "", "off", "low", "medium", "high", "xhigh", "max":
 		default:
 			return fmt.Errorf("%s: model %q has unsupported thinking level %q (want off|low|medium|high|xhigh|max)", path, name, m.Thinking)
+		}
+		switch m.KeySource {
+		case "", "config":
+		case "user":
+			// Per-user keys live in the credential store; without it every call
+			// would fail at request time, so refuse the configuration at boot.
+			if !c.Runtime.Credentials.Enabled {
+				return fmt.Errorf("%s: model %q has key_source: user, which requires runtime.credentials.enabled", path, name)
+			}
+			if m.APIKey != "" {
+				return fmt.Errorf("%s: model %q has key_source: user and an api_key; remove api_key (a user-keyed model never sends an operator key)", path, name)
+			}
+		default:
+			return fmt.Errorf("%s: model %q has unsupported key_source %q (want config or user)", path, name, m.KeySource)
 		}
 	}
 
@@ -1654,6 +1877,11 @@ func validate(path string, c *Config) error {
 	case "open", "invite":
 	default:
 		return fmt.Errorf("%s: runtime.users.registration must be open or invite (got %q)", path, c.Runtime.Users.Registration)
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Runtime.Users.Unregistered)) {
+	case "", "allow", "reject":
+	default:
+		return fmt.Errorf("%s: runtime.users.unregistered must be allow or reject (got %q)", path, c.Runtime.Users.Unregistered)
 	}
 	if c.Runtime.Users.LinkTTL != "" {
 		if _, err := time.ParseDuration(c.Runtime.Users.LinkTTL); err != nil {

@@ -1,0 +1,8 @@
+{
+  "workspace": {
+    "library": ["./api/luau"]
+  },
+  "diagnostics": {
+    "globals": ["session", "llm", "tools", "agent", "store", "memory", "http", "shell", "files", "scheduler", "log", "time", "json", "credential", "runtime", "tool"]
+  }
+}

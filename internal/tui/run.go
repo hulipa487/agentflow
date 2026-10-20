@@ -19,7 +19,13 @@ func Start(src Source) *Dashboard {
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	m.SetProgram(p)
 	d := &Dashboard{model: m, prog: p}
-	go func() { _, _ = p.Run() }()
+	go func() {
+		_, _ = p.Run()
+		// The UI and the engine live and die together: a clean quit, a
+		// terminal error or a panic all take the engine down instead of
+		// leaving a headless process with its logs discarded.
+		m.requestQuit()
+	}()
 	return d
 }
 

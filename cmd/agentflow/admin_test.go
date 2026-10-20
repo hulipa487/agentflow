@@ -11,10 +11,10 @@ import (
 	"agentflow/internal/config"
 )
 
-// TestWarnInertConfig: every field below is parsed — so an existing config keeps
-// booting — and read by nothing. The warning is the only thing that tells a
-// deployment its setting did nothing, which is exactly the failure this fixes:
-// a setting that looks applied is worse than one that is absent.
+// TestWarnInertConfig: the fields in the "want" list are parsed — so an
+// existing config keeps booting — and read by nothing. The warning is the only
+// thing that tells a deployment its setting did nothing. Live settings set in
+// the same config must stay silent.
 func TestWarnInertConfig(t *testing.T) {
 	str := func(s string) *string { return &s }
 	workers, visible, cost := 4, true, 3
@@ -40,7 +40,7 @@ func TestWarnInertConfig(t *testing.T) {
 
 	out := buf.String()
 	for _, want := range []string{
-		"vm.instruction_budget", "scheduler.workers", "reload.watch",
+		"vm.instruction_budget", "reload.watch",
 		"memory store collection", "memory store policy",
 		"tools.policy.write", "cost_level", "user_visible",
 	} {
@@ -48,11 +48,13 @@ func TestWarnInertConfig(t *testing.T) {
 			t.Errorf("nothing warned about %q; got:\n%s", want, out)
 		}
 	}
-	// vm.memory_limit used to be on the inert list; it is live now — the cap
-	// reaches every new session's Luau state — so it must warn NOTHING, and
-	// the absence of a warning is the assertion.
-	if strings.Contains(out, "memory_limit") {
-		t.Errorf("vm.memory_limit is live now but still warned as inert:\n%s", out)
+	// These were on the inert list and are live now — the memory cap reaches
+	// every new session, the worker count drives the op pool — so they must
+	// warn NOTHING.
+	for _, live := range []string{"memory_limit", "scheduler.workers"} {
+		if strings.Contains(out, live) {
+			t.Errorf("%s is live now but still warned as inert:\n%s", live, out)
+		}
 	}
 
 	// A config that sets none of them says nothing: the warnings must not fire

@@ -7,6 +7,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/mattn/go-isatty"
 
+	"agentflow/internal/config"
 	"agentflow/internal/core/credentials"
 	"agentflow/internal/llog"
 )
@@ -29,8 +31,13 @@ commands:
   delete <name>  remove a credential
 
 flags:
-  -config <path>      agentflow.yaml (default "agentflow.yaml")
-  -configdir <dir>    config directory (alternative to -config)
+  -config <path>      config file or directory (default: agentflow.yaml, then config.yaml)
+  -configdir <dir>    deprecated: config directory (use -config DIR)
+  -user <uuid>        store/list this profile's credential (default: engine-wide)
+  -kind <kind>        credential kind for set (default "api")
+  -header <name>      request header the secret is injected into (default Authorization)
+  -scheme <scheme>    header scheme prefix (default Bearer)
+  -format text|json   output format for get/list (default text)
 
 the master key is read from the env var named by
 runtime.credentials.master_key_env (default CREDENTIALS_MASTER_KEY).
@@ -45,8 +52,13 @@ examples:
 func credMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("cred", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	cfgPath := fs.String("config", "agentflow.yaml", "path to agentflow.yaml")
-	configDir := fs.String("configdir", "", "path to a config directory (alternative to -config)")
+	cfgPath := fs.String("config", "", "config file or directory")
+	configDir := fs.String("configdir", "", "deprecated: config directory (use -config DIR)")
+	user := fs.String("user", "", "profile uuid (default: engine-wide)")
+	kind := fs.String("kind", "api", "credential kind")
+	header := fs.String("header", "Authorization", "request header")
+	scheme := fs.String("scheme", "Bearer", "header scheme")
+	format := fs.String("format", "text", "text or json")
 	if err := fs.Parse(hoistFlags(args)); err != nil {
 		io.WriteString(stderr, credUsage)
 		return 2
@@ -75,11 +87,27 @@ func credMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "agentflow cred: list takes no name")
 		return 2
 	}
+	if *format != "text" && *format != "json" {
+		fmt.Fprintln(stderr, "agentflow cred: -format must be text or json")
+		return 2
+	}
+	if *user != "" && cmd == "set" {
+		// The identity store may not be enabled; a uuid is still a valid key.
+		if !strings.HasPrefix(*user, "u_") {
+			fmt.Fprintln(stderr, "agentflow cred: -user must be a profile uuid (u_...)")
+			return 2
+		}
+	}
 
 	lvl, _ := llog.ParseLevel("error") // CLI: quiet by default, errors only
 	log := slog.New(llog.NewTextHandler(stderr, lvl))
 
-	cfg, err := loadConfigSource(*cfgPath, *configDir, log)
+	src, err := config.ResolveSource(*cfgPath, *configDir)
+	if err != nil {
+		fmt.Fprintln(stderr, "agentflow cred:", err)
+		return 1
+	}
+	cfg, err := src.Load(log)
 	if err != nil {
 		fmt.Fprintln(stderr, "agentflow cred:", err)
 		return 1
@@ -106,15 +134,15 @@ func credMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "agentflow cred:", err)
 			return 1
 		}
-		if err := store.Put(ctx, "", name, "api", value, "Authorization", "Bearer"); err != nil {
+		if err := store.Put(ctx, *user, name, *kind, value, *header, *scheme); err != nil {
 			fmt.Fprintln(stderr, "agentflow cred:", err)
 			return 1
 		}
-		fmt.Fprintf(stdout, "stored %s\n", name)
+		fmt.Fprintf(stdout, "stored %s (user %q)\n", name, *user)
 		return 0
 
 	case "get":
-		sec, ok, err := store.Get(ctx, "", name)
+		sec, ok, err := store.Get(ctx, *user, name)
 		if err != nil {
 			fmt.Fprintln(stderr, "agentflow cred:", err)
 			return 1
@@ -123,14 +151,25 @@ func credMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "agentflow cred: no credential named %s\n", name)
 			return 1
 		}
-		fmt.Fprintln(stdout, sec.Value)
+		if *format == "json" {
+			_ = json.NewEncoder(stdout).Encode(map[string]any{
+				"service": name, "user": *user, "value": sec.Value,
+				"header": sec.Header, "scheme": sec.Scheme,
+			})
+		} else {
+			fmt.Fprintln(stdout, sec.Value)
+		}
 		return 0
 
 	case "list":
-		refs, err := store.List(ctx, "")
+		refs, err := store.List(ctx, *user)
 		if err != nil {
 			fmt.Fprintln(stderr, "agentflow cred:", err)
 			return 1
+		}
+		if *format == "json" {
+			_ = json.NewEncoder(stdout).Encode(refs)
+			return 0
 		}
 		for _, r := range refs {
 			fmt.Fprintln(stdout, r.Service) // names only, never values
@@ -138,11 +177,11 @@ func credMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 0
 
 	case "delete":
-		if err := store.Delete(ctx, "", name); err != nil {
+		if err := store.Delete(ctx, *user, name); err != nil {
 			fmt.Fprintln(stderr, "agentflow cred:", err)
 			return 1
 		}
-		fmt.Fprintf(stdout, "deleted %s\n", name)
+		fmt.Fprintf(stdout, "deleted %s (user %q)\n", name, *user)
 		return 0
 	}
 

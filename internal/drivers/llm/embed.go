@@ -48,7 +48,7 @@ type EmbedOpts struct {
 // space) and jina-clip-v2. A nil/zero store on a handle part is resolved by
 // the caps layer before this point; here Data must already be inline.
 func (m *Manager) EmbedParts(ctx context.Context, model string, parts []media.Part, eo EmbedOpts) ([][]float32, Usage, error) {
-	cfg, err := m.resolveModel(model)
+	cfg, err := m.resolveModel(ctx, model)
 	if err != nil {
 		return nil, Usage{}, err
 	}
@@ -57,7 +57,7 @@ func (m *Manager) EmbedParts(ctx context.Context, model string, parts []media.Pa
 	}
 	var vectors [][]float32
 	var usage Usage
-	err = m.doWithRetry(ctx, cfg, "embed", func(ctx context.Context) (bool, error) {
+	err = m.doWithRetry(ctx, cfg, "embed", func(ctx context.Context, cfg config.Model) (bool, error) {
 		v, u, retryable, err := openEmbed(ctx, m.http, cfg, parts, eo)
 		if err != nil {
 			return retryable, err
@@ -258,12 +258,13 @@ func embedDocs(parts []media.Part) ([]map[string]any, error) {
 // doWithRetry runs fn with the same policy as stream establishment: retry
 // retryable failures (transport, 429, 5xx) with exponential backoff, per
 // attempt bounded by the model's configured timeout.
-func (m *Manager) doWithRetry(ctx context.Context, cfg config.Model, what string, fn func(context.Context) (bool, error)) error {
+func (m *Manager) doWithRetry(ctx context.Context, cfg config.Model, what string, fn func(context.Context, config.Model) (bool, error)) error {
 	retry := cfg.Retry
 	if retry < 0 {
 		retry = 0
 	}
 	var last error
+	rekeyed := false
 	for attempt := 0; attempt <= retry; attempt++ {
 		if attempt > 0 {
 			backoff := time.Duration(500<<uint(attempt-1)) * time.Millisecond
@@ -276,10 +277,19 @@ func (m *Manager) doWithRetry(ctx context.Context, cfg config.Model, what string
 		}
 		attemptCtx, cancel := context.WithTimeout(ctx, cfg.TimeoutD())
 		m.log.Debug("llm: request", "op", what, "provider", cfg.Provider, "model", cfg.Model, "attempt", attempt)
-		retryable, err := fn(attemptCtx)
+		retryable, err := fn(attemptCtx, cfg)
 		cancel()
 		if err == nil {
 			return nil
+		}
+		// Same one-shot recovery as openWithRetry: a rejected user key is
+		// replaced once, without spending a retry slot.
+		if !rekeyed {
+			if fresh, ok := m.rekey(ctx, cfg, err); ok {
+				rekeyed, cfg = true, fresh
+				attempt--
+				continue
+			}
 		}
 		last = err
 		if !retryable {

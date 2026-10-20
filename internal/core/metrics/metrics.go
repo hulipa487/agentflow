@@ -8,10 +8,13 @@ package metrics
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -305,36 +308,43 @@ func (h *History) Series(name string) []Point {
 // DefaultCounters creates the standard set of runtime counters.
 func DefaultCounters() map[string]*Counter {
 	return map[string]*Counter{
-		"agentflow_ingress_total":          NewCounter("agentflow_ingress_total", "Total inbound messages"),
-		"agentflow_ingress_dropped":        NewCounter("agentflow_ingress_dropped", "Inbound messages dropped"),
-		"agentflow_egress_total":           NewCounter("agentflow_egress_total", "Total outbound replies"),
-		"agentflow_egress_failed":          NewCounter("agentflow_egress_failed", "Outbound replies that failed delivery"),
-		"agentflow_sessions_active":        NewCounter("agentflow_sessions_active", "Currently active sessions (gauge)"),
-		"agentflow_children_spawned":       NewCounter("agentflow_children_spawned", "Total spawned child agents"),
-		"agentflow_children_died":          NewCounter("agentflow_children_died", "Total child agent deaths"),
-		"agentflow_llm_calls":              NewCounter("agentflow_llm_calls", "Total LLM calls"),
-		"agentflow_llm_tokens":             NewCounter("agentflow_llm_tokens", "Total LLM tokens consumed"),
-		"agentflow_budget_denied":          NewCounter("agentflow_budget_denied", "LLM calls denied by budget"),
-		"agentflow_safety_drops":           NewCounter("agentflow_safety_drops", "Messages/replies dropped by safety"),
-		"agentflow_channel_errors":         NewCounter("agentflow_channel_errors", "Channel delivery errors"),
-		"agentflow_media_ingested":         NewCounter("agentflow_media_ingested", "Inbound messages carrying media that were stored"),
-		"agentflow_media_bytes":            NewCounter("agentflow_media_bytes", "Bytes of inbound media stored (gauge-style sum)"),
-		"agentflow_media_unsupported":      NewCounter("agentflow_media_unsupported", "Media parts rejected (policy, provider, or transport)"),
-		"agentflow_credential_gets":        NewCounter("agentflow_credential_gets", "credential.get accesses granted"),
-		"agentflow_credential_gets_denied": NewCounter("agentflow_credential_gets_denied", "credential.get accesses denied or failed"),
-		"agentflow_files_gc_swept":         NewCounter("agentflow_files_gc_swept", "Orphaned file blobs reclaimed by the mark-and-sweep GC"),
-		"agentflow_files_scratch_swept":    NewCounter("agentflow_files_scratch_swept", "Expired per-session scratch entries reclaimed"),
-		"agentflow_identity_mints":         NewCounter("agentflow_identity_mints", "User identities minted (first contact per channel handle)"),
-		"agentflow_user_registrations":     NewCounter("agentflow_user_registrations", "Profiles created through the users API"),
-		"agentflow_user_provisions":        NewCounter("agentflow_user_provisions", "Profiles provisioned by a first identity-provider login"),
-		"agentflow_user_link_challenges":   NewCounter("agentflow_user_link_challenges", "Channel-link challenges issued"),
-		"agentflow_user_links":             NewCounter("agentflow_user_links", "Channel handles linked to a profile"),
-		"agentflow_usage_record_failed":    NewCounter("agentflow_usage_record_failed", "Metered calls whose ledger write failed"),
-		"agentflow_user_quota_denied":      NewCounter("agentflow_user_quota_denied", "LLM calls refused by a per-user daily token quota"),
-		"agentflow_user_quota_unavailable": NewCounter("agentflow_user_quota_unavailable", "Quota checks that failed open because the ledger was unreadable"),
-		"agentflow_trigger_fires":          NewCounter("agentflow_trigger_fires", "Scheduled every:/cron: triggers fired by the engine"),
-		"agentflow_http_private_blocked":   NewCounter("agentflow_http_private_blocked", "Outbound HTTP connections refused by the private-address guard"),
-		"agentflow_http_insecure_tls":      NewCounter("agentflow_http_insecure_tls", "Outbound HTTP requests that skipped TLS verification"),
+		"agentflow_ingress_total":           NewCounter("agentflow_ingress_total", "Total inbound messages"),
+		"agentflow_ingress_dropped":         NewCounter("agentflow_ingress_dropped", "Inbound messages dropped"),
+		"agentflow_egress_total":            NewCounter("agentflow_egress_total", "Total outbound replies"),
+		"agentflow_egress_failed":           NewCounter("agentflow_egress_failed", "Outbound replies that failed delivery"),
+		"agentflow_sessions_active":         NewCounter("agentflow_sessions_active", "Currently active sessions (gauge)"),
+		"agentflow_children_spawned":        NewCounter("agentflow_children_spawned", "Total spawned child agents"),
+		"agentflow_children_died":           NewCounter("agentflow_children_died", "Total child agent deaths"),
+		"agentflow_llm_calls":               NewCounter("agentflow_llm_calls", "Total LLM calls"),
+		"agentflow_llm_tokens":              NewCounter("agentflow_llm_tokens", "Total LLM tokens consumed"),
+		"agentflow_budget_denied":           NewCounter("agentflow_budget_denied", "LLM calls denied by budget"),
+		"agentflow_safety_drops":            NewCounter("agentflow_safety_drops", "Messages/replies dropped by safety"),
+		"agentflow_channel_errors":          NewCounter("agentflow_channel_errors", "Channel delivery errors"),
+		"agentflow_media_ingested":          NewCounter("agentflow_media_ingested", "Inbound messages carrying media that were stored"),
+		"agentflow_media_bytes":             NewCounter("agentflow_media_bytes", "Bytes of inbound media stored (gauge-style sum)"),
+		"agentflow_media_unsupported":       NewCounter("agentflow_media_unsupported", "Media parts rejected (policy, provider, or transport)"),
+		"agentflow_bridge_auth_failed":      NewCounter("agentflow_bridge_auth_failed", "Bridge inbound requests rejected by HMAC verification"),
+		"agentflow_unregistered_rejected":   NewCounter("agentflow_unregistered_rejected", "Inbound messages dropped because the sender is not linked to a profile"),
+		"agentflow_session_tenant_mismatch": NewCounter("agentflow_session_tenant_mismatch", "Messages refused because a session is bound to another tenant"),
+		"agentflow_credential_gets":         NewCounter("agentflow_credential_gets", "credential.get accesses granted"),
+		"agentflow_credential_gets_denied":  NewCounter("agentflow_credential_gets_denied", "credential.get accesses denied or failed"),
+		"agentflow_files_gc_swept":          NewCounter("agentflow_files_gc_swept", "Orphaned file blobs reclaimed by the mark-and-sweep GC"),
+		"agentflow_files_scratch_swept":     NewCounter("agentflow_files_scratch_swept", "Expired per-session scratch entries reclaimed"),
+		"agentflow_identity_mints":          NewCounter("agentflow_identity_mints", "User identities minted (first contact per channel handle)"),
+		"agentflow_user_registrations":      NewCounter("agentflow_user_registrations", "Profiles created through the users API"),
+		"agentflow_user_provisions":         NewCounter("agentflow_user_provisions", "Profiles provisioned by a first identity-provider login"),
+		"agentflow_user_link_challenges":    NewCounter("agentflow_user_link_challenges", "Channel-link challenges issued"),
+		"agentflow_user_links":              NewCounter("agentflow_user_links", "Channel handles linked to a profile"),
+		"agentflow_usage_record_failed":     NewCounter("agentflow_usage_record_failed", "Metered calls whose ledger write failed"),
+		"agentflow_user_quota_denied":       NewCounter("agentflow_user_quota_denied", "LLM calls refused by a per-user daily token quota"),
+		"agentflow_user_quota_unavailable":  NewCounter("agentflow_user_quota_unavailable", "Quota checks that failed open because the ledger was unreadable"),
+		"agentflow_trigger_fires":           NewCounter("agentflow_trigger_fires", "Scheduled every:/cron: triggers fired by the engine"),
+		"agentflow_http_private_blocked":    NewCounter("agentflow_http_private_blocked", "Outbound HTTP connections refused by the private-address guard"),
+		"agentflow_http_insecure_tls":       NewCounter("agentflow_http_insecure_tls", "Outbound HTTP requests that skipped TLS verification"),
+		"agentflow_session_cap_drops":       NewCounter("agentflow_session_cap_drops", "Sessions refused by the per-tenant live-session cap"),
+		"agentflow_studio_chats":            NewCounter("agentflow_studio_chats", "Playground turns run through the Studio API"),
+		"agentflow_studio_chat_errors":      NewCounter("agentflow_studio_chat_errors", "Playground turns that failed to start or timed out"),
+		"agentflow_studio_trace_events":     NewCounter("agentflow_studio_trace_events", "Execution trace events observed for the Studio timeline"),
 	}
 }
 
@@ -345,9 +355,11 @@ type AdminServer struct {
 	mux       *http.ServeMux
 	reg       *Registry
 	token     string
+	operators map[string]string // name -> token
 	readyz    func() bool
 	sessions  func() []SessionInfo
 	credStore *credentials.Store
+	cors      []string
 	log       *slog.Logger
 }
 
@@ -392,11 +404,52 @@ func (s *AdminServer) Mount(pattern string, h http.Handler, requireAuth bool) {
 	s.mux.Handle(pattern, h)
 }
 
+// SetCORS installs the exact origins allowed to call the admin API from a
+// browser (the standalone Studio app). Preflight is answered before the bearer
+// check — a browser sends it without the Authorization header by design. Must
+// be called before Start; an empty list keeps the API same-origin only.
+func (s *AdminServer) SetCORS(origins []string) {
+	s.cors = append([]string(nil), origins...)
+	s.srv.Handler = s.withCORS(s.mux)
+}
+
+// withCORS wraps the mux with the origin allow-list.
+func (s *AdminServer) withCORS(next http.Handler) http.Handler {
+	if len(s.cors) == 0 {
+		return next
+	}
+	allowed := make(map[string]bool, len(s.cors))
+	for _, o := range s.cors {
+		allowed[o] = true
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		ok := origin != "" && allowed[origin]
+		if ok {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Max-Age", "600")
+		}
+		if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+			if !ok {
+				http.Error(w, "origin not allowed", http.StatusForbidden)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // Token returns the configured bearer token ("" when auth is disabled).
 func (s *AdminServer) Token() string { return s.token }
 
-// Handler exposes the mux, letting tests serve it via httptest.
-func (s *AdminServer) Handler() http.Handler { return s.mux }
+// Handler exposes the server's handler (the mux, wrapped with CORS when
+// SetCORS was called), letting tests serve it via httptest.
+func (s *AdminServer) Handler() http.Handler { return s.srv.Handler }
 
 // SetReady sets the readiness check. The runtime calls this once boot is complete.
 func (s *AdminServer) SetReady(ready bool) {
@@ -418,7 +471,22 @@ func (s *AdminServer) SetCredentials(store *credentials.Store) {
 // Start begins listening. Blocks until shutdown.
 func (s *AdminServer) Start() error {
 	s.log.Info("admin server listening", "addr", s.srv.Addr)
-	return s.srv.ListenAndServe()
+	err := s.srv.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
+// Serve serves on an already-open listener (TCP or a local socket/pipe). The
+// same http.Server backs every listener, so Shutdown closes them together.
+func (s *AdminServer) Serve(l net.Listener) error {
+	s.log.Info("admin server listening", "transport", l.Addr().Network(), "addr", l.Addr().String())
+	err := s.srv.Serve(l)
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
 }
 
 // Stop gracefully shuts down.
@@ -426,17 +494,41 @@ func (s *AdminServer) Stop(ctx context.Context) error {
 	return s.srv.Shutdown(ctx)
 }
 
+// SetOperators installs named admin bearer tokens. Each has the same authority
+// as the break-glass token, but the authenticated name is written to the
+// X-Operator header so handlers and logs can attribute the action.
+func (s *AdminServer) SetOperators(operators map[string]string) { s.operators = operators }
+
 func (s *AdminServer) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.token != "" {
 			got := r.Header.Get("Authorization")
-			if got != "Bearer "+s.token {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
+			switch {
+			case subtle.ConstantTimeCompare([]byte(got), []byte("Bearer "+s.token)) == 1:
+				r.Header.Set("X-Operator", "admin")
+			default:
+				name, ok := s.operatorFor(got)
+				if !ok {
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+					return
+				}
+				r.Header.Set("X-Operator", name)
 			}
 		}
 		next(w, r)
 	}
+}
+
+func (s *AdminServer) operatorFor(authorization string) (string, bool) {
+	for name, token := range s.operators {
+		if token == "" {
+			continue
+		}
+		if subtle.ConstantTimeCompare([]byte(authorization), []byte("Bearer "+token)) == 1 {
+			return name, true
+		}
+	}
+	return "", false
 }
 
 func (s *AdminServer) handleHealth(w http.ResponseWriter, r *http.Request) {

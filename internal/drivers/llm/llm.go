@@ -6,6 +6,7 @@ package llm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -163,21 +164,53 @@ type Manager struct {
 	// key as a literal" (the legacy path expands at load, so keys arrive
 	// literal). A failed resolution is NOT cached: the next call retries.
 	resolveSecret func(raw string) (string, bool)
+
+	// userKeys supplies the acting user's own key for key_source:user models.
+	// nil means no resolver is wired, and every user-keyed call fails closed.
+	userKeys UserKeySource
 }
+
+// UserKeySource resolves the key a key_source:user model sends, for the user
+// the request acts for. The user is read from ctx by the implementation (the
+// session layer stamps it), which keeps this package free of session imports.
+//
+// Key returns ErrNoUser when ctx carries no user. refresh asks for a key other
+// than the one handed out last, because the provider rejected that one; an
+// implementation that cannot obtain a new key returns an error.
+type UserKeySource interface {
+	Key(ctx context.Context, service string, refresh bool) (string, error)
+}
+
+// ErrNoUser is what a UserKeySource returns for a request that acts for nobody
+// (engine-internal traffic, an unlinked handle). A user-keyed model has no key
+// to send then, and the call fails rather than borrowing one.
+var ErrNoUser = errors.New("no user in context: a key_source:user model needs the acting user's key")
 
 // SetSecretResolver installs the lazy api_key resolver (see the field).
 func (m *Manager) SetSecretResolver(fn func(string) (string, bool)) {
 	m.resolveSecret = fn
 }
 
-// resolveModel is resolve plus lazy api_key resolution. A model whose key
-// cannot be resolved stays configured — the first LLM call fails here with
-// an error naming the model and the unresolved credential, rather than the
-// boot failing or a bare 401 reaching the provider.
-func (m *Manager) resolveModel(name string) (config.Model, error) {
+// SetUserKeys installs the per-user key resolver for key_source:user models.
+func (m *Manager) SetUserKeys(src UserKeySource) {
+	m.userKeys = src
+}
+
+// resolveModel is resolve plus key resolution. A model whose key cannot be
+// resolved stays configured — the first LLM call fails here with an error
+// naming the model and the unresolved credential, rather than the boot failing
+// or a bare 401 reaching the provider.
+//
+// A key_source:user model takes the acting user's key and never api_key. With
+// no resolver, no user, or no key, the call fails here: there is no fallback to
+// an operator key, because that would bill one person's request to someone else.
+func (m *Manager) resolveModel(ctx context.Context, name string) (config.Model, error) {
 	cfg, err := m.resolve(name)
 	if err != nil {
 		return config.Model{}, err
+	}
+	if cfg.UserKeyed() {
+		return m.withUserKey(ctx, name, cfg, false)
 	}
 	if m.resolveSecret != nil && cfg.APIKey != "" {
 		v, ok := m.resolveSecret(cfg.APIKey)
@@ -187,6 +220,42 @@ func (m *Manager) resolveModel(name string) (config.Model, error) {
 		cfg.APIKey = v
 	}
 	return cfg, nil
+}
+
+// withUserKey stamps the acting user's key onto a user-keyed model's config.
+// Whatever api_key the entry carries is discarded first, so a failure can only
+// ever produce an error, never a request carrying some other key.
+func (m *Manager) withUserKey(ctx context.Context, name string, cfg config.Model, refresh bool) (config.Model, error) {
+	cfg.APIKey = ""
+	if m.userKeys == nil {
+		return config.Model{}, fmt.Errorf("model %q: key_source is user but no per-user key resolver is configured", name)
+	}
+	key, err := m.userKeys.Key(ctx, cfg.CredentialService(), refresh)
+	if err != nil {
+		return config.Model{}, fmt.Errorf("model %q: %w", name, err)
+	}
+	if key == "" {
+		return config.Model{}, fmt.Errorf("model %q: the per-user key resolver returned an empty key", name)
+	}
+	cfg.APIKey = key
+	return cfg, nil
+}
+
+// rekey is the one recovery a user-keyed request gets from a 401: the user's
+// key may have been rotated or revoked upstream since it was cached, so ask the
+// resolver for a fresh one. ok is false when the error was not a 401, the model
+// is not user-keyed, or no fresh key could be had (that error is logged and the
+// original 401 stands).
+func (m *Manager) rekey(ctx context.Context, cfg config.Model, err error) (config.Model, bool) {
+	if !cfg.UserKeyed() || !isUnauthorized(err) {
+		return cfg, false
+	}
+	fresh, rerr := m.withUserKey(ctx, cfg.Model, cfg, true)
+	if rerr != nil {
+		m.log.Warn("llm: user key rejected and could not be refreshed", "model", cfg.Model, "err", rerr)
+		return cfg, false
+	}
+	return fresh, true
 }
 
 func NewManager(models map[string]config.Model, log *slog.Logger) *Manager {
@@ -260,7 +329,7 @@ func (m *Manager) Get(name string) (config.Model, error) { return m.resolve(name
 // content the provider sent (passive capture — surfaced, never requested
 // beyond what the thinking level already asks for).
 func (m *Manager) Chat(ctx context.Context, model string, msgs []Message, opts Opts) (*Reply, error) {
-	cfg, err := m.resolveModel(model)
+	cfg, err := m.resolveModel(ctx, model)
 	if err != nil {
 		return nil, err
 	}
@@ -304,7 +373,7 @@ type Stream struct {
 
 // StreamOpen starts a completion and returns a stream id for StreamNext.
 func (m *Manager) StreamOpen(ctx context.Context, model string, msgs []Message, opts Opts) (string, error) {
-	cfg, err := m.resolveModel(model)
+	cfg, err := m.resolveModel(ctx, model)
 	if err != nil {
 		return "", err
 	}
@@ -404,6 +473,7 @@ func (m *Manager) openWithRetry(ctx context.Context, cfg config.Model, msgs []Me
 		retry = 0
 	}
 	var last error
+	rekeyed := false
 	for attempt := 0; attempt <= retry; attempt++ {
 		if attempt > 0 {
 			backoff := time.Duration(500<<uint(attempt-1)) * time.Millisecond
@@ -418,6 +488,16 @@ func (m *Manager) openWithRetry(ctx context.Context, cfg config.Model, msgs []Me
 		events, retryable, err := m.open(ctx, cfg, msgs, opts)
 		if err == nil {
 			return events, nil
+		}
+		// A user-keyed request whose key was rejected gets one more try with a
+		// freshly issued key. It does not consume a retry slot: a stale key is
+		// not a provider fault, and rekey only succeeds once per call.
+		if !rekeyed {
+			if fresh, ok := m.rekey(ctx, cfg, err); ok {
+				rekeyed, cfg = true, fresh
+				attempt--
+				continue
+			}
 		}
 		last = err
 		if !retryable {

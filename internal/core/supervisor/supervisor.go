@@ -88,11 +88,17 @@ type Supervisor struct {
 	// sessionCap is the per-tenant bound on live sessions (E18): 0 disables
 	// it. tenants maps a session key to the tenant its first message carried;
 	// a session serves the tenant it was spawned for.
-	sessionCap int
-	tenants    map[string]string
+	sessionCap     int
+	tenants        map[string]string
+	pushSameTenant bool
 	// vmMemory is the per-state allocation cap new sessions get (0 =
 	// uncapped). See SetVMMemory.
 	vmMemory int64
+
+	// tracer, when set, receives every session's execution events (the
+	// standalone Studio app). tracePayloads additionally captures text.
+	tracer        session.Tracer
+	tracePayloads bool
 
 	mu       sync.Mutex
 	sessions map[string]*session.Actor
@@ -155,6 +161,14 @@ func (s *Supervisor) SetSessionCap(n int) { s.sessionCap = n }
 // bounds each tenant's VM footprint: cap × sessions_per_tenant.
 func (s *Supervisor) SetVMMemory(n int64) { s.vmMemory = n }
 
+// SetTracer installs the execution-event observer every session gets. payloads
+// additionally captures message and reply text. Nil (the default) disables
+// tracing; it is observability only and never changes execution.
+func (s *Supervisor) SetTracer(t session.Tracer, payloads bool) {
+	s.tracer = t
+	s.tracePayloads = payloads
+}
+
 // tenantOf is the tenant a message's turn acts for, from the core-stamped
 // provenance — the only authority, as everywhere. "" (unprovenanced) is
 // engine-internal traffic and is exempt from tenant bounds.
@@ -215,6 +229,11 @@ type SessionRouter interface {
 // instance's to handle. Nil — the default — delivers everything locally.
 func (s *Supervisor) SetHub(h SessionRouter) { s.hub = h }
 
+// SetPushSameTenant makes session.push_user refuse targets outside the current
+// tenant. Call before Start; the default keeps operator-service notifications
+// working as before.
+func (s *Supervisor) SetPushSameTenant(v bool) { s.pushSameTenant = v }
+
 // Deliver routes a message to the session for (agent, key), spawning it on
 // first contact. With a hub installed the message may instead be queued for
 // the instance that owns the session; see SetHub.
@@ -271,7 +290,11 @@ func (s *Supervisor) DeliverLocal(agent, key string, msg session.Message) error 
 func (s *Supervisor) ensureSession(agent, skey string, def *AgentDef, tenant string) (*session.Actor, error) {
 	s.mu.Lock()
 	if a, ok := s.sessions[skey]; ok {
+		err := s.bindTenantLocked(skey, tenant)
 		s.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
 		return a, nil
 	}
 	if tenant != "" && s.sessionCap > 0 && s.countTenantLocked(tenant) >= s.sessionCap {
@@ -287,10 +310,11 @@ func (s *Supervisor) ensureSession(agent, skey string, def *AgentDef, tenant str
 	}
 
 	identity := session.Identity{
-		SessionID:    skey,
-		Agent:        agent,
-		CanContact:   def.CanContact,
-		Capabilities: def.Capabilities,
+		SessionID:      skey,
+		Agent:          agent,
+		CanContact:     def.CanContact,
+		Capabilities:   def.Capabilities,
+		PushSameTenant: s.pushSameTenant,
 	}
 	a := session.New(skey, identity, def.Info, s.gw, s, s.sched, s.users, def.Safety, def.Handlers, s.pool, s.log)
 	a.LoopFile = def.LoopFile
@@ -300,6 +324,8 @@ func (s *Supervisor) ensureSession(agent, skey string, def *AgentDef, tenant str
 	a.SetProfileSettings(s.profileSettings)
 	a.Journal = s.EgressJournal
 	a.MemBudget = s.vmMemory
+	a.Tracer = s.tracer
+	a.TracePayloads = s.tracePayloads
 	actorCtx, cancel := context.WithCancel(s.ctx)
 
 	s.mu.Lock()
@@ -308,6 +334,9 @@ func (s *Supervisor) ensureSession(agent, skey string, def *AgentDef, tenant str
 		// Lost the race: the actor built above was never started, so its
 		// context is the only thing to release.
 		cancel()
+		if err := s.bindTenantLocked(skey, tenant); err != nil {
+			return nil, err
+		}
 		return existing, nil
 	}
 	s.sessions[skey] = a
@@ -319,6 +348,33 @@ func (s *Supervisor) ensureSession(agent, skey string, def *AgentDef, tenant str
 	metrics.Inc("agentflow_sessions_active")
 	s.log.Info("session spawned", "session", skey)
 	return a, nil
+}
+
+// bindTenantLocked enforces the session-to-tenant binding. A session serves
+// the tenant it was spawned for; a message stamped with another tenant must
+// never be appended to it, because session state, scratch and shell handles are
+// keyed by the session, not re-resolved per message. An incoming tenantless
+// message (engine work, boot pushes) is allowed and does not adopt the session.
+// Caller holds s.mu.
+func (s *Supervisor) bindTenantLocked(skey, tenant string) error {
+	if tenant == "" {
+		return nil
+	}
+	stored, ok := s.tenants[skey]
+	if !ok {
+		s.tenants[skey] = tenant
+		return nil
+	}
+	if stored != "" && stored != tenant {
+		metrics.Inc("agentflow_session_tenant_mismatch")
+		// Do not name the other tenant in the error: the caller already knows
+		// its own identity and does not need the other side's uuid.
+		return fmt.Errorf("session %q belongs to another tenant", skey)
+	}
+	if stored == "" {
+		s.tenants[skey] = tenant
+	}
+	return nil
 }
 
 // countTenantLocked counts the live sessions attributed to one tenant.
@@ -333,6 +389,20 @@ func (s *Supervisor) countTenantLocked(tenant string) int {
 		}
 	}
 	return n
+}
+
+// SessionBusy reports whether a live session is processing a message. The
+// second value is false when the session does not exist (never started, or
+// exited) — an observer uses it to finish a turn whose loop ended instead of
+// parking on the inbox.
+func (s *Supervisor) SessionBusy(sessionID string) (busy, live bool) {
+	s.mu.Lock()
+	a, ok := s.sessions[sessionID]
+	s.mu.Unlock()
+	if !ok {
+		return false, false
+	}
+	return a.Busy(), true
 }
 
 // StopSession terminates one actor without stopping the runtime. It is safe to

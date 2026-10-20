@@ -457,3 +457,23 @@ func drainMailbox(t *testing.T, sup *Supervisor, skey string) session.Message {
 		return session.Message{}
 	}
 }
+
+// TestSessionTenantBindingRejectsMismatch pins the transport-level invariant:
+// a session is bound to the tenant it was spawned for. Session state, scratch
+// and shell handles are keyed by the session, so accepting another tenant's
+// message would mix two tenants even though memory/file scopes re-resolve.
+func TestSessionTenantBindingRejectsMismatch(t *testing.T) {
+	s := &Supervisor{tenants: map[string]string{"support|chat": tenantA}}
+	if err := s.bindTenantLocked("support|chat", tenantA); err != nil {
+		t.Fatalf("same tenant: %v", err)
+	}
+	if err := s.bindTenantLocked("support|chat", ""); err != nil {
+		t.Fatalf("engine message: %v", err)
+	}
+	if err := s.bindTenantLocked("support|chat", tenantB); err == nil {
+		t.Fatal("a second tenant must be refused")
+	}
+	if got := s.tenants["support|chat"]; got != tenantA {
+		t.Fatalf("binding moved to %q", got)
+	}
+}

@@ -12,12 +12,14 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
-	"strconv"
 	"os/signal"
 	"path/filepath"
+	stdruntime "runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -52,11 +54,13 @@ import (
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/sessionhub"
 	"agentflow/internal/core/storedb"
+	"agentflow/internal/core/studio"
 	"agentflow/internal/core/supervisor"
 	"agentflow/internal/core/tenancy"
 	"agentflow/internal/core/tools"
 	"agentflow/internal/core/triggers"
 	"agentflow/internal/core/users"
+	"agentflow/internal/drivers/bridge"
 	"agentflow/internal/drivers/browser"
 	"agentflow/internal/drivers/fetch"
 	"agentflow/internal/drivers/ghhook"
@@ -79,6 +83,7 @@ import (
 	"agentflow/internal/drivers/webhook"
 	"agentflow/internal/llog"
 	"agentflow/internal/tui"
+	"agentflow/internal/vm"
 	"agentflow/internal/webui"
 )
 
@@ -86,26 +91,41 @@ import (
 var version = "dev"
 
 func main() {
-	cfgPath := flag.String("config", "agentflow.yaml", "path to agentflow.yaml")
-	configDir := flag.String("configdir", "", "path to a config directory (alternative to -config; mutually exclusive)")
-	workers := flag.Int("workers", 8, "op worker pool size")
+	// Standalone commands (version, validate, doctor, init, config schema,
+	// loop check, tools import-openapi, cred) never boot the engine. The
+	// no-subcommand path below is unchanged.
+	if handled, code := runSubcommand(hoistConfigFlags(os.Args[1:]), os.Stdout, os.Stderr); handled {
+		os.Exit(code)
+	}
+
+	cfgPath := flag.String("config", "", "config file or directory (default: agentflow.yaml, then config.yaml)")
+	configDir := flag.String("configdir", "", "deprecated: config directory (use -config DIR)")
+	workers := flag.Int("workers", 8, "op worker pool size (overrides runtime.scheduler.workers)")
 	logLevel := flag.String("log-level", "info", "minimum log level: dev|debug|info|warn|error (additive)")
+	logFormat := flag.String("log-format", "", "log format: text|json (default text)")
+	logJSON := flag.Bool("log-json", false, "deprecated: use -log-format json")
+	logFile := flag.String("log-file", "", "append logs to this file as well as stderr")
 	noTUI := flag.Bool("no-tui", false, "disable the terminal dashboard (plain stderr logs)")
-	noWebUI := flag.Bool("no-webui", false, "disable the web console (the admin server still requires the bearer token)")
+	noConsole := flag.Bool("no-console", false, "serve the admin API without the static web console")
+	noWebUI := flag.Bool("no-webui", false, "deprecated: use -no-console")
+	showVersion := flag.Bool("version", false, "print version and exit")
+	flag.Usage = func() { printUsage(os.Stderr) }
 	flag.Parse()
 
-	// The credential CLI shares the -config/-configdir source selection; it
-	// runs standalone and never boots the engine.
-	if len(os.Args) > 1 && os.Args[1] == "cred" {
-		os.Exit(credMain(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
+	if *showVersion {
+		fmt.Printf("agentflow %s\nprelude %d\ngo %s\n", version, vm.PreludeVersion, stdruntime.Version())
+		return
+	}
+	// A positional argument is almost always a subcommand typo or a stray
+	// shell argument. Refusing it is safer than silently booting an engine the
+	// caller did not mean to start.
+	if flag.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "agentflow: unexpected argument %q\nrun `agentflow help` for commands and examples\n", flag.Arg(0))
+		os.Exit(2)
 	}
 
 	explicit := map[string]bool{}
 	flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
-	if err := checkConfigSource(explicit); err != nil {
-		fmt.Fprintln(os.Stderr, "agentflow:", err)
-		os.Exit(2)
-	}
 
 	startedAt := time.Now()
 
@@ -114,9 +134,54 @@ func main() {
 		fmt.Fprintln(os.Stderr, "agentflow:", err)
 		os.Exit(2)
 	}
-	log := slog.New(llog.NewTextHandler(os.Stderr, lvl))
+	var logOut io.Writer = os.Stderr
+	if *logFile != "" {
+		f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "agentflow: log file:", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		logOut = io.MultiWriter(os.Stderr, f)
+	}
+	format := strings.ToLower(strings.TrimSpace(*logFormat))
+	if format == "" {
+		format = "text"
+		if *logJSON {
+			format = "json"
+		}
+	}
+	if *logJSON && *logFormat != "" && format != "json" {
+		fmt.Fprintln(os.Stderr, "agentflow: -log-json conflicts with -log-format", *logFormat)
+		os.Exit(2)
+	}
+	var log *slog.Logger
+	switch format {
+	case "text":
+		log = slog.New(llog.NewTextHandler(logOut, lvl))
+	case "json":
+		log = slog.New(slog.NewJSONHandler(logOut, &slog.HandlerOptions{Level: lvl}))
+	default:
+		fmt.Fprintln(os.Stderr, "agentflow: -log-format must be text or json")
+		os.Exit(2)
+	}
 
-	cfg, err := loadConfigSource(*cfgPath, *configDir, log)
+	cfgSource, err := config.ResolveSource(*cfgPath, *configDir)
+	if err != nil {
+		log.Error("config source", "err", err)
+		os.Exit(2)
+	}
+	if explicit["configdir"] {
+		log.Warn("-configdir is deprecated; use -config DIR")
+	}
+	if explicit["no-webui"] {
+		log.Warn("-no-webui is deprecated; use -no-console (the admin and Studio APIs stay available)")
+	}
+	consoleEnabled := !*noConsole && !*noWebUI
+	if cfgSource.Legacy {
+		log.Warn("using config.yaml; rename it to agentflow.yaml so both the engine and the CLI discover the same file")
+	}
+	cfg, err := cfgSource.Load(log)
 	if err != nil {
 		log.Error("config load failed", "err", err)
 		os.Exit(1)
@@ -124,11 +189,15 @@ func main() {
 
 	// The configuration's epoch: a fleet compares these to tell a stale or
 	// divergent instance from a healthy one.
-	log.Info("config loaded", "epoch", cfg.Epoch, "version", cfg.Version)
+	log.Info("config loaded", "source", cfgSource.String(), "epoch", cfg.Epoch, "version", cfg.Version)
+	if len(cfg.Agents) == 0 {
+		log.Warn("no agents configured; starting as an admin/Studio control plane (create an agent in Studio or add one to the config)")
+	}
 
 	// plugins.dir may shadow any builtin Lua (loops, routes, support chunks)
 	// by name — wire it before the first builtins.Resolve below.
 	builtins.SetPluginDir(cfg.Plugins.Dir)
+	builtins.SetPackages(cfg.Packages)
 
 	// Every session loads the support chunks into its Lua state before its loop,
 	// so they are policy exactly as a loop is, and a chunk this core cannot
@@ -142,6 +211,16 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// The dashboard reads stdin for keys, so it sees a ctrl+c typed into a
+	// pseudo-terminal (Git Bash/mintty, some IDE terminals) even though Windows
+	// never turns that keystroke into a console control event. Without the TUI
+	// nothing reads stdin; watch it so the same ctrl+c still stops the engine.
+	// A real console is unaffected: its ctrl+c arrives as SIGINT, not a byte.
+	tuiActive := !*noTUI && isatty.IsTerminal(os.Stdout.Fd())
+	if !tuiActive {
+		watchStdinInterrupt(stop)
+	}
 
 	// Encrypted per-tenant credential store. Enabled via runtime.credentials;
 	// the master key is read from the named env var (never the config file).
@@ -162,6 +241,9 @@ func main() {
 			os.Exit(1)
 		}
 		defer credStore.Close()
+		if !cfg.Runtime.Credentials.EngineWideMaintenance() {
+			log.Warn("credential.get() exposes engine-wide secrets to ordinary turns; set runtime.credentials.engine_wide: maintenance to restrict it to engine-fired contexts")
+		}
 	}
 
 	// Lazy secret resolution: raw references (${VAR} / cred:<service>) in
@@ -266,7 +348,21 @@ func main() {
 	llmMgr.SetSecretResolver(func(raw string) (string, bool) {
 		return credResolver.Resolve(ctx, raw)
 	})
-	opPool := pool.New(*workers)
+	// runtime.scheduler.workers and -workers are one setting with one
+	// precedence rule: the flag wins when given, otherwise the config decides,
+	// otherwise the flag's default (8) stands.
+	workerCount := *workers
+	if !explicit["workers"] {
+		if w := cfg.Runtime.Scheduler.Workers; w != nil && *w > 0 {
+			workerCount = *w
+		}
+	}
+	if workerCount <= 0 {
+		log.Error("worker pool size must be positive", "value", workerCount)
+		os.Exit(1)
+	}
+	log.Info("op pool", "workers", workerCount)
+	opPool := pool.New(workerCount)
 	gw := gateway.NewRegistry(log)
 
 	// Metrics registry + in-process history sampler. Created early so both the
@@ -310,7 +406,7 @@ func main() {
 	tenReg := tenancy.New(rtStore, log)
 	memReg.SetPoolResolver(func(name string) (string, error) {
 		return tenReg.PoolUUIDByName(context.Background(), name)
-	})	// Per-call token detail in the ledger (the daily rollup is always written).
+	}) // Per-call token detail in the ledger (the daily rollup is always written).
 	usageEvents := cfg.Usage.UsageEvents()
 
 	// The log plane: the two append-only planes — the message journal and the
@@ -575,6 +671,10 @@ func main() {
 	tools.RegisterBrowserBuiltins(toolReg, browserClient, filesMgr)
 	tools.RegisterFetchBuiltins(toolReg, fetch.New(netPolicy), log, filesMgr)
 	tools.RegisterShellBuiltins(toolReg, shellMgr)
+	// Declarative HTTP tools: config-declared REST integrations, no Go code per
+	// API. They share the same dialer guard and per-tenant credential store as
+	// http.request and builtin:fetch.
+	tools.RegisterHTTPTools(toolReg, cfg.Tools.HTTP, credStore, netPolicy, log)
 	mcpClients := map[string]*mcp.Client{}
 	for sname, s := range cfg.MCP.Servers {
 		// url selects the Streamable HTTP transport, command the stdio one;
@@ -588,7 +688,26 @@ func main() {
 			if s.Command != "" {
 				log.Warn("mcp server declares both url and command; using the url (Streamable HTTP)", "server", sname)
 			}
-			c, err = mcp.NewHTTPClient(sname, s.URL, s.Token, log)
+			token := s.Token
+			if token != "" {
+				v, ok := credResolver.Resolve(ctx, token)
+				if !ok {
+					log.Warn("mcp server skipped: unresolved credential",
+						"server", sname, "field", "token", "credential", config.CredentialName(token))
+					continue
+				}
+				token = v
+			}
+			// An operator-configured loopback endpoint (a local sidecar) is
+			// trusted the same way the webhook's own config is; remote URLs
+			// keep the shared address guard. This preserves the local MCP
+			// setup that predates the guard without reopening private-network
+			// destinations to a model-driven tool.
+			policy := netPolicy
+			if u, perr := url.Parse(s.URL); perr == nil && hostIsLoopback(u.Hostname()) {
+				policy = netguard.Policy{AllowPrivate: true}
+			}
+			c, err = mcp.NewHTTPClientWithPolicy(sname, s.URL, token, policy, log)
 		default:
 			c, err = mcp.NewClient(sname, s.Command, s.Args, log)
 		}
@@ -738,7 +857,8 @@ func main() {
 		}
 
 		effectiveCaps := capabilitySet(a.Capabilities)
-		agentSet := toolReg.Expose(a.Skills, toolPolicyFor(cfg.Tools.Policy, effectiveCaps), false)
+		agentSet := toolReg.Expose(a.Skills, toolPolicyFor(cfg.Tools.Policy, effectiveCaps), false).
+			RequireCapabilities(effectiveCaps)
 		// A skills entry naming a builtin loop matches no tool and is dropped
 		// silently, so say so rather than letting the agent look toolless.
 		for _, s := range a.Skills {
@@ -816,7 +936,7 @@ func main() {
 		for k, h := range runtimeHandlers {
 			handlers[k] = h
 		}
-		handlers["credential.get"] = caps.CredentialHandler(credStore, a.Credentials, log)
+		handlers["credential.get"] = caps.CredentialHandlerPolicy(credStore, a.Credentials, cfg.Runtime.Credentials.EngineWideMaintenance(), log)
 		if len(withheld) > 0 {
 			log.Warn("capabilities withheld from agent", "agent", name, "ops", strings.Join(withheld, "; "))
 		}
@@ -909,7 +1029,8 @@ func main() {
 		}
 
 		profileCaps := capabilitySet(p.Capabilities)
-		agentSet := toolReg.Expose(p.Skills, toolPolicyFor(cfg.Tools.Policy, profileCaps), false)
+		agentSet := toolReg.Expose(p.Skills, toolPolicyFor(cfg.Tools.Policy, profileCaps), false).
+			RequireCapabilities(profileCaps)
 		for _, s := range p.Skills {
 			if h := skillHint(s, builtins.Names()); h != "" {
 				log.Warn("skills entry names a loop, not a tool", "profile", pname, "skill", s, "hint", h)
@@ -981,7 +1102,7 @@ func main() {
 		for k, h := range runtimeHandlers {
 			handlers[k] = h
 		}
-		handlers["credential.get"] = caps.CredentialHandler(credStore, p.Credentials, log)
+		handlers["credential.get"] = caps.CredentialHandlerPolicy(credStore, p.Credentials, cfg.Runtime.Credentials.EngineWideMaintenance(), log)
 		if len(withheld) > 0 {
 			log.Warn("capabilities withheld from spawn profile", "profile", pname, "ops", strings.Join(withheld, "; "))
 		}
@@ -1046,8 +1167,13 @@ func main() {
 	// the dashboard can be created before the supervisor.
 	var sup *supervisor.Supervisor
 	var dash *tui.Dashboard
-	if !*noTUI && isatty.IsTerminal(os.Stdout.Fd()) {
+	if tuiActive {
 		dash = tui.Start(tui.Source{
+			// Bubble Tea owns the terminal in raw mode, so ctrl+c is a key
+			// event here, not SIGINT. Cancel the engine context with the
+			// dashboard; stop() also restores the default signal behavior so
+			// a second ctrl+c can force-kill a stubborn shutdown.
+			Quit: stop,
 			Snapshot: func() (int, int) {
 				if sup == nil {
 					return 0, 0
@@ -1073,6 +1199,42 @@ func main() {
 	}
 
 	sup = supervisor.New(defs, gw, opPool, shellMgr, log)
+	sup.SetPushSameTenant(cfg.Runtime.Users.PushSameTenant)
+
+	// Studio (the standalone builder/playground app): one broker both observes
+	// every session (trace rings) and acts as the synthetic "studio" channel,
+	// so a playground reply arrives through the ordinary egress path — safety,
+	// journaling and delivery unchanged.
+	var studioBroker *studio.Broker
+	var studioWS *studio.Workspace
+	var channelsStore *studio.Channels
+	if cfg.Runtime.Studio.IsEnabled() {
+		studioBroker = studio.NewBroker(sup, journalSink, studio.Config{
+			TraceEvents:   cfg.Runtime.Studio.TraceEvents,
+			TraceSessions: cfg.Runtime.Studio.TraceSessions,
+			ChatTimeout:   cfg.Runtime.Studio.Timeout(),
+			ValidateUser: func(id string) bool {
+				if identReg == nil {
+					return false
+				}
+				_, ok, err := identReg.Get(id)
+				return err == nil && ok
+			},
+		}, log)
+		gw.Register(studioBroker)
+		sup.SetTracer(studioBroker.Trace, cfg.Runtime.Studio.TracePayloads)
+		studioWS = studio.NewWorkspace(cfgSource.ConfigDir(), cfgSource.ConfigPath(), cfg.Runtime.Studio.Workspace, cfg, log)
+		channelsStore = studio.NewChannels(cfg, cfgSource.ConfigDir(), cfgSource.ConfigPath(), func() []string {
+			names := make([]string, 0, len(sup.Agents()))
+			for name, def := range sup.Agents() {
+				if def.SpawnTemplate != nil {
+					continue
+				}
+				names = append(names, name)
+			}
+			return names
+		}, log)
+	}
 	// Per-tenant resource bounds (E18). Both are opt-in: 0 disables. The op
 	// pool's fairness, the sharpest bound, is not here — it is how the pool
 	// works now, not a setting.
@@ -1370,6 +1532,7 @@ func main() {
 				log.Warn("identity reply failed", "channel", channel, "err", err)
 			}
 		})
+		sc.SetRejectUnregistered(cfg.Runtime.Users.RejectUnregistered())
 		sink = sc
 		sup.SetUserResolver(identReg)
 		// Per-user overrides: a profile's model and instruction layer reach every
@@ -1494,6 +1657,35 @@ func main() {
 			}
 			d := ghhook.New(name, ch.Path, ch.Agent, secret, sink, httpSrv, log)
 			gw.Register(d)
+		case "bridge":
+			secret, ok := credResolver.Resolve(ctx, ch.Secret)
+			if !ok {
+				log.Warn("channel skipped: unresolved credential",
+					"channel", name, "field", "secret", "credential", config.CredentialName(ch.Secret))
+				continue
+			}
+			token := ch.Token
+			if token != "" {
+				if v, ok := credResolver.Resolve(ctx, token); ok {
+					token = v
+				} else {
+					log.Warn("bridge channel outbound token unresolved; delivering without auth",
+						"channel", name, "credential", config.CredentialName(token))
+					token = ""
+				}
+			}
+			var timeout time.Duration
+			if ch.Timeout != "" {
+				timeout, _ = time.ParseDuration(ch.Timeout) // validated at config load
+			}
+			d := bridge.New(name, ch.Agent, bridge.Options{
+				Path:       ch.Path,
+				DeliverURL: ch.DeliverURL,
+				Secret:     secret,
+				Token:      token,
+				Timeout:    timeout,
+			}, sink, httpSrv, mstore, mpol, log)
+			gw.Register(d)
 		}
 	}
 	// Bind the shared listener now that every path is mounted, BEFORE the
@@ -1526,6 +1718,7 @@ func main() {
 	// because every session loads all of them.
 	watcher.SetRoute(&reload.RouteSource{Ref: routeRef, WatchPath: routeWatchPath, Apply: rtr.Reload})
 	watcher.SetSupport(&reload.SupportSource{Paths: builtins.SupportChunkPaths(), Reload: sup.ReloadAll})
+	watcher.SetPackages(&reload.PackageSource{Paths: builtins.PackagePaths(), Reload: sup.ReloadAll})
 	watcher.Start()
 
 	// Metrics/admin: authenticated HTTP endpoint with health/readiness/metrics
@@ -1534,12 +1727,37 @@ func main() {
 	if adminAddr == "" {
 		adminAddr = "127.0.0.1:9090"
 	}
-	adminToken, tokErr := resolveAdminToken(os.Getenv("ADMIN_TOKEN"), adminAddr, log)
+	adminSocket := strings.TrimSpace(cfg.Runtime.Admin.Socket)
+	if adminSocket != "" && stdruntime.GOOS != "windows" && !filepath.IsAbs(adminSocket) {
+		adminSocket = filepath.Join(cfgSource.Dir, adminSocket)
+	}
+	tcpAdmin := cfg.Runtime.Admin.TCPEnabled()
+	authListen := adminAddr
+	if !tcpAdmin {
+		// A socket-only admin plane is local by construction; the loopback
+		// sentinel keeps the non-loopback token guard from firing on a
+		// disabled TCP address.
+		authListen = "127.0.0.1:9090"
+	}
+	adminToken, tokErr := resolveAdminTokenWithOperators(os.Getenv("ADMIN_TOKEN"), authListen, len(cfg.Runtime.Admin.Operators) > 0, log)
 	if tokErr != nil {
 		log.Error("admin plane has no usable authentication", "err", tokErr)
 		os.Exit(1)
 	}
 	admin := metrics.NewAdminServer(adminAddr, adminToken, metricReg, log)
+	admin.SetCORS(cfg.Runtime.Admin.CORSOrigins)
+	if len(cfg.Runtime.Admin.Operators) > 0 {
+		ops := make(map[string]string, len(cfg.Runtime.Admin.Operators))
+		for name, raw := range cfg.Runtime.Admin.Operators {
+			v, ok := credResolver.Resolve(ctx, raw)
+			if !ok {
+				log.Warn("admin operator skipped: unresolved credential", "operator", name)
+				continue
+			}
+			ops[name] = v
+		}
+		admin.SetOperators(ops)
+	}
 	admin.SetReady(true)
 	admin.SetSessions(func() []metrics.SessionInfo {
 		infos := []metrics.SessionInfo{}
@@ -1552,10 +1770,10 @@ func main() {
 		return infos
 	})
 	admin.SetCredentials(credStore)
-	if !*noWebUI {
+	{
 		console := webui.New(webui.Deps{
-			ConfigPath: *cfgPath,
-			ConfigDir:  *configDir,
+			ConfigPath: cfgSource.ConfigPath(),
+			ConfigDir:  cfgSource.ConfigDir(),
 			Cfg:        cfg,
 			Instance:   leaseMgr.Owner(),
 			Region:     cfg.Runtime.Region,
@@ -1571,6 +1789,28 @@ func main() {
 			Agents:     sup,
 			BuildAgent: buildAgentDef,
 			Tenancy:    tenReg,
+			Studio:     studioBroker,
+			Workspace:  studioWS,
+			Channels:   channelsStore,
+			StudioCatalog: func() studio.Catalog {
+				models := make([]string, 0)
+				for name := range llmMgr.List() {
+					models = append(models, name)
+				}
+				safety := []string{"default", "none"}
+				for name := range cfg.Profiles.Safety {
+					safety = append(safety, name)
+				}
+				memory := make([]string, 0)
+				for name := range cfg.Profiles.Memory {
+					memory = append(memory, name)
+				}
+				prompts := make([]string, 0)
+				for name := range cfg.Prompts {
+					prompts = append(prompts, name)
+				}
+				return studio.NewCatalog(models, toolReg.Names(), safety, memory, prompts, config.DefaultCapabilities)
+			},
 			Users: webui.UserDeps{
 				Identities: identReg,
 				Store:      rtStore,
@@ -1578,23 +1818,49 @@ func main() {
 				Journal:    journalSink,
 				Quota:      userQuota,
 				Files:      filesMgr,
+				Purge:      rtStore,
 			},
 		})
 		admin.Mount("/admin/api/", console.API(), true)
-		// Docs site (embedded, unauthenticated). Redirect bare /docs so the
-		// page's relative asset paths (css/, js/) resolve under the subtree.
-		admin.Mount("/docs", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, "/docs/", http.StatusMovedPermanently)
-		}), false)
-		admin.Mount("/docs/", console.Docs(), false)
-		admin.Mount("/", console.Static(), false)
-		log.Info("web console enabled", "url", "http://"+adminAddr+"/")
-	}
-	go func() {
-		if err := admin.Start(); err != nil {
-			log.Warn("admin server stopped", "err", err)
+		// The docs are part of AgentFlow Studio now. Keep a one-release
+		// signpost so old bookmarks and scripts get an explanation instead of
+		// a bare 404; no assets are shipped in this binary.
+		docsGone := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "documentation moved to AgentFlow Studio (agentflow-studio)", http.StatusGone)
+		})
+		admin.Mount("/docs", docsGone, false)
+		admin.Mount("/docs/", docsGone, false)
+		if consoleEnabled {
+			admin.Mount("/", console.Static(), false)
+			if tcpAdmin {
+				log.Info("web console enabled", "url", "http://"+adminAddr+"/")
+			} else {
+				log.Info("web console HTTP disabled; the API is served on the local admin socket")
+			}
+		} else {
+			log.Info("web console static files disabled; the admin and Studio APIs are still served")
 		}
-	}()
+	}
+	if tcpAdmin {
+		go func() {
+			if err := admin.Start(); err != nil {
+				log.Warn("admin server stopped", "err", err)
+			}
+		}()
+	}
+	if adminSocket != "" {
+		l, err := metrics.ListenLocalAdmin(adminSocket)
+		if err != nil {
+			log.Error("admin local listener failed", "socket", adminSocket, "err", err)
+			os.Exit(1)
+		}
+		log.Info("admin local listener", "socket", adminSocket)
+		go func() {
+			if err := admin.Serve(l); err != nil {
+				log.Warn("admin local listener stopped", "err", err)
+			}
+		}()
+	}
 
 	// Engine trigger scheduler: every:/cron: triggers fire from the engine
 	// itself — no agent holds the scheduler capability and no loop runs its own
@@ -1615,8 +1881,8 @@ func main() {
 	triggerSvc.Reload(cfg.Triggers)
 	// A configdir's triggers/*.yaml is re-read on a poll, so editing a schedule
 	// needs no restart (the rest of the directory still does).
-	if *configDir != "" {
-		go triggerSvc.WatchConfigDir(ctx, *configDir)
+	if cfgSource.IsDir {
+		go triggerSvc.WatchConfigDir(ctx, cfgSource.Dir)
 	}
 
 	// Daemon agents (persistent: true) get a synthetic boot message so their
@@ -1652,25 +1918,6 @@ func main() {
 	httpSrv.Stop(shutdownCtx)
 }
 
-// checkConfigSource enforces -config / -configdir mutual exclusion. The
-// default -config value is not "set" unless the operator passed it explicitly
-// (tracked via flag.Visit), so `-configdir dir` alone is legal.
-func checkConfigSource(explicit map[string]bool) error {
-	if explicit["config"] && explicit["configdir"] {
-		return fmt.Errorf("-config and -configdir are mutually exclusive")
-	}
-	return nil
-}
-
-// loadConfigSource loads the config from whichever source the flags select:
-// a config directory (-configdir) or the single file (-config).
-func loadConfigSource(cfgPath, configDir string, log *slog.Logger) (*config.Config, error) {
-	if configDir != "" {
-		return config.LoadDir(configDir, log)
-	}
-	return config.Load(cfgPath)
-}
-
 // warnInertConfig reports configuration that is parsed — so a config that sets
 // it keeps booting — and that nothing reads. Each one claims a behaviour the
 // engine does not have, so staying silent is how a deployment comes to believe
@@ -1686,9 +1933,6 @@ func warnInertConfig(cfg *config.Config, log *slog.Logger) {
 	// supervisor stamps every new session's state with the cap.)
 	if v := cfg.Runtime.VM.InstructionBudget; v != nil {
 		log.Warn("runtime.vm.instruction_budget has no effect: the per-resume budget is fixed at 5,000,000", "value", *v)
-	}
-	if v := cfg.Runtime.Scheduler.Workers; v != nil {
-		log.Warn("runtime.scheduler.workers has no effect: the op pool size is the -workers flag", "value", *v)
 	}
 	if v := cfg.Runtime.Reload.Watch; v != nil {
 		log.Warn("runtime.reload.watch has no effect: the reload watcher always runs", "value", *v)
@@ -1782,6 +2026,17 @@ func warnUnenforceableGC(cfg *config.Config, log *slog.Logger) {
 // bare port or an unparseable address is not vouched for, and a name other
 // than "localhost" is not assumed to resolve to a loopback address. Anything
 // this cannot vouch for is treated as reachable and requires a real token.
+// hostIsLoopback reports whether a URL host is a loopback address. It is used
+// only to keep operator-configured local MCP sidecars working under the
+// outbound address guard; it is not an input from a model or a channel.
+func hostIsLoopback(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func loopbackListen(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -1808,14 +2063,21 @@ func loopbackListen(addr string) bool {
 // served. envToken is a parameter rather than read here so both branches are
 // testable.
 func resolveAdminToken(envToken, listen string, log *slog.Logger) (string, error) {
+	return resolveAdminTokenWithOperators(envToken, listen, false, log)
+}
+
+// resolveAdminTokenWithOperators is the boot path: named operator tokens make
+// a non-loopback admin listener authenticatable without a shared ADMIN_TOKEN.
+// The break-glass token is still minted and logged once.
+func resolveAdminTokenWithOperators(envToken, listen string, hasOperators bool, log *slog.Logger) (string, error) {
 	if log == nil {
 		log = slog.Default()
 	}
 	if envToken != "" {
 		return envToken, nil
 	}
-	if !loopbackListen(listen) {
-		return "", fmt.Errorf("runtime.admin.listen %q is not loopback and ADMIN_TOKEN is unset; set ADMIN_TOKEN, or bind runtime.admin.listen to a loopback address", listen)
+	if !loopbackListen(listen) && !hasOperators {
+		return "", fmt.Errorf("runtime.admin.listen %q is not loopback and ADMIN_TOKEN is unset; set ADMIN_TOKEN, name runtime.admin.operators, or bind runtime.admin.listen to a loopback address", listen)
 	}
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
@@ -2070,7 +2332,8 @@ func parseByteSize(v *string) (int64, error) {
 	return n * mult, nil
 }
 
-func memoryFromConfig(s config.Store) memory.Store {	ret := memory.Store{
+func memoryFromConfig(s config.Store) memory.Store {
+	ret := memory.Store{
 		Backend:  s.Backend,
 		Table:    s.Table,
 		Window:   s.Window,

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
 	"reflect"
 	"regexp"
 	"sort"
@@ -378,7 +377,7 @@ func (u *UI) persistModels() error {
 		return fmt.Errorf("render config: %w", err)
 	}
 	_ = enc.Close()
-	return validateThenSwap(path, buf.Bytes())
+	return config.ValidateAndSwap(path, buf.Bytes())
 }
 
 // handleModelsRevert re-applies the config file's models: section to the live
@@ -472,42 +471,4 @@ func preserveFileAPIKeys(models *yaml.Node, fileKeys map[string]*yaml.Node, live
 // a cred:<service> lookup.
 func isSecretReference(s string) bool {
 	return envPlaceholderRe.MatchString(s) || strings.HasPrefix(s, "cred:")
-}
-
-// validateThenSwap validates candidate as a full config (same code path as
-// boot), backs the current file up to .bak, and atomically replaces it.
-func validateThenSwap(path string, candidate []byte) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".agentflow-*.yaml")
-	if err != nil {
-		return fmt.Errorf("temp file: %w", err)
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op after a successful rename
-	if _, err := tmp.Write(candidate); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("write temp: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp: %w", err)
-	}
-	if _, err := config.Load(tmpName); err != nil {
-		return fmt.Errorf("result does not validate: %w", err)
-	}
-
-	cur, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("read current config: %w", err)
-	}
-	if err := os.WriteFile(path+".bak", cur, 0o600); err != nil {
-		return fmt.Errorf("backup: %w", err)
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		// Windows rename-over-existing can fail on some filesystems; the
-		// backup already exists, so a direct write is a safe fallback.
-		if err2 := os.WriteFile(path, candidate, 0o600); err2 != nil {
-			return fmt.Errorf("replace config: %w (fallback: %v)", err, err2)
-		}
-	}
-	return nil
 }

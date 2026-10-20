@@ -17,15 +17,29 @@ data/
 # Custom plugins
 plugins/orchestrator/
 
-# local loop plugins (instance-specific, e.g. loops/react.lua)
-loops/
+# local loop plugins (instance-specific, e.g. loops/react.lua). Root-only: a
+# bare "loops/" would also hide examples/configdir/loops and
+# examples/minimal/loops, which are checked-in documentation.
+/loops/
 
 # local instance config (may carry secrets). Both spellings: the README's quick
 # start writes config.yaml, and the -config flag defaults to agentflow.yaml —
 # without this line an operator following the default path commits credentials.
 config.yaml
 agentflow.yaml
+# Example deployments are tracked; the ignore above is for local instances.
+!examples/**/agentflow.yaml
 *.bak
+
+# local secrets and generated deployment files
+.env
+.env.*
+!.env.example
+agentflow.schema.json
+agentflow-support-*.zip
+*.db
+*.db-shm
+*.db-wal
 
 # editor / OS cruft
 *~
@@ -39,11 +53,13 @@ Thumbs.db
 # go test / coverage artifacts
 *.out
 *.prof
+*.test
 coverage.*
 
 # claude dev notes (design docs, progress tracking) and local agent settings
 claude_dev/
 .claude/
+.zcode/
 agentflow-test.exe
 
 # agent skills installed locally (npx skills add) — developer tooling, not part

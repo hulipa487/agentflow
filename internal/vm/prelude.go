@@ -895,15 +895,24 @@ function llm.rerank(query, documents, opts)
   return op(with_opts({ type = "llm.rerank", text = query, documents = documents }, opts))
 end
 
--- llm.stream(msgs, opts) -> iterator [, close]
--- for delta in llm.stream(msgs) do ... end
+-- llm.stream(msgs, opts) -> next_delta, close
 --
--- The iterator closes the stream when the provider reports done. It also
--- returns a close function as a SECOND value, which the plain "for ... in"
--- form discards: a loop that breaks out early should call it, or the stream
--- stays open — holding its goroutine, its provider connection and its cancel
--- func — until the session's context ends. (Lua's generic for has no other hook
--- on abandonment.)
+--   local next_delta, close = llm.stream(msgs)
+--   while true do
+--     local d = next_delta()          -- nil when the provider is done
+--     if d == nil then break end
+--     ...
+--   end
+--   close()                           -- after an early break/return
+--
+-- Do NOT write a generic for over llm.stream(...). The iterator yields across the
+-- native bridge, and Luau refuses that from the generic-for C boundary
+-- ("attempt to yield across metamethod/C-call boundary"). Call next_delta
+-- directly instead. The iterator closes the stream itself at done; an early
+-- exit must call close(), or the stream stays open — holding its goroutine,
+-- provider connection and cancel func — until the session's context ends.
+-- The iterator returns text deltas only: it does not expose the terminal
+-- frame's usage or tool_calls, so use llm.chat when you need those.
 function llm.stream(messages, opts)
   local h = op(with_opts({ type = "llm.stream.open", messages = messages }, opts))
   local done = false

@@ -1,0 +1,22 @@
+# Drop this block under the top-level `tools:` key (it is a fragment, not a
+# complete config). The tool is exposed to the model as http:crm_lookup.
+tools:
+  http:
+    - name: crm_lookup
+      description: Look up a customer by email address.
+      method: GET
+      url: https://api.example.com/v1/customers
+      query:
+        email: "{email}"
+      auth:
+        service: crm
+      params:
+        type: object
+        properties:
+          email:
+            type: string
+            description: Customer email address.
+        required: [email]
+      response: customer
+      timeout: 15s
+      hosts: [api.example.com]

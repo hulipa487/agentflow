@@ -8,7 +8,7 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 
 - **Actor-model sessions** — per-session Luau state, message-passing only, hot reload of loops, instructions, the gateway route and the support chunks (all the Lua policy a deployment owns, so no restart is needed to change behavior; a file that does not compile keeps the version that is running).
 - **Multi-agent** — `agent.send` / `agent.request` / `agent.reply` / `agent.spawn`, address authority with `can_contact` ACLs, per-child budgets. Spawn profiles carry their own `extras` and credential allow-list through to each child. **Tenant scope follows the chain**: a hop carries the sending turn's tenant on its core-stamped provenance, so a delegated agent acts as the same user — writing that user's files, memory and shell scope rather than one fleet-wide one — and the stamp comes from the engine, never the payload (`payload.user_uuid` is ignored). An agent opts out with `inherit_user: false` and then runs tenant-less; the chain can only attenuate.
-- **Memory** — provider → backend → store layering; `conversational` preset; retention/window GC. Stores are isolated per agent by default (`<agent>.<table>`); `shared: true` opts a store into deliberate cross-agent sharing. Private stores are further scoped per user at the key level (engine-enforced: a turn with a tenant reads only its own scope + service + pre-upgrade rows, and that includes a delegated turn, which inherits the tenant of the hop that reached it; engine-fired maintenance contexts like the nightly distiller read all scopes with scope-explicit writes and enumerate them via the maintenance-only `store.scopes` op; `scope: agent` opts back into one pool). A backend whose credential is unresolvable is skipped with a warning, and its stores rebind to a surviving backend (vector → full-text search) or drop — never a boot failure.
+- **Memory** — provider → backend → store layering; `conversational` preset; retention/window GC. Stores are isolated per agent by default (`<agent>.<table>`); a store bound to a named `pool:` shares through tenancy grants. Private stores are further scoped per user at the key level (engine-enforced: a turn with a tenant reads only its own scope + service + pre-upgrade rows, and that includes a delegated turn, which inherits the tenant of the hop that reached it; engine-fired maintenance contexts like the nightly distiller read all scopes with scope-explicit writes and enumerate them via the maintenance-only `store.scopes` op; `scope: agent` opts back into one pool). A backend whose credential is unresolvable is skipped with a warning, and its stores rebind to a surviving backend (vector → full-text search) or drop — never a boot failure.
 - **Embeddings & reranking** — `llm.embed` (OpenAI-compatible `/embeddings`) and `llm.rerank` (Jina/Cohere/TEI/vLLM `/rerank`); pgvector ingest on write and a `plugin:semantic` recall pipeline (embed → vector k-NN → rerank). Multimodal embeddings follow the Jina convention (`jina-embeddings-v5-omni-small`: text + image/video/audio/pdf in one vector space); `memory.write` embeds attachment-carrying records as one merged vector.
 - **Tools** — three surfaces, kept deliberately distinct:
   - **Builtins** registered by the runtime: filesystem ops inside shell handles, `web_search` (multi-engine), `legal_search` / `legal_read`, `browser`, `fetch`, `shell.exec` / `shell.write` / `shell.destroy` — plus MCP servers discovered at boot (a spawned child over stdio, or a Streamable HTTP endpoint).
@@ -23,17 +23,23 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 - **Files** — user-scoped project trees with engine-native snapshot versioning (commits + named refs on a parent chain — deliberately not a git server). Scope is engine-resolved per turn (`user:<uuid>` when the turn has a tenant — a channel turn, or a delegated turn that inherited one over the hop — else `agent:<name>`); bytes are content-addressed (`files:` config, fs or S3-compatible); snapshot metadata lives in the runtime sqlite store, inspectable with plain SQL. `files.put/read/list/delete/commit/checkout` + `files.projects()` (the caller's own project names) + per-session `files.scratch.*` with TTL (cap `files`); puts accept content, base64, or an existing `{handle=...}` so rollback can restore a commit's tree without bytes crossing Lua. A boot-time mark-sweep GC reclaims orphaned blobs past `files.gc_grace` (commit trees stay live so rollback keeps working). Shell spawns can mount volumes and check out a snapshot (or the session's scratch) into the container before it reports ready; `http.request` / `builtin:fetch` / `builtin:browser` can save bodies straight to scratch.
 - **Audit journal** — core-owned `message_journal` in the runtime store: every inbound (router) and outbound (session egress) message is recorded with channel, sender, agent, session, text, attachment handles, and delivery status — loops and channels can neither bypass nor forge it. Retention is configurable (`audit.retention_days`, default 90, 0 = forever).
 - **Config at runtime** — loops read their deployment instead of having it baked in: `agent.config()` (own profile incl. `goal` + extras + the resolved `prompts` registry, secrets as opaque markers), `runtime.triggers()` (the merged triggers list, answered to both loops and the gateway route — replaces baked CRON_TASKS/ROUTES tables), and `credential.get(name)` (allow-listed, logged, counted; the value never touches the journal). `os.time()` and `os.date()` give loops a UTC wall clock.
-- **Prompt registry** — a top-level `prompts:` map holds deployment prompt text in one place (`file:` resolved relative to the configdir, or `inline:`/`text:` literals) instead of hardcoding it in Lua. The resolved text is surfaced read-only to loops as `agent.config().prompts`; `instructions` accepts `{prompt: <key>}` as well as a file path, and a tool override's `description` accepts the same form. A `file:`-backed entry stays live: editing the file republishes the text to every loop and refreshes in place the system prompt of any agent sourced from that key, with no session restart. An unreadable prompt file or an unknown key fails the boot, never a silently empty prompt.
+- **Prompt registry** — a top-level `prompts:` map holds deployment prompt text in one place (`file:` resolved relative to the config source, or `inline:`/`text:` literals) instead of hardcoding it in Lua. The resolved text is surfaced read-only to loops as `agent.config().prompts`; `instructions` accepts `{prompt: <key>}` as well as a file path, and a tool override's `description` accepts the same form. A `file:`-backed entry stays live: editing the file republishes the text to every loop and refreshes in place the system prompt of any agent sourced from that key, with no session restart. An unreadable prompt file or an unknown key fails the boot, never a silently empty prompt.
 - **Credentials** — encrypted-at-rest, per-tenant credential store; loops reference a key by `{service=...}` and Go resolves and injects it at request time. Secret config fields (`models.*.api_key`, channel tokens, backend urls/passwords, …) accept literals, `${VAR}`, or `cred:<service>`; resolution is env → store → honest degradation (optional components skip with a warning naming the credential; a model key fails the first LLM call clearly). Manage engine-wide entries with `agentflow cred set|get|list|delete <name>` (stdin/prompt only, never argv; `list` shows names only).
 - **Terminal dashboard** — a Bubbletea TUI that attaches automatically when stdout is a TTY (`-no-tui` to disable): the curated counters sectioned by subsystem with in-process sparklines, the live session counts in the header, and a log footer that scales with the terminal (3–8 lines). Read-only by design — it renders metrics and mirrors the log stream, and nothing it shows can change the runtime; `q`/`esc` quits. A terminal too short for the pane clips it and says so rather than dropping rows silently, and one too short for both panes drops the metrics pane entirely so the frame always fits. Piped output (systemd, `| tee`) keeps the plain logger instead.
-- **User API** — a JSON-only, frontend-agnostic profile API on the shared public listener (`runtime.users`): channel linking proven by an in-channel challenge (the engine hands the profile owner a code, and only the handle's owner can send it), self-service usage/quota/projects, and per-profile API tokens. **The engine has no login of its own**: with `runtime.users.oidc` set it verifies access tokens from an external identity provider (Better Auth, Keycloak, Auth0, …) against that issuer's published JWKS, checks `iss`/`aud`/`exp`, and takes the subject claim as the identity — provisioning a profile on first login unless `jit_provisioning: false`. Every request is a bearer token, so there is no cookie, no server-side session, and nothing ambient for another site to replay; `POST /register` still mints `afu_…` tokens for scripts and for deployments without a provider. CORS is off until an operator lists the frontend's origin, and the engine ships no user interface — an external frontend deploys on its own cadence against the published contract (`internal/webui/docs/openapi/users.yaml`, served at `/docs/openapi/users.yaml`).
+- **User API** — a JSON-only, frontend-agnostic profile API on the shared public listener (`runtime.users`): channel linking proven by an in-channel challenge (the engine hands the profile owner a code, and only the handle's owner can send it), self-service usage/quota/projects, and per-profile API tokens. **The engine has no login of its own**: with `runtime.users.oidc` set it verifies access tokens from an external identity provider (Better Auth, Keycloak, Auth0, …) against that issuer's published JWKS, checks `iss`/`aud`/`exp`, and takes the subject claim as the identity — provisioning a profile on first login unless `jit_provisioning: false`. Every request is a bearer token, so there is no cookie, no server-side session, and nothing ambient for another site to replay; `POST /register` still mints `afu_…` tokens for scripts and for deployments without a provider. CORS is off until an operator lists the frontend's origin, and the engine ships no user interface — an external frontend deploys on its own cadence against the published contract (`api/openapi/users.yaml`).
 - **Web console** — embedded single-page operator UI on the admin server (no build step): hot model management with test/persist (including the per-model `thinking` level), a validated config editor, an API-key manager over the credential store, live sessions, and in-process metrics sparklines. Token-authenticated; secrets are write-only.
+- **Studio** — a standalone **desktop app** (Go + Fyne) in the [`agentflow-studio`](../agentflow-studio) repository over `/admin/api/studio/*`. Create or edit an agent with a form, a Luau loop editor and an instructions editor; validate (prelude directive, compile, boot-equivalent agent checks), apply live, and persist into the deployment config (`profiles/`, `loops/`, `prompts/` for a configdir; the config's `agents:` map plus a studio directory for a single file). Chat in per-thread sessions through a synthetic `studio` channel — so replies still go through safety, journaling and normal delivery — with an optional act-as-user tenant and a live trace timeline of turns, ops, model calls, tool calls, tokens, safety decisions and errors. Trace payload text is opt-in (`runtime.studio.trace_payloads`); rings are bounded and in-memory.
 - **Scheduler** — `scheduler.every/after/cron`; timers arrive as mailbox messages carrying `payload.timer_id` (multiple independent timers per session), never a cross-goroutine Luau call. Daemon agents (`persistent: true`) boot on a synthetic message instead of waiting for traffic.
-- **Scheduled triggers** — `every:` / `cron:` triggers declared in config are executed by the **engine**, not by an agent: when due, the runtime enqueues a `Message{ type = "cron" }` (payload copied from the trigger) into the target profile's session — a configured agent or a spawn profile. No capability is involved, so a deployment needs no user-space scheduler agent. `every:` takes `ms/s/m/h/d` (`30s`, `6h`, `1d`), `cron:` the classic 5 fields (`*`, `N`, `N-M`, `*/N`, lists) matched in `runtime.timezone_offset_hours` (default UTC, a fixed offset — no DST drift). `run_on_boot` fires once at startup. A malformed expression or unknown target is logged and skipped, never a boot failure, and a `-configdir` re-reads `triggers/*.yaml` on a poll so edits apply without a restart.
-- **Config directories** — `-configdir <dir>` loads `system.yaml` + `channels.yaml` + `profiles/*.yaml` (one agent per file, `spawn: true` routes to `profiles.agent`) + `triggers/*.yaml` instead of a single `-config` file; same strict validation after merge, and the directory is the base for every relative path.
+- **Scheduled triggers** — `every:` / `cron:` triggers declared in config are executed by the **engine**, not by an agent: when due, the runtime enqueues a `Message{ type = "cron" }` (payload copied from the trigger) into the target profile's session — a configured agent or a spawn profile. No capability is involved, so a deployment needs no user-space scheduler agent. `every:` takes `ms/s/m/h/d` (`30s`, `6h`, `1d`), `cron:` the classic 5 fields (`*`, `N`, `N-M`, `*/N`, lists) matched in `runtime.timezone_offset_hours` (default UTC, a fixed offset — no DST drift). `run_on_boot` fires once at startup. A malformed expression or unknown target is logged and skipped, never a boot failure, and a config directory re-reads `triggers/*.yaml` on a poll so edits apply without a restart.
+- **Config directories** — `-config <dir>` (or the deprecated `-configdir <dir>`) loads `system.yaml` + `channels.yaml` + `profiles/*.yaml` (one agent per file, `spawn: true` routes to `profiles.agent`) + `triggers/*.yaml` instead of a single file; same strict validation after merge, and the config source is the base for every relative path.
 - **Budget** — per-agent token pools with reserve/commit/release around LLM calls; daily reset or rolling-window accounting; spawn profiles get their own shared pool.
 - **Safety** — core-owned ingress/egress chain (source-attribution, signal-gate, steady-directive, support-offer, affect-guard) that cannot be uninstalled from Lua.
-- **Observability** — `/healthz`, `/readyz`, `/metrics`, `/admin/sessions`, `/admin/credentials` on loopback; an embedded web console on the admin server (token-authenticated, `-no-webui` to disable); shared channel listener serves `GET /health`.
+- **Observability** — `/healthz`, `/readyz`, `/metrics`, `/admin/sessions`, `/admin/credentials` on loopback; an embedded web console on the admin server (token-authenticated, `-no-console` to serve only the API); shared channel listener serves `GET /health`.
+- **Declarative integrations** — `tools.http` turns a REST endpoint into a model-visible `http:<name>` tool from YAML, with per-tenant credentials, host allow-lists, response caps and dotted-path selection. `agentflow tools import-openapi` generates the block from an OpenAPI 3 document. MCP remains the arbitrary external-tool boundary; its HTTP transport now shares the address guard and resolves `cred:` tokens.
+- **External channel bridge** — `type: bridge` mounts an HMAC-verified inbound endpoint and POSTs replies to an adapter's `deliver_url`. Slack, Discord, Feishu or a bespoke platform can be added without a Go change; the adapter owns the platform-specific signature check and API call.
+- **Lua packages** — `packages:` maps a name to a directory of version-gated Lua source; `-- af-import: <name>` (or `loop: package:<name>`) composes it into a loop. A manifest pins `prelude_api` and file order, and editing a package restarts the sessions that may import it.
+- **Developer CLI** — `agentflow init`, `validate`, `doctor`, `config schema`, `loop check`, `loop test` (offline scenarios with fake LLM/tool/channel), `tools import-openapi`, `support-bundle` (redacted config + doctor), and the extended `cred` command. `validate`/`doctor` resolve relative paths against the config source, exactly as boot does; `agentflow help` lists every command; `-log-format json` emits structured logs.
+- **Tenant operations** — `GET /admin/api/usage` aggregates a day across tenants; `GET /admin/api/users/{id}/export` returns a profile's data; `DELETE /admin/api/users/{id}?confirm=<id>` removes the profile, handles, tokens, credentials, usage, journal and file metadata. `runtime.admin.operators` adds named admin tokens so actions carry an operator identity; `runtime.users.unregistered: reject` closes the anonymous service-stratum bypass; `runtime.users.push_same_tenant: true` keeps `session.push_user` inside the current tenant; `runtime.credentials.engine_wide: maintenance` restricts raw `credential.get()` to engine-fired turns.
 
 ### Driver set
 
@@ -55,7 +61,7 @@ Every agent session is an actor — one goroutine, one mailbox, one Luau state. 
 
 ## Requirements
 
-- Go 1.25+
+- Go 1.26+
 - GNU make
 - A C/C++ toolchain for the Luau cgo bridge — the Makefile auto-selects by host OS:
   - **Windows**: [zig](https://ziglang.org/) (hermetic; no system gcc needed)
@@ -78,9 +84,25 @@ The Makefile detects the host via `go env GOHOSTOS`/`GOHOSTARCH` and picks the c
 
 ## Quick start
 
-No model needed — a file-based echo loop replies out of the box. Save the loop as `echo.lua`:
+No model needed — a file-based echo loop replies out of the box. The initializer writes a runnable deployment:
+
+```bash
+./agentflow init             # agentflow.yaml + loops/echo.lua + .env.example
+./agentflow doctor           # offline: config, loop compile, credentials, admin
+./agentflow                  # boot; webhook channel on :8080
+curl -X POST localhost:8080/webhook/local/ \
+     -H 'Content-Type: application/json' \
+     -d '{"from":"alice","text":"hello"}'
+```
+
+A fully commented configuration with two agents, memory, Studio/admin settings,
+channels and optional sections is [`agentflow.example.yaml`](agentflow.example.yaml);
+copy it over `agentflow.yaml` to explore the schema.
+
+Use `./agentflow init -layout dir` for the fragment layout (`system.yaml`, `channels.yaml`, `profiles/*.yaml`); `-configdir` remains a deprecated alias. If you wire a loop by hand, it must declare the prelude API version in its leading comment block:
 
 ```lua
+-- af-prelude-version: 1
 function loop()
   while true do
     local msg = session.inbox()
@@ -89,27 +111,29 @@ function loop()
 end
 ```
 
-and this as `config.yaml`:
+and the matching config:
 
 ```yaml
 version: "1"
 
 agents:
   echo:
-    loop: ./echo.lua
+    loop: ./loops/echo.lua
 
 gateway:
   listen: ":8080"            # one shared listener; channels mount paths on it
   channels:
-    - type: webhook
-      path: /webhook/
+    - name: local
+      type: webhook
+      path: /webhook/local/
       agent: echo
 ```
 
 ```bash
-./agentflow -config config.yaml
-curl -X POST localhost:8080/webhook/ -d '{"from":"alice","text":"hello"}'
+./agentflow -config agentflow.yaml
 ```
+
+The binary also accepts `config.yaml` when `agentflow.yaml` is absent, so older checkouts keep working.
 
 > The webhook path ends in `/` (a subtree mount). Posting to `/webhook` without
 > the slash returns a `307` redirect, which `curl -d` does not follow — include
@@ -138,21 +162,57 @@ holds only the runtime.
 
 ## Documentation
 
-Full docs (install guide, architecture, config reference, Lua plugin development guide, capability API) are embedded in the binary and served by the web console at **`/docs/`**:
+The documentation lives in **AgentFlow Studio**, in
+[`agentflow-studio/docs/`](../agentflow-studio/docs): install and quick start,
+architecture and deployment, the full configuration reference, the Luau loop
+guide, the extension guide, and the admin API contract. Studio embeds it and
+renders it offline from its Help button, so it works even when the runtime uses
+only a Unix socket or named pipe.
+
+Runnable loops referenced by the guide stay in [`examples/loops/`](examples/loops/).
+The machine-readable user API contract is [`api/openapi/users.yaml`](api/openapi/users.yaml);
+the engine no longer serves a documentation site, and `/docs` answers `410 Gone`.
+
+## Studio
+
+A config with no agents is valid: the runtime boots as an admin/Studio control
+plane so the first agent can be created from the app.
+
+The desktop client — agent builder, playground, live trace, channels, and the documentation viewer — lives in its own repository, [`agentflow-studio`](../agentflow-studio). It is a native Go + Fyne app that calls the admin API with the admin bearer token; there is no browser, no web server and therefore no CORS entry to configure.
 
 ```bash
-./agentflow -config config.yaml
-# open http://127.0.0.1:9090/docs/
+cd ../agentflow-studio
+make build        # or: CGO_ENABLED=1 go build -o agentflow-studio .
+./agentflow-studio
 ```
 
-No separate server or build step — the site is `go:embed`ded from `internal/webui/docs/` and readable without the admin token. (It is mounted on the admin server, so `-no-webui` disables the docs site along with the console.) The config reference there covers every key this README only summarizes: models, memory, gateway/channels (including Telegram's `mode: polling | webhook | auto`, `secret_token` webhook auth, and the stale-webhook cleanup on polling), tools policy, media, audit, triggers, and the `-configdir` layout.
+Enter the instance URL (`http://127.0.0.1:9090`) and the admin token. The runtime side is configured by:
+
+```yaml
+runtime:
+  admin:
+    cors_origins: []         # only browser clients of the admin API need this
+  studio:
+    enabled: true            # default true
+    workspace: ""            # single-file mode default: <config dir>/studio
+    trace_events: 2000       # per-session ring
+    trace_sessions: 200      # rings retained
+    trace_payloads: false    # include message/reply text in events
+    chat_timeout: 120s
+```
+
+`runtime.admin.cors_origins` remains for browser clients of the admin API (a custom frontend, a script with a browser origin); the native desktop app sends the bearer token directly and does not need it. Exact origins only, and `"*"` is refused.
+
+Playground turns are instance-local: the `studio` channel is registered in one process, so in a fleet a thread owned by another instance does not capture replies there. Studio stores no chat history (the agent's memory is the source of truth), and traces reset on restart.
 
 ## Repository layout
 
 ```
 agentflow/
 ├── Makefile            # build: Luau submodule -> libluau.a -> agentflow binary
+├── api/openapi/        # machine-readable user API contract
 ├── cmd/agentflow/      # main entrypoint
+├── examples/           # runnable loops and prompts referenced by the guide
 ├── internal/           # core runtime + drivers (not importable — internal module)
 │   ├── builtins/       # embedded Lua builtins (per_chat route + support chunks)
 │   ├── core/           # actor/session, supervisor, router, gateway, scheduler, triggers,
@@ -162,13 +222,25 @@ agentflow/
 │   │                   #   webhook, ghhook, sqlite/redis/postgres/volatile,
 │   │                   #   pgvector/qdrant/redisvector, s3media, docparse
 │   ├── tui/            # terminal dashboard (bubbletea): sectioned metrics + log footer
-│   ├── webui/          # embedded operator console (SPA + JSON API) + docs site (at /docs/)
+│   ├── webui/          # embedded operator console (SPA + JSON API)
 │   └── vm/             # Luau cgo bridge + embedded prelude
 └── third_party/luau/   # git submodule: luau-lang/luau @ 0.731 (full upstream tree; MIT)
 ```
 
 ## Upgrade notes
 
+- **Documentation moved to AgentFlow Studio.** The embedded `/docs` site is no
+  longer part of the runtime binary; `/docs` answers `410 Gone`. Install the
+  desktop app to read the guides offline. The user API contract stays at
+  `api/openapi/users.yaml`.
+- **Config paths now resolve from the config source, and the CLI flags changed.**
+  `-config` accepts a file or a directory; `-configdir` is a deprecated alias.
+  Relative loops, prompts, routes and persistence paths resolve against the
+  config file's directory or the config directory, so the engine and
+  `validate`/`doctor` always agree. `-no-console` hides only the static web
+  console; the deprecated `-no-webui` maps to it and no longer disables the
+  admin/Studio API. `-log-format text|json` replaces `-log-json`, and
+  `runtime.scheduler.workers` is live (the `-workers` flag overrides it).
 - **The LLM providers now speak their vendors' official SDKs.** `anthropic`, `openai`,
   `openai-responses`, `gemini` and embeddings are built on `anthropic-sdk-go`, `openai-go` and
   `genai` instead of hand-rolled HTTP. Everything a loop can observe is unchanged: the same
@@ -247,18 +319,18 @@ agentflow/
   - **`ghhook` requires `secret`.** Its HMAC check returned `true` when no secret was configured, so a channel without one accepted any event posted to its path and handed it to the router as an agent turn. A ghhook channel with no secret is now a boot error; an unresolvable `${VAR}`/`cred:<service>` reference skips the channel at construction rather than running it unauthenticated.
   - **telegram refuses deliveries it cannot authenticate.** A missing webhook secret token (a generation failure — it is minted per boot otherwise) now returns `503` instead of admitting the update. Its `allow_users` list is also checked *before* media is downloaded and written to the blob store, so a non-allowed sender can no longer make the runtime fetch and persist a file.
   - **`webhook`'s `callback_url` is now address-guarded.** It goes through the same outbound guard `http.request` and `builtin:fetch` share, so a caller can no longer have the runtime POST an agent's reply to a private, loopback or link-local address. A deployment whose callback receiver *is* on a private network must set `net.http.allow_private: true` — which relaxes that guard on all three paths at once.
-- **Memory stores are private per agent by default.** Two agents on the same memory profile bind `<agent>.<table>` (e.g. `writer.dialogue`), so history cannot leak across agents. Loops are unaffected (table names are the profile's; the prefix is applied at bind time). A deliberately shared store opts in with `shared: true`:
+- **Memory stores are private per agent by default.** Two agents on the same memory profile bind `<agent>.<table>` (e.g. `writer.dialogue`), so history cannot leak across agents. Loops are unaffected (table names are the profile's; the prefix is applied at bind time). A deliberately shared store opts into a named pool (created through the tenancy admin API, whose grants decide access); `shared: true` is a boot error:
   ```yaml
   profiles:
     memory/team:
       stores:
-        kb: { backend: main_db, table: kb, shared: true }
+        kb: { backend: main_db, table: kb, pool: team }
   ```
 - **One shared HTTP listener.** Every HTTP channel mounts its `path` on the single `gateway.listen` server (per-channel `listen:` fields no longer exist). Paths must end in `/`; a UUID-style segment is a recommended unguessable secret prefix. Set `gateway.public_url` for Telegram webhook/auto; the shared server serves `GET /health` for probes.
 
 ## Notes
 
-- **Flags** — `-config <file>` (default `agentflow.yaml`) or `-configdir <dir>`, mutually exclusive; `-workers N` sets the op worker pool size (default 8); `-log-level`, `-no-tui`, `-no-webui`. `-workers` is the only way to size the pool: `runtime.scheduler.workers` is parsed and read by nothing.
+- **Flags** — `-config <file|dir>` (default: `agentflow.yaml`, then `config.yaml`); `-configdir` is a deprecated alias; `-workers N` overrides `runtime.scheduler.workers` (default 8); `-log-level`, `-log-format text|json`, `-no-tui`, `-no-console` (the deprecated `-no-webui` maps to it). Run `agentflow help` for the grouped reference.
 - **Log levels** — five additive levels, selected with `-log-level` (default `info`): `error` (runtime cannot continue), `warn` (degraded: upstream 429/502, retries), `info` (lifecycle: launch, channels, webhooks), `debug` (every interaction: LLM API request, memory put/query, telegram update, op dispatch), `dev` (temporary development logs). Setting a level prints it and everything above.
 - **Luau is a git submodule**, not vendored code: `third_party/luau` pins upstream `luau-lang/luau` at release **0.731** (the full upstream tree; only `VM`, `Common`, `Ast`, `Bytecode` and `Compiler` are compiled). A fresh clone needs `git clone --recurse-submodules` (or `git submodule update --init`) before `make`. To upgrade: `git -C third_party/luau fetch --tags && git -C third_party/luau checkout <new-tag> && git add third_party/luau`, then `make` and run the test suite.
 - **`config.yaml`** is gitignored — it's the local instance config and may contain credentials. Keep secrets in it or in environment variables, never in tracked files.

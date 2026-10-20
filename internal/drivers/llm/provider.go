@@ -3,9 +3,13 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/openai/openai-go"
 
 	"agentflow/internal/config"
 )
@@ -48,7 +52,38 @@ func statusError(status int, body []byte) (retryable bool, err error) {
 		snippet = snippet[:300]
 	}
 	retryable = status == 429 || status >= 500
-	return retryable, fmt.Errorf("provider returned %d: %s", status, snippet)
+	return retryable, &httpStatusError{status: status, msg: fmt.Sprintf("provider returned %d: %s", status, snippet)}
+}
+
+// httpStatusError is a provider failure the hand-rolled paths (rerank, the
+// Gemini status fallback) report. It keeps the status so isUnauthorized can
+// read it without parsing the message.
+type httpStatusError struct {
+	status int
+	msg    string
+}
+
+func (e *httpStatusError) Error() string { return e.msg }
+
+// isUnauthorized reports whether a provider rejected the request's credential
+// (HTTP 401), across every SDK error shape this package produces.
+func isUnauthorized(err error) bool {
+	if err == nil {
+		return false
+	}
+	var se *httpStatusError
+	if errors.As(err, &se) {
+		return se.status == http.StatusUnauthorized
+	}
+	var oe *openai.Error
+	if errors.As(err, &oe) {
+		return oe.StatusCode == http.StatusUnauthorized
+	}
+	var ae *anthropic.Error
+	if errors.As(err, &ae) {
+		return ae.StatusCode == http.StatusUnauthorized
+	}
+	return geminiStatus(err) == http.StatusUnauthorized
 }
 
 func maxTokensOf(cfg config.Model, opts Opts) int {

@@ -27,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"agentflow/internal/core/netguard"
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/tools"
 
@@ -51,6 +52,10 @@ type Client struct {
 	session *mcpsdk.ClientSession
 	log     *slog.Logger
 	alive   atomic.Bool
+	// requiresCapability gates the discovered tools. A remote Streamable HTTP
+	// server is network egress and requires net.http; a stdio child process is
+	// not, so it stays governed by tools/agent policy alone.
+	requiresCapability string
 }
 
 // NewClient starts an MCP server as a child process and completes the handshake
@@ -71,18 +76,35 @@ func NewClient(name, command string, args []string, log *slog.Logger) (*Client, 
 // optional event stream. token, when set, is sent as a bearer credential on
 // every request.
 func NewHTTPClient(name, endpoint, token string, log *slog.Logger) (*Client, error) {
+	// Legacy constructor: no address policy. Kept for tests and embedders that
+	// dial a loopback sidecar; the runtime uses the policy-aware constructor so
+	// net.http.allow_private governs MCP URLs like every other outbound path.
+	return NewHTTPClientWithPolicy(name, endpoint, token, netguard.Policy{AllowPrivate: true}, log)
+}
+
+// NewHTTPClientWithPolicy is the runtime constructor. The transport carries the
+// shared address guard, so a `url:` MCP server cannot reach loopback, private,
+// link-local or reserved addresses unless net.http.allow_private is set — the
+// same rule http.request and builtin:fetch follow.
+func NewHTTPClientWithPolicy(name, endpoint, token string, policy netguard.Policy, log *slog.Logger) (*Client, error) {
 	l := log.With("mcp_server", name)
-	httpClient := &http.Client{}
+	base := policy.Transport()
+	httpClient := &http.Client{Transport: base}
 	if token != "" {
 		// StreamableClientTransport has no header field, so the credential
 		// rides on the transport. Requests are cloned rather than mutated:
 		// Go's client may retry, and a mutated shared request is a data race.
-		httpClient.Transport = &bearerTransport{token: token, base: http.DefaultTransport}
+		httpClient.Transport = &bearerTransport{token: token, base: base}
 	}
-	return connect(l, name, &mcpsdk.StreamableClientTransport{
+	c, err := connect(l, name, &mcpsdk.StreamableClientTransport{
 		Endpoint:   endpoint,
 		HTTPClient: httpClient,
 	})
+	if err != nil {
+		return nil, err
+	}
+	c.requiresCapability = "net.http"
+	return c, nil
 }
 
 // connect performs the handshake over whichever transport was built, and
@@ -143,11 +165,12 @@ func (c *Client) ListTools(ctx context.Context) ([]tools.ToolSpec, error) {
 		// JSON Schema, so it must not be reshaped into a typed struct here.
 		schema, _ := t.InputSchema.(map[string]any)
 		out = append(out, tools.ToolSpec{
-			Name:        c.name + "/" + t.Name,
-			Description: t.Description,
-			Parameters:  schema,
-			Autonomous:  false,
-			Invoke:      c.makeInvoker(t.Name),
+			Name:               c.name + "/" + t.Name,
+			Description:        t.Description,
+			Parameters:         schema,
+			Autonomous:         false,
+			RequiresCapability: c.requiresCapability,
+			Invoke:             c.makeInvoker(t.Name),
 		})
 	}
 	return out, nil

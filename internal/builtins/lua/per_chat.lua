@@ -72,9 +72,11 @@ function loop()
 
     -- Durable mode: a chat in group mode routes to the group's session and
     -- proposes the group; the engine validates the sender's membership.
-    -- state.set stored a Lua string, which arrives back as a JSON string.
+    -- af.op already decodes the response; decoding it a second time turned a
+    -- missing key (null) into nil, which json.decode rejects, and crashed the
+    -- router on the first message of a new chat.
     if group == nil then
-      local mode = json.decode(af.op({ type = "router.state.get", key = mk }))
+      local mode = af.op({ type = "router.state.get", key = mk })
       if mode ~= nil and mode ~= "" then
         group = tostring(mode)
       end

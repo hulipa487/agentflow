@@ -4,6 +4,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -25,6 +26,12 @@ func TestEveryCounterHasAnIncrementSite(t *testing.T) {
 	root := filepath.Join("..", "..", "..")
 	counters := DefaultCounters()
 	seen := map[string]bool{}
+	// The other direction: a name that is incremented but never registered is
+	// silently discarded by Inc (it is a no-op on an unknown name), so the
+	// counter reads as zero everywhere and nothing fails. Scan the same tree
+	// for literal call sites.
+	emitted := map[string]bool{}
+	callRE := regexp.MustCompile(`metrics\.(?:Inc|Add)\("([^"]+)"`)
 
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -54,6 +61,9 @@ func TestEveryCounterHasAnIncrementSite(t *testing.T) {
 				seen[name] = true
 			}
 		}
+		for _, m := range callRE.FindAllStringSubmatch(src, -1) {
+			emitted[m[1]] = true
+		}
 		return nil
 	})
 	if err != nil {
@@ -63,6 +73,11 @@ func TestEveryCounterHasAnIncrementSite(t *testing.T) {
 	for name := range counters {
 		if !seen[name] {
 			t.Errorf("counter %q is registered but never incremented outside this package — it can only ever render as zero", name)
+		}
+	}
+	for name := range emitted {
+		if _, ok := counters[name]; !ok {
+			t.Errorf("counter %q is incremented but not registered in DefaultCounters — Inc is a no-op for it, so it is invisible", name)
 		}
 	}
 }

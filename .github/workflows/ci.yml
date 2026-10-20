@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build
+        run: make
+      - name: Vet
+        run: make vet
+      - name: Test
+        run: make test
+      - name: Config schema
+        run: ./agentflow config schema > /dev/null
+      - name: Loop checks
+        run: |
+          ./agentflow loop check examples/loops/echo.lua
+          ./agentflow loop test examples/scenarios/echo.yaml
+          ./agentflow loop test examples/scenarios/package.yaml
+
+  windows:
+    name: build + test (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+      - name: Install make
+        run: choco install make -y --no-progress
+      - name: Build
+        shell: bash
+        run: make BIN=agentflow.exe
+      - name: Test
+        shell: bash
+        run: make test
+      - name: Loop checks
+        shell: bash
+        run: |
+          ./agentflow.exe loop check examples/loops/echo.lua
+          ./agentflow.exe loop test examples/scenarios/echo.yaml

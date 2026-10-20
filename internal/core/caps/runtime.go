@@ -78,6 +78,13 @@ func RuntimeHandlers(triggers []config.Trigger) map[string]session.OpHandler {
 // message journal (op responses are not journaled; handlers never log it).
 // store may be nil — the op then fails with a clear "not enabled" error.
 func CredentialHandler(store *credentials.Store, allowed []string, log *slog.Logger) session.OpHandler {
+	return CredentialHandlerPolicy(store, allowed, false, log)
+}
+
+// CredentialHandlerPolicy is CredentialHandler with the engine-wide exposure
+// mode. maintenanceOnly restricts raw engine-wide secrets to engine-fired
+// turns; tenant turns then have no path to a value that is not their own.
+func CredentialHandlerPolicy(store *credentials.Store, allowed []string, maintenanceOnly bool, log *slog.Logger) session.OpHandler {
 	allow := map[string]bool{}
 	for _, name := range allowed {
 		allow[name] = true
@@ -106,6 +113,10 @@ func CredentialHandler(store *credentials.Store, allowed []string, log *slog.Log
 				reason = "not in the agent's credentials allow-list"
 			}
 			return deny(ctx, owner, name, reason)
+		}
+		if maintenanceOnly && !session.MaintenanceFromCtx(ctx) {
+			return deny(ctx, owner, name,
+				"engine-wide credentials are restricted to maintenance contexts (runtime.credentials.engine_wide: maintenance)")
 		}
 		sec, ok, err := store.Get(ctx, "", name) // engine-wide tenancy
 		if err != nil {

@@ -195,6 +195,19 @@ func (s *Store) Delete(ctx context.Context, userUUID, service string) error {
 	return nil
 }
 
+// DeleteUser removes every credential belonging to one profile. It is the
+// credential half of tenant deletion; the engine-wide bucket (user_uuid="") is
+// never touched.
+func (s *Store) DeleteUser(ctx context.Context, userUUID string) error {
+	if userUUID == "" {
+		return fmt.Errorf("credentials: refusing to delete the engine-wide bucket")
+	}
+	if _, err := s.st.Exec(ctx, `DELETE FROM credentials WHERE user_uuid = ?`, userUUID); err != nil {
+		return fmt.Errorf("credentials: delete user %s: %w", userUUID, err)
+	}
+	return nil
+}
+
 // List returns service metadata (never values) for a user.
 func (s *Store) List(ctx context.Context, userUUID string) ([]ServiceRef, error) {
 	rows, err := s.st.Query(ctx,

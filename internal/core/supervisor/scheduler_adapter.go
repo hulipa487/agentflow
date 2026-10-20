@@ -21,7 +21,11 @@ func newSchedulerAdapter(svc *scheduler.Service, sup *Supervisor, log *slog.Logg
 	return &schedulerAdapter{svc: svc, sup: sup, log: log}
 }
 
-func (a *schedulerAdapter) deliver(owner string, timerID scheduler.TimerID) {
+func (a *schedulerAdapter) deliver(owner string, timerID scheduler.TimerID, scope session.SchedulerScope) {
+	principal := scope.Principal
+	if principal == "" {
+		principal = "system:scheduler"
+	}
 	msg := session.Message{
 		ID:   "timer:" + owner + ":" + string(timerID),
 		Type: "timer",
@@ -30,9 +34,15 @@ func (a *schedulerAdapter) deliver(owner string, timerID scheduler.TimerID) {
 		Payload: map[string]any{
 			"timer_id": string(timerID),
 		},
+		// Kind "timer" is deliberately NOT a maintenance provenance. A timer
+		// scheduled by a tenant turn must run as that tenant, not with the
+		// all-scope access engine triggers have. It carries the tenant and
+		// membership captured when it was registered.
 		Provenance: &session.Provenance{
-			Kind:      "scheduler",
-			Principal: "system:scheduler",
+			Kind:           "timer",
+			Principal:      principal,
+			UserUUID:       scope.UserUUID,
+			MembershipUUID: scope.MembershipUUID,
 		},
 	}
 	a.sup.mu.Lock()
@@ -51,7 +61,12 @@ func (a *schedulerAdapter) deliver(owner string, timerID scheduler.TimerID) {
 }
 
 func (a *schedulerAdapter) Every(owner string, intervalSec float64) (string, error) {
-	id, err := a.svc.Every(owner, time.Duration(intervalSec*float64(time.Second)), a.deliver)
+	return a.EveryScoped(owner, intervalSec, session.SchedulerScope{})
+}
+
+func (a *schedulerAdapter) EveryScoped(owner string, intervalSec float64, scope session.SchedulerScope) (string, error) {
+	deliver := func(owner string, id scheduler.TimerID) { a.deliver(owner, id, scope) }
+	id, err := a.svc.Every(owner, time.Duration(intervalSec*float64(time.Second)), deliver)
 	if err != nil {
 		return "", err
 	}
@@ -59,7 +74,12 @@ func (a *schedulerAdapter) Every(owner string, intervalSec float64) (string, err
 }
 
 func (a *schedulerAdapter) After(owner string, delaySec float64) (string, error) {
-	id, err := a.svc.After(owner, time.Duration(delaySec*float64(time.Second)), a.deliver)
+	return a.AfterScoped(owner, delaySec, session.SchedulerScope{})
+}
+
+func (a *schedulerAdapter) AfterScoped(owner string, delaySec float64, scope session.SchedulerScope) (string, error) {
+	deliver := func(owner string, id scheduler.TimerID) { a.deliver(owner, id, scope) }
+	id, err := a.svc.After(owner, time.Duration(delaySec*float64(time.Second)), deliver)
 	if err != nil {
 		return "", err
 	}
@@ -67,7 +87,12 @@ func (a *schedulerAdapter) After(owner string, delaySec float64) (string, error)
 }
 
 func (a *schedulerAdapter) Cron(owner string, expr string) (string, error) {
-	id, err := a.svc.Cron(owner, expr, a.deliver)
+	return a.CronScoped(owner, expr, session.SchedulerScope{})
+}
+
+func (a *schedulerAdapter) CronScoped(owner string, expr string, scope session.SchedulerScope) (string, error) {
+	deliver := func(owner string, id scheduler.TimerID) { a.deliver(owner, id, scope) }
+	id, err := a.svc.Cron(owner, expr, deliver)
 	if err != nil {
 		return "", err
 	}
@@ -84,5 +109,6 @@ func (a *schedulerAdapter) CancelOwner(owner string) {
 	a.svc.CancelOwner(owner)
 }
 
-// Ensure the adapter satisfies the interface.
+// Ensure the adapter satisfies both interfaces.
 var _ session.SchedulerService = (*schedulerAdapter)(nil)
+var _ session.ScopedSchedulerService = (*schedulerAdapter)(nil)

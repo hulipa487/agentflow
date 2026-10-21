@@ -172,6 +172,9 @@ func (u *UI) API() http.Handler {
 	mux.HandleFunc("GET /admin/api/metrics", u.handleMetrics)
 	mux.HandleFunc("GET /admin/api/logs", u.handleLogs)
 	mux.HandleFunc("GET /admin/api/credentials/users", u.handleCredentialUsers)
+	mux.HandleFunc("GET /admin/api/credentials", u.handleStudioCredentials)
+	mux.HandleFunc("POST /admin/api/credentials", u.handleStudioCredentialPut)
+	mux.HandleFunc("DELETE /admin/api/credentials", u.handleStudioCredentialDelete)
 	// Per-user profiles: who they are, what they spent, what they own, and what
 	// they did.
 	mux.HandleFunc("GET /admin/api/users", u.handleUsers)

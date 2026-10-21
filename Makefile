@@ -35,7 +35,8 @@ ifeq ($(GOHOSTOS),windows)
     CXX      := zig c++ -target x86_64-linux-gnu
     AR       := zig ar
     CXXFLAGS += -target x86_64-linux-gnu -include stdlib.h
-    GOENV    := GOOS=linux GOARCH=amd64 CGO_ENABLED=1 CC="zig cc -target x86_64-linux-gnu" CXX="zig c++ -target x86_64-linux-gnu"
+    GOOS     := linux
+    GOARCH   := amd64
   else
     CC       := zig cc
     CXX      := zig c++
@@ -48,28 +49,68 @@ ifeq ($(GOHOSTOS),windows)
       ZIG_ARCH := aarch64
     endif
     CXXFLAGS += -target $(ZIG_ARCH)-windows-gnu -include stdlib.h
-    GOENV    := CGO_ENABLED=1 CC="zig cc" CXX="zig c++"
   endif
 else ifeq ($(GOHOSTOS),linux)
   CC      := cc
   CXX     := c++
   AR      := ar
-  GOENV   := CGO_ENABLED=1 CC="cc" CXX="c++"
 else ifeq ($(GOHOSTOS),darwin)
   CC      := clang
   CXX     := clang++
   AR      := ar
-  GOENV   := CGO_ENABLED=1 CC="clang" CXX="clang++"
 else
   $(error unsupported host OS: $(GOHOSTOS))
 endif
 
-# Output binary. On Windows you may want: make BIN=agentflow.exe
-BIN     ?= agentflow
+# Exported instead of prefixed onto each go invocation. Under PowerShell make
+# runs recipes through cmd.exe, where a POSIX "VAR=value cmd" prefix fails with
+# "'CGO_ENABLED' is not recognized as an internal or external command".
+export CGO_ENABLED := 1
+export CC
+export CXX
+ifdef GOOS
+  export GOOS
+  export GOARCH
+endif
+
+# ---- recipe shell ----------------------------------------------------------
+# Make runs recipes through sh.exe when it is on PATH (Git Bash, CI) and
+# through cmd.exe otherwise (PowerShell). Probe with `echo $0`: sh prints its
+# own path, cmd echoes the literal "$0". Everything below that differs between
+# the two shells is selected from SHELL_KIND.
+ifeq ($(shell echo $$0),$$0)
+  SHELL_KIND := cmd
+else
+  SHELL_KIND := sh
+endif
+
+ifeq ($(SHELL_KIND),sh)
+  # Recursive so BIN (defined below) is expanded when the recipe runs.
+  RUN      = ./$(BIN)
+  MKDIR    = mkdir -p "$1"
+else
+  RUN      = $(BIN)
+  # cmd's mkdir creates intermediate directories itself and rejects -p.
+  MKDIR    = if not exist "$(subst /,\,$1)" mkdir "$(subst /,\,$1)"
+endif
+
+# Output binary. Windows names it .exe so the target make tracks is the file Go
+# actually writes; cross-compiling a Linux binary from Windows keeps the plain
+# name.
+ifeq ($(GOHOSTOS),windows)
+  ifeq ($(TARGET_OS),linux)
+    BIN ?= agentflow
+  else
+    BIN ?= agentflow.exe
+  endif
+else
+  BIN ?= agentflow
+endif
 
 # Release stamp. Ordinary builds say "dev"; a tag or dirty checkout is visible
-# in `agentflow version` and the web console.
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+# in `agentflow version` and the web console. No stderr redirect: "2>/dev/null"
+# is an invalid path under cmd.exe and made the version fall back to "dev".
+VERSION ?= $(or $(shell git describe --tags --always --dirty),dev)
 LDFLAGS := -X main.version=$(VERSION)
 
 # Config used by `make run` (your local instance config; gitignored). Prefer
@@ -117,74 +158,94 @@ $(OBJ)/cc_%.o: $(LUAU)/Compiler/src/%.cpp | $(OBJ)
 	$(CXX) $(CXXFLAGS) $(INCFLAGS) -c $< -o $@
 
 $(OBJ):
-	mkdir -p $(OBJ)
+	$(call MKDIR,$@)
 
 $(LIB): $(OBJS)
-	mkdir -p $(dir $(LIB))
+	$(call MKDIR,$(patsubst %/,%,$(dir $(LIB))))
 	$(AR) rcs $@ $^
 
 luau: $(LIB)
 
 # ---- Go binary -------------------------------------------------------------
-# Prerequisites beyond the static lib: every Go source (the prelude is one),
-# the module files, and the cgo shim. Without these a Go-only change reports
-# nothing-to-do and hands out the stale binary.
+# Every Go source (tracked or untracked-but-not-ignored), the module files and
+# the cgo shim. Without these a Go-only change reports nothing-to-do and hands
+# out the stale binary.
 # Embedded assets count as sources: a change to a builtin Lua chunk, the
 # prelude or the console SPA is compiled into the binary by go:embed, and
 # without these a Lua-only edit reports nothing-to-do and hands out a stale
 # binary.
-GOSRC := $(shell find cmd internal -name '*.go' 2>/dev/null) \
-	$(shell find internal/builtins/lua internal/webui/static -type f 2>/dev/null) \
+# git ls-files rather than find: under PowerShell make's $(shell) runs through
+# cmd.exe, where "find" is C:\Windows\System32\find.exe and the Go sources
+# silently never make it into this list.
+GOSRC := $(shell git ls-files -co --exclude-standard -- "*.go") \
+	$(shell git ls-files -co --exclude-standard -- "internal/builtins/lua" "internal/webui/static") \
 	internal/vm/shim.cpp internal/vm/shim.h \
 	go.mod go.sum
 
 $(BIN): $(LIB) $(GOSRC)
-	$(GOENV) go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN) ./cmd/agentflow
+	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN) ./cmd/agentflow
 
 all: $(BIN)
 
 build: $(BIN)
 
 run: $(BIN)
-	./$(BIN) -config $(CONFIG)
+	$(RUN) -config $(CONFIG)
 
 test:
-	$(GOENV) go test ./...
+	go test ./...
 
 vet:
-	$(GOENV) go vet ./...
+	go vet ./...
 
 # Format/check only files touched by this working tree. The repository's
 # baseline predates the current gofmt (it has many untouched files the tool
 # would rewrite), so a repo-wide -w would bury a real change in formatting
 # noise.
-CHANGED_GO := $(shell git diff --name-only HEAD -- '*.go'; git ls-files --others --exclude-standard '*.go')
+# Two separate git calls: cmd.exe has no ";" statement separator, so chaining
+# them in one $(shell) broke under PowerShell. NL turns the newline-separated
+# output into a space-separated argument list.
+define NL
+
+
+endef
+CHANGED_GO := $(subst $(NL), ,$(shell git diff --name-only HEAD -- "*.go")) \
+	$(subst $(NL), ,$(shell git ls-files --others --exclude-standard -- "*.go"))
 
 fmt:
-	@files="$(CHANGED_GO)"; \
-	if [ -n "$$files" ]; then gofmt -w $$files; fi
+	@$(if $(strip $(CHANGED_GO)),gofmt -w $(CHANGED_GO))
+
+FMT_OUT = $(if $(strip $(CHANGED_GO)),$(shell gofmt -l $(CHANGED_GO)))
 
 fmt-check:
-	@files="$(CHANGED_GO)"; \
-	if [ -z "$$files" ]; then exit 0; fi; \
-	out="$$(gofmt -l $$files)"; \
-	if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
+	$(if $(strip $(FMT_OUT)),$(error gofmt needed: $(FMT_OUT)),@echo gofmt clean)
 
 check: vet test
 
 schema: $(BIN)
-	./$(BIN) config schema > agentflow.schema.json
+	$(RUN) config schema > agentflow.schema.json
 	@echo "wrote agentflow.schema.json"
 
 loop-check: $(BIN)
-	./$(BIN) loop check examples/loops/echo.lua
-	./$(BIN) loop test examples/scenarios/echo.yaml
+	$(RUN) loop check examples/loops/echo.lua
+	$(RUN) loop test examples/scenarios/echo.yaml
 
 docker:
 	docker build -t agentflow:$(VERSION) .
 
+# Both names: a Linux-named binary can be left behind by a cross build or an
+# older checkout even when the host default is agentflow.exe.
+CLEANBINS := $(sort $(BIN) agentflow agentflow.exe)
+
+ifeq ($(SHELL_KIND),sh)
 clean:
-	rm -rf $(OBJ) $(LIB) $(BIN) $(BIN).exe
+	rm -rf $(OBJ) $(LIB) $(CLEANBINS)
+else
+clean:
+	if exist "$(subst /,\,$(OBJ))" rmdir /s /q "$(subst /,\,$(OBJ))"
+	if exist "$(subst /,\,$(LIB))" del /q "$(subst /,\,$(LIB))"
+	$(foreach b,$(CLEANBINS),if exist "$(b)" del /q "$(b)"&)
+endif
 
 
 .PHONY: all luau build run test vet fmt fmt-check check schema loop-check docker clean

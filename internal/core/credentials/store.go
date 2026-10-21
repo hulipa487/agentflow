@@ -47,6 +47,8 @@ type Secret struct {
 type ServiceRef struct {
 	Service     string `json:"service"`
 	Kind        string `json:"kind"`
+	Header      string `json:"header,omitempty"`
+	Scheme      string `json:"scheme,omitempty"`
 	Fingerprint string `json:"fingerprint,omitempty"`
 	CreatedAt   int64  `json:"created_at"`
 	UpdatedAt   int64  `json:"updated_at"`
@@ -211,7 +213,7 @@ func (s *Store) DeleteUser(ctx context.Context, userUUID string) error {
 // List returns service metadata (never values) for a user.
 func (s *Store) List(ctx context.Context, userUUID string) ([]ServiceRef, error) {
 	rows, err := s.st.Query(ctx,
-		`SELECT service, kind, secret, created_at, updated_at FROM credentials WHERE user_uuid = ? AND revoked = 0 ORDER BY service`,
+		`SELECT service, kind, header, scheme, secret, created_at, updated_at FROM credentials WHERE user_uuid = ? AND revoked = 0 ORDER BY service`,
 		userUUID)
 	if err != nil {
 		return nil, fmt.Errorf("credentials: list %s: %w", userUUID, err)
@@ -221,7 +223,7 @@ func (s *Store) List(ctx context.Context, userUUID string) ([]ServiceRef, error)
 	for rows.Next() {
 		var r ServiceRef
 		var ctBlob []byte
-		if err := rows.Scan(&r.Service, &r.Kind, &ctBlob, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.Service, &r.Kind, &r.Header, &r.Scheme, &ctBlob, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("credentials: list scan: %w", err)
 		}
 		// Best-effort fingerprint: a decrypt failure (wrong master key) must

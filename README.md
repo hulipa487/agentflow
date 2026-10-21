@@ -49,11 +49,10 @@ make
 - **Ease of Development**: High level Lua language with unified calls.
 - **Cross Platform**: Windows, MacOS, Linux, we've got you covered.
 
-
 ## Contributors
 <a href="https://github.com/hulipa487/agentflow/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=hulipa487/agentflow" />
-</a>
+</a><p></p>
 
 **LICENSE**: MIT
 

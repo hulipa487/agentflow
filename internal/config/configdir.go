@@ -263,6 +263,7 @@ func (f *agentFile) spawnProfile() (SpawnProfile, error) {
 		Instructions: a.Instructions,
 		Memory:       a.Memory.Profile,
 		Shell:        a.Shell,
+		Safety:       a.Safety,
 		Skills:       a.Skills,
 		Capabilities: a.Capabilities,
 		CanContact:   a.CanContact,

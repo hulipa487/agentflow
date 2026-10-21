@@ -3,6 +3,8 @@ package session
 import (
 	"encoding/json"
 	"time"
+
+	"agentflow/internal/core/safety"
 )
 
 // TraceEvent is one step of a session's execution, emitted for an observing
@@ -42,6 +44,9 @@ type TraceEvent struct {
 	// It is populated only when the deployment opts into payload capture
 	// (runtime.studio.trace_payloads); metadata is always safe to emit.
 	Text string `json:"text,omitempty"`
+	// Safety carries a classifier verdict. It never contains message text, so
+	// it is emitted regardless of payload capture.
+	Safety *safety.SafetyMeta `json:"safety,omitempty"`
 }
 
 // Tracer receives execution events. Implementations must be fast and

@@ -601,6 +601,12 @@ type Actor struct {
 	// snapshot for the TUI; written only by the actor goroutine.
 	busy atomic.Bool
 
+	// Refusals and fallbacks are core-authored replies to blocked traffic.
+	// Rate-limit them so a flood of blocked messages cannot turn into an
+	// outbound flood.
+	refusalMu   sync.Mutex
+	lastRefusal time.Time
+
 	// pendingDef stages a def snapshot pushed by the runtime agent registry;
 	// applied on the actor goroutine at the top of runOnce (applyDefAtRestart).
 	pendingDef atomic.Pointer[DefUpdate]
@@ -883,26 +889,47 @@ func (a *Actor) dispatchInline(ctx context.Context, op Op, current *Message) (re
 		if current != nil && current.ID != "" {
 			a.trace(TraceEvent{Kind: "turn.end", Turn: current.ID})
 		}
-		m, goOn := a.waitInbox(ctx)
-		if !goOn {
-			return "", false, false
-		}
-		// Safety ingress: run the message through the dispatcher before the
-		// loop sees it. A drop means the loop gets a no-op message.
-		if a.safety != nil {
-			res := a.safety.Ingress(ctx, safety.IngressInput{
+		var m Message
+		var goOn bool
+		for {
+			m, goOn = a.waitInbox(ctx)
+			if !goOn {
+				return "", false, false
+			}
+			// Stamp the turn's identity before safety so a classifier can
+			// attribute usage and apply tenant policy. The op context is also
+			// what the loop's later handlers see.
+			turnCtx := a.opContext(ctx, &m)
+			if a.safety == nil {
+				break
+			}
+			// Safety ingress: run the message through the dispatcher before
+			// the loop sees it. A classifier block skips the turn entirely;
+			// other drops preserve the historical "empty message" behavior.
+			res := a.safety.Ingress(turnCtx, safety.IngressInput{
 				Message: m.Text,
-				Source:  m.Type,
+				Source:  ingressSource(m.Type),
 			})
-			if res.Drop {
+			if res.Drop || res.Skip {
 				a.log.Info("safety ingress dropped message", "reason", res.Reason)
 				metrics.Inc("agentflow_safety_drops")
-				m.Text = "" // loop sees an empty message, not the original
-				a.trace(TraceEvent{Kind: "safety", Op: "ingress", Turn: m.ID, Err: res.Reason})
-			} else if res.Text != m.Text {
-				m.Text = res.Text
-				a.trace(TraceEvent{Kind: "safety", Op: "ingress", Turn: m.ID, OK: true, Err: "rewritten"})
+				a.trace(TraceEvent{Kind: "safety", Op: "ingress", Turn: m.ID, Err: res.Reason, Safety: res.Meta})
+				if res.Refusal != "" {
+					a.sendRefusal(turnCtx, m, res.Refusal, res.Reason)
+				}
+				if res.Skip {
+					continue // wait for the next message; this turn is over
+				}
+				m.Text = "" // legacy drop: loop sees an empty message
+				break
 			}
+			if res.Text != m.Text {
+				m.Text = res.Text
+				a.trace(TraceEvent{Kind: "safety", Op: "ingress", Turn: m.ID, OK: true, Err: "rewritten", Safety: res.Meta})
+			} else if res.Meta != nil {
+				a.trace(TraceEvent{Kind: "safety", Op: "ingress", Turn: m.ID, OK: true, Err: res.Reason, Safety: res.Meta})
+			}
+			break
 		}
 		*current = m
 		ev := TraceEvent{Kind: "turn.start", Turn: m.ID, Messages: 1}
@@ -1144,6 +1171,45 @@ type EgressRecord struct {
 // fatal — an audit hiccup must not drop user replies.
 type EgressJournalFunc func(EgressRecord)
 
+// allowRefusal enforces one core-authored auto-reply per session per 30s.
+// Without it, an attacker can make the bot answer every blocked message.
+func (a *Actor) allowRefusal() bool {
+	const interval = 30 * time.Second
+	a.refusalMu.Lock()
+	defer a.refusalMu.Unlock()
+	if !a.lastRefusal.IsZero() && time.Since(a.lastRefusal) < interval {
+		return false
+	}
+	a.lastRefusal = time.Now()
+	return true
+}
+
+// sendRefusal delivers a core-authored refusal for a dropped inbound turn.
+// It is intentionally outside the safety chain: the text is written by the
+// deployment, never by a loop or a model.
+func (a *Actor) sendRefusal(ctx context.Context, m Message, text, reason string) {
+	if text == "" || a.gw == nil || m.Channel == "" || !a.allowRefusal() {
+		return
+	}
+	if err := a.gw.Send(m.Channel, m.ReplyTo, text, nil); err != nil {
+		a.log.Warn("safety refusal send failed", "err", err, "channel", m.Channel)
+		return
+	}
+	if a.Journal != nil {
+		a.Journal(EgressRecord{
+			SessionID: a.Identity.SessionID,
+			Agent:     a.Identity.Agent,
+			Channel:   m.Channel,
+			ReplyTo:   m.ReplyTo,
+			UserUUID:  PersonalUUIDFromCtx(ctx),
+			Text:      text,
+			InReplyTo: m.ID,
+			Status:    "blocked_safety",
+			Err:       reason,
+		})
+	}
+}
+
 // egress runs text through the safety dispatcher and delivers it to a
 // channel recipient via the gateway. A safety drop means nothing is sent.
 // Attachments are not safety-screened (the filters are text-only by design);
@@ -1175,10 +1241,30 @@ func (a *Actor) egress(ctx context.Context, channel, replyTo, text string, attac
 			a.log.Info("safety egress dropped reply", "reason", res.Reason)
 			metrics.Inc("agentflow_safety_drops")
 			journal("blocked_safety", res.Reason)
-			a.trace(TraceEvent{Kind: "safety", Op: "egress", Turn: inReplyTo, Err: res.Reason})
+			a.trace(TraceEvent{Kind: "safety", Op: "egress", Turn: inReplyTo, Err: res.Reason, Safety: res.Meta})
+			if res.Fallback != "" && a.gw != nil && a.allowRefusal() {
+				if err := a.gw.Send(channel, replyTo, res.Fallback, nil); err != nil {
+					a.log.Warn("safety fallback send failed", "err", err, "channel", channel)
+				} else if a.Journal != nil {
+					a.Journal(EgressRecord{
+						SessionID: a.Identity.SessionID,
+						Agent:     a.Identity.Agent,
+						Channel:   channel,
+						ReplyTo:   replyTo,
+						UserUUID:  PersonalUUIDFromCtx(ctx),
+						Text:      res.Fallback,
+						InReplyTo: inReplyTo,
+						Status:    "blocked_safety",
+						Err:       res.Reason,
+					})
+				}
+			}
 			return `"reply blocked by safety filter"`, false
 		}
 		text = res.Text
+		if res.Meta != nil {
+			a.trace(TraceEvent{Kind: "safety", Op: "egress", Turn: inReplyTo, OK: true, Err: res.Reason, Safety: res.Meta})
+		}
 	}
 	if a.gw != nil {
 		if err := a.gw.Send(channel, replyTo, text, attachments); err != nil {
@@ -1407,6 +1493,19 @@ func sleepOr(ctx context.Context, reload chan struct{}, d time.Duration) bool {
 		return false
 	case <-ctx.Done():
 		return false
+	}
+}
+
+// ingressSource maps the internal message type to the safety chain's source
+// vocabulary. Channel drivers stamp Type:"user"; timers stamp Type:"timer".
+func ingressSource(typ string) string {
+	switch typ {
+	case "user":
+		return "channel"
+	case "timer":
+		return "scheduler"
+	default:
+		return typ
 	}
 }
 

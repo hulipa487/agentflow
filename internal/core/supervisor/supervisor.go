@@ -56,6 +56,10 @@ type SpawnTemplate struct {
 	Skills       []string
 	Handlers     map[string]session.OpHandler
 	Safety       *safety.Dispatcher
+	// InheritSafety means the profile did not name a safety profile; a child
+	// inherits the spawning session's dispatcher instead of silently running
+	// with none.
+	InheritSafety bool
 }
 
 // Supervisor resolves (agent, key) → session actor.
@@ -109,8 +113,12 @@ type Supervisor struct {
 	// not been started yet), never for resurrecting a dead one.
 	retired   map[string]struct{}
 	templates map[string]*SpawnTemplate
-	ctx       context.Context
-	requests  *request.Registry
+	// safetyBySession is the dispatcher each live session runs under, so a
+	// spawned child can inherit its parent's chain when the profile does not
+	// name one.
+	safetyBySession map[string]*safety.Dispatcher
+	ctx             context.Context
+	requests        *request.Registry
 }
 
 func New(defs map[string]*AgentDef, gw *gateway.Registry, p *pool.Pool, shellMgr *shell.Manager, log *slog.Logger) *Supervisor {
@@ -121,17 +129,18 @@ func New(defs map[string]*AgentDef, gw *gateway.Registry, p *pool.Pool, shellMgr
 		}
 	}
 	return &Supervisor{
-		defs:      defs,
-		gw:        gw,
-		pool:      p,
-		shellMgr:  shellMgr,
-		sessions:  map[string]*session.Actor{},
-		cancels:   map[string]context.CancelFunc{},
-		retired:   map[string]struct{}{},
-		templates: templates,
-		tenants:   map[string]string{},
-		requests:  request.New(),
-		log:       log.With("module", "supervisor"),
+		defs:            defs,
+		gw:              gw,
+		pool:            p,
+		shellMgr:        shellMgr,
+		sessions:        map[string]*session.Actor{},
+		cancels:         map[string]context.CancelFunc{},
+		retired:         map[string]struct{}{},
+		templates:       templates,
+		safetyBySession: map[string]*safety.Dispatcher{},
+		tenants:         map[string]string{},
+		requests:        request.New(),
+		log:             log.With("module", "supervisor"),
 	}
 }
 
@@ -341,6 +350,7 @@ func (s *Supervisor) ensureSession(agent, skey string, def *AgentDef, tenant str
 	}
 	s.sessions[skey] = a
 	s.cancels[skey] = cancel
+	s.safetyBySession[skey] = def.Safety
 	if tenant != "" {
 		s.tenants[skey] = tenant
 	}
@@ -425,6 +435,7 @@ func (s *Supervisor) onActorExit(id session.Identity, reason session.EndReason) 
 		delete(s.sessions, id.SessionID)
 		delete(s.cancels, id.SessionID)
 		delete(s.tenants, id.SessionID)
+		delete(s.safetyBySession, id.SessionID)
 		metrics.Add("agentflow_sessions_active", -1)
 		metrics.Inc("agentflow_children_died")
 		if s.retired != nil {

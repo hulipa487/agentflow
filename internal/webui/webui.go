@@ -84,6 +84,7 @@ type Deps struct {
 	Studio        *studio.Broker
 	Workspace     *studio.Workspace
 	Channels      *studio.Channels
+	Safety        *studio.Safety
 	StudioCatalog func() studio.Catalog
 }
 
@@ -199,6 +200,14 @@ func (u *UI) API() http.Handler {
 	mux.HandleFunc("POST /admin/api/studio/channels", u.handleStudioChannelCreate)
 	mux.HandleFunc("PUT /admin/api/studio/channels/{index}", u.handleStudioChannelPut)
 	mux.HandleFunc("DELETE /admin/api/studio/channels/{index}", u.handleStudioChannelDelete)
+	mux.HandleFunc("GET /admin/api/studio/safety", u.handleStudioSafety)
+	mux.HandleFunc("POST /admin/api/studio/safety/validate", u.handleStudioSafetyValidate)
+	mux.HandleFunc("POST /admin/api/studio/safety/profiles", u.handleStudioSafetyProfileCreate)
+	mux.HandleFunc("PUT /admin/api/studio/safety/profiles/{name}", u.handleStudioSafetyProfilePut)
+	mux.HandleFunc("DELETE /admin/api/studio/safety/profiles/{name}", u.handleStudioSafetyProfileDelete)
+	mux.HandleFunc("POST /admin/api/studio/safety/classifiers", u.handleStudioSafetyClassifierCreate)
+	mux.HandleFunc("PUT /admin/api/studio/safety/classifiers/{name}", u.handleStudioSafetyClassifierPut)
+	mux.HandleFunc("DELETE /admin/api/studio/safety/classifiers/{name}", u.handleStudioSafetyClassifierDelete)
 	return mux
 }
 

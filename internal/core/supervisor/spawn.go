@@ -93,7 +93,18 @@ func (s *Supervisor) Spawn(ctx context.Context, parent session.Identity, profile
 		}
 	}
 
-	a := session.New(skey, identity, info, s.gw, s, s.sched, s.users, tmpl.Safety, tmpl.Handlers, s.pool, s.log)
+	safe := tmpl.Safety
+	if tmpl.InheritSafety {
+		// The profile did not name a chain: run the parent's. A nested spawn
+		// finds its parent in the same map, so inheritance is transitive
+		// without the supervisor needing the parent actor's internals.
+		s.mu.Lock()
+		if parentSafe, ok := s.safetyBySession[parent.SessionID]; ok && parentSafe != nil {
+			safe = parentSafe
+		}
+		s.mu.Unlock()
+	}
+	a := session.New(skey, identity, info, s.gw, s, s.sched, s.users, safe, tmpl.Handlers, s.pool, s.log)
 	a.LoopFile = tmpl.LoopFile
 	a.LoopSrc = tmpl.LoopSrc
 	a.SupportSrcs = support
@@ -114,6 +125,7 @@ func (s *Supervisor) Spawn(ctx context.Context, parent session.Identity, profile
 	}
 	s.sessions[skey] = a
 	s.cancels[skey] = cancel
+	s.safetyBySession[skey] = safe
 	if tenant != "" {
 		s.tenants[skey] = tenant
 	}

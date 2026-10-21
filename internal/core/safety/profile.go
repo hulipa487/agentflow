@@ -18,6 +18,18 @@ func FilterNames() []string {
 	return out
 }
 
+// Builtin returns the baseline-configured filter with this name. It is the
+// lookup main uses to compose a profile that mixes builtin filters with
+// configured classifier filters.
+func Builtin(name string) (Filter, bool) {
+	for _, f := range DefaultProfile().Filters {
+		if f.Name() == name {
+			return f, true
+		}
+	}
+	return nil, false
+}
+
 // ProfileOf builds a profile from baseline filter names, keeping each selected
 // filter as the baseline configures it (its phrases and patterns, not a bare
 // zero value).

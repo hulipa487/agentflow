@@ -43,6 +43,7 @@ import (
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/memory"
 	"agentflow/internal/core/metrics"
+	"agentflow/internal/core/moderation"
 	"agentflow/internal/core/netguard"
 	"agentflow/internal/core/oidc"
 	"agentflow/internal/core/pool"
@@ -800,6 +801,55 @@ func main() {
 			return h(ctx, op)
 		}
 	}
+	// Model-backed safety classifiers are built once and shared by every
+	// agent profile that references them. Each client owns its cache, breaker
+	// and concurrency limit; the policy (thresholds, label actions) is applied
+	// per agent by the safety filter.
+	classifierClients := map[string]*moderation.Client{}
+	for cname, p := range cfg.Safety.Classifiers {
+		prompt := ""
+		if p.Prompt != "" {
+			prompt = cfg.Prompts[p.Prompt].Content
+		}
+		labels := make([]string, 0, len(p.Categories))
+		for label := range p.Categories {
+			labels = append(labels, label)
+		}
+		sort.Strings(labels)
+		var modPool *budget.Pool
+		if p.Budget.TokensPerDay > 0 {
+			modPool = budget.NewPool(p.Budget.TokensPerDay)
+			// Moderation has its own ledger bucket, so its spend never drains
+			// an agent's tokens_per_day pool or a user's LLM quota.
+			modPool.SetUsageSource(agentDayUsage("__moderation_" + cname))
+			modPool.StartDailyReset()
+		}
+		concurrency := p.MaxConcurrency
+		if concurrency == 0 {
+			concurrency = 8
+		}
+		client, err := moderation.New(llmMgr, moderation.Options{
+			Name:           cname,
+			Model:          p.Model,
+			Prompt:         prompt,
+			Labels:         labels,
+			MaxTokens:      p.MaxTokens,
+			MaxConcurrency: concurrency,
+			CacheSize:      p.Cache.Size,
+			CacheTTL:       p.CacheTTLD(),
+			Pool:           modPool,
+			Ledger:         usageWriter,
+			Events:         usageEvents,
+			LedgerAgent:    "__moderation_" + cname,
+			Log:            log,
+		})
+		if err != nil {
+			log.Error("safety classifier failed", "classifier", cname, "err", err)
+			os.Exit(1)
+		}
+		classifierClients[cname] = client
+	}
+
 	// buildAgentDef resolves one configured agent into a supervisor
 	// definition. It is the single recipe for agent construction: the boot
 	// loop and the runtime registry (PUT /admin/api/agents/{name}, via the
@@ -942,7 +992,10 @@ func main() {
 		}
 
 		canContact := stringSet(a.CanContact)
-		safeDispatcher := resolveSafety(cfg, a.Safety)
+		safeDispatcher, err := resolveSafety(cfg, a.Safety, classifierClients, name)
+		if err != nil {
+			return nil, err
+		}
 		return &supervisor.AgentDef{
 			Info: &session.Info{
 				Name:          name,
@@ -1107,18 +1160,24 @@ func main() {
 			log.Warn("capabilities withheld from spawn profile", "profile", pname, "ops", strings.Join(withheld, "; "))
 		}
 
+		safeDispatcher, err := resolveSafety(cfg, p.Safety, classifierClients, pname)
+		if err != nil {
+			log.Error("spawn profile safety resolution failed", "profile", pname, "err", err)
+			os.Exit(1)
+		}
 		tmpl := &supervisor.SpawnTemplate{
-			Name:         pname,
-			LoopFile:     watchPath,
-			LoopSrc:      src,
-			Model:        p.Model,
-			Instructions: p.Instructions.File,
-			Shell:        shellProfileMap(cfg, p.Shell),
-			CanContact:   stringSet(p.CanContact),
-			Capabilities: profileCaps,
-			Skills:       p.Skills,
-			Handlers:     handlers,
-			Safety:       resolveSafety(cfg, ""),
+			Name:          pname,
+			LoopFile:      watchPath,
+			LoopSrc:       src,
+			Model:         p.Model,
+			Instructions:  p.Instructions.File,
+			Shell:         shellProfileMap(cfg, p.Shell),
+			CanContact:    stringSet(p.CanContact),
+			Capabilities:  profileCaps,
+			Skills:        p.Skills,
+			Handlers:      handlers,
+			Safety:        safeDispatcher,
+			InheritSafety: p.Safety == "",
 			Memory: &session.Info{
 				Name:          "spawn:" + pname,
 				Model:         p.Model,
@@ -1208,6 +1267,7 @@ func main() {
 	var studioBroker *studio.Broker
 	var studioWS *studio.Workspace
 	var channelsStore *studio.Channels
+	var safetyStore *studio.Safety
 	if cfg.Runtime.Studio.IsEnabled() {
 		studioBroker = studio.NewBroker(sup, journalSink, studio.Config{
 			TraceEvents:   cfg.Runtime.Studio.TraceEvents,
@@ -1234,6 +1294,7 @@ func main() {
 			}
 			return names
 		}, log)
+		safetyStore = studio.NewSafety(cfg, cfgSource.ConfigDir(), cfgSource.ConfigPath(), log)
 	}
 	// Per-tenant resource bounds (E18). Both are opt-in: 0 disables. The op
 	// pool's fairness, the sharpest bound, is not here — it is how the pool
@@ -1792,6 +1853,7 @@ func main() {
 			Studio:     studioBroker,
 			Workspace:  studioWS,
 			Channels:   channelsStore,
+			Safety:     safetyStore,
 			StudioCatalog: func() studio.Catalog {
 				models := make([]string, 0)
 				for name := range llmMgr.List() {
@@ -2239,26 +2301,82 @@ func stringSet(values []string) map[string]bool {
 
 // resolveSafety turns a safety profile reference into a dispatcher. "" or
 // "none" opts out entirely; "default" is the built-in baseline; any other name
-// is a profiles.safety entry, which selects from the baseline's filters by name.
+// is a profiles.safety entry. That entry may mix baseline filters with
+// classifier:<name> references, which resolve against the process's classifier
+// registry.
 //
-// The named case is new. It used to fall through to safety.None with no
-// warning, so a profiles.safety map was parsed by YAML and read by nothing, and
-// a typo in an agent's safety: field turned the chain off silently — the
-// opposite of failing closed. config.validate now rejects an unknown name at
-// load, so the fallback below is defensive only, and it falls back to the
-// baseline rather than to none.
-func resolveSafety(cfg *config.Config, ref string) *safety.Dispatcher {
+// An unresolvable reference is an error, not a silent downgrade. A previous
+// version fell through to safety.None, so a typo turned the chain off; the
+// agent build (and Studio Apply) now fails closed instead.
+func resolveSafety(cfg *config.Config, ref string, classifiers map[string]*moderation.Client, agent string) (*safety.Dispatcher, error) {
 	switch ref {
 	case "", "none":
-		return safety.New(safety.None)
+		return safety.New(safety.None), nil
 	case "default":
-		return safety.New(safety.DefaultProfile())
+		return safety.New(safety.DefaultProfile()), nil
 	}
 	sp, ok := cfg.Profiles.Safety[ref]
 	if !ok {
-		return safety.New(safety.DefaultProfile())
+		return nil, fmt.Errorf("safety profile %q is not configured", ref)
 	}
-	return safety.New(safety.ProfileOf(ref, sp.Filters))
+	filters := make([]safety.Filter, 0, len(sp.Filters))
+	for _, name := range sp.Filters {
+		if cname, ok := strings.CutPrefix(name, "classifier:"); ok {
+			client := classifiers[cname]
+			profile, exists := cfg.Safety.Classifiers[cname]
+			if !exists || client == nil {
+				return nil, fmt.Errorf("safety profile %q references classifier %q, which is not available in this process", ref, cname)
+			}
+			filters = append(filters, safety.NewClassifierFilter(classifierOptions(cname, profile, client, agent)))
+			continue
+		}
+		f, ok := safety.Builtin(name)
+		if !ok {
+			return nil, fmt.Errorf("safety profile %q references unknown filter %q", ref, name)
+		}
+		filters = append(filters, f)
+	}
+	return safety.New(&safety.Profile{Name: ref, Filters: filters}), nil
+}
+
+// classifierOptions translates a config definition into the safety filter's
+// policy. Defaults that are not applied during validation live here so a
+// hand-built config (tests) behaves like a loaded one.
+func classifierOptions(name string, p config.ClassifierProfile, client *moderation.Client, agent string) safety.ClassifierOptions {
+	ingress, egress := true, true
+	if len(p.Directions) > 0 {
+		ingress, egress = false, false
+		for _, d := range p.Directions {
+			switch d {
+			case "ingress":
+				ingress = true
+			case "egress":
+				egress = true
+			}
+		}
+	}
+	maxInput := p.MaxInputChars
+	if maxInput == 0 {
+		maxInput = 8000
+	}
+	return safety.ClassifierOptions{
+		Name:          name,
+		Agent:         agent,
+		Classifier:    client,
+		Ingress:       ingress,
+		Egress:        egress,
+		Sources:       p.Sources,
+		Threshold:     p.ThresholdValue(),
+		Categories:    p.Categories,
+		Mode:          p.Mode,
+		Timeout:       p.TimeoutD(),
+		OnError:       p.OnError,
+		OnSaturated:   p.OnSaturated,
+		OnBudget:      p.OnBudget,
+		MaxInputChars: maxInput,
+		Refusal:       p.Refusal,
+		Fallback:      p.Fallback,
+	}
 }
 
 // budgetTokens extracts the tokens_per_day from the agent's budget config.

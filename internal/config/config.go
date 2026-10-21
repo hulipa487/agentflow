@@ -36,6 +36,7 @@ type Config struct {
 	Models   map[string]Model  `yaml:"models"`
 	Memory   Memory            `yaml:"memory"`
 	Profiles Profiles          `yaml:"profiles"`
+	Safety   SafetyConfig      `yaml:"safety"`
 	Gateway  Gateway           `yaml:"gateway"`
 	MCP      MCP               `yaml:"mcp"`
 	Tools    Tools             `yaml:"tools"`
@@ -631,6 +632,82 @@ type SafetyProfile struct {
 	Filters []string `yaml:"filters"`
 }
 
+// SafetyConfig holds deployment-wide model classifiers. Profiles reference
+// them by name as "classifier:<name>" in profiles.safety.<name>.filters.
+type SafetyConfig struct {
+	Classifiers map[string]ClassifierProfile `yaml:"classifiers"`
+}
+
+// ClassifierProfile is one model-backed moderation/classification policy.
+// The model returns a label and a score; this policy maps labels to actions.
+type ClassifierProfile struct {
+	Model  string `yaml:"model"`
+	Prompt string `yaml:"prompt"`
+	Mode   string `yaml:"mode"` // enforce | shadow
+	// Directions selects where the classifier runs. Empty means both.
+	Directions []string `yaml:"directions"`
+	// Sources selects message sources. Empty means channel and agent.
+	Sources []string `yaml:"sources"`
+	// Threshold is the minimum score for a label's action to apply. Nil
+	// means 0.7; an explicit 0 is a valid "block everything" policy.
+	Threshold   *float64          `yaml:"threshold"`
+	Categories  map[string]string `yaml:"categories"` // label -> allow | review | block
+	Timeout     string            `yaml:"timeout"`
+	OnError     string            `yaml:"on_error"`            // block | pass
+	OnSaturated string            `yaml:"on_saturated"`        // block | pass
+	OnBudget    string            `yaml:"on_budget_exhausted"` // block | pass
+	// MaxTokens caps the classifier's answer; empty/zero means 64. Keep it
+	// small: the model returns one label, a score and a short reason.
+	MaxTokens      int              `yaml:"max_tokens"`
+	MaxInputChars  int              `yaml:"max_input_chars"`
+	MaxConcurrency int              `yaml:"max_concurrency"`
+	Cache          ClassifierCache  `yaml:"cache"`
+	Budget         ClassifierBudget `yaml:"budget"`
+	Refusal        string           `yaml:"refusal"`
+	Fallback       string           `yaml:"fallback"`
+}
+
+type ClassifierCache struct {
+	Size int    `yaml:"size"`
+	TTL  string `yaml:"ttl"`
+}
+
+type ClassifierBudget struct {
+	TokensPerDay int64 `yaml:"tokens_per_day"`
+}
+
+// ThresholdValue returns the configured score threshold or the default.
+func (p ClassifierProfile) ThresholdValue() float64 {
+	if p.Threshold == nil {
+		return 0.7
+	}
+	return *p.Threshold
+}
+
+// TimeoutD returns the classifier timeout, defaulting to two seconds.
+func (p ClassifierProfile) TimeoutD() time.Duration {
+	if p.Timeout == "" {
+		return 2 * time.Second
+	}
+	d, err := time.ParseDuration(p.Timeout)
+	if err != nil || d <= 0 {
+		return 2 * time.Second
+	}
+	return d
+}
+
+// CacheTTLD returns the cache TTL, defaulting to five minutes.
+func (p ClassifierProfile) CacheTTLD() time.Duration {
+	if p.Cache.TTL == "" {
+		return 5 * time.Minute
+	}
+	d, err := time.ParseDuration(p.Cache.TTL)
+	if err != nil || d <= 0 {
+		return 5 * time.Minute
+	}
+	return d
+}
+
 // MemoryProfile defines logical stores and the filter chain.
 type MemoryProfile struct {
 	Stores map[string]Store `yaml:"stores"`
@@ -703,6 +780,7 @@ type SpawnProfile struct {
 	Instructions InstructionsRef `yaml:"instructions"`
 	Memory       string          `yaml:"memory"`
 	Shell        string          `yaml:"shell"`
+	Safety       string          `yaml:"safety"`
 	Skills       []string        `yaml:"skills"`
 	Capabilities []string        `yaml:"capabilities"`
 	CanContact   []string        `yaml:"can_contact"`
@@ -1349,11 +1427,18 @@ func validateSafetyProfiles(path string, c *Config) error {
 	for _, n := range safety.FilterNames() {
 		known[n] = true
 	}
+	var classifierRefs []string
+	for name := range c.Safety.Classifiers {
+		ref := "classifier:" + name
+		known[ref] = true
+		classifierRefs = append(classifierRefs, ref)
+	}
+	knownList := append(append([]string{}, safety.FilterNames()...), classifierRefs...)
 	for pname, p := range c.Profiles.Safety {
 		for _, f := range p.Filters {
 			if !known[f] {
 				return fmt.Errorf("%s: profiles.safety %q names unknown filter %q (known: %s)",
-					path, pname, f, strings.Join(safety.FilterNames(), ", "))
+					path, pname, f, strings.Join(knownList, ", "))
 			}
 		}
 	}
@@ -1365,6 +1450,145 @@ func validateSafetyProfiles(path string, c *Config) error {
 				return fmt.Errorf("%s: agent %q references unknown safety profile %q (use \"default\", \"none\", or a profiles.safety entry)",
 					path, name, a.Safety)
 			}
+		}
+	}
+	for name, p := range c.Profiles.Agent {
+		switch p.Safety {
+		case "", "none", "default":
+		default:
+			if _, ok := c.Profiles.Safety[p.Safety]; !ok {
+				return fmt.Errorf("%s: spawn profile %q references unknown safety profile %q (use \"default\", \"none\", or a profiles.safety entry)",
+					path, name, p.Safety)
+			}
+		}
+	}
+	return nil
+}
+
+// ValidateSafetySections checks a proposed replacement for the deployment's
+// safety profiles and classifiers against the rest of the config. It runs the
+// same two checks boot runs, so a Studio edit is refused for the reasons a
+// restart would fail: an unknown filter, a classifier that names an unknown or
+// user-keyed model, or a profile an agent still references disappearing.
+func ValidateSafetySections(path string, base *Config, profiles map[string]SafetyProfile, classifiers map[string]ClassifierProfile) error {
+	if base == nil {
+		return fmt.Errorf("%s: no configuration to validate against", path)
+	}
+	clone := *base
+	clone.Profiles.Safety = profiles
+	clone.Safety.Classifiers = classifiers
+	if err := validateClassifiers(path, &clone); err != nil {
+		return err
+	}
+	return validateSafetyProfiles(path, &clone)
+}
+
+// validateClassifiers checks the model-backed safety classifiers. The model
+// must exist and be engine-keyed: a user-keyed moderation model would let a
+// user without a key disable the classifier. Labels with no allow action are
+// rejected because the model would then have no way to say "benign".
+func validateClassifiers(path string, c *Config) error {
+	validSource := map[string]bool{
+		"channel": true, "agent": true, "scheduler": true, "system": true,
+	}
+	for name, p := range c.Safety.Classifiers {
+		if name == "" || strings.ContainsAny(name, " \t/:|") {
+			return fmt.Errorf("%s: safety.classifiers: %q is not a valid classifier name", path, name)
+		}
+		if p.Model == "" {
+			return fmt.Errorf("%s: safety.classifiers.%s: model is required", path, name)
+		}
+		m, ok := c.Models[p.Model]
+		if !ok {
+			return fmt.Errorf("%s: safety.classifiers.%s references unknown model %q", path, name, p.Model)
+		}
+		switch m.Provider {
+		case "anthropic", "openai", "openai-responses", "gemini":
+		default:
+			return fmt.Errorf("%s: safety.classifiers.%s model %q uses provider %q, which cannot answer a classification call", path, name, p.Model, m.Provider)
+		}
+		if m.UserKeyed() {
+			return fmt.Errorf("%s: safety.classifiers.%s model %q has key_source: user; a classifier must use an engine-owned key so a missing user key cannot disable moderation", path, name, p.Model)
+		}
+		if p.Prompt != "" {
+			if _, ok := c.Prompts[p.Prompt]; !ok {
+				return fmt.Errorf("%s: safety.classifiers.%s references unknown prompt %q", path, name, p.Prompt)
+			}
+		}
+		switch p.Mode {
+		case "", "enforce", "shadow":
+		default:
+			return fmt.Errorf("%s: safety.classifiers.%s: mode %q is not enforce or shadow", path, name, p.Mode)
+		}
+		for _, d := range p.Directions {
+			switch d {
+			case "ingress", "egress":
+			default:
+				return fmt.Errorf("%s: safety.classifiers.%s: direction %q is not ingress or egress", path, name, d)
+			}
+		}
+		for _, s := range p.Sources {
+			if !validSource[s] {
+				return fmt.Errorf("%s: safety.classifiers.%s: source %q is not channel, agent, scheduler, or system", path, name, s)
+			}
+		}
+		if p.Threshold != nil && (*p.Threshold < 0 || *p.Threshold > 1) {
+			return fmt.Errorf("%s: safety.classifiers.%s: threshold must be between 0 and 1", path, name)
+		}
+		if p.Timeout != "" {
+			if d, err := time.ParseDuration(p.Timeout); err != nil || d <= 0 {
+				return fmt.Errorf("%s: safety.classifiers.%s: timeout %q must be a positive duration", path, name, p.Timeout)
+			}
+		}
+		for _, field := range []struct {
+			name  string
+			value string
+		}{
+			{"on_error", p.OnError},
+			{"on_saturated", p.OnSaturated},
+			{"on_budget_exhausted", p.OnBudget},
+		} {
+			switch field.value {
+			case "", "block", "pass":
+			default:
+				return fmt.Errorf("%s: safety.classifiers.%s: %s %q is not block or pass", path, name, field.name, field.value)
+			}
+		}
+		if len(p.Categories) == 0 {
+			return fmt.Errorf("%s: safety.classifiers.%s: categories must name at least one label", path, name)
+		}
+		allow := false
+		for label, action := range p.Categories {
+			switch action {
+			case "allow":
+				allow = true
+			case "review", "block":
+			default:
+				return fmt.Errorf("%s: safety.classifiers.%s: category %q action %q is not allow, review, or block", path, name, label, action)
+			}
+		}
+		if !allow {
+			return fmt.Errorf("%s: safety.classifiers.%s: categories need at least one allow label (for example safe: allow), or the model has no way to report benign text", path, name)
+		}
+		if p.MaxTokens < 0 {
+			return fmt.Errorf("%s: safety.classifiers.%s: max_tokens must not be negative", path, name)
+		}
+		if p.MaxInputChars < 0 {
+			return fmt.Errorf("%s: safety.classifiers.%s: max_input_chars must not be negative", path, name)
+		}
+		if p.MaxConcurrency < 0 {
+			return fmt.Errorf("%s: safety.classifiers.%s: max_concurrency must not be negative", path, name)
+		}
+		if p.Cache.Size < 0 {
+			return fmt.Errorf("%s: safety.classifiers.%s: cache.size must not be negative", path, name)
+		}
+		if p.Cache.TTL != "" {
+			if d, err := time.ParseDuration(p.Cache.TTL); err != nil || d <= 0 {
+				return fmt.Errorf("%s: safety.classifiers.%s: cache.ttl %q must be a positive duration", path, name, p.Cache.TTL)
+			}
+		}
+		if p.Budget.TokensPerDay < 0 {
+			return fmt.Errorf("%s: safety.classifiers.%s: budget.tokens_per_day must not be negative", path, name)
 		}
 	}
 	return nil
@@ -1624,6 +1848,11 @@ func validate(path string, c *Config) error {
 		if err := scopingCheck(fmt.Sprintf("memory profile %q", pname), p.Stores); err != nil {
 			return err
 		}
+	}
+
+	// Model-backed classifiers must resolve before profiles reference them.
+	if err := validateClassifiers(path, c); err != nil {
+		return err
 	}
 
 	// Safety profile names. An unknown one used to resolve to safety.None with

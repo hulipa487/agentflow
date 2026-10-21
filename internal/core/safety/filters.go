@@ -131,8 +131,10 @@ func (g AffectGuard) Egress(_ context.Context, in EgressInput) EgressResult {
 	return EgressResult{Text: in.Text}
 }
 
-// DefaultProfile returns a baseline profile with all five filters configured
-// conservatively. Deployments can override via YAML.
+// DefaultProfile returns a baseline profile with all five builtin filters
+// configured conservatively. A deployment can select a subset by name in
+// profiles.safety and can add model-backed classifier:<name> filters from
+// safety.classifiers; the builtin phrase lists themselves stay compiled in.
 func DefaultProfile() *Profile {
 	return &Profile{
 		Name: "default",

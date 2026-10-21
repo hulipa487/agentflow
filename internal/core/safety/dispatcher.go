@@ -4,7 +4,10 @@
 //
 // The dispatcher delegates to a configured SafetyProfile, which selects
 // deterministic builtin filters. The filters may annotate a per-turn context
-// or mutate/drop text. Filters never autonomously contact external services.
+// or mutate/drop text. Builtin filters never contact external services; a
+// classifier filter is different by construction: it calls the model behind the
+// injected Classifier interface, and its timeout, cache and failure policy are
+// part of ClassifierOptions.
 package safety
 
 import (
@@ -17,12 +20,29 @@ type IngressInput struct {
 	Source  string // channel | agent | scheduler | system
 }
 
+// SafetyMeta describes a classifier verdict for the trace and audit journal.
+// It never carries message text.
+type SafetyMeta struct {
+	Classifier string  `json:"classifier,omitempty"`
+	Label      string  `json:"label,omitempty"`
+	Action     string  `json:"action,omitempty"`
+	Score      float64 `json:"score,omitempty"`
+	Model      string  `json:"model,omitempty"`
+	LatencyMS  int64   `json:"latency_ms,omitempty"`
+	Cached     bool    `json:"cached,omitempty"`
+}
+
 // IngressResult is the dispatcher's decision. If Drop is true, the message is
-// discarded and the loop never sees it. Otherwise Text replaces the original.
+// discarded and the loop never sees it. Skip additionally ends the turn
+// without handing the loop an empty message; Refusal, when set, is a
+// core-authored reply delivered instead. Otherwise Text replaces the original.
 type IngressResult struct {
-	Text   string
-	Drop   bool
-	Reason string // auditable reason code, never logged with raw content
+	Text    string
+	Drop    bool
+	Skip    bool   // drop the turn rather than passing an empty message
+	Refusal string // optional core-authored reply for a dropped turn
+	Reason  string // auditable reason code, never logged with raw content
+	Meta    *SafetyMeta
 }
 
 // EgressInput is what the dispatcher receives before the gateway sends a reply.
@@ -32,11 +52,14 @@ type EgressInput struct {
 }
 
 // EgressResult is the dispatcher's decision. If Drop is true, the reply is
-// suppressed (nothing is sent). Otherwise Text replaces the original.
+// suppressed (nothing is sent). Fallback, when set, is a core-authored reply
+// delivered instead of the blocked text. Otherwise Text replaces the original.
 type EgressResult struct {
-	Text   string
-	Drop   bool
-	Reason string
+	Text     string
+	Drop     bool
+	Fallback string
+	Reason   string
+	Meta     *SafetyMeta
 }
 
 // Filter is a single safety filter. Filters are chained in profile order.
@@ -83,17 +106,21 @@ func (d *Dispatcher) Ingress(ctx context.Context, in IngressInput) IngressResult
 	}
 	text := in.Message
 	reason := ""
+	var meta *SafetyMeta
 	for _, f := range d.profile.Filters {
 		res := f.Ingress(ctx, IngressInput{Message: text, Source: in.Source})
-		if res.Drop {
+		if res.Drop || res.Skip {
 			return res
 		}
 		text = res.Text
 		if res.Reason != "" {
 			reason = res.Reason
 		}
+		if res.Meta != nil {
+			meta = res.Meta
+		}
 	}
-	return IngressResult{Text: text, Reason: reason}
+	return IngressResult{Text: text, Reason: reason, Meta: meta}
 }
 
 // Egress runs all egress filters in order. If any filter drops, the chain stops.
@@ -104,6 +131,7 @@ func (d *Dispatcher) Egress(ctx context.Context, in EgressInput) EgressResult {
 	}
 	text := in.Text
 	reason := ""
+	var meta *SafetyMeta
 	for _, f := range d.profile.Filters {
 		res := f.Egress(ctx, EgressInput{Text: text, Source: in.Source})
 		if res.Drop {
@@ -113,8 +141,11 @@ func (d *Dispatcher) Egress(ctx context.Context, in EgressInput) EgressResult {
 		if res.Reason != "" {
 			reason = res.Reason
 		}
+		if res.Meta != nil {
+			meta = res.Meta
+		}
 	}
-	return EgressResult{Text: text, Reason: reason}
+	return EgressResult{Text: text, Reason: reason, Meta: meta}
 }
 
 // Profile returns the active profile name.

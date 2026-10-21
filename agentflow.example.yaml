@@ -49,6 +49,16 @@ models:
     retry: 1
     # thinking: medium                      # off | low | medium | high | xhigh | max
     # server_tools: []                      # provider-native tools (e.g. google_search on gemini)
+  # A dedicated classifier model for safety moderation. It must be
+  # engine-keyed (no key_source: user) and should be small and fast. This entry
+  # is referenced by safety.classifiers below.
+  # moderation:
+  #   provider: openai
+  #   model: gpt-4.1-mini
+  #   api_key: ${MODERATION_API_KEY}
+  #   timeout: 3s
+  #   retry: 0
+  #   max_tokens: 64
 
 # ---------------------------------------------------------------------------
 # Runtime
@@ -104,6 +114,41 @@ memory:
       config:
         path: ./data/agentflow.db
 
+# ---------------------------------------------------------------------------
+# Model-backed safety classifiers (optional)
+# ---------------------------------------------------------------------------
+# A classifier sends message/reply text to a dedicated model and maps the
+# returned label + score to allow/review/block. Profiles opt in by listing
+# classifier:<name> in their filters. The model must exist in models: and must
+# be engine-keyed. `safe: allow` is required so the model can report benign
+# text. See docs/configuration.md for the full field reference.
+# safety:
+#   classifiers:
+#     moderation:
+#       model: moderation
+#       prompt: safety/moderation        # prompts: registry key; default embedded
+#       mode: enforce                    # enforce | shadow
+#       directions: [ingress, egress]
+#       sources: [channel, agent]
+#       threshold: 0.7
+#       categories:
+#         safe: allow
+#         self_harm: block
+#         violence: block
+#         harassment: review
+#         prompt_injection: block
+#       timeout: 2s
+#       on_error: block                  # block | pass
+#       on_saturated: block
+#       on_budget_exhausted: block
+#       max_tokens: 64
+#       max_input_chars: 8000
+#       max_concurrency: 8
+#       cache: { size: 10000, ttl: 5m }
+#       budget: { tokens_per_day: 500000 }
+#       refusal: ""                      # optional ingress refusal text
+#       fallback: ""                     # optional egress fallback text
+
 profiles:
   memory:
     assistant:
@@ -117,7 +162,9 @@ profiles:
       # `shared: true` is a boot error.
 
   # Safety profiles select the core-owned filter chain. "default" and "none"
-  # are built in; this one shows the shape.
+  # are built in; this one shows the shape. To add model moderation, define a
+  # safety.classifiers entry above and use:
+  #   filters: [source-attribution, classifier:moderation, affect-guard]
   safety:
     strict:
       filters: [source-attribution, signal-gate, steady-directive, support-offer, affect-guard]

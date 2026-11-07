@@ -1226,6 +1226,14 @@ func main() {
 	// the dashboard can be created before the supervisor.
 	var sup *supervisor.Supervisor
 	var dash *tui.Dashboard
+	// exit is os.Exit for everything after this point. os.Exit skips deferred
+	// calls, so a boot failure once the dashboard owns the terminal used to
+	// leave the shell in raw mode on the alternate screen; Stop restores it
+	// first (and is a no-op without a dashboard).
+	exit := func(code int) {
+		dash.Stop()
+		os.Exit(code)
+	}
 	if tuiActive {
 		dash = tui.Start(tui.Source{
 			// Bubble Tea owns the terminal in raw mode, so ctrl+c is a key
@@ -1302,7 +1310,7 @@ func main() {
 	sup.SetSessionCap(cfg.Runtime.Limits.SessionsPerTenant)
 	if mem, err := parseByteSize(cfg.Runtime.VM.MemoryLimit); err != nil {
 		log.Error("runtime.vm.memory_limit is not a size", "value", *cfg.Runtime.VM.MemoryLimit, "err", err)
-		os.Exit(1)
+		exit(1)
 	} else if mem > 0 {
 		sup.SetVMMemory(mem)
 	}
@@ -1318,7 +1326,7 @@ func main() {
 	hubQueue, err := inbox.Open(cfg.ClusterStore(), leaseMgr.Owner(), log)
 	if err != nil {
 		log.Error("session inbox failed", "err", err)
-		os.Exit(1)
+		exit(1)
 	}
 	defer hubQueue.Close()
 	hub := sessionhub.New(leaseMgr, hubQueue, sup.DeliverLocal, log)
@@ -1521,7 +1529,7 @@ func main() {
 	routeSrc, routeWatchPath, err := builtins.Resolve(routeRef)
 	if err != nil {
 		log.Error("route plugin resolve failed", "err", err)
-		os.Exit(1)
+		exit(1)
 	}
 	rtr := router.New(routeSrc, caps.TriggersResponse(cfg.Triggers), sup, log)
 	// Route handlers get durable, deployment-wide state. A handler's Lua state
@@ -1633,7 +1641,7 @@ func main() {
 			// Config validation already rejects this pairing; the check stays
 			// so a future refactor cannot mount a dead endpoint.
 			log.Error("users API requires runtime.identity.enabled")
-			os.Exit(1)
+			exit(1)
 		}
 		// Identity provider (opt-in): the engine verifies access tokens rather
 		// than logging anyone in. An unreachable issuer fails the boot — a
@@ -1650,7 +1658,7 @@ func main() {
 			}, log)
 			if err != nil {
 				log.Error("identity provider unusable", "err", err, "issuer", oc.Issuer)
-				os.Exit(1)
+				exit(1)
 			}
 			oidcVerifier = v
 			log.Info("identity provider enabled", "issuer", oc.Issuer,
@@ -1755,12 +1763,12 @@ func main() {
 	// surface before "agentflow up".
 	if err := httpSrv.Start(); err != nil {
 		log.Error("httpd server failed to start", "listen", cfg.Gateway.Listen, "err", err)
-		os.Exit(1)
+		exit(1)
 	}
 	for _, d := range telegramDrivers {
 		if err := d.Start(ctx); err != nil {
 			log.Error("channel start failed", "channel", d.Name(), "err", err)
-			os.Exit(1)
+			exit(1)
 		}
 	}
 
@@ -1803,7 +1811,7 @@ func main() {
 	adminToken, tokErr := resolveAdminTokenWithOperators(os.Getenv("ADMIN_TOKEN"), authListen, len(cfg.Runtime.Admin.Operators) > 0, log)
 	if tokErr != nil {
 		log.Error("admin plane has no usable authentication", "err", tokErr)
-		os.Exit(1)
+		exit(1)
 	}
 	admin := metrics.NewAdminServer(adminAddr, adminToken, metricReg, log)
 	admin.SetCORS(cfg.Runtime.Admin.CORSOrigins)
@@ -1914,7 +1922,7 @@ func main() {
 		l, err := metrics.ListenLocalAdmin(adminSocket)
 		if err != nil {
 			log.Error("admin local listener failed", "socket", adminSocket, "err", err)
-			os.Exit(1)
+			exit(1)
 		}
 		log.Info("admin local listener", "socket", adminSocket)
 		go func() {

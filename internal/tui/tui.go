@@ -11,6 +11,7 @@ package tui
 
 import (
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -59,6 +60,7 @@ type Model struct {
 	src     Source
 	mu      sync.Mutex
 	pending []string // log lines buffered before/without a running program
+	history []string // every line pushed while running, for the exit tail
 
 	active int
 	idle   int
@@ -69,6 +71,12 @@ type Model struct {
 	height int
 	prog   *tea.Program
 	quit   sync.Once
+
+	// finished is set once the program has handed the terminal back; from
+	// then on log lines are written to after instead of an invisible pane.
+	finished   bool
+	after      io.Writer
+	finishOnce sync.Once
 }
 
 const maxLogs = 200
@@ -98,14 +106,48 @@ func (m *Model) SetProgram(p *tea.Program) {
 // one line or every record renders twice.
 func (m *Model) PushLog(line string) {
 	m.mu.Lock()
+	if m.finished {
+		out := m.after
+		m.mu.Unlock()
+		if out != nil {
+			fmt.Fprintln(out, line)
+		}
+		return
+	}
 	prog := m.prog
 	if prog == nil {
 		m.pending = append(m.pending, line)
+	} else {
+		// Keep a copy here too: the update loop's slice is not safe to read
+		// from another goroutine, and the exit tail is read from this one.
+		m.history = append(m.history, line)
+		if len(m.history) > maxLogs {
+			m.history = m.history[len(m.history)-maxLogs:]
+		}
 	}
 	m.mu.Unlock()
 	if prog != nil {
 		prog.Send(logMsg(line))
 	}
+}
+
+// finish records that the terminal is restored, reprints the last n log
+// lines on it so the operator can see how the engine ended, and routes every
+// later line to out. It runs once; later calls do nothing.
+func (m *Model) finish(out io.Writer, n int) {
+	m.finishOnce.Do(func() {
+		m.mu.Lock()
+		lines := append(append([]string(nil), m.history...), m.pending...)
+		m.finished = true
+		m.after = out
+		m.mu.Unlock()
+		if len(lines) > n {
+			lines = lines[len(lines)-n:]
+		}
+		if out != nil && len(lines) > 0 {
+			fmt.Fprintln(out, strings.Join(lines, "\n"))
+		}
+	})
 }
 
 func (m *Model) drainPending() {

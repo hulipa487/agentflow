@@ -418,6 +418,44 @@ func (h *Handle) queryAll(table string) (memory.Iterator, error) {
 	return &rowsIter{rows: rows}, nil
 }
 
+// ExportRows implements memory.RowExporter.
+func (h *Handle) ExportRows(table string) ([]memory.ExportRecord, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	rows, err := h.db.QueryContext(ctx,
+		`SELECT key, value, embedding, expires_at FROM kv
+		 WHERE table_name = ? AND (expires_at IS NULL OR expires_at > ?)
+		 ORDER BY updated_at, key`,
+		table, time.Now().Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []memory.ExportRecord
+	for rows.Next() {
+		var key, raw string
+		var emb []byte
+		var exp sql.NullInt64
+		if err := rows.Scan(&key, &raw, &emb, &exp); err != nil {
+			return nil, err
+		}
+		rec := memory.ExportRecord{Key: key}
+		if err := json.Unmarshal([]byte(raw), &rec.Value); err != nil {
+			return nil, fmt.Errorf("sqlite: %s/%s: %w", table, key, err)
+		}
+		if len(emb) > 0 {
+			if rec.Vector, err = decodeVector(emb); err != nil {
+				return nil, fmt.Errorf("sqlite: %s/%s: %w", table, key, err)
+			}
+		}
+		if exp.Valid {
+			rec.ExpiresAt = time.Unix(exp.Int64, 0)
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
 func quoteFTS(s string) string {
 	parts := strings.Fields(s)
 	for i, p := range parts {

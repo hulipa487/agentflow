@@ -87,8 +87,8 @@ type Registry struct {
 }
 
 // Open creates the registry table and returns a handle. It does not write a row
-// yet: the caller checks for a competing instance first (CheckSingle), then
-// starts the heartbeat.
+// yet: CheckSingle writes the first one in a `single` deployment, and Start
+// keeps it fresh.
 func Open(c Config) (*Registry, error) {
 	if c.Owner == "" {
 		return nil, fmt.Errorf("fleet: empty owner")
@@ -217,21 +217,35 @@ func (r *Registry) listSince(ctx context.Context, since int64) ([]Instance, erro
 // unplanned fleet, and every symptom of that (sessions running twice, singleton
 // work per instance) looks like a bug rather than a topology mistake.
 //
+// It registers this instance before it looks. Reading first would let two
+// processes that start together both find an empty table and both come up.
+// Writing first means that of two racing checks at least the later one sees
+// the other, so two instances never both pass. When the writes land before
+// either read, both see each other and both are refused: neither can tell
+// whether the other already passed, and refusing both is the answer that is
+// never wrong. A refused instance takes its own row back out, so a peer that
+// did start does not list a process that never ran.
+//
 // A peer whose process is gone but whose row has not expired is exactly what
 // -force-single is for; waiting out LiveWindow is the other answer.
 func (r *Registry) CheckSingle(ctx context.Context) error {
+	if err := r.Heartbeat(ctx); err != nil {
+		return err
+	}
 	peers, err := r.Peers(ctx)
 	if err != nil {
 		return err
 	}
-	if len(peers) == 0 {
-		return nil
+	for _, p := range peers {
+		if _, err := r.st.Exec(ctx, `DELETE FROM instances WHERE owner = ?`, r.owner); err != nil {
+			r.log.Warn("refused instance row not removed", "err", err)
+		}
+		last := time.Unix(p.LastSeen, 0).Format(time.RFC3339)
+		return fmt.Errorf(
+			"another AgentFlow instance (%s, region %q zone %q, version %s) used this store, last seen %s; single topology allows one instance. Stop it, set runtime.topology: regional, or start with -force-single if it crashed",
+			p.Owner, p.Region, p.Zone, p.Version, last)
 	}
-	p := peers[0]
-	last := time.Unix(p.LastSeen, 0).Format(time.RFC3339)
-	return fmt.Errorf(
-		"another AgentFlow instance (%s, region %q zone %q, version %s) used this store, last seen %s; single topology allows one instance. Stop it, set runtime.topology: regional, or start with -force-single if it crashed",
-		p.Owner, p.Region, p.Zone, p.Version, last)
+	return nil
 }
 
 // Sweep deletes rows whose last heartbeat is older than the given cutoff.

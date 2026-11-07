@@ -17,7 +17,7 @@ func TestTimerTickRoutesThroughHub(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	router := &fakeRouter{}
 	sup := &Supervisor{
-		sessions: map[string]*session.Actor{},
+		sessions: map[string]*session.Actor{"bot|chat-1": {}},
 		hub:      router,
 		log:      log,
 	}
@@ -44,5 +44,19 @@ func TestTimerTickRoutesThroughHub(t *testing.T) {
 	a.deliver("bot|chat-1", scheduler.TimerID("t1"), scope)
 	if router.lastMsg.ID == second {
 		t.Fatalf("consecutive timer fires reused id %q", second)
+	}
+}
+
+// A tick that fires as its session exits must be dropped, not routed: the hub
+// would hand it to the supervisor, which spawns the conversation again just to
+// deliver a timer the dead session no longer has.
+func TestTimerTickForExitedSessionIsDropped(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	router := &fakeRouter{}
+	sup := &Supervisor{sessions: map[string]*session.Actor{}, hub: router, log: log}
+	a := newSchedulerAdapter(scheduler.New(log), sup, log)
+	a.deliver("bot|chat-1", scheduler.TimerID("t1"), session.SchedulerScope{})
+	if router.routed != 0 {
+		t.Fatalf("a tick for a session with no local actor was routed %d times", router.routed)
 	}
 }

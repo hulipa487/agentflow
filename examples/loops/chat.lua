@@ -1,4 +1,4 @@
--- af-prelude-version: 2
+-- af-prelude-version: 1
 -- A conversational loop with memory:
 --   1. recall earlier turns from the dialogue store (full-text query),
 --   2. build the prompt (system instructions + recalled turns + this turn),

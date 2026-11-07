@@ -74,6 +74,36 @@ type Lease struct {
 	userID   string
 	amount   int64
 	released bool
+	// stop ends the keep-alive of a hold with a deadline; nil when the hold
+	// store has none (the in-memory quota).
+	stop chan struct{}
+}
+
+// holdRenewer is a hold store whose holds expire and can be kept alive.
+type holdRenewer interface {
+	Renew(ctx context.Context, id string) error
+	TTL() time.Duration
+}
+
+// keepAlive renews the hold at a third of its TTL until the lease ends, so a
+// call that runs longer than the TTL stays bounded by its reservation.
+func (l *Lease) keepAlive(r holdRenewer) {
+	tick := time.NewTicker(r.TTL() / 3)
+	defer tick.Stop()
+	deadline := time.NewTimer(holdMaxLife)
+	defer deadline.Stop()
+	for {
+		select {
+		case <-l.stop:
+			return
+		case <-deadline.C:
+			return
+		case <-tick.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = r.Renew(ctx, l.id) // a missed renewal is retried on the next tick
+			cancel()
+		}
+	}
 }
 
 // Reserve checks the user's remaining daily budget and holds amount against it.
@@ -98,7 +128,12 @@ func (q *Quota) Reserve(ctx context.Context, userID string, amount int64) (*Leas
 		return nil, fmt.Errorf("%w: %d of %d tokens used today (%d in flight)",
 			ErrQuotaExhausted, used, limit, inFlight)
 	}
-	return &Lease{q: q, id: id, userID: userID, amount: amount}, nil
+	l := &Lease{q: q, id: id, userID: userID, amount: amount}
+	if r, ok := q.holds.(holdRenewer); ok {
+		l.stop = make(chan struct{})
+		go l.keepAlive(r)
+	}
+	return l, nil
 }
 
 // Commit ends a reservation. The durable record is the ledger row the caller
@@ -114,6 +149,9 @@ func (l *Lease) end() {
 		return
 	}
 	l.released = true
+	if l.stop != nil {
+		close(l.stop)
+	}
 	// Releasing is best-effort by design: a hold that cannot be deleted in the
 	// shared store expires on its own, which errs toward refusing a call rather
 	// than admitting one that should not fit.

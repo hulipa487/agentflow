@@ -28,10 +28,13 @@ import (
 )
 
 // storeTables are the tables `migrate store` knows how to copy: the runtime
-// store's planes, the identity registry and the credential store. Tenancy,
-// route state, session state, shell handles and file metadata live in
-// files_meta as key/value rows, so they move with that table.
+// store's planes, the identity registry, the credential store and the memory
+// rows (memoryTable, converted between the sqlite and postgres drivers' tables
+// rather than copied; see migrate_memory.go). Tenancy, route state, session
+// state, shell handles and file metadata live in files_meta as key/value rows,
+// so they move with that table.
 var storeTables = []string{
+	memoryTable,
 	"message_journal",
 	"files_meta",
 	"usage_daily",
@@ -142,6 +145,15 @@ func cmdMigrateStore(args []string, stdout, stderr io.Writer) int {
 
 	var copied int64
 	for _, table := range tables {
+		if table == memoryTable {
+			n, err := migrateMemory(ctx, src, dst, *from, *to, *appendRows, stdout)
+			if err != nil {
+				fmt.Fprintf(stderr, "migrate store: %s: %v\n", memoryTable, err)
+				return 1
+			}
+			copied += n
+			continue
+		}
 		count, err := tableCount(ctx, src, table)
 		if err != nil {
 			// A table the source never created is nothing to copy (identity
@@ -167,6 +179,10 @@ func cmdMigrateStore(args []string, stdout, stderr io.Writer) int {
 		n, err := copyTable(ctx, src, dst, table)
 		if err != nil {
 			fmt.Fprintf(stderr, "migrate store: %s: %v\n", table, err)
+			return 1
+		}
+		if err := advanceSequence(ctx, dst, table); err != nil {
+			fmt.Fprintf(stderr, "migrate store: %s: advance id sequence: %v\n", table, err)
 			return 1
 		}
 		copied += n

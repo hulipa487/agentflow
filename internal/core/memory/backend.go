@@ -20,6 +20,26 @@ type Record struct {
 	Meta  map[string]any `json:"meta,omitempty"`
 }
 
+// ExportRecord is one row read back whole: the value plus what a Query result
+// leaves out, its embedding and its expiry. Moving a user between cells needs
+// both, or the moved rows drop out of semantic recall and stop expiring.
+type ExportRecord struct {
+	Key    string
+	Value  any
+	Vector []float32
+	// ExpiresAt is when the row's TTL ends; the zero time means it has none.
+	ExpiresAt time.Time
+}
+
+// RowExporter is implemented by backends that can read rows back whole. It is
+// optional: a backend without it is exported through Query, which carries the
+// value only.
+type RowExporter interface {
+	// ExportRows returns the table's unexpired rows, oldest first, so writing
+	// them back in order keeps their relative recency.
+	ExportRows(table string) ([]ExportRecord, error)
+}
+
 // PutOpts carries optional parameters for Put.
 type PutOpts struct {
 	TTL time.Duration
@@ -249,6 +269,25 @@ func (l *loggingHandle) GC(table string, window int) error {
 }
 
 func (l *loggingHandle) Close() error { return l.h.Close() }
+
+// Unwrap returns the driver handle this one decorates.
+func (l *loggingHandle) Unwrap() BackendHandle { return l.h }
+
+// AsRowExporter reports whether h, or the driver handle it decorates, can read
+// rows back whole.
+func AsRowExporter(h BackendHandle) (RowExporter, bool) {
+	for h != nil {
+		if ex, ok := h.(RowExporter); ok {
+			return ex, true
+		}
+		u, ok := h.(interface{ Unwrap() BackendHandle })
+		if !ok {
+			return nil, false
+		}
+		h = u.Unwrap()
+	}
+	return nil, false
+}
 
 // BackendFeatures forwards the handle's own feature report, when it has one.
 func (l *loggingHandle) BackendFeatures() []string {

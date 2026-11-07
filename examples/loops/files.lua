@@ -1,4 +1,4 @@
--- af-prelude-version: 2
+-- af-prelude-version: 1
 -- A note-taking loop over the user-scoped file store.
 --
 -- Needs: files. The project scope is resolved by the engine from the turn's

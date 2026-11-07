@@ -1,4 +1,4 @@
--- af-prelude-version: 2
+-- af-prelude-version: 1
 Greeting = {}
 
 function Greeting.hello(name)

@@ -11,12 +11,17 @@ import (
 	"agentflow/internal/core/storedb"
 )
 
-// holdTTL is how long an in-flight reservation survives without being released.
-// It must outlive any model call (a long generation can take minutes), because
-// a hold that expires mid-call stops bounding the call it was taken for. Ten
-// minutes is deliberately generous; the row is normally deleted the moment the
-// call ends.
-const holdTTL = 10 * time.Minute
+// holdTTL is how long an in-flight reservation survives without being renewed.
+// A hold that expires mid-call stops bounding the call it was taken for, and a
+// long generation can outlast any fixed TTL, so the lease renews its hold while
+// the call runs (see Lease.keepAlive) and the TTL only has to cover an instance
+// that died holding one. The row is normally deleted the moment the call ends.
+var holdTTL = 2 * time.Minute
+
+// holdMaxLife bounds how long a hold is renewed. A lease that is never ended —
+// a caller bug, not a long call — stops renewing here and its hold then expires
+// on its own, instead of a goroutine renewing it for the life of the process.
+var holdMaxLife = 2 * time.Hour
 
 // quotaHoldsSchema is the shared reservation table. Deadlines are unix
 // nanoseconds, the same convention the lease and inbox tables use.
@@ -49,7 +54,7 @@ func NewShared(target string, ledger runtime.Ledger, limitFn func(userID string)
 		Default: defaultPerDay,
 		now:     time.Now,
 	}
-	q.holds = &sqlHolds{st: st, ledger: ledger, now: func() time.Time { return q.now() }}
+	q.holds = &sqlHolds{st: st, ledger: ledger, ttl: holdTTL, now: func() time.Time { return q.now() }}
 	return q, nil
 }
 
@@ -75,8 +80,12 @@ func (q *Quota) SweepHolds(ctx context.Context, before time.Time) (int64, error)
 type sqlHolds struct {
 	st     *storedb.DB
 	ledger runtime.Ledger
+	ttl    time.Duration
 	now    func() time.Time
 }
+
+// TTL is how long a hold lives without renewal.
+func (s *sqlHolds) TTL() time.Duration { return s.ttl }
 
 // Reserve takes a hold atomically. The per-user advisory lock serialises the
 // check-and-insert across instances: without it two transactions could both
@@ -115,7 +124,7 @@ func (s *sqlHolds) Reserve(ctx context.Context, userID string, amount, limit int
 	id := uuid.NewString()
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO quota_holds (id, user_id, amount, expires_at) VALUES (?, ?, ?, ?)`,
-		id, userID, amount, now+int64(holdTTL)); err != nil {
+		id, userID, amount, now+int64(s.ttl)); err != nil {
 		return "", 0, 0, false, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -129,6 +138,14 @@ func (s *sqlHolds) Release(ctx context.Context, id, _ string, _ int64) error {
 		return nil
 	}
 	_, err := s.st.Exec(ctx, `DELETE FROM quota_holds WHERE id = ?`, id)
+	return err
+}
+
+// Renew pushes a hold's deadline a full TTL out from now. A hold that is gone
+// (released, or swept after it expired) is not recreated.
+func (s *sqlHolds) Renew(ctx context.Context, id string) error {
+	_, err := s.st.Exec(ctx, `UPDATE quota_holds SET expires_at = ? WHERE id = ?`,
+		s.now().UnixNano()+int64(s.ttl), id)
 	return err
 }
 

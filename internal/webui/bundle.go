@@ -53,7 +53,7 @@ func (u *UI) handleUserImport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "the migration bundle service is not wired")
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 256<<20)
+	r.Body = http.MaxBytesReader(w, r.Body, bundle.MaxBundleBytes)
 	if err := r.ParseMultipartForm(64 << 20); err != nil {
 		writeErr(w, http.StatusBadRequest, "expected multipart/form-data with a bundle file")
 		return

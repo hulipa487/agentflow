@@ -1,4 +1,4 @@
--- af-prelude-version: 2
+-- af-prelude-version: 1
 -- Session timers.
 --
 -- Timers are ordinary mailbox messages (type="timer", payload.timer_id), so

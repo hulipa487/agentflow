@@ -133,3 +133,34 @@ func TestSharedQuotaHoldsPostgresConcurrent(t *testing.T) {
 		t.Fatalf("after sweeping expired holds in-flight = %d, want 0", inFlight)
 	}
 }
+
+// A call that outlasts the hold TTL must stay bounded: the lease renews its hold
+// while it is open, and stops when it ends.
+func TestSharedQuotaHoldOutlivesItsTTLWhileOpen(t *testing.T) {
+	oldTTL := holdTTL
+	holdTTL = 150 * time.Millisecond
+	defer func() { holdTTL = oldTTL }()
+	q, err := NewShared(filepath.Join(t.TempDir(), "agentflow.db"), usageOnly{used: 0}, nil, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	ctx := context.Background()
+	l, err := q.Reserve(ctx, "u1", 800)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * holdTTL)
+	if _, _, inFlight, err := q.Status("u1"); err != nil || inFlight != 800 {
+		t.Fatalf("in flight after 3 TTLs = %d (%v), want the open hold's 800", inFlight, err)
+	}
+	if _, err := q.Reserve(ctx, "u1", 400); err == nil {
+		t.Fatal("an open hold lapsed and let an over-limit call in")
+	}
+	l.Release()
+	again, err := q.Reserve(ctx, "u1", 400)
+	if err != nil {
+		t.Fatalf("reservation after release: %v", err)
+	}
+	again.Release()
+}

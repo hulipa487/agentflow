@@ -467,6 +467,28 @@ func (s *Supervisor) SessionBusy(sessionID string) (busy, live bool) {
 	return a.Busy(), true
 }
 
+// Wait blocks until every session actor has exited, or ctx ends, and reports
+// whether they all did. Shutdown calls it between cancelling the actors and
+// releasing their leases: a peer may claim a session the moment its lease is
+// given up, and it must not run a turn this instance is still finishing.
+func (s *Supervisor) Wait(ctx context.Context) bool {
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		s.mu.Lock()
+		n := len(s.sessions)
+		s.mu.Unlock()
+		if n == 0 {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-tick.C:
+		}
+	}
+}
+
 // StopSession terminates one actor without stopping the runtime. It is safe to
 // call repeatedly and is used by lifecycle policies and child supervision.
 func (s *Supervisor) StopSession(sessionID string) {

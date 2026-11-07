@@ -52,6 +52,17 @@ func (a *schedulerAdapter) deliver(owner string, timerID scheduler.TimerID, scop
 			MembershipUUID: scope.MembershipUUID,
 		},
 	}
+	a.sup.mu.Lock()
+	actor, ok := a.sup.sessions[owner]
+	a.sup.mu.Unlock()
+	if !ok {
+		// Session exited; the scheduler's CancelOwner should have removed the
+		// timer, but a fire may still be in flight. Drop it. A timer lives as
+		// long as the actor that set it, so this holds with a hub too: routing
+		// the tick would spawn the conversation again just to deliver a timer
+		// it no longer has.
+		return
+	}
 	// With a hub installed, a timer tick is traffic like any other: it must go
 	// to whichever instance owns the session. Writing straight to the local
 	// mailbox is how a stalled instance kept running a session whose lease a
@@ -69,14 +80,6 @@ func (a *schedulerAdapter) deliver(owner string, timerID scheduler.TimerID, scop
 		if err := a.sup.hub.Route(ctx, agent, key, msg); err != nil {
 			a.log.Warn("timer tick could not be routed; dropping it", "session", owner, "timer", string(timerID), "err", err)
 		}
-		return
-	}
-	a.sup.mu.Lock()
-	actor, ok := a.sup.sessions[owner]
-	a.sup.mu.Unlock()
-	if !ok {
-		// Session exited; the scheduler's CancelOwner should have removed the
-		// timer, but a fire may still be in flight. Drop it.
 		return
 	}
 	select {

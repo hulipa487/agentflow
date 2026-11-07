@@ -213,8 +213,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// Two contexts, because shutdown has two moments. sigCtx ends when the
+	// operator asks the process to stop; ctx is what the router, the session
+	// actors, the hub and every periodic job run on, and it ends only after the
+	// drain below. Running them on the signal context would stop all serving
+	// at the signal, leaving the grace period nothing to drain.
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	ctx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
 
 	// The dashboard reads stdin for keys, so it sees a ctrl+c typed into a
 	// pseudo-terminal (Git Bash/mintty, some IDE terminals) even though Windows
@@ -2042,23 +2049,40 @@ func main() {
 	sup.BootPersistent(ctx)
 
 	log.Info("agentflow up", "agents", len(defs), "channels", len(cfg.Gateway.Channels))
-	<-ctx.Done()
+	<-sigCtx.Done()
+	// From here a second ctrl+c or SIGTERM takes the default action and kills
+	// the process, so a drain that hangs can always be cut short.
+	stop()
 
 	log.Info("shutting down")
 	// Report unready first, then drain: a load balancer that honours readiness
 	// stops sending new traffic before the listeners close, and an in-flight
-	// turn gets the window to finish. A regional cell defaults to five seconds;
-	// single keeps the old immediate exit.
+	// turn gets the window to finish. Everything keeps running on ctx during
+	// the window — this is a drain, not a pause. A regional cell defaults to
+	// five seconds; single keeps the old immediate exit. The triggers stop
+	// first so their claims go to a peer now and the next scheduled fire is
+	// not lost to the window.
 	admin.SetReady(false)
+	triggerSvc.Stop()
 	if grace := cfg.ShutdownGrace(); grace > 0 {
 		log.Info("draining before shutdown", "grace", grace.String())
 		time.Sleep(grace)
 	}
-	// Before the stores close: stopping the triggers gives up their claims, and
-	// the hub gives up its sessions, so the rest of the fleet picks both up at
-	// once instead of waiting out the leases.
-	triggerSvc.Stop()
-	hub.Release(ctx)
+	cancelRun()
+	// The actors unwind on ctx; let them finish before their leases go, or a
+	// peer can claim a session while this instance is still ending its turn.
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if !sup.Wait(waitCtx) {
+		log.Warn("sessions still running after shutdown wait; releasing their leases anyway")
+	}
+	waitCancel()
+	// Before the stores close: the hub gives up its sessions so the rest of the
+	// fleet picks them up at once instead of waiting out the leases. ctx is
+	// cancelled by now, and the store refuses a cancelled context, so the
+	// release gets its own.
+	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	hub.Release(releaseCtx)
+	releaseCancel()
 	watcher.Stop()
 	memMgr.Stop()
 	for _, c := range mcpClients {

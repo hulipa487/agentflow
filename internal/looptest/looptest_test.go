@@ -19,7 +19,7 @@ func write(t *testing.T, path, body string) {
 
 func TestEchoScenario(t *testing.T) {
 	dir := t.TempDir()
-	write(t, filepath.Join(dir, "echo.lua"), `-- af-prelude-version: 2
+	write(t, filepath.Join(dir, "echo.lua"), `-- af-prelude-version: 1
 function loop()
   while true do
     local msg = session.inbox()
@@ -48,7 +48,7 @@ expect:
 
 func TestLLMScenario(t *testing.T) {
 	dir := t.TempDir()
-	write(t, filepath.Join(dir, "chat.lua"), `-- af-prelude-version: 2
+	write(t, filepath.Join(dir, "chat.lua"), `-- af-prelude-version: 1
 function loop()
   while true do
     local msg = session.inbox()
@@ -80,12 +80,12 @@ expect:
 
 func TestPackageScenario(t *testing.T) {
 	dir := t.TempDir()
-	write(t, filepath.Join(dir, "pkg", "manifest.yaml"), "name: greet\nprelude_api: 2\nfiles: [greet.lua]\n")
-	write(t, filepath.Join(dir, "pkg", "greet.lua"), `-- af-prelude-version: 2
+	write(t, filepath.Join(dir, "pkg", "manifest.yaml"), "name: greet\nprelude_api: 1\nfiles: [greet.lua]\n")
+	write(t, filepath.Join(dir, "pkg", "greet.lua"), `-- af-prelude-version: 1
 Greeting = {}
 function Greeting.hello(name) return "hello, " .. name end
 `)
-	write(t, filepath.Join(dir, "loop.lua"), `-- af-prelude-version: 2
+	write(t, filepath.Join(dir, "loop.lua"), `-- af-prelude-version: 1
 -- af-import: greet
 function loop()
   while true do

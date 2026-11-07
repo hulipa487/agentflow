@@ -8,9 +8,12 @@ import (
 	"log/slog"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"agentflow/internal/core/identity"
 	"agentflow/internal/core/memory"
+	"agentflow/internal/core/storedb"
+	sqlitemem "agentflow/internal/drivers/sqlite"
 	"agentflow/internal/drivers/volatile"
 )
 
@@ -191,12 +194,88 @@ func TestMemoryRoundTrip(t *testing.T) {
 
 	dstMgr, dstAM, dstScoped, dstBind := memoryFixture(t, "u_1")
 	dst := &Service{Memory: dstMgr, Memories: []memory.AgentMemory{dstAM}}
-	n, err := dst.importMemory(&Bundle{Profile: identity.Profile{UserID: "u_1"}, Memory: rows})
+	n, err := dst.importMemory(&Bundle{Profile: identity.Profile{UserID: "u_1"}, Memory: rows}, new(int))
 	if err != nil || n != 1 {
 		t.Fatalf("importMemory = %d, %v", n, err)
 	}
 	v, ok, err := dstScoped.Get(dstBind.Table, "turn:1")
 	if err != nil || !ok || v != "hello" {
 		t.Fatalf("imported row = %v, %v, %v", v, ok, err)
+	}
+}
+
+// sqliteFixture is memoryFixture on a sqlite backend, which can read rows back
+// whole (memory.RowExporter).
+func sqliteFixture(t *testing.T, userID string) (*memory.Manager, memory.AgentMemory, memory.BackendHandle, memory.StoreBinding, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "mem.db")
+	reg := memory.NewRegistry()
+	reg.RegisterProvider(sqlitemem.Provider{})
+	reg.AddBackend("s", "sqlite", map[string]any{"path": path})
+	if err := reg.Open(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reg.Close() })
+	mgr := memory.NewManager(reg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	am, err := reg.ResolveStoresFor("bot", map[string]memory.Store{
+		"dialogue": {Backend: "s", Table: "dialogue", Scope: "user"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, bind, err := mgr.BindForTable(am, "dialogue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped := memory.WrapScoped(h, bind.Scoping, memory.ModeInteractive,
+		memory.Caller{ScopeUUID: userID, PersonalUUID: userID, Locality: bind.Locality}, memory.PoolScope{})
+	return mgr, am, scoped, bind, path
+}
+
+// A moved row keeps its embedding and its TTL when both stores can hold them,
+// and is still imported, minus the embedding, when the destination cannot.
+func TestMemoryRoundTripKeepsVectorAndTTL(t *testing.T) {
+	srcMgr, srcAM, srcScoped, srcBind, _ := sqliteFixture(t, "u_1")
+	if err := srcScoped.Put(srcBind.Table, "turn:1", "hello", memory.PutOpts{Vector: []float32{1, 0, 0}, TTL: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := (&Service{Memory: srcMgr, Memories: []memory.AgentMemory{srcAM}}).exportMemory("u_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || len(rows[0].Vector) != 3 || rows[0].ExpiresAt <= time.Now().Unix() {
+		t.Fatalf("exported rows = %+v; want the vector and a future expiry", rows)
+	}
+	b := &Bundle{Profile: identity.Profile{UserID: "u_1"}, Memory: rows}
+
+	dstMgr, dstAM, dstScoped, dstBind, dstPath := sqliteFixture(t, "u_1")
+	dropped := 0
+	if n, err := (&Service{Memory: dstMgr, Memories: []memory.AgentMemory{dstAM}}).importMemory(b, &dropped); err != nil || n != 1 || dropped != 0 {
+		t.Fatalf("importMemory = %d, %v, dropped %d", n, err, dropped)
+	}
+	it, err := dstScoped.Query(dstBind.Table, memory.Query{Kind: "vector", Vector: []float32{1, 0, 0}, K: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !it.Next() || it.Record().Value != "hello" {
+		t.Fatal("imported row is not found by vector recall")
+	}
+	db, err := storedb.Open(dstPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var exp *int64
+	if err := db.QueryRow(context.Background(), `SELECT expires_at FROM kv`).Scan(&exp); err != nil || exp == nil {
+		t.Fatalf("imported row has no expiry: %v %v", exp, err)
+	}
+
+	volMgr, volAM, volScoped, volBind := memoryFixture(t, "u_1")
+	dropped = 0
+	if n, err := (&Service{Memory: volMgr, Memories: []memory.AgentMemory{volAM}}).importMemory(b, &dropped); err != nil || n != 1 || dropped != 1 {
+		t.Fatalf("import into volatile = %d, %v, dropped %d; want 1 row, 1 vector dropped", n, err, dropped)
+	}
+	if v, ok, _ := volScoped.Get(volBind.Table, "turn:1"); !ok || v != "hello" {
+		t.Fatalf("volatile row = %v, %v", v, ok)
 	}
 }

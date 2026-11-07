@@ -264,6 +264,11 @@ func (h *Hub) Drain(ctx context.Context) {
 // trips that find nothing; against a store in another region that is seconds of
 // latency each time round.
 func (h *Hub) drainOnce(ctx context.Context) {
+	// First, before anything that needs the store: a store this instance
+	// cannot reach is exactly when the rest of the pass fails, and exactly when
+	// a peer that can reach it may be taking these sessions over.
+	h.fenceStale()
+
 	h.mu.Lock()
 	keys := make([]string, 0, len(h.held))
 	for k := range h.held {
@@ -328,6 +333,43 @@ func (h *Hub) drainOnce(ctx context.Context) {
 		}
 		if _, err := h.renewIfDue(ctx, sessKey); err != nil {
 			h.log.Warn("sessionhub: claim renewal failed", "session", sessKey, "err", err)
+		}
+	}
+}
+
+// fenceNum/fenceDen is how much of the TTL may pass since a claim was last written
+// before this instance stops acting on it. Renewal is due at a third, so this
+// is two missed renewals; the remaining sixth is the margin that lets the
+// local actor stop before a peer's claim on the expired lease can succeed.
+const fenceNum, fenceDen = 5, 6
+
+// fenceStale gives up every session whose claim this instance has not managed
+// to renew within the fence window, and stops it here through onLost.
+//
+// Without it, losing a session is only discovered by a claim that succeeds in
+// reading the lease row, so an instance cut off from the store keeps running
+// its sessions for as long as the outage lasts, while a peer that can reach
+// the store owns and runs the same conversations. The instance cannot ask the
+// store whether it still owns them; the only safe reading of "could not renew
+// in time" is "no longer ours". A session given up this way is not retired:
+// when the store is back, the next message claims it again normally.
+func (h *Hub) fenceStale() {
+	limit := h.ttl * fenceNum / fenceDen
+	h.mu.Lock()
+	var stale []string
+	for k := range h.held {
+		if time.Since(h.renewed[k]) >= limit {
+			stale = append(stale, k)
+			delete(h.held, k)
+			delete(h.generations, k)
+			delete(h.renewed, k)
+		}
+	}
+	h.mu.Unlock()
+	for _, k := range stale {
+		h.log.Warn("sessionhub: claim not renewed in time; stopping the session here so a peer can own it", "session", k)
+		if h.onLost != nil {
+			h.onLost(k)
 		}
 	}
 }

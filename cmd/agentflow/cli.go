@@ -201,8 +201,10 @@ Convert an OpenAPI document into declarative tools.http entries.
 	"migrate": `usage: agentflow migrate store -from <target> -to <target> [-tables LIST] [-append]
        agentflow migrate blobs -from fs:<dir> [-kind media|files] [-config PATH]
 
-store copies the runtime, identity and credential tables between SQLite and
-PostgreSQL (credentials stay ciphertext; both stores need the same master key).
+store copies the runtime, identity, credential and memory tables between
+SQLite and PostgreSQL (credentials stay ciphertext; both stores need the same
+master key). Memory keeps its embeddings, recency and TTLs; a PostgreSQL
+destination needs the vector extension when the source has embeddings.
 blobs copies a local media/files directory into the S3 bucket configured for
 the chosen kind. Both are idempotent: rerunning skips what is already there.
 `,
@@ -733,8 +735,9 @@ func cmdInit(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "init:", err)
 		return 1
 	}
-	loop := `-- af-prelude-version: 1
--- Echo loop: the smallest runnable agent. Replace it with your own behavior.
+	// The directive comes from vm.PreludeVersion so a version bump cannot leave
+	// init writing a loop that this same binary refuses to load.
+	loop := fmt.Sprintf("-- af-prelude-version: %d\n", vm.PreludeVersion) + `-- Echo loop: the smallest runnable agent. Replace it with your own behavior.
 function loop()
   while true do
     local msg = session.inbox()

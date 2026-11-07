@@ -93,8 +93,8 @@ func TestExpiredRowIsNotLive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(list) != 0 {
-		t.Fatalf("List returned %d instances, want 0 after expiry", len(list))
+	if len(list) != 1 || list[0].Owner != "instance-b" {
+		t.Fatalf("List returned %v, want only instance-b (registered by its own check) after expiry", list)
 	}
 	n, err := b.Sweep(ctx, time.Now().Add(-time.Minute))
 	if err != nil {
@@ -125,5 +125,43 @@ func TestHeartbeatLoop(t *testing.T) {
 			t.Fatal("heartbeat did not register the instance")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Two instances that start at once must not both pass: each registers before
+// it looks, so whichever way the writes and reads interleave, at most one runs.
+func TestSimultaneousStartNeverAdmitsTwo(t *testing.T) {
+	ctx := context.Background()
+
+	// Sequential checks: the first passes, the second sees it and is refused.
+	target := filepath.Join(t.TempDir(), "agentflow.db")
+	a, b := openTest(t, target, "instance-a"), openTest(t, target, "instance-b")
+	if err := b.CheckSingle(ctx); err != nil {
+		t.Fatalf("first check refused: %v", err)
+	}
+	if err := a.CheckSingle(ctx); err == nil {
+		t.Fatal("second check passed while the first instance is registered")
+	}
+	list, err := b.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].Owner != "instance-b" {
+		t.Fatalf("registry lists %v, want only the admitted instance", list)
+	}
+
+	// Interleaved: a's row lands before b reads. b is refused and takes its
+	// row back out, so a's own check, which reads after that, still passes.
+	target = filepath.Join(t.TempDir(), "agentflow.db")
+	a, b = openTest(t, target, "instance-a"), openTest(t, target, "instance-b")
+	if err := a.Heartbeat(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.CheckSingle(ctx); err == nil {
+		t.Fatal("b passed with a registered")
+	}
+	if err := a.CheckSingle(ctx); err != nil {
+		// b removed its row on refusal, so a's own check now finds no peer.
+		t.Fatalf("a refused after b withdrew: %v", err)
 	}
 }

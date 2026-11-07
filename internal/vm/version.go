@@ -50,7 +50,7 @@ import (
 // version. TestPreludeDeclaresItsVersion and the builtins conformance suite
 // (internal/builtins TestPreludeContract) are what keep that rule and the
 // literal in the prelude from drifting apart.
-const PreludeVersion = 2
+const PreludeVersion = 1
 
 // ErrPreludeVersion marks a refusal produced by the version gate. A caller can
 // tell a version refusal from a read or compile failure with errors.Is, which

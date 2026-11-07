@@ -1,4 +1,4 @@
--- af-prelude-version: 2
+-- af-prelude-version: 1
 -- af-import: greeting
 
 function loop()

@@ -350,6 +350,50 @@ func (h *Handle) queryAll(table string) (memory.Iterator, error) {
 	return memory.NewSliceIterator(recs), nil
 }
 
+// ExportRows implements memory.RowExporter.
+func (h *Handle) ExportRows(table string) ([]memory.ExportRecord, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	embedding := "NULL::text"
+	if h.hasVector {
+		embedding = "embedding::text"
+	}
+	rows, err := h.db.QueryContext(ctx,
+		`SELECT key, value::text, `+embedding+`, expires_at FROM store_kv
+		 WHERE table_name = $1 AND (expires_at IS NULL OR expires_at > $2)
+		 ORDER BY updated_at, key`,
+		table, time.Now().Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []memory.ExportRecord
+	for rows.Next() {
+		var key, raw string
+		var emb sql.NullString
+		var exp sql.NullInt64
+		if err := rows.Scan(&key, &raw, &emb, &exp); err != nil {
+			return nil, err
+		}
+		rec := memory.ExportRecord{Key: key}
+		if err := json.Unmarshal([]byte(raw), &rec.Value); err != nil {
+			return nil, fmt.Errorf("postgres: %s/%s: %w", table, key, err)
+		}
+		if emb.Valid && emb.String != "" {
+			var v pgvector.Vector
+			if err := v.Parse(emb.String); err != nil {
+				return nil, fmt.Errorf("postgres: %s/%s: embedding: %w", table, key, err)
+			}
+			rec.Vector = v.Slice()
+		}
+		if exp.Valid {
+			rec.ExpiresAt = time.Unix(exp.Int64, 0)
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
 func (h *Handle) GC(table string, window int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

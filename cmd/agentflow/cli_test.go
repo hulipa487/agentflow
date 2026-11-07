@@ -102,6 +102,30 @@ func TestInitLayout(t *testing.T) {
 	if !strings.Contains(out.String(), "agentflow -config") {
 		t.Errorf("init output does not point at -config: %s", out.String())
 	}
+
+}
+
+// What init writes must load on the binary that wrote it, in both layouts:
+// a starter loop declaring a stale prelude version is a first run that fails.
+func TestInitOutputValidates(t *testing.T) {
+	for _, layout := range []string{"file", "dir"} {
+		t.Run(layout, func(t *testing.T) {
+			dir := t.TempDir()
+			var out, errOut bytes.Buffer
+			if code := cmdInit([]string{"-dir", dir, "-layout", layout}, &out, &errOut); code != 0 {
+				t.Fatalf("init exit = %d: %s", code, errOut.String())
+			}
+			args := []string{"-config", filepath.Join(dir, "agentflow.yaml")}
+			if layout == "dir" {
+				args = []string{"-configdir", dir}
+			}
+			out.Reset()
+			errOut.Reset()
+			if code := cmdValidate(args, &out, &errOut); code != 0 {
+				t.Fatalf("validate on init output exit = %d: %s%s", code, out.String(), errOut.String())
+			}
+		})
+	}
 }
 
 // The checked-in example is the schema's front door: keep it compiling and

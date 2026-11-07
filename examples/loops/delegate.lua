@@ -1,4 +1,4 @@
--- af-prelude-version: 2
+-- af-prelude-version: 1
 -- Parent agent delegating to an ephemeral child.
 --
 -- Needs: agent.spawn, agent.request, and a spawn template named here under

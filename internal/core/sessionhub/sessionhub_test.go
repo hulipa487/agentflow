@@ -508,3 +508,42 @@ func TestOnLostOnlyFiresForSessionsThisInstanceHeld(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 }
+
+// An instance that cannot reach the store must stop its sessions before a peer
+// can claim them, not when the store comes back. A cancelled context fails
+// every store call, which is what a partition looks like from inside.
+func TestUnrenewableClaimIsFenced(t *testing.T) {
+	a, _ := oneInstance(t, filepath.Join(t.TempDir(), "hub.db"), "instance-a")
+	ctx := context.Background()
+	a.SetSessionTTL(300 * time.Millisecond)
+	if ok, err := a.Claim(ctx, "bot|chat-1"); err != nil || !ok {
+		t.Fatalf("claim: %v %v", ok, err)
+	}
+	lost := make(chan string, 1)
+	a.SetOnLost(func(key string) { lost <- key })
+	dead, cancel := context.WithCancel(ctx)
+	cancel()
+
+	a.drainOnce(dead)
+	if len(lost) != 0 || a.Held() != 1 {
+		t.Fatal("a fresh claim was fenced")
+	}
+	time.Sleep(260 * time.Millisecond) // past 5/6 of the TTL with no renewal
+	a.drainOnce(dead)
+	select {
+	case key := <-lost:
+		if key != "bot|chat-1" {
+			t.Fatalf("onLost(%q)", key)
+		}
+	default:
+		t.Fatal("an unrenewable claim was kept past the fence window")
+	}
+	if a.Held() != 0 {
+		t.Fatalf("held = %d after fencing, want 0", a.Held())
+	}
+	// The lease itself is untouched, so the store comes back with the session
+	// still claimable by this instance on its next message.
+	if ok, err := a.Claim(ctx, "bot|chat-1"); err != nil || !ok {
+		t.Fatalf("reclaim after the store returns: %v %v", ok, err)
+	}
+}

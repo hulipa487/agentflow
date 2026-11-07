@@ -48,12 +48,29 @@ const envelopeInfo = "agentflow-user-bundle-v1"
 
 // MemoryRow is one record in a user-scoped memory store, with its scope prefix
 // already removed. Agent and Table name the binding to write it back to.
+//
+// Vector and ExpiresAt are present when the source backend can read rows back
+// whole (memory.RowExporter): without them a moved row drops out of semantic
+// recall and never expires.
 type MemoryRow struct {
-	Agent string `json:"agent"`
-	Table string `json:"table"`
-	Key   string `json:"key"`
-	Value any    `json:"value"`
+	Agent  string    `json:"agent"`
+	Table  string    `json:"table"`
+	Key    string    `json:"key"`
+	Value  any       `json:"value"`
+	Vector []float32 `json:"vector,omitempty"`
+	// ExpiresAt is unix seconds; 0 means the row has no TTL.
+	ExpiresAt int64 `json:"expires_at,omitempty"`
 }
+
+// MaxBundleBytes is the largest bundle an import reads. An export refuses to
+// build one that would not fit, rather than produce a file the other cell
+// rejects.
+const MaxBundleBytes = 256 << 20
+
+// maxFileBytes bounds the file bytes in one bundle. They travel base64-encoded
+// inside the JSON document, a third larger, and the rest of the bundle needs
+// room too.
+const maxFileBytes = 160 << 20
 
 // FileEntry is one working-tree file with its bytes.
 type FileEntry struct {
@@ -108,9 +125,13 @@ type Service struct {
 
 // Report is what an import did and what it could not do.
 type Report struct {
-	Profile         bool     `json:"profile"`
-	Identities      int      `json:"identities"`
-	MemoryRows      int      `json:"memory_rows"`
+	Profile    bool `json:"profile"`
+	Identities int  `json:"identities"`
+	MemoryRows int  `json:"memory_rows"`
+	// VectorsDropped counts memory rows imported without their embedding
+	// because the destination store cannot hold it (no vector support, or a
+	// different dimension). They need re-embedding to appear in vector recall.
+	VectorsDropped  int      `json:"vectors_dropped,omitempty"`
 	Files           int      `json:"files"`
 	Credentials     int      `json:"credentials"`
 	GroupsAdded     int      `json:"groups_added"`
@@ -184,6 +205,24 @@ func (s *Service) exportMemory(userID string) ([]MemoryRow, error) {
 			if err != nil {
 				continue // a table this agent's profile does not expose
 			}
+			if ex, ok := memory.AsRowExporter(h); ok {
+				recs, err := ex.ExportRows(b.Table)
+				if err != nil {
+					return nil, err
+				}
+				for _, rec := range recs {
+					k, ok := userScopedKey(rec.Key, userID)
+					if !ok {
+						continue
+					}
+					row := MemoryRow{Agent: b.Agent, Table: b.Table, Key: k, Value: rec.Value, Vector: rec.Vector}
+					if !rec.ExpiresAt.IsZero() {
+						row.ExpiresAt = rec.ExpiresAt.Unix()
+					}
+					out = append(out, row)
+				}
+				continue
+			}
 			it, err := h.Query(b.Table, memory.Query{Kind: "all"})
 			if err != nil {
 				return nil, err
@@ -242,6 +281,7 @@ func (s *Service) exportFiles(ctx context.Context, userID string) ([]FileEntry, 
 		return nil, err
 	}
 	var out []FileEntry
+	var total int64
 	for _, project := range projects {
 		entries, err := s.Files.List(ctx, scope, project, "")
 		if err != nil {
@@ -251,6 +291,10 @@ func (s *Service) exportFiles(ctx context.Context, userID string) ([]FileEntry, 
 			data, err := s.Files.ReadBlob(ctx, e.Handle, s.Files.MaxFileBytes())
 			if err != nil {
 				return nil, fmt.Errorf("bundle: read %s/%s: %w", project, e.Path, err)
+			}
+			total += int64(len(data))
+			if total > maxFileBytes {
+				return nil, fmt.Errorf("bundle: the user's files exceed %d MiB, more than one bundle can carry; move the largest ones separately and export again", maxFileBytes>>20)
 			}
 			out = append(out, FileEntry{Project: project, Path: e.Path, MIME: e.MIME, Data: data})
 		}
@@ -310,7 +354,7 @@ func (s *Service) Import(ctx context.Context, b *Bundle, privateKey []byte) (Rep
 	rep.Profile = true
 	rep.Identities = linked
 
-	n, err := s.importMemory(b)
+	n, err := s.importMemory(b, &rep.VectorsDropped)
 	if err != nil {
 		return rep, err
 	}
@@ -365,7 +409,7 @@ func (s *Service) Import(ctx context.Context, b *Bundle, privateKey []byte) (Rep
 	return rep, nil
 }
 
-func (s *Service) importMemory(b *Bundle) (int, error) {
+func (s *Service) importMemory(b *Bundle, dropped *int) (int, error) {
 	if s.Memory == nil || len(b.Memory) == 0 {
 		return 0, nil
 	}
@@ -383,6 +427,7 @@ func (s *Service) importMemory(b *Bundle) (int, error) {
 		}
 	}
 	imported := 0
+	now := time.Now()
 	for _, row := range b.Memory {
 		tgt, ok := byBinding[row.Agent+"|"+row.Table]
 		if !ok {
@@ -395,12 +440,46 @@ func (s *Service) importMemory(b *Bundle) (int, error) {
 		scoped := memory.WrapScoped(h, bnd.Scoping, memory.ModeInteractive,
 			memory.Caller{ScopeUUID: b.Profile.UserID, PersonalUUID: b.Profile.UserID, Locality: bnd.Locality},
 			memory.PoolScope{})
-		if err := scoped.Put(bnd.Table, row.Key, row.Value, memory.PutOpts{}); err != nil {
+		var opts memory.PutOpts
+		if row.ExpiresAt > 0 {
+			opts.TTL = time.Unix(row.ExpiresAt, 0).Sub(now)
+			if opts.TTL <= 0 {
+				continue // expired in transit
+			}
+		}
+		if len(row.Vector) > 0 {
+			if hasFeature(s.Memory.Features(bnd.Backend), "vector") {
+				opts.Vector = row.Vector
+			} else {
+				*dropped++
+			}
+		}
+		err = scoped.Put(bnd.Table, row.Key, row.Value, opts)
+		if err != nil && opts.Vector != nil {
+			// A vector-capable store can still refuse this one, typically a
+			// different dimension because the cells embed with different
+			// models. The value is what the person owns; keep it, and report
+			// the row as needing a re-embed.
+			opts.Vector = nil
+			if err = scoped.Put(bnd.Table, row.Key, row.Value, opts); err == nil {
+				*dropped++
+			}
+		}
+		if err != nil {
 			return imported, fmt.Errorf("bundle: memory %s/%s %q: %w", row.Agent, row.Table, row.Key, err)
 		}
 		imported++
 	}
 	return imported, nil
+}
+
+func hasFeature(features []string, want string) bool {
+	for _, f := range features {
+		if f == want {
+			return true
+		}
+	}
+	return false
 }
 
 // Zip renders the bundle as the downloadable document.
@@ -439,9 +518,12 @@ func ReadZip(data []byte) (*Bundle, error) {
 			return nil, err
 		}
 		defer rc.Close()
-		doc, err := io.ReadAll(io.LimitReader(rc, 256<<20))
+		doc, err := io.ReadAll(io.LimitReader(rc, MaxBundleBytes+1))
 		if err != nil {
 			return nil, err
+		}
+		if len(doc) > MaxBundleBytes {
+			return nil, fmt.Errorf("bundle: bundle.json is larger than %d MiB", MaxBundleBytes>>20)
 		}
 		var b Bundle
 		if err := json.Unmarshal(doc, &b); err != nil {

@@ -4,7 +4,7 @@
 -- its version (af.version) is the compatibility contract; every chunk must
 -- declare it in its leading comment block:
 --
---   -- af-prelude-version: 2
+--   -- af-prelude-version: 1
 --
 -- The canonical copy lives in the runtime repo at api/luau/af.d.luau; Studio's
 -- docs/luau/af.d.luau is synced from it with `make docs-sync`.

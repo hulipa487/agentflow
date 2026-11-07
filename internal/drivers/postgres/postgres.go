@@ -1,6 +1,9 @@
 // Package postgres implements the postgres memory backend provider.
-// It provides kv, prefix_scan, text_search, and transaction features via a
-// PostgreSQL server.
+// It provides kv, prefix_scan, text_search and transaction features via a
+// PostgreSQL server, and vector queries as well when the database has the
+// pgvector extension — in which case the backend reports "vector" and serves
+// it from the same table, rather than needing a second backend of provider
+// pgvector.
 //
 // The connection string is set in the backend config under "url" (e.g.
 // "postgres://user:pass@localhost:5432/agentflow?sslmode=disable"). The
@@ -17,6 +20,7 @@ import (
 
 	"agentflow/internal/core/memory"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/pgvector/pgvector-go"
 )
 
 // Provider implements memory.BackendProvider for "postgres".
@@ -24,14 +28,31 @@ type Provider struct{}
 
 func (Provider) Name() string { return "postgres" }
 
+// Features is the static answer. An opened handle reports the real one via
+// BackendFeatures, because vector support depends on the database.
 func (Provider) Features() []string {
 	return []string{"kv", "prefix_scan", "text_search", "transaction"}
 }
+
+// defaultDim matches pgvector's and the embedding model family's default.
+const defaultDim = 1536
 
 func (Provider) Open(config map[string]any) (memory.BackendHandle, error) {
 	url, _ := config["url"].(string)
 	if url == "" {
 		return nil, fmt.Errorf("postgres: url is required")
+	}
+	dim := defaultDim
+	switch v := config["dim"].(type) {
+	case int:
+		dim = v
+	case int64:
+		dim = int(v)
+	case float64:
+		dim = int(v)
+	}
+	if dim <= 0 {
+		return nil, fmt.Errorf("postgres: dim must be positive, got %d", dim)
 	}
 	db, err := sql.Open("pgx", url)
 	if err != nil {
@@ -41,7 +62,29 @@ func (Provider) Open(config map[string]any) (memory.BackendHandle, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("postgres: ping: %w", err)
 	}
-	h := &Handle{db: db}
+	h := &Handle{db: db, dim: dim}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// Vector support is a property of the database, not of the provider. No
+	// CREATE EXTENSION here: installing server extensions is an operator's
+	// decision (and usually a DBA's privilege), so a database without one
+	// simply reports the features it can honour.
+	var vectorExt int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pg_extension WHERE extname = 'vector'`).Scan(&vectorExt); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("postgres: check vector extension: %w", err)
+	}
+	h.hasVector = vectorExt > 0
+	if !h.hasVector {
+		// A dimension only means something with vectors; an explicit one on a
+		// database without the extension is a configuration mistake worth
+		// saying out loud rather than silently ignoring.
+		if _, set := config["dim"]; set {
+			_ = db.Close()
+			return nil, fmt.Errorf("postgres: dim is set but this database has no vector extension; create it (CREATE EXTENSION vector) or remove dim")
+		}
+	}
 	if err := h.migrate(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("postgres: migrate: %w", err)
@@ -50,7 +93,18 @@ func (Provider) Open(config map[string]any) (memory.BackendHandle, error) {
 }
 
 type Handle struct {
-	db *sql.DB
+	db        *sql.DB
+	dim       int
+	hasVector bool
+}
+
+// BackendFeatures reports what this database can actually serve.
+func (h *Handle) BackendFeatures() []string {
+	features := []string{"kv", "prefix_scan", "text_search", "transaction"}
+	if h.hasVector {
+		features = append(features, "vector")
+	}
+	return features
 }
 
 func (h *Handle) migrate() error {
@@ -59,24 +113,40 @@ func (h *Handle) migrate() error {
 	// A single generic table keyed by (table_name, key). The value is JSONB.
 	// A GIN index on value supports text_search. A btree on updated_at
 	// supports prefix_scan ordering.
-	// Several statements in one Exec. That works because pgx falls back to the
-	// simple protocol when a statement carries no arguments — adding a single
-	// bind parameter here would make it a prepared statement, and the extended
-	// protocol refuses multi-command text. storedb.ExecDDL exists for exactly
-	// that reason and runs one statement per call.
-	_, err := h.db.ExecContext(ctx, `
+	//
+	// The embedding column exists only on a vector-capable database. It is in
+	// the CREATE for a new table and added with ALTER for an existing one, so
+	// enabling pgvector later upgrades the same table rather than moving data.
+	embedding := ""
+	if h.hasVector {
+		embedding = fmt.Sprintf(",\n\t\t\tembedding  vector(%d)", h.dim)
+	}
+	if _, err := h.db.ExecContext(ctx, fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS store_kv (
 			table_name TEXT NOT NULL,
 			key        TEXT NOT NULL,
 			value      JSONB NOT NULL,
 			updated_at BIGINT NOT NULL,
-			expires_at BIGINT,
+			expires_at BIGINT%s,
 			PRIMARY KEY (table_name, key)
 		);
 		CREATE INDEX IF NOT EXISTS idx_store_kv_table_time ON store_kv(table_name, updated_at DESC);
 		CREATE INDEX IF NOT EXISTS idx_store_kv_expires ON store_kv(expires_at) WHERE expires_at IS NOT NULL;
 		CREATE INDEX IF NOT EXISTS idx_store_kv_value_gin ON store_kv USING gin(value);
-	`)
+	`, embedding)); err != nil {
+		return err
+	}
+	if !h.hasVector {
+		return nil
+	}
+	if _, err := h.db.ExecContext(ctx, fmt.Sprintf(
+		`ALTER TABLE store_kv ADD COLUMN IF NOT EXISTS embedding vector(%d)`, h.dim)); err != nil {
+		return err
+	}
+	// ivfflat is the index pgvector recommends for cosine k-NN. Creating it on
+	// an empty table is allowed; it becomes useful as rows arrive.
+	_, err := h.db.ExecContext(ctx,
+		`CREATE INDEX IF NOT EXISTS idx_store_kv_embedding ON store_kv USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)`)
 	return err
 }
 
@@ -92,6 +162,36 @@ func (h *Handle) Put(table, key string, value any, opts memory.PutOpts) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	if len(opts.Vector) > 0 {
+		if !h.hasVector {
+			return fmt.Errorf("postgres: a vector was supplied but this database has no vector extension; create it or store without a vector")
+		}
+		if len(opts.Vector) != h.dim {
+			return fmt.Errorf("postgres: embedding has %d dimensions, backend configured for %d (set dim in the backend config to match the embedding model)", len(opts.Vector), h.dim)
+		}
+		_, err = h.db.ExecContext(ctx,
+			`INSERT INTO store_kv (table_name, key, value, embedding, updated_at, expires_at)
+			 VALUES ($1, $2, $3, $4::vector, $5, $6)
+			 ON CONFLICT (table_name, key) DO UPDATE SET
+			   value = EXCLUDED.value,
+			   embedding = EXCLUDED.embedding,
+			   updated_at = EXCLUDED.updated_at,
+			   expires_at = EXCLUDED.expires_at`,
+			table, key, b, pgvector.NewVector(opts.Vector), now, expires)
+		return err
+	}
+	if h.hasVector {
+		// No embedding supplied: keep any existing one rather than NULLing it.
+		_, err = h.db.ExecContext(ctx,
+			`INSERT INTO store_kv (table_name, key, value, updated_at, expires_at)
+			 VALUES ($1, $2, $3, $4, $5)
+			 ON CONFLICT (table_name, key) DO UPDATE SET
+			   value = EXCLUDED.value,
+			   updated_at = EXCLUDED.updated_at,
+			   expires_at = EXCLUDED.expires_at`,
+			table, key, b, now, expires)
+		return err
+	}
 	_, err = h.db.ExecContext(ctx,
 		`INSERT INTO store_kv (table_name, key, value, updated_at, expires_at)
 		 VALUES ($1, $2, $3, $4, $5)
@@ -141,9 +241,46 @@ func (h *Handle) Query(table string, q memory.Query) (memory.Iterator, error) {
 		return h.queryText(table, q.Text, q.K)
 	case "all":
 		return h.queryAll(table)
+	case "vector":
+		return h.queryVector(table, q)
 	default:
 		return nil, fmt.Errorf("postgres: unsupported query kind %q", q.Kind)
 	}
+}
+
+func (h *Handle) queryVector(table string, q memory.Query) (memory.Iterator, error) {
+	if !h.hasVector {
+		return nil, fmt.Errorf("postgres: vector queries require the vector extension in this database; create it (CREATE EXTENSION vector) or configure a vector-capable backend")
+	}
+	if len(q.Vector) == 0 {
+		return nil, fmt.Errorf("postgres: vector query requires a query vector")
+	}
+	if len(q.Vector) != h.dim {
+		return nil, fmt.Errorf("postgres: query vector has %d dimensions, backend configured for %d", len(q.Vector), h.dim)
+	}
+	k := q.K
+	if k <= 0 {
+		k = 10
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	rows, err := h.db.QueryContext(ctx,
+		`SELECT key, value FROM store_kv
+		 WHERE table_name = $1 AND embedding IS NOT NULL
+		   AND (expires_at IS NULL OR expires_at > $4)
+		 ORDER BY embedding <=> $2::vector
+		 LIMIT $3`,
+		table, pgvector.NewVector(q.Vector), k, time.Now().Unix())
+	if err != nil {
+		return nil, err
+	}
+	// Drained here, while ctx is alive: the rows are bound to it and would be
+	// closed by the deferred cancel before the caller could read them.
+	recs, err := memory.DrainRows(rows, scanKV)
+	if err != nil {
+		return nil, err
+	}
+	return memory.NewSliceIterator(recs), nil
 }
 
 func (h *Handle) queryPrefix(table, prefix string) (memory.Iterator, error) {
@@ -178,8 +315,9 @@ func (h *Handle) queryText(table string, text string, k int) (memory.Iterator, e
 	rows, err := h.db.QueryContext(ctx,
 		`SELECT key, value FROM store_kv
 		 WHERE table_name = $1 AND value::text ILIKE '%' || $2 || '%'
+		   AND (expires_at IS NULL OR expires_at > $4)
 		 ORDER BY updated_at DESC LIMIT $3`,
-		table, text, k)
+		table, text, k, time.Now().Unix())
 	if err != nil {
 		return nil, err
 	}

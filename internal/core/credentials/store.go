@@ -117,6 +117,23 @@ func (s *Store) migrate() error {
 	return s.st.ExecDDL(ctx, schema...)
 }
 
+// EnsureSchema creates the credential table without opening a usable store.
+// The store migration uses it to prepare a destination: ciphertext is copied
+// as bytes and never decrypted, so no master key is involved.
+func EnsureSchema(target string, log *slog.Logger) error {
+	if log == nil {
+		log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	st, err := storedb.Open(target)
+	if err != nil {
+		return fmt.Errorf("credentials: %w", err)
+	}
+	defer st.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return st.ExecDDL(ctx, schema...)
+}
+
 // Close releases the store's hold on the connection pool.
 func (s *Store) Close() error { return s.st.Close() }
 

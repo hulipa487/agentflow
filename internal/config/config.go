@@ -1803,6 +1803,24 @@ func validate(path string, c *Config) error {
 	if c.Runtime.Persistence == "" {
 		c.Runtime.Persistence = "sqlite://./data/agentflow.db"
 	}
+	// The built-in conversational profile names backend main_db. A deployment
+	// that declares no memory backends at all gets it on the runtime store: one
+	// file or one server, no extra setting, which is what a minimal config
+	// promises. An explicit backend named main_db wins.
+	if len(c.Memory.Backends) == 0 {
+		c.Memory.Backends = map[string]Backend{}
+		if storedb.BackendFor(c.PersistencePath()) == storedb.BackendPostgres {
+			c.Memory.Backends["main_db"] = Backend{
+				Provider: "postgres",
+				Config:   map[string]any{"url": c.PersistencePath()},
+			}
+		} else {
+			c.Memory.Backends["main_db"] = Backend{
+				Provider: "sqlite",
+				Config:   map[string]any{"path": c.PersistencePath()},
+			}
+		}
+	}
 	if off := c.Runtime.TimezoneOffsetHours; off < -12 || off > 14 {
 		return fmt.Errorf("%s: runtime.timezone_offset_hours %g is outside the real-world range -12..14", path, off)
 	}

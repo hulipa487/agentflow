@@ -56,6 +56,8 @@ func runSubcommand(args []string, stdout, stderr io.Writer) (bool, int) {
 		return true, cmdLoop(args[1:], stdout, stderr)
 	case "tools":
 		return true, cmdTools(args[1:], stdout, stderr)
+	case "migrate":
+		return true, cmdMigrate(args[1:], stdout, stderr)
 	case "support-bundle":
 		return true, cmdSupport(args[1:], stdout, stderr)
 	default:
@@ -109,7 +111,7 @@ func hoistConfigFlags(args []string) []string {
 
 func isCommand(name string) bool {
 	switch name {
-	case "help", "version", "cred", "validate", "doctor", "init", "config", "loop", "tools", "support-bundle":
+	case "help", "version", "cred", "validate", "doctor", "init", "config", "loop", "tools", "migrate", "support-bundle":
 		return true
 	}
 	return false
@@ -132,6 +134,7 @@ commands:
   config        schema | path | show
   loop          check <file|dir|plugin:name> | test <scenario.yaml>
   tools         import-openapi <spec> [-out dir]
+  migrate       store|blobs — copy state to another backend
   cred          set|get|list|delete <name>
   support-bundle  collect diagnostics for a support request
   version       print version information
@@ -191,6 +194,14 @@ commands:
 	"tools": `usage: agentflow tools import-openapi <spec> [-out DIR]
 
 Convert an OpenAPI document into declarative tools.http entries.
+`,
+	"migrate": `usage: agentflow migrate store -from <target> -to <target> [-tables LIST] [-append]
+       agentflow migrate blobs -from fs:<dir> [-kind media|files] [-config PATH]
+
+store copies the runtime, identity and credential tables between SQLite and
+PostgreSQL (credentials stay ciphertext; both stores need the same master key).
+blobs copies a local media/files directory into the S3 bucket configured for
+the chosen kind. Both are idempotent: rerunning skips what is already there.
 `,
 	"support-bundle": `usage: agentflow support-bundle [-config PATH | -configdir DIR] [-out FILE]
 

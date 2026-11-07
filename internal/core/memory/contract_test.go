@@ -166,14 +166,17 @@ func runContract(t *testing.T, h memory.BackendHandle, features []string) {
 	}
 
 	if has("vector") {
-		// Three points on a line, so the nearest neighbour is unambiguous.
-		for i, vec := range [][]float32{{0, 0, 0}, {1, 1, 1}, {9, 9, 9}} {
+		// Three distinct directions, so the nearest neighbour is unambiguous.
+		// An all-zero vector cannot be one of them: cosine similarity with it
+		// is undefined, and the backends would rank the undefined point
+		// differently (pgvector's NaN sorts last; a Go scan has to choose).
+		for i, vec := range [][]float32{{1, 0, 0}, {0, 1, 0}, {-1, 0, 0}} {
 			key := []string{"v:zero", "v:one", "v:nine"}[i]
 			if err := h.Put(table, key, key, memory.PutOpts{Vector: vec}); err != nil {
 				t.Fatalf("Put with vector (%s): %v", key, err)
 			}
 		}
-		it, err := h.Query(table, memory.Query{Kind: "vector", Vector: []float32{0.1, 0.1, 0.1}, K: 1})
+		it, err := h.Query(table, memory.Query{Kind: "vector", Vector: []float32{1, 0.1, 0}, K: 1})
 		if err != nil {
 			t.Fatalf("vector query: %v", err)
 		}

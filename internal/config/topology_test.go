@@ -262,3 +262,29 @@ func TestVolatileStoreNeedsABound(t *testing.T) {
 		t.Fatalf("a backend max_entries should bound volatile: %v", err)
 	}
 }
+
+// TestDefaultMainBackend: the built-in conversational profile names main_db, so
+// a config with no memory.backends block gets it on the runtime store — the
+// minimal deployment needs no second setting.
+func TestDefaultMainBackend(t *testing.T) {
+	c := &Config{Runtime: Runtime{Persistence: "sqlite://./data/agentflow.db"}}
+	if err := validate("test.yaml", c); err != nil {
+		t.Fatal(err)
+	}
+	b, ok := c.Memory.Backends["main_db"]
+	if !ok || b.Provider != "sqlite" {
+		t.Fatalf("default backend = %+v, want sqlite main_db", b)
+	}
+
+	c = &Config{Runtime: Runtime{Persistence: "postgres://u:p@db:5432/agentflow"}}
+	if err := validate("test.yaml", c); err != nil {
+		t.Fatal(err)
+	}
+	b = c.Memory.Backends["main_db"]
+	if b.Provider != "postgres" {
+		t.Fatalf("default backend = %+v, want postgres main_db", b)
+	}
+	if got, _ := b.Config["url"].(string); got != c.PersistencePath() {
+		t.Fatalf("default postgres url = %q, want %q", got, c.PersistencePath())
+	}
+}

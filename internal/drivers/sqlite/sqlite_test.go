@@ -114,6 +114,63 @@ func TestSQLiteGCExpired(t *testing.T) {
 	}
 }
 
+// TestSQLiteVectorScan: the brute-force fallback ranks by cosine and respects
+// the configured row cap. It is what makes a single-instance deployment need
+// no extension for semantic recall.
+func TestSQLiteVectorScan(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vec.db")
+	h, err := Provider{}.Open(map[string]any{"path": path, "vector_scan_limit": 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	// Two dimensions for readability: near (1,0), far (0,1).
+	if err := h.Put("t", "near", "a", memory.PutOpts{Vector: []float32{1, 0}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Put("t", "far", "b", memory.PutOpts{Vector: []float32{0, 1}}); err != nil {
+		t.Fatal(err)
+	}
+	it, err := h.Query("t", memory.Query{Kind: "vector", Vector: []float32{0.9, 0.1}, K: 1})
+	if err != nil {
+		t.Fatalf("vector query: %v", err)
+	}
+	var keys []string
+	for it.Next() {
+		keys = append(keys, it.Record().Key)
+	}
+	if err := it.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 1 || keys[0] != "near" {
+		t.Fatalf("nearest keys = %v, want [near]", keys)
+	}
+
+	// A value update without a vector keeps the existing embedding.
+	if err := h.Put("t", "near", "updated", memory.PutOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := h.Get("t", "near"); !ok {
+		t.Fatal("updated row missing")
+	}
+	it, err = h.Query("t", memory.Query{Kind: "vector", Vector: []float32{1, 0}, K: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !it.Next() || it.Record().Key != "near" {
+		t.Fatalf("embedding was lost on a value-only update")
+	}
+
+	// The third vector crosses the configured cap.
+	if err := h.Put("t", "third", "c", memory.PutOpts{Vector: []float32{0.5, 0.5}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Query("t", memory.Query{Kind: "vector", Vector: []float32{1, 0}}); err == nil {
+		t.Fatal("scan above vector_scan_limit must be refused")
+	}
+}
+
 func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }

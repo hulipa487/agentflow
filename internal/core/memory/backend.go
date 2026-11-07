@@ -104,6 +104,14 @@ type BackendProvider interface {
 	Open(config map[string]any) (BackendHandle, error)
 }
 
+// BackendFeatureReporter lets an opened handle report features that depend on
+// what the backend actually connected to — postgres, for instance, serves
+// vectors only when the database has the vector extension. Provider.Features
+// is the static answer; this is the per-instance one, and it wins.
+type BackendFeatureReporter interface {
+	BackendFeatures() []string
+}
+
 // Locality is where a backend's data lives relative to the sessions that read
 // it. It is derived from the provider and the deployment tier, and exposed to
 // loops through agent.info so a loop can tell a durable store from a cache.
@@ -120,7 +128,10 @@ type Registry struct {
 	providers map[string]BackendProvider
 	backends  map[string]BackendHandle
 	config    map[string]BackendConfig
-	log       *slog.Logger
+	// features is the per-backend feature list resolved at Open, when a
+	// handle's connected database may offer more than its provider declares.
+	features map[string][]string
+	log      *slog.Logger
 	// topology is the deployment tier the locality derivation uses. Empty
 	// reads as single, the backward-compatible tier.
 	topology string
@@ -169,6 +180,7 @@ func NewRegistry(log ...*slog.Logger) *Registry {
 		providers: map[string]BackendProvider{},
 		backends:  map[string]BackendHandle{},
 		config:    map[string]BackendConfig{},
+		features:  map[string][]string{},
 		log:       l.With("module", "memory"),
 	}
 }
@@ -192,6 +204,11 @@ func (r *Registry) Open(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("open memory backend %q: %w", name, err)
 		}
+		features := p.Features()
+		if fr, ok := h.(BackendFeatureReporter); ok {
+			features = fr.BackendFeatures()
+		}
+		r.features[name] = features
 		r.backends[name] = &loggingHandle{h: h, backend: name, log: r.log}
 	}
 	return nil
@@ -233,6 +250,14 @@ func (l *loggingHandle) GC(table string, window int) error {
 
 func (l *loggingHandle) Close() error { return l.h.Close() }
 
+// BackendFeatures forwards the handle's own feature report, when it has one.
+func (l *loggingHandle) BackendFeatures() []string {
+	if fr, ok := l.h.(BackendFeatureReporter); ok {
+		return fr.BackendFeatures()
+	}
+	return nil
+}
+
 // Close closes all opened backends.
 func (r *Registry) Close() error {
 	var first error
@@ -250,9 +275,14 @@ func (r *Registry) Handle(name string) (BackendHandle, bool) {
 	return h, ok
 }
 
-// Features reports the provider features of a named backend (nil when the
-// backend or its provider is unknown).
+// Features reports the features of a named backend (nil when the backend or
+// its provider is unknown). The per-backend list resolved at Open wins: a
+// postgres database with the vector extension serves vector queries, and a
+// provider-level list could not say so.
 func (r *Registry) Features(name string) []string {
+	if f, ok := r.features[name]; ok {
+		return append([]string(nil), f...)
+	}
 	c, ok := r.config[name]
 	if !ok {
 		return nil

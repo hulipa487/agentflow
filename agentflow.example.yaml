@@ -121,7 +121,7 @@ memory:
 # returned label + score to allow/review/block. Profiles opt in by listing
 # classifier:<name> in their filters. The model must exist in models: and must
 # be engine-keyed. `safe: allow` is required so the model can report benign
-# text. See docs/configuration.md for the full field reference.
+# text. See configuration.md in AgentFlow Studio's docs for every field.
 # safety:
 #   classifiers:
 #     moderation:
@@ -222,8 +222,8 @@ gateway:
     #   path: /webhook/github/
     #   secret: ${GITHUB_WEBHOOK_SECRET}
     #
-    # Bridge adapter: the runtime POSTs replies to deliver_url, signed with
-    # `secret`; `token` is the outbound bearer token for your adapter.
+    # Bridge adapter: your adapter POSTs events to `path`, HMAC-signed with
+    # `secret`; the runtime POSTs replies to deliver_url with `token` as a bearer.
     # - type: bridge
     #   name: teams
     #   agent: assistant

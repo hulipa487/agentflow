@@ -37,6 +37,7 @@ require (
 	github.com/Microsoft/go-winio v0.6.3
 	github.com/charmbracelet/x/term v0.2.1
 	github.com/invopop/jsonschema v0.14.0
+	golang.org/x/sys v0.48.0
 )
 
 require (
@@ -97,7 +98,6 @@ require (
 	golang.org/x/net v0.59.0 // indirect
 	golang.org/x/oauth2 v0.37.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
-	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/time v0.16.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260921155816-b14227669459 // indirect

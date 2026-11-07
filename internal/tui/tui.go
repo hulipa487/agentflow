@@ -18,6 +18,10 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	// Must initialize before Bubble Tea: it stops Bubble Tea's package init
+	// from querying the terminal on every agentflow command. See its doc.
+	_ "agentflow/internal/tui/noquery"
 )
 
 // snapshotMsg carries one supervisor snapshot's session counts into the model.

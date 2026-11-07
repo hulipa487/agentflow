@@ -433,3 +433,78 @@ func TestSessionKeyRoundTrip(t *testing.T) {
 		t.Fatal("a key without a divider is not a session key")
 	}
 }
+
+// TestLostLeaseStopsLocalActor: when a peer takes a session this instance held,
+// the hub must say so, so the supervisor can stop the local actor. Otherwise
+// the old owner keeps running turns the new owner is also running — two copies
+// of one conversation — and a timer tick on the old instance must be queued for
+// the new owner instead of delivered locally.
+func TestLostLeaseStopsLocalActor(t *testing.T) {
+	a, b, da, db := twoInstances(t)
+	ctx := context.Background()
+	// A short TTL on A lets its claim lapse without B having to release it.
+	a.SetSessionTTL(40 * time.Millisecond)
+	if ok, err := a.Claim(ctx, "bot|chat-1"); err != nil || !ok {
+		t.Fatalf("a claim: %v %v", ok, err)
+	}
+	lost := make(chan string, 2)
+	a.SetOnLost(func(key string) { lost <- key })
+
+	time.Sleep(120 * time.Millisecond) // A does not renew; the claim expires
+	if ok, err := b.Claim(ctx, "bot|chat-1"); err != nil || !ok {
+		t.Fatalf("b claim: %v %v", ok, err)
+	}
+
+	// A's next claim attempt is where it learns it lost the session.
+	if ok, err := a.Claim(ctx, "bot|chat-1"); err != nil || ok {
+		t.Fatalf("a reclaimed a session b owns: ok=%v err=%v", ok, err)
+	}
+	select {
+	case key := <-lost:
+		if key != "bot|chat-1" {
+			t.Fatalf("onLost(%q), want bot|chat-1", key)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("losing the lease did not call onLost")
+	}
+
+	// A timer tick on A — the old owner — must be queued for B, never
+	// delivered by A. That is the path the scheduler adapter uses.
+	if err := a.Route(ctx, "bot", "chat-1", msg("timer:bot|chat-1:t1:1")); err != nil {
+		t.Fatalf("route timer tick on a: %v", err)
+	}
+	if da.count() != 0 {
+		t.Fatalf("the old owner delivered a timer tick: %v", da.got())
+	}
+	b.SetPoll(5 * time.Millisecond)
+	bctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go b.Drain(bctx)
+	deadline := time.Now().Add(2 * time.Second)
+	for db.count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if db.count() != 1 {
+		t.Fatalf("the new owner did not deliver the queued tick: %v", db.got())
+	}
+}
+
+// TestOnLostOnlyFiresForSessionsThisInstanceHeld: being unable to take someone
+// else's session is the normal routing case, not a loss.
+func TestOnLostOnlyFiresForSessionsThisInstanceHeld(t *testing.T) {
+	a, b, _, _ := twoInstances(t)
+	ctx := context.Background()
+	if ok, err := b.Claim(ctx, "bot|chat-9"); err != nil || !ok {
+		t.Fatalf("b claim: %v %v", ok, err)
+	}
+	called := make(chan string, 1)
+	a.SetOnLost(func(key string) { called <- key })
+	if err := a.Route(ctx, "bot", "chat-9", msg("m1")); err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	select {
+	case key := <-called:
+		t.Fatalf("onLost fired for a session this instance never held: %q", key)
+	case <-time.After(50 * time.Millisecond):
+	}
+}

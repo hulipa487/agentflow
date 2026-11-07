@@ -518,20 +518,12 @@ func main() {
 	// living on the host forever.
 	shellMgr.SetRegistry(caps.ShellStore{Store: rtStore}, leaseMgr.Owner())
 
-	// singleton runs fn only while this instance holds the named lease. A store
-	// that cannot answer is a store that cannot arbitrate: the work is skipped
-	// rather than run by everyone.
-	singleton := func(ctx context.Context, name string, fn func()) {
-		ok, err := leaseMgr.Acquire(ctx, name)
-		if err != nil {
-			log.Warn("scheduled work skipped: lease unavailable", "name", name, "err", err)
-			return
-		}
-		if !ok {
-			log.Debug("scheduled work skipped: another instance holds it", "name", name)
-			return
-		}
-		fn()
+	// singletonFor runs fn only while this instance holds the named lease for
+	// ttl. The TTL belongs to the job: a job that repeats should hold its lease
+	// for at least its interval plus slack, or the lease lapses between two of
+	// its own ticks and a peer runs the job as well (see housekeepingTTL).
+	singletonFor := func(ctx context.Context, name string, ttl time.Duration, fn func()) {
+		claimAndRun(ctx, leaseMgr, name, ttl, log, fn)
 	}
 
 	// agentDayUsage reads an agent's deployment-wide spend for today from the
@@ -592,9 +584,23 @@ func main() {
 	// Per-user token quota: durable (read from the ledger, so a restart
 	// forgives nothing) and only meaningful for a linked handle — traffic with
 	// no profile has no account to charge.
+	//
+	// A regional cell keeps the in-flight holds in the shared store: two
+	// instances admitting a call each against the same remaining budget is the
+	// overspend the hold exists to prevent, and per-process maps cannot see
+	// each other. Single keeps the in-memory map it always had.
 	var userQuota *accounting.Quota
 	if identReg != nil {
-		userQuota = accounting.New(rtStore, identReg.LimitFor, cfg.Usage.DefaultTokensPerDay)
+		if cfg.IsRegional() {
+			userQuota, err = accounting.NewShared(cfg.PersistencePath(), rtStore, identReg.LimitFor, cfg.Usage.DefaultTokensPerDay)
+			if err != nil {
+				log.Error("shared quota holds failed", "err", err)
+				os.Exit(1)
+			}
+			defer func() { _ = userQuota.Close() }()
+		} else {
+			userQuota = accounting.New(rtStore, identReg.LimitFor, cfg.Usage.DefaultTokensPerDay)
+		}
 	}
 
 	// The loop-visible projection of a profile: a display name and the handles,
@@ -655,26 +661,37 @@ func main() {
 		filesMgr = files.New(blobStore, rtStore, cfg.Files.FilesScratchTTL(), cfg.Files.FilesMaxBytes(), log)
 	}
 	if filesMgr != nil {
-		singleton(ctx, "files-scratch", func() {
+		// Scratch expiry and blob GC ran only at boot, so a long-lived instance
+		// accumulated scratch until it restarted. They now tick hourly too; the
+		// lease is hourly plus slack, so a fleet still runs each pass once.
+		sweepScratch := func() {
 			if n, err := filesMgr.SweepScratch(ctx); err != nil {
 				log.Warn("files scratch sweep failed", "err", err)
 			} else if n > 0 {
 				metrics.Add("agentflow_files_scratch_swept", int64(n))
 				log.Info("files scratch swept", "expired", n)
 			}
+		}
+		singletonFor(ctx, "files-scratch", housekeepingTTL(time.Hour), sweepScratch)
+		every(ctx, time.Hour, func() {
+			singletonFor(ctx, "files-scratch", housekeepingTTL(time.Hour), sweepScratch)
 		})
 		// Blob GC: mark-and-sweep unreferenced blobs past the grace window.
 		// Disabled with files.gc_grace: "0". One instance sweeps: two concurrent
 		// mark-and-sweeps over one blob store can delete what the other is still
 		// writing.
 		if grace := cfg.Files.FilesGCGrace(); grace > 0 {
-			singleton(ctx, "files-gc", func() {
+			sweepBlobs := func() {
 				if live, swept, err := filesMgr.GC(ctx, grace); err != nil {
 					log.Warn("files blob gc failed", "err", err)
 				} else if swept > 0 {
 					metrics.Add("agentflow_files_gc_swept", int64(swept))
 					log.Info("files blob gc swept", "live", live, "swept", swept)
 				}
+			}
+			singletonFor(ctx, "files-gc", housekeepingTTL(time.Hour), sweepBlobs)
+			every(ctx, time.Hour, func() {
+				singletonFor(ctx, "files-gc", housekeepingTTL(time.Hour), sweepBlobs)
 			})
 		}
 	}
@@ -1371,6 +1388,14 @@ func main() {
 		hub.SetSessionTTL(d)
 	}
 	sup.SetHub(hub)
+	// A session this instance loses to a peer must stop locally at once, not
+	// keep running turns the new owner is also running. StopSessionForLease
+	// cancels the actor without retiring the id, so this instance can run the
+	// conversation again if it later wins the lease back.
+	hub.SetOnLost(func(sessKey string) {
+		log.Warn("session lease lost to another instance; stopping the local actor", "session", sessKey)
+		sup.StopSessionForLease(sessKey)
+	})
 	// Group-identity validation: the router proposes, the engine resolves.
 	// A proposal naming a group the sender is not active in is refused at the
 	// deliver boundary; an accepted one stamps the derived membership uuid
@@ -1386,6 +1411,17 @@ func main() {
 		return tenancy.MembershipUUID(personalUUID, groupUUID), nil
 	})
 	go hub.Drain(ctx)
+
+	// Daemon failover. BootPersistent runs once per instance at startup, so a
+	// daemon whose instance is killed stays down until some instance restarts.
+	// Check every half session TTL: FailoverPersistent asks the lease table
+	// whether anyone owns the daemon and claims it when nobody does, so a peer
+	// that also notices still runs the boot turn once.
+	failoverEvery := hub.SessionTTL() / 2
+	if failoverEvery < time.Second {
+		failoverEvery = time.Second
+	}
+	every(ctx, failoverEvery, func() { sup.FailoverPersistent(ctx) })
 
 	// Shell handle reclaim. A session that ends reaps its own shells, but an
 	// instance that is killed never runs that, and its containers would stay on
@@ -1404,24 +1440,18 @@ func main() {
 			log.Info("shell handles reclaimed", "handles", n)
 		}
 	}
-	singleton(ctx, "shell-reclaim", reclaim)
-	go func() {
-		tick := time.NewTicker(shell.ReclaimInterval)
-		defer tick.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-tick.C:
-				singleton(ctx, "shell-reclaim", reclaim)
-			}
-		}
-	}()
+	reclaimTTL := housekeepingTTL(shell.ReclaimInterval)
+	singletonFor(ctx, "shell-reclaim", reclaimTTL, reclaim)
+	every(ctx, shell.ReclaimInterval, func() {
+		singletonFor(ctx, "shell-reclaim", reclaimTTL, reclaim)
+	})
 
 	// Expired key/value rows — a route handler's state, the file store's
 	// scratch — are reclaimed once a day. A row's deadline is a promise the
 	// store keeps on read; this is what keeps the space, including for rows
-	// nothing reads again.
+	// nothing reads again. The same pass reclaims delivered inbox rows (which
+	// otherwise grow without bound) and instance rows whose process is long
+	// gone.
 	sweepRows := func() {
 		if n, err := rtStore.SweepExpired(ctx); err != nil {
 			log.Warn("expired row sweep failed", "err", err)
@@ -1434,20 +1464,29 @@ func main() {
 		if err := tenReg.Sweep(ctx); err != nil {
 			log.Warn("tenancy sweep failed", "err", err)
 		}
-	}
-	singleton(ctx, "rows-sweep", sweepRows)
-	go func() {
-		tick := time.NewTicker(24 * time.Hour)
-		defer tick.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-tick.C:
-				singleton(ctx, "rows-sweep", sweepRows)
+		if n, err := hubQueue.Sweep(ctx); err != nil {
+			log.Warn("inbox sweep failed", "err", err)
+		} else if n > 0 {
+			log.Info("delivered inbox rows reclaimed", "rows", n)
+		}
+		if n, err := fleetReg.Sweep(ctx, time.Now().Add(-fleet.SweepAfter)); err != nil {
+			log.Warn("instance registry sweep failed", "err", err)
+		} else if n > 0 {
+			log.Info("stale instance rows reclaimed", "rows", n)
+		}
+		if userQuota != nil {
+			if n, err := userQuota.SweepHolds(ctx, time.Now()); err != nil {
+				log.Warn("quota hold sweep failed", "err", err)
+			} else if n > 0 {
+				log.Info("expired quota holds reclaimed", "rows", n)
 			}
 		}
-	}()
+	}
+	sweepRowsTTL := housekeepingTTL(24 * time.Hour)
+	singletonFor(ctx, "rows-sweep", sweepRowsTTL, sweepRows)
+	every(ctx, 24*time.Hour, func() {
+		singletonFor(ctx, "rows-sweep", sweepRowsTTL, sweepRows)
+	})
 
 	// Token ledger retention: the daily rollup and (when enabled) the per-call
 	// detail log age out on a daily tick, like the journal. One instance does it:
@@ -1469,19 +1508,11 @@ func main() {
 				}
 			}
 		}
-		singleton(ctx, "usage-prune", prune)
-		go func() {
-			tick := time.NewTicker(24 * time.Hour)
-			defer tick.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-tick.C:
-					singleton(ctx, "usage-prune", prune)
-				}
-			}
-		}()
+		pruneTTL := housekeepingTTL(24 * time.Hour)
+		singletonFor(ctx, "usage-prune", pruneTTL, prune)
+		every(ctx, 24*time.Hour, func() {
+			singletonFor(ctx, "usage-prune", pruneTTL, prune)
+		})
 	}
 
 	// Message journal (core-owned audit). Every inbound event is recorded at
@@ -1497,19 +1528,11 @@ func main() {
 					log.Info("journal pruned", "rows", n, "retention_days", days)
 				}
 			}
-			singleton(ctx, "journal-prune", prune)
-			go func() {
-				tick := time.NewTicker(24 * time.Hour)
-				defer tick.Stop()
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case <-tick.C:
-						singleton(ctx, "journal-prune", prune)
-					}
-				}
-			}()
+			pruneTTL := housekeepingTTL(24 * time.Hour)
+			singletonFor(ctx, "journal-prune", pruneTTL, prune)
+			every(ctx, 24*time.Hour, func() {
+				singletonFor(ctx, "journal-prune", pruneTTL, prune)
+			})
 		}
 		sup.EgressJournal = func(rec session.EgressRecord) {
 			errStr := rec.Err
@@ -2001,6 +2024,15 @@ func main() {
 	<-ctx.Done()
 
 	log.Info("shutting down")
+	// Report unready first, then drain: a load balancer that honours readiness
+	// stops sending new traffic before the listeners close, and an in-flight
+	// turn gets the window to finish. A regional cell defaults to five seconds;
+	// single keeps the old immediate exit.
+	admin.SetReady(false)
+	if grace := cfg.ShutdownGrace(); grace > 0 {
+		log.Info("draining before shutdown", "grace", grace.String())
+		time.Sleep(grace)
+	}
 	// Before the stores close: stopping the triggers gives up their claims, and
 	// the hub gives up its sessions, so the rest of the fleet picks both up at
 	// once instead of waiting out the leases.

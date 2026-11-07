@@ -111,7 +111,12 @@ type Supervisor struct {
 	// session address must fail (the recipient is gone); find-or-create is only
 	// for session addresses that have never existed (e.g. a PM session that has
 	// not been started yet), never for resurrecting a dead one.
-	retired   map[string]struct{}
+	retired map[string]struct{}
+	// leaseLost marks sessions this instance stopped because the hub lost their
+	// lease to a peer. Such a session must NOT be retired: this instance may win
+	// the lease back later, and the same conversation then has to be able to
+	// run here again.
+	leaseLost map[string]struct{}
 	templates map[string]*SpawnTemplate
 	// safetyBySession is the dispatcher each live session runs under, so a
 	// spawned child can inherit its parent's chain when the profile does not
@@ -136,6 +141,7 @@ func New(defs map[string]*AgentDef, gw *gateway.Registry, p *pool.Pool, shellMgr
 		sessions:        map[string]*session.Actor{},
 		cancels:         map[string]context.CancelFunc{},
 		retired:         map[string]struct{}{},
+		leaseLost:       map[string]struct{}{},
 		templates:       templates,
 		safetyBySession: map[string]*safety.Dispatcher{},
 		tenants:         map[string]string{},
@@ -216,6 +222,48 @@ func (s *Supervisor) BootPersistent(ctx context.Context) {
 // daemonKey is the session key a daemon agent's boot turn is delivered to.
 const daemonKey = "boot"
 
+// FailoverPersistent boots every persistent agent that no live instance owns.
+//
+// BootPersistent only runs at startup, so a daemon whose instance is killed
+// stays down until some instance restarts — the one piece of fleet state that
+// was not self-healing. The loop calls this every half session TTL: `Live` reads
+// the lease, and `bootPersistentOne` claims it, so two instances noticing the
+// same dead daemon still boot it once.
+func (s *Supervisor) FailoverPersistent(ctx context.Context) {
+	if s.hub == nil {
+		return
+	}
+	for name, def := range s.defs {
+		if !def.Persistent || def.SpawnTemplate != nil {
+			continue
+		}
+		sessKey := name + "|" + daemonKey
+		live, err := s.hub.Live(ctx, sessKey)
+		if err != nil {
+			s.log.Warn("daemon failover check failed; leaving the daemon alone", "agent", name, "err", err)
+			continue
+		}
+		if live {
+			continue
+		}
+		s.log.Info("daemon has no live owner; attempting to boot it here", "agent", name)
+		s.bootPersistentOne(ctx, name, def)
+	}
+}
+
+// BootPersistentAgent boots one daemon by name — the runtime-registry path,
+// where an agent is installed after Start and the definition is already in the
+// map. Reports whether the boot turn was delivered here.
+func (s *Supervisor) BootPersistentAgent(ctx context.Context, name string) bool {
+	s.mu.Lock()
+	def := s.defs[name]
+	s.mu.Unlock()
+	if def == nil {
+		return false
+	}
+	return s.bootPersistentOne(ctx, name, def)
+}
+
 // Agents returns the agent definitions (the reload watcher reads these).
 func (s *Supervisor) Agents() map[string]*AgentDef { return s.defs }
 
@@ -232,6 +280,10 @@ type SessionRouter interface {
 	// see BootPersistent — so a router that cannot answer must return an error
 	// rather than a hopeful true.
 	Claim(ctx context.Context, sessKey string) (bool, error)
+	// Live reports whether any instance still owns the session. The daemon
+	// failover loop asks it before re-booting a daemon; a store that cannot
+	// answer makes the loop skip rather than risk a second copy.
+	Live(ctx context.Context, sessKey string) (bool, error)
 }
 
 // SetHub installs the router that decides whether a delivered message is this
@@ -426,6 +478,22 @@ func (s *Supervisor) StopSession(sessionID string) {
 	}
 }
 
+// StopSessionForLease stops the local actor for a session whose lease moved to
+// another instance. Unlike an ordinary stop, the session is not retired: this
+// instance may take the lease back later, and the conversation must then be
+// able to run here again. If the actor is already gone the call does nothing.
+func (s *Supervisor) StopSessionForLease(sessionID string) {
+	s.mu.Lock()
+	cancel, ok := s.cancels[sessionID]
+	if ok {
+		s.leaseLost[sessionID] = struct{}{}
+	}
+	s.mu.Unlock()
+	if ok {
+		cancel()
+	}
+}
+
 func (s *Supervisor) onActorExit(id session.Identity, reason session.EndReason) {
 	var parent *session.Actor
 
@@ -438,7 +506,12 @@ func (s *Supervisor) onActorExit(id session.Identity, reason session.EndReason) 
 		delete(s.safetyBySession, id.SessionID)
 		metrics.Add("agentflow_sessions_active", -1)
 		metrics.Inc("agentflow_children_died")
-		if s.retired != nil {
+		if _, lost := s.leaseLost[id.SessionID]; lost {
+			// The lease moved to a peer. Retiring the id here would make every
+			// later send to this conversation fail if this instance wins it
+			// back, so the loss marker is consumed without retiring.
+			delete(s.leaseLost, id.SessionID)
+		} else if s.retired != nil {
 			s.retired[id.SessionID] = struct{}{}
 		}
 	}

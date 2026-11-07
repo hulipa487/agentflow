@@ -276,6 +276,12 @@ type Runtime struct {
 	// metrics and the instance registry, never a routing decision: a regional
 	// cell treats every zone the same, and a session may move between them.
 	Zone string `yaml:"zone"`
+	// ShutdownGrace is how long this instance reports itself unready and keeps
+	// serving before it closes. A regional cell defaults to 5s so a load
+	// balancer has time to stop sending new traffic and in-flight turns can
+	// finish; single defaults to 0, preserving the immediate shutdown it always
+	// had. "0" explicitly disables the wait.
+	ShutdownGrace string `yaml:"shutdown_grace"`
 }
 
 // TimezoneOffset is the cron matching offset as a duration. It is a fixed
@@ -1746,6 +1752,17 @@ func validate(path string, c *Config) error {
 	if n := c.Runtime.Studio.TraceSessions; n < 0 || n > 10_000 {
 		return fmt.Errorf("%s: runtime.studio.trace_sessions must be between 0 and 10000", path)
 	}
+	// Grace 0 is meaningful (shut down immediately), so this cannot join the
+	// positive-duration loop above.
+	if raw := strings.TrimSpace(c.Runtime.ShutdownGrace); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("%s: runtime.shutdown_grace: %v", path, err)
+		}
+		if d < 0 {
+			return fmt.Errorf("%s: runtime.shutdown_grace must be >= 0", path)
+		}
+	}
 	if !c.Runtime.Admin.TCPEnabled() && strings.TrimSpace(c.Runtime.Admin.Socket) == "" {
 		return fmt.Errorf("%s: runtime.admin.tcp is false but no runtime.admin.socket is configured", path)
 	}
@@ -2459,6 +2476,24 @@ func (c *Config) Topology() string {
 
 // IsRegional reports whether this instance is part of a regional cell.
 func (c *Config) IsRegional() bool { return c.Topology() == "regional" }
+
+// ShutdownGrace returns the drain window before shutdown: the configured value,
+// or the tier's default (5s regional, 0 single). A value that does not parse is
+// 0 here; validation refuses it with a message naming the setting.
+func (c *Config) ShutdownGrace() time.Duration {
+	raw := strings.TrimSpace(c.Runtime.ShutdownGrace)
+	if raw == "" {
+		if c.IsRegional() {
+			return 5 * time.Second
+		}
+		return 0
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d < 0 {
+		return 0
+	}
+	return d
+}
 
 // PersistencePath is the runtime store's target, resolved to the address its
 // backend opens: a file path for SQLite, a DSN for PostgreSQL.

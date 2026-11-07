@@ -220,6 +220,48 @@ func (d *DB) QueryRow(ctx context.Context, query string, args ...any) *sql.Row {
 	return d.db.QueryRowContext(ctx, d.bind(query), args...)
 }
 
+// Tx is a transaction on either backend, with the same "?" placeholder rule as
+// DB. It exists for the few operations that must be one atomic unit across
+// several statements — the shared quota holds are the first — where the
+// alternative is a second, hand-written statement per backend.
+type Tx struct {
+	tx      *sql.Tx
+	backend string
+}
+
+// BeginTx starts a transaction. The caller owns Commit/Rollback.
+func (d *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
+	tx, err := d.db.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, fmt.Errorf("storedb: begin transaction: %w", err)
+	}
+	return &Tx{tx: tx, backend: d.backend}, nil
+}
+
+// Exec runs a statement inside the transaction.
+func (t *Tx) Exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return t.tx.ExecContext(ctx, t.bind(query), args...)
+}
+
+// QueryRow runs a statement inside the transaction.
+func (t *Tx) QueryRow(ctx context.Context, query string, args ...any) *sql.Row {
+	return t.tx.QueryRowContext(ctx, t.bind(query), args...)
+}
+
+// Commit commits the transaction.
+func (t *Tx) Commit() error { return t.tx.Commit() }
+
+// Rollback rolls the transaction back. Rolling back a committed transaction is
+// a no-op error in database/sql, so callers can defer it unconditionally.
+func (t *Tx) Rollback() error { return t.tx.Rollback() }
+
+func (t *Tx) bind(query string) string {
+	if t.backend != BackendPostgres {
+		return query
+	}
+	return rebind(query)
+}
+
 // ExecDDL runs schema statements one at a time. A single Exec carrying several
 // statements is not portable: the PostgreSQL driver's extended protocol refuses
 // more than one command in a prepared statement, so a schema that worked on one

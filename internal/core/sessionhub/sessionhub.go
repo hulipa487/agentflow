@@ -57,6 +57,13 @@ type Hub struct {
 	poll time.Duration
 	ttl  time.Duration
 
+	// onLost, when set, is called with a session key this instance held and no
+	// longer holds — a peer took the lease, typically because this instance was
+	// stalled or partitioned past the TTL. Without it the local actor keeps
+	// running turns the new owner is also running: two copies of one
+	// conversation, which is the failure the lease exists to prevent.
+	onLost func(sessionKey string)
+
 	mu   sync.Mutex
 	held map[string]bool // session keys this instance owns
 	// renewed is when each held session's claim was last written to the store.
@@ -97,6 +104,17 @@ func (h *Hub) SetSessionTTL(d time.Duration) {
 		h.ttl = d
 	}
 }
+
+// SessionTTL reports the claim TTL this hub renews at. Callers that schedule
+// work around the lease (the daemon failover loop) use it rather than reading
+// the setting twice.
+func (h *Hub) SessionTTL() time.Duration { return h.ttl }
+
+// SetOnLost installs the callback for a session this instance has lost to a
+// peer. It is called outside the hub's lock, once per loss, and must stop the
+// local actor: a session running here after the lease moved runs the same
+// conversation as its new owner.
+func (h *Hub) SetOnLost(fn func(sessionKey string)) { h.onLost = fn }
 
 // Claim takes the session for this instance and keeps it: from here on the
 // drain renews the claim and delivers anything queued for it, exactly as for a
@@ -164,16 +182,22 @@ func (h *Hub) claim(ctx context.Context, sessKey string) (bool, error) {
 		return false, err
 	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	lost := false
 	if ok {
 		h.held[sessKey] = true
 		h.renewed[sessKey] = time.Now()
-		return true, nil
+	} else {
+		// Another instance owns it. Only a session this instance actually held
+		// is a loss; a message for someone else's session is the normal case.
+		_, lost = h.held[sessKey]
+		delete(h.held, sessKey)
+		delete(h.renewed, sessKey)
 	}
-	// Another instance owns it, and this one does not.
-	delete(h.held, sessKey)
-	delete(h.renewed, sessKey)
-	return false, nil
+	h.mu.Unlock()
+	if lost && h.onLost != nil {
+		h.onLost(sessKey)
+	}
+	return ok, nil
 }
 
 // renewIfDue renews a session's claim when the renewal is due — at a third of

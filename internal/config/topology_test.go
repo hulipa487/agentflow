@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // regionalConfig is a configuration every regional rule accepts: one PostgreSQL
@@ -172,5 +173,29 @@ func TestSamePostgresServer(t *testing.T) {
 	}
 	if SamePostgresServer("sqlite://./data/a.db", "sqlite://./data/a.db") {
 		t.Fatal("a SQLite target has no PostgreSQL server")
+	}
+}
+
+func TestShutdownGraceDefault(t *testing.T) {
+	if got := (&Config{}).ShutdownGrace(); got != 0 {
+		t.Fatalf("single default grace = %v, want 0", got)
+	}
+	if got := (&Config{Runtime: Runtime{Topology: "regional"}}).ShutdownGrace(); got != 5*time.Second {
+		t.Fatalf("regional default grace = %v, want 5s", got)
+	}
+	for raw, want := range map[string]time.Duration{
+		"0":   0,
+		"2s":  2 * time.Second,
+		"1m":  time.Minute,
+		"30s": 30 * time.Second,
+	} {
+		c := &Config{Runtime: Runtime{ShutdownGrace: raw}}
+		if got := c.ShutdownGrace(); got != want {
+			t.Errorf("shutdown_grace %q = %v, want %v", raw, got, want)
+		}
+	}
+	c := &Config{Runtime: Runtime{ShutdownGrace: "-1s"}}
+	if err := validate("test.yaml", c); err == nil || !strings.Contains(err.Error(), "runtime.shutdown_grace") {
+		t.Fatalf("negative grace err = %v, want a runtime.shutdown_grace refusal", err)
 	}
 }

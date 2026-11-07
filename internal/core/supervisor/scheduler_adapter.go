@@ -1,11 +1,14 @@
 package supervisor
 
 import (
+	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
 	"agentflow/internal/core/scheduler"
 	"agentflow/internal/core/session"
+	"agentflow/internal/core/sessionhub"
 )
 
 // schedulerAdapter adapts the scheduler.Service to the session.SchedulerService
@@ -27,7 +30,11 @@ func (a *schedulerAdapter) deliver(owner string, timerID scheduler.TimerID, scop
 		principal = "system:scheduler"
 	}
 	msg := session.Message{
-		ID:   "timer:" + owner + ":" + string(timerID),
+		// One id per fire, not per timer. The inbox deduplicates on
+		// (session, origin|id), so a stable id would make every tick after the
+		// first look like a retry and silently drop it. The timestamp keeps the
+		// id unique without a second counter to persist.
+		ID:   fmt.Sprintf("timer:%s:%s:%d", owner, timerID, time.Now().UnixNano()),
 		Type: "timer",
 		From: "system:scheduler",
 		Ts:   time.Now().Unix(),
@@ -44,6 +51,25 @@ func (a *schedulerAdapter) deliver(owner string, timerID scheduler.TimerID, scop
 			UserUUID:       scope.UserUUID,
 			MembershipUUID: scope.MembershipUUID,
 		},
+	}
+	// With a hub installed, a timer tick is traffic like any other: it must go
+	// to whichever instance owns the session. Writing straight to the local
+	// mailbox is how a stalled instance kept running a session whose lease a
+	// peer had already taken — two copies of one conversation.
+	if a.sup.hub != nil {
+		agent, key, ok := sessionhub.SplitSessionKey(owner)
+		if !ok {
+			a.log.Warn("timer has malformed owner; dropping tick", "owner", owner, "timer", string(timerID))
+			return
+		}
+		ctx := a.sup.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if err := a.sup.hub.Route(ctx, agent, key, msg); err != nil {
+			a.log.Warn("timer tick could not be routed; dropping it", "session", owner, "timer", string(timerID), "err", err)
+		}
+		return
 	}
 	a.sup.mu.Lock()
 	actor, ok := a.sup.sessions[owner]

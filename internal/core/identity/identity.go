@@ -466,6 +466,55 @@ func (r *Registry) CreateProfile(displayName, email string) (Profile, error) {
 	return p, nil
 }
 
+// ImportProfile creates or updates a profile with the id and handles a bundle
+// carries, preserving the user uuid the exported data is scoped to. Handles
+// already owned by another profile are left alone rather than stolen; the
+// returned count is how many rows this import linked.
+func (r *Registry) ImportProfile(p Profile) (int, error) {
+	if p.UserID == "" {
+		return 0, fmt.Errorf("identity: import profile has no user_id")
+	}
+	now := time.Now().Unix()
+	created := p.CreatedAt
+	if created == 0 {
+		created = now
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := r.st.Exec(ctx, `
+		INSERT INTO profiles (user_id, display_name, email, tokens_per_day, model, instructions_append, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (user_id) DO UPDATE SET
+			display_name = excluded.display_name,
+			email = excluded.email,
+			tokens_per_day = excluded.tokens_per_day,
+			model = excluded.model,
+			instructions_append = excluded.instructions_append,
+			updated_at = excluded.updated_at`,
+		p.UserID, p.DisplayName, p.Email, p.TokensPerDay, p.Model, p.InstructionsAppend, created, now); err != nil {
+		return 0, err
+	}
+	linked := 0
+	for _, id := range p.Identities {
+		if id.Channel == "" || id.NativeFrom == "" {
+			continue
+		}
+		res, err := r.st.Exec(ctx, `
+			INSERT INTO identities (id, user_id, channel, native_from, reply_to, username, name, trust, deliverable, linkable, first_seen, last_seen)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT DO NOTHING`,
+			id.ID, p.UserID, id.Channel, id.NativeFrom, id.ReplyTo, id.Username, id.Name,
+			id.Trust, boolInt(id.Deliverable), boolInt(id.Linkable), id.FirstSeen, id.LastSeen)
+		if err != nil {
+			return linked, err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			linked++
+		}
+	}
+	return linked, nil
+}
+
 // Get returns a profile with its linked identities.
 func (r *Registry) Get(userID string) (Profile, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

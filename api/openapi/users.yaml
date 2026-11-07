@@ -72,6 +72,9 @@ paths:
                   identity_provider:
                     type: boolean
                     description: True when an access token from the configured provider is accepted
+                  region:
+                    type: string
+                    description: The regional cell this API serves (runtime.region); empty when the deployment has no regions
   /register:
     post:
       summary: Create a profile and receive its API token

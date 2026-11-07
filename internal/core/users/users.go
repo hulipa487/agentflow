@@ -57,6 +57,10 @@ type Options struct {
 	Verifier *oidc.Verifier
 	// JITProvisioning creates a profile on a verified first login.
 	JITProvisioning bool
+	// Region names the cell this API serves (runtime.region). A frontend uses
+	// it to show and pin the user's home region; an empty value means the
+	// deployment has no regions.
+	Region string
 }
 
 // QuotaStatus is the quota's read surface, as the API needs it.
@@ -78,6 +82,7 @@ type API struct {
 	store    runtime.Ledger
 	quota    QuotaStatus
 	limiter  *ipLimiter
+	region   string
 }
 
 // New builds the API. mode selects whether registration is open or requires an
@@ -95,6 +100,7 @@ func New(reg *identity.Registry, cfg config.UsersConfig, log *slog.Logger, opts 
 		files:    opts.Files,
 		store:    opts.Store,
 		quota:    opts.Quota,
+		region:   opts.Region,
 		// Registration and the public endpoints are the anonymous surface; they
 		// share one modest per-address budget.
 		limiter: newIPLimiter(30, 10),
@@ -162,6 +168,10 @@ func (a *API) handleConfig(w http.ResponseWriter, r *http.Request) {
 		// deployment's identity provider when one is configured, or an API
 		// token from /register. Both go in Authorization: Bearer.
 		"identity_provider": a.verifier != nil,
+		// The cell this API serves. A multi-region frontend pins each user to
+		// one region and sends their traffic there; this is what it reports so
+		// the frontend can tell which cell answered.
+		"region": a.region,
 	})
 }
 

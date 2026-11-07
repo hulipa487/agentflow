@@ -32,6 +32,7 @@ import (
 	"agentflow/internal/config"
 	"agentflow/internal/core/accounting"
 	"agentflow/internal/core/budget"
+	"agentflow/internal/core/bundle"
 	"agentflow/internal/core/caps"
 	"agentflow/internal/core/credentials"
 	"agentflow/internal/core/files"
@@ -1730,6 +1731,7 @@ func main() {
 			Quota:            userQuota,
 			Verifier:         oidcVerifier,
 			JITProvisioning:  cfg.Runtime.Users.JITEnabled(),
+			Region:           cfg.Runtime.Region,
 		}).Handler().ServeHTTP)
 		log.Info("user API enabled", "prefix", users.Prefix,
 			"registration", cfg.Runtime.Users.RegistrationMode(),
@@ -1903,6 +1905,18 @@ func main() {
 	})
 	admin.SetCredentials(credStore)
 	{
+		// The full-fidelity user bundle: one person's profile, memory, files and
+		// re-encrypted credentials, for moving them between regional cells.
+		bundleSvc := &bundle.Service{
+			Identity: identReg,
+			Memory:   memMgr,
+			Memories: agentMemories,
+			Files:    filesMgr,
+			Creds:    credStore,
+			Tenancy:  tenReg,
+			Region:   cfg.Runtime.Region,
+			Log:      log,
+		}
 		console := webui.New(webui.Deps{
 			ConfigPath: cfgSource.ConfigPath(),
 			ConfigDir:  cfgSource.ConfigDir(),
@@ -1912,6 +1926,7 @@ func main() {
 			Topology:   cfg.Topology(),
 			Zone:       cfg.Runtime.Zone,
 			Instances:  fleetReg.List,
+			Bundle:     bundleSvc,
 			Models:     llmMgr,
 			History:    history,
 			Creds:      credStore,

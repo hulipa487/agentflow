@@ -352,3 +352,22 @@ func textInbound(from, channel, text string) router.Inbound {
 		},
 	}
 }
+
+// TestConfigReportsRegion: a multi-region frontend needs to know which cell
+// answered /config, so it can pin the user to their home region.
+func TestConfigReportsRegion(t *testing.T) {
+	reg, err := identity.Open(filepath.Join(t.TempDir(), "identity.db"), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+	srv := httptest.NewServer(New(reg, config.UsersConfig{Enabled: true}, discardLogger(), Options{Region: "eu-west"}).Handler())
+	defer srv.Close()
+	status, out := do(t, srv, "GET", Prefix+"/config", "", nil)
+	if status != http.StatusOK {
+		t.Fatalf("config: status %d", status)
+	}
+	if out["region"] != "eu-west" {
+		t.Fatalf("region = %v, want eu-west", out["region"])
+	}
+}

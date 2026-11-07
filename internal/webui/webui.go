@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"agentflow/internal/config"
+	"agentflow/internal/core/bundle"
 	"agentflow/internal/core/credentials"
 	"agentflow/internal/core/fleet"
 	"agentflow/internal/core/metrics"
@@ -82,6 +83,11 @@ type Deps struct {
 	// (tests, or a boot that has not opened the store yet) and the field is
 	// reported empty rather than failing the whole state call.
 	Instances func(context.Context) ([]fleet.Instance, error)
+
+	// Bundle is the full-fidelity user migration service: profile, memory,
+	// files and re-encrypted credentials, for moving one person between
+	// regional cells. Nil answers 503 with a named reason.
+	Bundle *bundle.Service
 
 	// Users is the per-user surface: profiles, the usage ledger and the message
 	// journal (both live in the runtime store), the quota, and the file store.
@@ -198,6 +204,8 @@ func (u *UI) API() http.Handler {
 	mux.HandleFunc("POST /admin/api/users/{id}/unlink", u.handleUserUnlink)
 	mux.HandleFunc("POST /admin/api/users/invites", u.handleInviteIssue)
 	mux.HandleFunc("GET /admin/api/users/{id}/export", u.handleUserExport)
+	mux.HandleFunc("GET /admin/api/users/{id}/bundle", u.handleUserBundle)
+	mux.HandleFunc("POST /admin/api/users/import", u.handleUserImport)
 	mux.HandleFunc("DELETE /admin/api/users/{id}", u.handleUserDelete)
 	mux.HandleFunc("GET /admin/api/usage", u.handleUsage)
 

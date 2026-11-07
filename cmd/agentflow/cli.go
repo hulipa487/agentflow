@@ -171,10 +171,12 @@ Write a runnable starter deployment. The default layout is one agentflow.yaml;
 Load the config, compile every agent and spawn-profile loop, and check the
 gateway route. Relative paths resolve against the config file or directory.
 `,
-	"doctor": `usage: agentflow doctor [-config PATH | -configdir DIR]
+	"doctor": `usage: agentflow doctor [-config PATH | -configdir DIR] [-online]
 
 Offline checks: config load, loop compilation, credentials, identity, admin
-authentication, models and channels. It does not call a provider.
+authentication, models and channels. -online also connects to the runtime
+store, checks the pgvector extension, and probes each S3 bucket, Redis and
+Qdrant backend. -online is the default when runtime.topology is regional.
 `,
 	"config": `usage: agentflow config <command> [-config PATH | -configdir DIR]
 
@@ -341,6 +343,7 @@ type doctorResult struct {
 
 func cmdDoctor(args []string, stdout, stderr io.Writer) int {
 	fs, cfgPath, configDir := cliConfigFlags("doctor", stderr)
+	online := fs.Bool("online", false, "also check runtime store, vector extension, S3, Redis and Qdrant (default on for regional)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -362,6 +365,19 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) int {
 	builtins.SetPluginDir(cfg.Plugins.Dir)
 	builtins.SetPackages(cfg.Packages)
 	add("PASS", "configuration", used.String()+" (epoch "+cfg.Epoch+")")
+
+	// A regional cell's failure modes are all "some instance cannot reach what
+	// the config names", so the live checks default on there; single keeps the
+	// old offline default and opts in with -online.
+	onlineSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "online" {
+			onlineSet = true
+		}
+	})
+	if !onlineSet && cfg.IsRegional() {
+		*online = true
+	}
 
 	if err := validateLoops(cfg); err != nil {
 		add("FAIL", "loops", err.Error())
@@ -427,7 +443,13 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) int {
 	} else {
 		add("PASS", "channels", fmt.Sprintf("%d configured", len(cfg.Gateway.Channels)))
 	}
-	add("SKIP", "network", "no provider connectivity was attempted (doctor is offline by design)")
+	if *online {
+		if runDoctorOnline(cfg, add) {
+			exit = 1
+		}
+	} else {
+		add("SKIP", "network", "no provider connectivity was attempted; pass -online to check backends")
+	}
 	printDoctor(stdout, results)
 	if exit != 0 {
 		return exit

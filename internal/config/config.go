@@ -259,6 +259,23 @@ type Runtime struct {
 	// trigger matching (e.g. 8 for UTC+8, -5.5 for UTC-5:30). 0 = UTC, the
 	// default. every: triggers are unaffected: an interval has no wall clock.
 	TimezoneOffsetHours float64 `yaml:"timezone_offset_hours"`
+
+	// Topology names the deployment shape this instance is part of: "single"
+	// (one process) or "regional" (several instances in one region sharing one
+	// PostgreSQL). Empty means single, which is what every deployment before
+	// this setting was — so an existing config boots unchanged.
+	//
+	// It is one setting rather than a dozen because the tier decides which
+	// other settings are valid: single accepts the local backends it always
+	// did, while regional refuses the ones that would silently give every
+	// instance its own copy of the data (a local blob directory, a SQLite
+	// memory store, a per-boot admin token). The refusals live in validate;
+	// the checks that need the environment (ADMIN_TOKEN) live at boot.
+	Topology string `yaml:"topology"`
+	// Zone names the availability zone within the region. It is a label for
+	// metrics and the instance registry, never a routing decision: a regional
+	// cell treats every zone the same, and a session may move between them.
+	Zone string `yaml:"zone"`
 }
 
 // TimezoneOffset is the cron matching offset as a duration. It is a fixed
@@ -1652,6 +1669,28 @@ func validateHTTPTools(path string, c *Config) error {
 	return nil
 }
 
+// validateRuntimeLabel checks one of the runtime labels (region, zone) that
+// ends up in a metric label and a log line. It is a token, not free text, and
+// empty is always allowed.
+func validateRuntimeLabel(path, key, value string) error {
+	if value == "" {
+		return nil
+	}
+	if len(value) > 32 {
+		return fmt.Errorf("%s: %s %q is longer than 32 characters", path, key, value)
+	}
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		switch {
+		case ch >= 'a' && ch <= 'z', ch >= 'A' && ch <= 'Z', ch >= '0' && ch <= '9':
+		case ch == '-' || ch == '_' || ch == '.':
+		default:
+			return fmt.Errorf("%s: %s %q may contain only letters, digits and . _ -", path, key, value)
+		}
+	}
+	return nil
+}
+
 func validate(path string, c *Config) error {
 	// An empty deployment is legal: the engine comes up as an admin/Studio
 	// control plane and the first agent can be created there. Channels and
@@ -1668,20 +1707,20 @@ func validate(path string, c *Config) error {
 	}
 	// A region ends up in a metric label and a log line, so it is a token
 	// rather than free text. Empty is the default and means the deployment has
-	// no regions at all.
-	if r := c.Runtime.Region; r != "" {
-		if len(r) > 32 {
-			return fmt.Errorf("%s: runtime.region %q is longer than 32 characters", path, r)
-		}
-		for i := 0; i < len(r); i++ {
-			ch := r[i]
-			switch {
-			case ch >= 'a' && ch <= 'z', ch >= 'A' && ch <= 'Z', ch >= '0' && ch <= '9':
-			case ch == '-' || ch == '_' || ch == '.':
-			default:
-				return fmt.Errorf("%s: runtime.region %q may contain only letters, digits and . _ -", path, r)
-			}
-		}
+	// no regions at all. A zone is the same kind of label; it is optional even
+	// in a regional cell.
+	if err := validateRuntimeLabel(path, "runtime.region", c.Runtime.Region); err != nil {
+		return err
+	}
+	if err := validateRuntimeLabel(path, "runtime.zone", c.Runtime.Zone); err != nil {
+		return err
+	}
+	// The tier is the one setting the rest of the file is judged against, so an
+	// unknown value fails here rather than falling through to single.
+	switch t := strings.ToLower(strings.TrimSpace(c.Runtime.Topology)); t {
+	case "", "single", "regional":
+	default:
+		return fmt.Errorf("%s: runtime.topology %q is not a tier (want \"single\" or \"regional\")", path, c.Runtime.Topology)
 	}
 	for key, raw := range map[string]string{
 		"runtime.cluster.session_ttl":   c.Runtime.Cluster.SessionTTL,
@@ -2142,7 +2181,63 @@ func validate(path string, c *Config) error {
 		}
 	}
 
+	// A regional cell's promises are only true if every instance shares the
+	// state they claim to share. Each refusal names the setting and the fix,
+	// because silently accepting one is how a "fleet" ends up with per-instance
+	// copies of data: local blobs, a local memory store, a local log plane.
+	// Rules that need the environment (ADMIN_TOKEN) are checked at boot in
+	// main, where the environment is resolvable.
+	if c.IsRegional() {
+		if storedb.BackendFor(c.Runtime.Persistence) != storedb.BackendPostgres {
+			return fmt.Errorf("%s: regional topology: runtime.persistence is not a PostgreSQL target; every instance would keep its own database. Set runtime.persistence to the shared postgres:// DSN", path)
+		}
+		for _, t := range []struct {
+			key    string
+			target string
+		}{
+			{"runtime.identity.persistence", c.Runtime.Identity.Persistence},
+			{"runtime.credentials.path", c.Runtime.Credentials.Path},
+		} {
+			if strings.TrimSpace(t.target) == "" {
+				continue
+			}
+			parsed, err := storedb.ParseTarget(t.target, storedb.BackendSQLite, storedb.BackendPostgres)
+			if err == nil && parsed.Backend != storedb.BackendPostgres {
+				return fmt.Errorf("%s: regional topology: %s is a SQLite target; each instance would keep its own copy. Unset it to follow runtime.persistence, or point it at the shared PostgreSQL server", path, t.key)
+			}
+		}
+		// The cluster store used to exist so regions could share one
+		// lease/inbox store. Leases and the inbox now always live in the runtime
+		// store, so a regional cell may only spell the same target twice.
+		if p := strings.TrimSpace(c.Runtime.Cluster.Persistence); p != "" && !SameStoreTarget(p, c.Runtime.Persistence) {
+			return fmt.Errorf("%s: regional topology: runtime.cluster.persistence %q must resolve to runtime.persistence (leases and the session inbox always live in the runtime store); remove the setting, or make it name the same target", path, p)
+		}
+		for name, b := range c.Memory.Backends {
+			if b.Provider == "sqlite" {
+				return fmt.Errorf("%s: regional topology: memory backend %q uses provider sqlite; every instance would keep its own memory. Use postgres, pgvector, qdrant or redisvector", path, name)
+			}
+		}
+		if c.Media.Backend != "s3" {
+			return fmt.Errorf("%s: regional topology: media.backend is %q; every instance would keep its own blobs. Set media.backend: s3", path, backendOrDefault(c.Media.Backend, "fs"))
+		}
+		if c.Files.Backend != "s3" {
+			return fmt.Errorf("%s: regional topology: files.backend is %q; every instance would keep its own files. Set files.backend: s3", path, backendOrDefault(c.Files.Backend, "fs"))
+		}
+		if strings.TrimSpace(c.Runtime.LogPlane.Persistence) != "" {
+			return fmt.Errorf("%s: regional topology: runtime.log_plane.persistence is set; a local log-plane directory would be per-instance. Unset it to keep the log in the runtime store", path)
+		}
+	}
+
 	return nil
+}
+
+// backendOrDefault renders an optional backend setting for an error message,
+// naming the default when the key is absent.
+func backendOrDefault(value, def string) string {
+	if value == "" {
+		return def
+	}
+	return value
 }
 
 // allowedCapabilitySet is the global capability ceiling: the configured
@@ -2349,6 +2444,22 @@ func (c *Config) ResolveMemoryProfile(a Agent) MemoryProfile {
 // one SQLite file beside the blobs.
 const defaultPersistence = "sqlite://./data/agentflow.db"
 
+// Topology returns the deployment tier: "single" when runtime.topology is
+// unset, otherwise the configured value. It is the one place the rest of the
+// engine asks which tier it is running as, so an unset key cannot be read
+// differently by two callers.
+func (c *Config) Topology() string {
+	switch t := strings.ToLower(strings.TrimSpace(c.Runtime.Topology)); t {
+	case "", "single":
+		return "single"
+	default:
+		return t
+	}
+}
+
+// IsRegional reports whether this instance is part of a regional cell.
+func (c *Config) IsRegional() bool { return c.Topology() == "regional" }
+
 // PersistencePath is the runtime store's target, resolved to the address its
 // backend opens: a file path for SQLite, a DSN for PostgreSQL.
 func (c *Config) PersistencePath() string {
@@ -2436,6 +2547,94 @@ func (c *Config) storeBesideRuntime(name string) string {
 		return name
 	}
 	return filepath.Join(dir, name)
+}
+
+// SameStoreTarget reports whether two store targets name the same store. For
+// PostgreSQL that means the same host, port and database — the credentials and
+// connection parameters in a DSN do not change which database it is. For SQLite
+// it means the same cleaned absolute path. A target that will not parse is only
+// equal to itself as written.
+//
+// It exists for the regional tier's "must be one store" rules, where two
+// spellings of the same DSN are the same store and two databases on one server
+// are not.
+func SameStoreTarget(a, b string) bool {
+	ta, errA := storedb.ParseTarget(a, storedb.BackendSQLite, storedb.BackendPostgres)
+	tb, errB := storedb.ParseTarget(b, storedb.BackendSQLite, storedb.BackendPostgres)
+	if errA != nil || errB != nil {
+		return strings.TrimSpace(a) == strings.TrimSpace(b)
+	}
+	if ta.Backend != tb.Backend {
+		return false
+	}
+	if ta.Backend == storedb.BackendPostgres {
+		ka, okA := postgresDatabaseKey(ta.Address)
+		kb, okB := postgresDatabaseKey(tb.Address)
+		if okA && okB {
+			return ka == kb
+		}
+		return ta.Address == tb.Address
+	}
+	return sameFilePath(ta.Address, tb.Address)
+}
+
+// SamePostgresServer reports whether two targets are on the same PostgreSQL
+// server (host and port), ignoring which database they name. A target that is
+// not a PostgreSQL DSN, or a DSN shape this helper cannot read, reports false:
+// the callers warn about a possible mistake, and a warning that fires when it
+// cannot tell is safer than silence.
+func SamePostgresServer(a, b string) bool {
+	ka, okA := postgresServerKey(a)
+	kb, okB := postgresServerKey(b)
+	return okA && okB && ka == kb
+}
+
+// postgresDatabaseKey canonicalises a PostgreSQL DSN to host:port/database.
+func postgresDatabaseKey(target string) (string, bool) {
+	server, db, ok := splitPostgresDSN(target)
+	if !ok {
+		return "", false
+	}
+	return server + "/" + db, true
+}
+
+// postgresServerKey canonicalises a PostgreSQL DSN to host:port.
+func postgresServerKey(target string) (string, bool) {
+	server, _, ok := splitPostgresDSN(target)
+	return server, ok
+}
+
+// splitPostgresDSN reads the host, port and database out of a URL-form
+// PostgreSQL DSN. The keyword=value form pgx also accepts is not parsed: it is
+// rare in this config and an unparsed target simply compares by its full
+// string, which is the conservative answer.
+func splitPostgresDSN(target string) (server, database string, ok bool) {
+	t, err := storedb.ParseTarget(target, storedb.BackendSQLite, storedb.BackendPostgres)
+	if err != nil || t.Backend != storedb.BackendPostgres {
+		return "", "", false
+	}
+	u, err := url.Parse(t.Address)
+	if err != nil || u.Hostname() == "" {
+		return "", "", false
+	}
+	port := u.Port()
+	if port == "" {
+		port = "5432"
+	}
+	server = strings.ToLower(u.Hostname()) + ":" + port
+	database = strings.TrimPrefix(u.Path, "/")
+	return server, database, true
+}
+
+// sameFilePath reports whether two SQLite paths name the same file.
+func sameFilePath(a, b string) bool {
+	abs := func(p string) string {
+		if v, err := filepath.Abs(p); err == nil {
+			p = v
+		}
+		return filepath.Clean(p)
+	}
+	return abs(a) == abs(b)
 }
 
 // CredentialsMasterKeyEnv returns the env var holding the credential master

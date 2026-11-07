@@ -510,20 +510,27 @@ func (s *AdminServer) SetOperators(operators map[string]string) { s.operators = 
 
 func (s *AdminServer) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.token != "" {
-			got := r.Header.Get("Authorization")
-			switch {
-			case subtle.ConstantTimeCompare([]byte(got), []byte("Bearer "+s.token)) == 1:
-				r.Header.Set("X-Operator", "admin")
-			default:
-				name, ok := s.operatorFor(got)
-				if !ok {
-					http.Error(w, "unauthorized", http.StatusUnauthorized)
-					return
-				}
-				r.Header.Set("X-Operator", name)
-			}
+		// No token and no operators means authentication was never configured
+		// (an embedded server, tests): leave the route open, as before. An empty
+		// token WITH operators is a different state — a regional cell that uses
+		// named operators instead of a shared break-glass token — and merging the
+		// two would serve that cell's admin API to anything that could reach it.
+		if s.token == "" && len(s.operators) == 0 {
+			next(w, r)
+			return
 		}
+		got := r.Header.Get("Authorization")
+		if s.token != "" && subtle.ConstantTimeCompare([]byte(got), []byte("Bearer "+s.token)) == 1 {
+			r.Header.Set("X-Operator", "admin")
+			next(w, r)
+			return
+		}
+		name, ok := s.operatorFor(got)
+		if !ok {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		r.Header.Set("X-Operator", name)
 		next(w, r)
 	}
 }

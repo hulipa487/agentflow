@@ -66,6 +66,83 @@ func TestWarnInertConfig(t *testing.T) {
 	}
 }
 
+// TestResolveAdminTokenRegional: a regional cell shares one admin token. With
+// no ADMIN_TOKEN it may use named operators, and must not mint a per-boot token
+// that no peer knows; with neither it refuses rather than minting.
+func TestResolveAdminTokenRegional(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	got, err := resolveAdminTokenForTopology("pinned", "0.0.0.0:9090", false, true, log)
+	if err != nil || got != "pinned" {
+		t.Fatalf("pinned regional token: got %q, %v; want %q, nil", got, err, "pinned")
+	}
+
+	got, err = resolveAdminTokenForTopology("", "127.0.0.1:9090", true, true, log)
+	if err != nil {
+		t.Fatalf("regional with operators: unexpected error %v", err)
+	}
+	if got != "" {
+		t.Fatalf("regional with operators minted a token %q; want none", got)
+	}
+
+	if _, err := resolveAdminTokenForTopology("", "127.0.0.1:9090", false, true, log); err == nil {
+		t.Fatal("regional with no token and no operators must be refused")
+	}
+
+	// Single keeps the old behaviour: a loopback listen gets a per-boot token.
+	got, err = resolveAdminTokenForTopology("", "127.0.0.1:9090", false, false, log)
+	if err != nil || len(got) != 32 {
+		t.Fatalf("single loopback token: got %q, %v; want 32 hex chars, nil", got, err)
+	}
+}
+
+func TestWarnDeprecatedConfig(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	cfg := &config.Config{}
+	warnDeprecatedConfig(cfg, log)
+	if got := buf.String(); got != "" {
+		t.Fatalf("an empty config warned about deprecations:\n%s", got)
+	}
+
+	cfg.Runtime.Cluster.Persistence = "sqlite://./other.db"
+	warnDeprecatedConfig(cfg, log)
+	if !strings.Contains(buf.String(), "runtime.cluster.persistence is deprecated") {
+		t.Fatalf("deprecated setting not reported:\n%s", buf.String())
+	}
+}
+
+func TestWarnTopologyConfig(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	// A Postgres runtime store with no topology is the historical fleet shape.
+	cfg := &config.Config{Runtime: config.Runtime{Persistence: "postgres://u:p@db:5432/agent"}}
+	warnTopologyConfig(cfg, log)
+	if !strings.Contains(buf.String(), "runtime.topology is unset") {
+		t.Fatalf("undeclared fleet not reported:\n%s", buf.String())
+	}
+
+	// A declared single instance says nothing.
+	buf.Reset()
+	cfg.Runtime.Topology = "single"
+	warnTopologyConfig(cfg, log)
+	if got := buf.String(); got != "" {
+		t.Fatalf("declared single warned:\n%s", got)
+	}
+
+	// Regional identity on another PostgreSQL server is a warning, not a
+	// refusal, and the message names the setting.
+	buf.Reset()
+	cfg.Runtime.Topology = "regional"
+	cfg.Runtime.Identity.Persistence = "postgres://u:p@identity:5432/agent"
+	warnTopologyConfig(cfg, log)
+	if !strings.Contains(buf.String(), "runtime.identity.persistence") {
+		t.Fatalf("different identity server not reported:\n%s", buf.String())
+	}
+}
+
 // TestMemoryFromConfigRetention: the store's retention reaches the backend as a
 // write TTL. It was parsed with time.ParseDuration and the error discarded, and
 // Go has no day unit — so the shipped `retention: "30d"` silently became zero,

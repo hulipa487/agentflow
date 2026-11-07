@@ -35,6 +35,7 @@ import (
 	"agentflow/internal/core/caps"
 	"agentflow/internal/core/credentials"
 	"agentflow/internal/core/files"
+	"agentflow/internal/core/fleet"
 	"agentflow/internal/core/gateway"
 	"agentflow/internal/core/identity"
 	"agentflow/internal/core/inbox"
@@ -109,6 +110,7 @@ func main() {
 	noTUI := flag.Bool("no-tui", false, "disable the terminal dashboard (plain stderr logs)")
 	noConsole := flag.Bool("no-console", false, "serve the admin API without the static web console")
 	noWebUI := flag.Bool("no-webui", false, "deprecated: use -no-console")
+	forceSingle := flag.Bool("force-single", false, "start despite another live instance using the store (single topology; use only after a crash)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Usage = func() { printUsage(os.Stderr) }
 	flag.Parse()
@@ -343,6 +345,8 @@ func main() {
 	memMgr := memory.NewManager(memReg, log)
 	warnUnenforceableGC(cfg, log)
 	warnInertConfig(cfg, log)
+	warnDeprecatedConfig(cfg, log)
+	warnTopologyConfig(cfg, log)
 
 	// Drivers and shared infrastructure.
 	llmMgr := llm.NewManager(cfg.Models, log)
@@ -452,20 +456,46 @@ func main() {
 	defer leaseMgr.Close()
 	log.Info("instance identity", "owner", leaseMgr.Owner(), "region", cfg.Runtime.Region)
 
-	// Two topology smells that are otherwise silent, because leases arbitrate
-	// which instance owns a piece of work and a lease store no peer can see
-	// makes every instance believe it is alone: singleton work runs once per
-	// instance instead of once per deployment, and with a region set, an
-	// instance in another region takes a session that is already running and
-	// starts a second copy of the conversation.
+	// Instance registry: one row per process using this store, refreshed as a
+	// heartbeat. It is what makes a `single` deployment refuse a stray second
+	// process instead of silently behaving as an unplanned fleet, and what lets
+	// an operator see every instance behind one admin API.
+	fleetReg, err := fleet.Open(fleet.Config{
+		Target:      cfg.PersistencePath(),
+		Owner:       leaseMgr.Owner(),
+		Region:      cfg.Runtime.Region,
+		Zone:        cfg.Runtime.Zone,
+		Version:     version,
+		Topology:    cfg.Topology(),
+		ConfigEpoch: cfg.Epoch,
+		Log:         log,
+	})
+	if err != nil {
+		log.Error("instance registry failed", "err", err)
+		os.Exit(1)
+	}
+	defer fleetReg.Close()
+	if !cfg.IsRegional() {
+		if err := fleetReg.CheckSingle(ctx); err != nil {
+			if *forceSingle {
+				log.Warn("-force-single: starting despite another live instance", "err", err)
+			} else {
+				log.Error("single topology refuses a second instance", "err", err)
+				os.Exit(1)
+			}
+		}
+	}
+	fleetReg.Start(ctx)
+
+	// The lease store differing from the runtime store is still possible in
+	// `single` (runtime.cluster.persistence is deprecated, not refused), and it
+	// is the smell that makes singleton work run once per instance. In a
+	// regional cell validation refuses it unless it names the runtime store, so
+	// only the single branch remains.
 	clusterTarget := cfg.ClusterStore()
-	if storedb.BackendFor(clusterTarget) != storedb.BackendFor(cfg.PersistencePath()) {
+	if !cfg.IsRegional() && storedb.BackendFor(clusterTarget) != storedb.BackendFor(cfg.PersistencePath()) {
 		log.Warn("the lease store is on a different backend from the runtime store: singleton work will run once per instance rather than once per deployment",
 			"lease_store", storedb.Display(clusterTarget))
-	}
-	if cfg.Runtime.Region != "" && storedb.BackendFor(clusterTarget) == storedb.BackendSQLite {
-		log.Warn("runtime.region is set but the lease store is a local file: an instance in another region cannot see this one's sessions and will start a second copy of the conversation",
-			"region", cfg.Runtime.Region)
 	}
 
 	// Every metric this instance exposes says which instance — and which region
@@ -1808,23 +1838,27 @@ func main() {
 		// disabled TCP address.
 		authListen = "127.0.0.1:9090"
 	}
-	adminToken, tokErr := resolveAdminTokenWithOperators(os.Getenv("ADMIN_TOKEN"), authListen, len(cfg.Runtime.Admin.Operators) > 0, log)
+	// Named operator tokens are resolved before the break-glass token decision:
+	// "has operators" has to mean tokens that actually resolved, or a regional
+	// cell whose every operator credential is missing would believe it has
+	// authentication and mint nothing.
+	ops := make(map[string]string, len(cfg.Runtime.Admin.Operators))
+	for name, raw := range cfg.Runtime.Admin.Operators {
+		v, ok := credResolver.Resolve(ctx, raw)
+		if !ok {
+			log.Warn("admin operator skipped: unresolved credential", "operator", name)
+			continue
+		}
+		ops[name] = v
+	}
+	adminToken, tokErr := resolveAdminTokenForTopology(os.Getenv("ADMIN_TOKEN"), authListen, len(ops) > 0, cfg.IsRegional(), log)
 	if tokErr != nil {
 		log.Error("admin plane has no usable authentication", "err", tokErr)
 		exit(1)
 	}
 	admin := metrics.NewAdminServer(adminAddr, adminToken, metricReg, log)
 	admin.SetCORS(cfg.Runtime.Admin.CORSOrigins)
-	if len(cfg.Runtime.Admin.Operators) > 0 {
-		ops := make(map[string]string, len(cfg.Runtime.Admin.Operators))
-		for name, raw := range cfg.Runtime.Admin.Operators {
-			v, ok := credResolver.Resolve(ctx, raw)
-			if !ok {
-				log.Warn("admin operator skipped: unresolved credential", "operator", name)
-				continue
-			}
-			ops[name] = v
-		}
+	if len(ops) > 0 {
 		admin.SetOperators(ops)
 	}
 	admin.SetReady(true)
@@ -1846,6 +1880,9 @@ func main() {
 			Cfg:        cfg,
 			Instance:   leaseMgr.Owner(),
 			Region:     cfg.Runtime.Region,
+			Topology:   cfg.Topology(),
+			Zone:       cfg.Runtime.Zone,
+			Instances:  fleetReg.List,
 			Models:     llmMgr,
 			History:    history,
 			Creds:      credStore,
@@ -2048,6 +2085,48 @@ func warnInertConfig(cfg *config.Config, log *slog.Logger) {
 	}
 }
 
+// warnDeprecatedConfig reports settings that still work but are on their way
+// out, naming the replacement. A deprecation warning is not an error: an
+// existing config keeps booting, which is the same call the inert settings get.
+func warnDeprecatedConfig(cfg *config.Config, log *slog.Logger) {
+	if p := strings.TrimSpace(cfg.Runtime.Cluster.Persistence); p != "" {
+		log.Warn("runtime.cluster.persistence is deprecated: leases and the session inbox always live in the runtime store; remove it (a regional cell refuses any other target)")
+	}
+}
+
+// warnTopologyConfig reports the topology mistakes that validation cannot see.
+//
+// The first is a fleet that never declared itself: a PostgreSQL runtime store
+// with no runtime.topology is what every multi-instance deployment looked like
+// before the tier existed, and it is exactly the configuration whose tier rules
+// are not checked. The second is a regional cell whose identity or credential
+// store is on a different PostgreSQL server from the runtime store: still
+// shared by every instance, so not refused, but a different failure domain from
+// the one the cell is designed around.
+func warnTopologyConfig(cfg *config.Config, log *slog.Logger) {
+	if strings.TrimSpace(cfg.Runtime.Topology) == "" && storedb.BackendFor(cfg.Runtime.Persistence) == storedb.BackendPostgres {
+		log.Warn("runtime.persistence is PostgreSQL but runtime.topology is unset: this looks like a fleet; set runtime.topology: regional so the tier's requirements are checked")
+	}
+	if !cfg.IsRegional() {
+		return
+	}
+	for _, t := range []struct {
+		key    string
+		target string
+	}{
+		{"runtime.identity.persistence", cfg.Runtime.Identity.Persistence},
+		{"runtime.credentials.path", cfg.Runtime.Credentials.Path},
+	} {
+		if strings.TrimSpace(t.target) == "" {
+			continue
+		}
+		if !config.SamePostgresServer(t.target, cfg.PersistencePath()) {
+			log.Warn(t.key+" is on a different PostgreSQL server from runtime.persistence: every instance can still reach it, but it is a separate failure domain from the one this cell is built around",
+				"setting", t.key, "target", storedb.Display(t.target))
+		}
+	}
+}
+
 // gcNoOpProviders are the memory providers whose GC does not trim anything:
 // each returns nil without deleting. A store that declares a window or a
 // retention on one of them grows without bound while its config says otherwise
@@ -2134,6 +2213,28 @@ func loopbackListen(addr string) bool {
 // testable.
 func resolveAdminToken(envToken, listen string, log *slog.Logger) (string, error) {
 	return resolveAdminTokenWithOperators(envToken, listen, false, log)
+}
+
+// resolveAdminTokenForTopology applies the regional tier's token rule before
+// delegating to resolveAdminTokenWithOperators.
+//
+// A regional cell shares one admin token. A per-boot token minted here is
+// unknown to every peer, so the rule refuses to mint one: either ADMIN_TOKEN is
+// set (one token for the cell) or named operators authenticate every request.
+// With operators configured the cell needs no break-glass token at all, and the
+// admin server treats "empty token plus operators" as operators-only, not as
+// "no auth" — that distinction is enforced in metrics.AdminServer.auth.
+func resolveAdminTokenForTopology(envToken, listen string, hasOperators, regional bool, log *slog.Logger) (string, error) {
+	if regional && envToken == "" {
+		if !hasOperators {
+			return "", fmt.Errorf("regional topology: ADMIN_TOKEN is unset and no runtime.admin.operators resolved; every instance would mint its own per-boot token and reject the others'. Set ADMIN_TOKEN or name runtime.admin.operators")
+		}
+		if log != nil {
+			log.Info("regional topology: admin authentication uses runtime.admin.operators; no per-boot token minted")
+		}
+		return "", nil
+	}
+	return resolveAdminTokenWithOperators(envToken, listen, hasOperators, log)
 }
 
 // resolveAdminTokenWithOperators is the boot path: named operator tokens make

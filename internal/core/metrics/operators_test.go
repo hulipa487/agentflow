@@ -34,3 +34,32 @@ func TestOperatorTokenIsAttributed(t *testing.T) {
 		t.Fatalf("bad token status=%d", rec.Code)
 	}
 }
+
+// TestOperatorsOnlyRequiresAuth: an empty break-glass token with operators
+// installed is an operators-only server, not an unauthenticated one. A
+// regional cell uses this shape when no shared ADMIN_TOKEN is configured, and
+// merging the two states would serve its admin API to anything that could
+// reach the port.
+func TestOperatorsOnlyRequiresAuth(t *testing.T) {
+	s := NewAdminServer("", "", Global(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s.SetOperators(map[string]string{"alice": "alice-token"})
+
+	h := s.auth(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	anon := httptest.NewRequest(http.MethodGet, "/admin/api/state", nil)
+	rec := httptest.NewRecorder()
+	h(rec, anon)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("anonymous request status=%d, want 401", rec.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/state", nil)
+	req.Header.Set("Authorization", "Bearer alice-token")
+	rec = httptest.NewRecorder()
+	h(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("operator request status=%d, want 200", rec.Code)
+	}
+}

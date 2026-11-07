@@ -11,6 +11,7 @@
 package webui
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"io/fs"
@@ -21,6 +22,7 @@ import (
 
 	"agentflow/internal/config"
 	"agentflow/internal/core/credentials"
+	"agentflow/internal/core/fleet"
 	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/studio"
 	"agentflow/internal/core/supervisor"
@@ -68,6 +70,18 @@ type Deps struct {
 	// reading this endpoint — needs to know to send a session's traffic to the
 	// region that owns it.
 	Region string
+
+	// Topology is the deployment tier ("single" or "regional"), and Zone is the
+	// optional availability-zone label inside a region. Both are reported so an
+	// operator can tell a fleet from a lone process without reading the config.
+	Topology string
+	Zone     string
+
+	// Instances lists the live instance registry: every process currently using
+	// this runtime store. Nil means the console was built without a registry
+	// (tests, or a boot that has not opened the store yet) and the field is
+	// reported empty rather than failing the whole state call.
+	Instances func(context.Context) ([]fleet.Instance, error)
 
 	// Users is the per-user surface: profiles, the usage ledger and the message
 	// journal (both live in the runtime store), the quota, and the file store.
@@ -275,6 +289,33 @@ func (u *UI) handleState(w http.ResponseWriter, r *http.Request) {
 	if d.ConfigDir != "" {
 		configPath = d.ConfigDir
 	}
+	// The live registry, with this instance marked and peers whose config epoch
+	// differs flagged: two instances of one fleet on different configs is the
+	// difference an operator cannot see from a single console otherwise.
+	instances := []map[string]any{}
+	if d.Instances != nil {
+		live, err := d.Instances(r.Context())
+		if err == nil {
+			for _, in := range live {
+				instances = append(instances, map[string]any{
+					"owner":                in.Owner,
+					"region":               in.Region,
+					"zone":                 in.Zone,
+					"version":              in.Version,
+					"topology":             in.Topology,
+					"config_epoch":         in.ConfigEpoch,
+					"config_epoch_differs": in.ConfigEpoch != d.Cfg.Epoch,
+					"started_at":           in.StartedAt,
+					"last_seen":            in.LastSeen,
+					"self":                 in.Owner == d.Instance,
+				})
+			}
+		}
+	}
+	topology := d.Topology
+	if topology == "" {
+		topology = "single"
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":                  true,
 		"version":             d.Version,
@@ -284,6 +325,9 @@ func (u *UI) handleState(w http.ResponseWriter, r *http.Request) {
 		"config_epoch":        d.Cfg.Epoch,
 		"instance":            d.Instance,
 		"region":              d.Region,
+		"topology":            topology,
+		"zone":                d.Zone,
+		"instances":           instances,
 		"agents":              agents,
 		"channels":            channels,
 		"sessions":            sessions,

@@ -15,6 +15,22 @@ type Manager struct {
 	log      *slog.Logger
 	stopCh   chan struct{}
 	stopOnce func()
+	// generation resolves a session's ownership generation. It is wired from
+	// the session hub; nil (a library consumer, or a runtime without a hub)
+	// leaves instance-local scopes ungenerationed, which is the old behaviour.
+	generation func(sessionKey string) int64
+}
+
+// SetGenerationSource wires the per-session ownership generation used to key
+// instance-local memory. Called by main once the hub exists.
+func (m *Manager) SetGenerationSource(fn func(sessionKey string) int64) { m.generation = fn }
+
+// Generation reports the generation for a session, or 0 when unknown.
+func (m *Manager) Generation(sessionKey string) int64 {
+	if m.generation == nil || sessionKey == "" {
+		return 0
+	}
+	return m.generation(sessionKey)
 }
 
 // NewManager creates a manager around an opened registry.

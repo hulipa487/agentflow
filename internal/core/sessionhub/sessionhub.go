@@ -66,6 +66,10 @@ type Hub struct {
 
 	mu   sync.Mutex
 	held map[string]bool // session keys this instance owns
+	// generations is the ownership generation each held session was claimed
+	// under. Instance-local memory is keyed by it, so a session that returns
+	// after a move does not read the data its earlier life left behind.
+	generations map[string]int64
 	// renewed is when each held session's claim was last written to the store.
 	// The drain renews an idle session at a fraction of the TTL rather than on
 	// every poll — see renewIfDue — so it has to know when it last did.
@@ -80,14 +84,15 @@ func New(leases *lease.Manager, queue *inbox.Queue, deliver Deliver, log *slog.L
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	return &Hub{
-		leases:  leases,
-		queue:   queue,
-		deliver: deliver,
-		log:     log.With("module", "sessionhub"),
-		poll:    DefaultPoll,
-		ttl:     DefaultSessionTTL,
-		held:    map[string]bool{},
-		renewed: map[string]time.Time{},
+		leases:      leases,
+		queue:       queue,
+		deliver:     deliver,
+		log:         log.With("module", "sessionhub"),
+		poll:        DefaultPoll,
+		ttl:         DefaultSessionTTL,
+		held:        map[string]bool{},
+		generations: map[string]int64{},
+		renewed:     map[string]time.Time{},
 	}
 }
 
@@ -177,7 +182,7 @@ func (h *Hub) Route(ctx context.Context, agent, key string, msg session.Message)
 // claim takes or renews the session's lease, reporting whether this instance
 // owns the session now.
 func (h *Hub) claim(ctx context.Context, sessKey string) (bool, error) {
-	ok, err := h.leases.AcquireFor(ctx, sessionLease+":"+sessKey, h.ttl)
+	ok, generation, err := h.leases.AcquireForGen(ctx, sessionLease+":"+sessKey, h.ttl)
 	if err != nil {
 		return false, err
 	}
@@ -185,12 +190,14 @@ func (h *Hub) claim(ctx context.Context, sessKey string) (bool, error) {
 	lost := false
 	if ok {
 		h.held[sessKey] = true
+		h.generations[sessKey] = generation
 		h.renewed[sessKey] = time.Now()
 	} else {
 		// Another instance owns it. Only a session this instance actually held
 		// is a loss; a message for someone else's session is the normal case.
 		_, lost = h.held[sessKey]
 		delete(h.held, sessKey)
+		delete(h.generations, sessKey)
 		delete(h.renewed, sessKey)
 	}
 	h.mu.Unlock()
@@ -198,6 +205,16 @@ func (h *Hub) claim(ctx context.Context, sessKey string) (bool, error) {
 		h.onLost(sessKey)
 	}
 	return ok, nil
+}
+
+// Generation reports the ownership generation this instance claimed a session
+// under, or 0 when it does not hold it. Memory scope uses it to keep a
+// returning session from reading instance-local rows written by an earlier
+// owner.
+func (h *Hub) Generation(sessKey string) int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.generations[sessKey]
 }
 
 // renewIfDue renews a session's claim when the renewal is due — at a third of
@@ -333,6 +350,7 @@ func (h *Hub) Release(ctx context.Context) {
 		keys = append(keys, k)
 	}
 	h.held = map[string]bool{}
+	h.generations = map[string]int64{}
 	h.renewed = map[string]time.Time{}
 	h.mu.Unlock()
 	for _, k := range keys {

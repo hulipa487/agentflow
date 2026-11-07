@@ -1,4 +1,4 @@
--- af-prelude-version: 1
+-- af-prelude-version: 2
 -- plugin:recency — default memory.recall handler.
 --
 -- Returns the most recent records from the agent's stores. Query.kind selects

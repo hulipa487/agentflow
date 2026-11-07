@@ -4,7 +4,7 @@
 -- its version (af.version) is the compatibility contract; every chunk must
 -- declare it in its leading comment block:
 --
---   -- af-prelude-version: 1
+--   -- af-prelude-version: 2
 --
 -- The canonical copy lives in the runtime repo at api/luau/af.d.luau; Studio's
 -- docs/luau/af.d.luau is synced from it with `make docs-sync`.
@@ -75,6 +75,12 @@
 ---@field tools? table[] {name, description, parameters} or tools.list() entries
 ---@field tool_choice? string
 
+---@class MemoryStoreBinding
+---@field backend string
+---@field table string
+---@field features string[]
+---@field locality "deployment" | "region" | "instance" how far the store's data reaches: durable across the deployment, shared within the region, or lost with the process
+
 ---@class AgentInfo
 ---@field name string
 ---@field session_id string
@@ -84,7 +90,7 @@
 ---@field history_budget? integer
 ---@field skills? string[]
 ---@field capabilities? string[]
----@field memory? { stores?: table<string, table>, recall?: string, embed_model?: string }
+---@field memory? { stores?: table<string, MemoryStoreBinding>, recall?: string, embed_model?: string }
 ---@field prompts? table<string, string>
 ---@field extras? table
 

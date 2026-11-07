@@ -54,7 +54,12 @@ func StoreHandlers(am *memory.AgentMemory, mgr *memory.Manager, auth memory.Pool
 			}
 		}
 		h = memory.WrapScoped(h, bind.Scoping, memory.ModeOf(session.ProvenanceKindFromCtx(ctx), scope),
-			memory.Caller{ScopeUUID: scope, PersonalUUID: personal}, poolScope)
+			memory.Caller{
+				ScopeUUID:    scope,
+				PersonalUUID: personal,
+				Locality:     bind.Locality,
+				Generation:   mgr.Generation(session.SessionKeyFromCtx(ctx)),
+			}, poolScope)
 		return h, bind, nil
 	}
 

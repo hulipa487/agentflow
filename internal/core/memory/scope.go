@@ -88,6 +88,33 @@ func ModeOf(provenanceKind, userUUID string) ScopeMode {
 
 func scopedKey(scope, key string) string { return scope + scopeSep + key }
 
+// generationSuffix returns the "@<n>" a scope carries when it is keyed by an
+// ownership generation, or "" when it is not. The suffix rides on the scope
+// head — "user:<uuid>@3" — rather than prefixing the key, so splitScopedKey
+// still recognises the stratum and the isolation filter can compare it
+// exactly. A generation-prefixed key that parsed as legacy would be readable
+// by every session, which is the opposite of the point.
+func generationSuffix(loc Locality, generation int64) string {
+	if loc != LocalityInstance || generation <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("@%d", generation)
+}
+
+// stripGeneration removes a trailing "@<digits>" from a scope head.
+func stripGeneration(head string) string {
+	i := strings.LastIndexByte(head, '@')
+	if i <= 0 || i == len(head)-1 {
+		return head
+	}
+	for _, ch := range head[i+1:] {
+		if ch < '0' || ch > '9' {
+			return head
+		}
+	}
+	return head[:i]
+}
+
 // splitScopedKey splits a stored key into (scope, key, true) when it carries
 // a recognized scope prefix, or ("", key, false) for legacy rows.
 func splitScopedKey(k string) (scope, key string, scoped bool) {
@@ -96,11 +123,12 @@ func splitScopedKey(k string) (scope, key string, scoped bool) {
 		return "", k, false
 	}
 	head, rest := k[:i], k[i+1:]
+	base := stripGeneration(head)
 	switch {
-	case head == scopeService || head == scopeAgent:
+	case base == scopeService || base == scopeAgent:
 		return head, rest, true
-	case strings.HasPrefix(head, scopeUserPfx) && len(head) > len(scopeUserPfx),
-		strings.HasPrefix(head, scopePoolPfx) && len(head) > len(scopePoolPfx):
+	case strings.HasPrefix(base, scopeUserPfx) && len(base) > len(scopeUserPfx),
+		strings.HasPrefix(base, scopePoolPfx) && len(base) > len(scopePoolPfx):
 		// The pool stratum is recognized here or not at all: an unrecognized
 		// pool row parses as legacy, and legacy is admitted to every filtered
 		// read — which would make pooled rows world-readable.
@@ -131,9 +159,14 @@ type PoolScope struct {
 // Caller is who is acting. ScopeUUID keys user-scoped strata — the membership
 // uuid in group context — while PersonalUUID is what pool grants key on:
 // grants belong to a tenant, a person, never to a scope the caller resolved.
+// Locality and Generation come from the store binding and the session's lease:
+// on an instance-local store the scope carries the generation, so a session
+// that returns after a move does not read data from its earlier life.
 type Caller struct {
 	ScopeUUID    string
 	PersonalUUID string
+	Locality     Locality
+	Generation   int64
 }
 
 // WrapScoped wraps h with scope enforcement for a non-shared binding.
@@ -150,10 +183,18 @@ func WrapScoped(h BackendHandle, scoping string, mode ScopeMode, caller Caller, 
 	if scoping == scopeAgent {
 		primary = scopeAgent
 	}
+	genSuffix := generationSuffix(caller.Locality, caller.Generation)
 	if strings.HasPrefix(scoping, scopePoolPfx) && len(scoping) > len(scopePoolPfx) {
 		primary = scoping
+		// A pool is shared by every instance that can own the session, so its
+		// locality is never instance and it never takes a generation. Keeping
+		// the suffix off also keeps pool uuid parsing intact.
+		genSuffix = ""
 	}
-	return &scopedHandle{inner: h, scoping: scoping, mode: mode, primary: primary, pool: pool, caller: caller}
+	if genSuffix != "" {
+		primary += genSuffix
+	}
+	return &scopedHandle{inner: h, scoping: scoping, mode: mode, primary: primary, genSuffix: genSuffix, pool: pool, caller: caller}
 }
 
 // ScopeEnumerator is implemented by scoped handles (maintenance mode) so an
@@ -164,12 +205,22 @@ type ScopeEnumerator interface {
 }
 
 type scopedHandle struct {
-	inner   BackendHandle
-	scoping string // "user" | "agent" | "pool:<uuid>"
-	mode    ScopeMode
-	primary string // user:<uuid>, agent, or pool:<uuid> — the binding's stratum
-	pool    PoolScope
-	caller  Caller
+	inner     BackendHandle
+	scoping   string // "user" | "agent" | "pool:<uuid>"
+	mode      ScopeMode
+	primary   string // user:<uuid>[@g], agent[@g], or pool:<uuid> — the binding's stratum
+	genSuffix string // "@<generation>" on an instance-local store, else ""
+	pool      PoolScope
+	caller    Caller
+}
+
+// scopeName applies the generation suffix to a stratum name. It is empty on
+// every shared store, where the suffix is "".
+func (s *scopedHandle) scopeName(base string) string {
+	if base == "" || s.genSuffix == "" {
+		return base
+	}
+	return base + s.genSuffix
 }
 
 // isPool reports whether the binding's world is a pool carve.
@@ -223,18 +274,18 @@ func (s *scopedHandle) strata() []string {
 		// through a pool must not widen into anyone's private rows, and the
 		// rule for user: scopes (your acting uuid must equal the scope uuid)
 		// cannot express a pool read at all.
-		return []string{s.primary, scopeService}
+		return []string{s.primary, s.scopeName(scopeService)}
 	}
 	switch s.mode {
 	case ModeMaintenance:
 		return nil
 	case ModeInteractive:
-		return []string{s.primary, scopeService}
+		return []string{s.primary, s.scopeName(scopeService)}
 	default: // ModeService
 		if s.scoping == scopeAgent {
-			return []string{scopeAgent, scopeService}
+			return []string{s.scopeName(scopeAgent), s.scopeName(scopeService)}
 		}
-		return []string{scopeService}
+		return []string{s.scopeName(scopeService)}
 	}
 }
 
@@ -250,7 +301,7 @@ func (s *scopedHandle) writeScope() string {
 		return s.primary
 	}
 	if s.mode == ModeService {
-		return scopeService
+		return s.scopeName(scopeService)
 	}
 	return s.primary
 }

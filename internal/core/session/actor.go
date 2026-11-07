@@ -1339,7 +1339,15 @@ func (a *Actor) infoJSON(ctx context.Context) string {
 	if a.Info.Memory != nil {
 		stores := map[string]any{}
 		for name, bind := range a.Info.Memory.Stores {
-			stores[name] = map[string]any{"backend": bind.Backend, "table": bind.Table, "features": bind.Features}
+			stores[name] = map[string]any{
+				"backend":  bind.Backend,
+				"table":    bind.Table,
+				"features": bind.Features,
+				// Where the store's data lives: deployment, region or instance.
+				// A durable conversation belongs on a shared locality; an
+				// instance-local store is a cache that dies with the process.
+				"locality": string(bind.Locality),
+			}
 		}
 		mem["stores"] = stores
 		mem["write"] = a.Info.Memory.Write

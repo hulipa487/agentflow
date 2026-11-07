@@ -195,7 +195,7 @@ af = { op = op }
 -- A Lua file declares the version it targets with a line in its leading comment
 -- block:
 --
---   -- af-prelude-version: 1
+--   -- af-prelude-version: 2
 --
 -- The core then refuses to load a file that declares another version, or none
 -- at all. There is no deprecation window: the prelude and the Lua that uses it
@@ -204,7 +204,7 @@ af = { op = op }
 -- (vm.CheckChunkVersion reads it out of the source; the gate runs on the boot
 -- path and on hot reload). Bump it for any change a chunk can observe; see the
 -- comment on PreludeVersion in version.go for what that means in practice.
-af.version = 1
+af.version = 2
 
 session = {}
 function session.inbox() return op({ type = "inbox" }) end

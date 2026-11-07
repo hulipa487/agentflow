@@ -9,6 +9,8 @@ import (
 	"io"
 	"log/slog"
 	"time"
+
+	"agentflow/internal/core/memory/locality"
 )
 
 // Record is a single memory item returned by query.
@@ -102,12 +104,26 @@ type BackendProvider interface {
 	Open(config map[string]any) (BackendHandle, error)
 }
 
+// Locality is where a backend's data lives relative to the sessions that read
+// it. It is derived from the provider and the deployment tier, and exposed to
+// loops through agent.info so a loop can tell a durable store from a cache.
+type Locality = locality.Locality
+
+const (
+	LocalityDeployment = locality.Deployment
+	LocalityRegion     = locality.Region
+	LocalityInstance   = locality.Instance
+)
+
 // Registry resolves provider names and opened backend instances.
 type Registry struct {
 	providers map[string]BackendProvider
 	backends  map[string]BackendHandle
 	config    map[string]BackendConfig
 	log       *slog.Logger
+	// topology is the deployment tier the locality derivation uses. Empty
+	// reads as single, the backward-compatible tier.
+	topology string
 	// poolResolver turns a config store's pool name into a pool uuid at bind
 	// time. Wired from the tenancy registry by main; nil means this runtime
 	// has no pools, and a store binding one fails to resolve.
@@ -116,6 +132,24 @@ type Registry struct {
 
 // SetPoolResolver wires the pool-name → uuid lookup used at bind time.
 func (r *Registry) SetPoolResolver(fn func(name string) (string, error)) { r.poolResolver = fn }
+
+// SetTopology sets the deployment tier locality is derived against. Called by
+// main before backends are resolved; empty reads as single.
+func (r *Registry) SetTopology(topology string) {
+	if topology == "" {
+		topology = "single"
+	}
+	r.topology = topology
+}
+
+// Locality reports the reach of a named backend's data.
+func (r *Registry) Locality(name string) Locality {
+	c, ok := r.config[name]
+	if !ok {
+		return LocalityInstance
+	}
+	return locality.For(c.Provider, r.topology)
+}
 
 type BackendConfig struct {
 	Provider string
@@ -232,11 +266,11 @@ func (r *Registry) Features(name string) []string {
 
 // Store describes a logical store binding (backend name + table/collection).
 type Store struct {
-	Backend    string
-	Table      string
-	Window     int
-	Retention  time.Duration
-	Requires   []string // provider features the backend must offer
+	Backend   string
+	Table     string
+	Window    int
+	Retention time.Duration
+	Requires  []string // provider features the backend must offer
 	// Pool binds the store to a named pool instead of a personal scope: rows
 	// live under the pool's carve (pool:<uuid>|key), and every access needs a
 	// grant. This is what replaced `shared: true` (§6.5) — nothing is
@@ -269,6 +303,10 @@ type StoreBinding struct {
 	// ...), resolved at bind time so loops can adapt (e.g. only embed for
 	// vector-capable stores).
 	Features []string
+	// Locality is where the backend's data lives relative to sessions
+	// (deployment, region, instance). It is derived from the provider and the
+	// tier, and surfaced to loops in agent.info.
+	Locality Locality
 }
 
 // AgentMemory holds the resolved memory profile for an agent.
@@ -330,7 +368,7 @@ func (r *Registry) ResolveStoresFor(agent string, profile map[string]Store) (Age
 			poolUUID = u
 			scoping = scopePoolPfx + u
 		}
-		b := StoreBinding{Backend: s.Backend, Table: table, Window: s.Window, Retention: s.Retention, Features: r.Features(s.Backend), Scoping: scoping, Agent: agent, PoolUUID: poolUUID}
+		b := StoreBinding{Backend: s.Backend, Table: table, Window: s.Window, Retention: s.Retention, Features: r.Features(s.Backend), Locality: r.Locality(s.Backend), Scoping: scoping, Agent: agent, PoolUUID: poolUUID}
 		out.Stores[sname] = b
 		out.Tables[s.Table] = b
 	}

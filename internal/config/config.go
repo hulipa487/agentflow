@@ -21,6 +21,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"agentflow/internal/core/memory/locality"
 	"agentflow/internal/core/safety"
 	"agentflow/internal/core/storedb"
 )
@@ -777,6 +778,12 @@ type Store struct {
 	// under the pool's carve, and every access needs a grant — r/w or
 	// r-only, per (pool, agent, tenant). The name must resolve at boot.
 	Pool string `yaml:"pool"`
+	// LocalityOK acknowledges that a durable store on an instance-local
+	// backend is intentional (a cache the deployment can afford to lose, or a
+	// single instance whose process lifetime is the deployment's). In a
+	// regional cell it is the only way past the refusal that keeps a
+	// conversation from disappearing when its session moves.
+	LocalityOK bool `yaml:"locality_ok"`
 }
 
 // ShellProfile defines defaults for shell.spawn.
@@ -1409,6 +1416,94 @@ func validateMemoryRetention(path string, c *Config) error {
 		}
 	}
 	return nil
+}
+
+// validateMemoryLocality enforces the two rules locality makes true.
+//
+// In a regional cell, a store that carries durable conversation data must not
+// live on an instance-local backend: the session can move to another instance,
+// and its history would disappear. The stores that carry it are the ones the
+// recall plugins read — `dialogue` and `facts`, plus `semantic` when
+// plugin:semantic is selected — and a profile may opt out with locality_ok.
+//
+// Every tier bounds volatile memory: the backend either sets max_entries or
+// every store bound to it sets a retention. Volatile is process-wide memory
+// shared by every session, and without one of the two it grows until the
+// process dies.
+func validateMemoryLocality(path string, c *Config) error {
+	type profileCheck struct {
+		label string
+		p     MemoryProfile
+	}
+	profiles := []profileCheck{{"built-in memory profile", DefaultMemoryProfile()}}
+	for name, p := range c.Profiles.Memory {
+		profiles = append(profiles, profileCheck{fmt.Sprintf("memory profile %q", name), p})
+	}
+	for name, a := range c.Agents {
+		if a.Memory.IsInline {
+			profiles = append(profiles, profileCheck{fmt.Sprintf("agent %q inline memory profile", name), a.Memory.Inline})
+		}
+	}
+
+	for _, prof := range profiles {
+		if c.IsRegional() {
+			durable := map[string]bool{"dialogue": true, "facts": true}
+			if prof.p.Recall == "plugin:semantic" {
+				durable["semantic"] = true
+			}
+			for sname, s := range prof.p.Stores {
+				if !durable[sname] || s.LocalityOK {
+					continue
+				}
+				b, ok := c.Memory.Backends[s.Backend]
+				if !ok {
+					continue // unresolved backend: another check or boot reports it
+				}
+				if locality.For(b.Provider, "regional") == locality.Instance {
+					return fmt.Errorf("%s: regional topology: %s store %q is on backend %q (provider %s), which is instance-local; a session that moves to another instance would lose its conversation. Move it to a shared backend or set locality_ok: true on the store", path, prof.label, sname, s.Backend, b.Provider)
+				}
+			}
+		}
+		for sname, s := range prof.p.Stores {
+			b, ok := c.Memory.Backends[s.Backend]
+			if !ok || b.Provider != "volatile" {
+				continue
+			}
+			if retentionBounded(s.Retention) || backendMaxEntries(b.Config) > 0 {
+				continue
+			}
+			return fmt.Errorf("%s: %s store %q is bound to volatile backend %q, which sets no max_entries and carries no TTL; volatile memory is shared by every session in the process and grows without bound. Set max_entries on the backend or retention on the store", path, prof.label, sname, s.Backend)
+		}
+	}
+	return nil
+}
+
+// retentionBounded reports whether a store's retention actually expires rows.
+// "forever", empty and zero all mean no TTL.
+func retentionBounded(raw string) bool {
+	if strings.TrimSpace(raw) == "" {
+		return false
+	}
+	d, err := ParseRetention(raw)
+	return err == nil && d > 0
+}
+
+// backendMaxEntries reads an optional max_entries from a backend's config map.
+// YAML decodes integers as int; the wider forms are accepted so a config built
+// by a program is not refused over a type.
+func backendMaxEntries(cfg map[string]any) int {
+	switch v := cfg["max_entries"].(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case uint64:
+		return int(v)
+	case float64:
+		return int(v)
+	default:
+		return 0
+	}
 }
 
 // poolNameRe keeps pool names key-safe: the name lives in tenancy row keys
@@ -2092,6 +2187,9 @@ func validate(path string, c *Config) error {
 			}
 			return fmt.Errorf("%s: memory backend %q has unsupported provider %q", path, bname, b.Provider)
 		}
+	}
+	if err := validateMemoryLocality(path, c); err != nil {
+		return err
 	}
 
 	// "conversational" is the one built-in memory profile, and it is resolved

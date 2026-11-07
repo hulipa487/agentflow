@@ -41,10 +41,16 @@ const DefaultTTL = 2 * time.Minute
 // nanoseconds, the same convention the file store's expiry rows use: a lease
 // TTL should mean what it says, and second granularity would let a one-second
 // lease live for nearly two.
+//
+// generation counts ownership changes. It is how a session that moves to
+// another instance and comes back can tell that the local data it left behind
+// belongs to an earlier life: instance-local memory is keyed by generation, so
+// stale rows are invisible rather than mistaken for the current conversation.
 var schema = `CREATE TABLE IF NOT EXISTS leases (
 	name       TEXT PRIMARY KEY,
 	owner      TEXT NOT NULL,
-	expires_at BIGINT NOT NULL
+	expires_at BIGINT NOT NULL,
+	generation BIGINT NOT NULL DEFAULT 0
 )`
 
 // Manager hands out and renews leases for one process. Its owner string
@@ -80,6 +86,12 @@ func Open(target, owner string, ttl time.Duration, log *slog.Logger) (*Manager, 
 		_ = st.Close()
 		return nil, fmt.Errorf("lease: %w", err)
 	}
+	// A database created before generations existed needs the column added;
+	// CREATE TABLE IF NOT EXISTS silently does nothing on an existing table.
+	if err := st.EnsureColumn(ctx, "leases", "generation", "BIGINT NOT NULL DEFAULT 0"); err != nil {
+		_ = st.Close()
+		return nil, fmt.Errorf("lease: %w", err)
+	}
 	return &Manager{st: st, owner: owner, ttl: ttl, log: log.With("module", "lease")}, nil
 }
 
@@ -108,30 +120,57 @@ func (m *Manager) Acquire(ctx context.Context, name string) (bool, error) {
 // to whoever asks first, which for a phase-offset timer means the schedule
 // quietly runs twice.
 func (m *Manager) AcquireFor(ctx context.Context, name string, ttl time.Duration) (bool, error) {
+	ok, _, err := m.AcquireForGen(ctx, name, ttl)
+	return ok, err
+}
+
+// AcquireForGen is AcquireFor and reports the ownership generation as well.
+// The generation increments whenever the owner changes, so a caller can key
+// instance-local data by it: rows written under an earlier generation belong to
+// a session that has since moved.
+//
+// The write and the read of the generation are one statement (RETURNING), not
+// an update followed by a select: a peer could take the lease between the two,
+// and the caller would then cache the peer's generation as its own.
+func (m *Manager) AcquireForGen(ctx context.Context, name string, ttl time.Duration) (bool, int64, error) {
 	if ttl <= 0 {
 		ttl = m.ttl
 	}
 	now := time.Now().UnixNano()
 	expires := now + int64(ttl)
-	res, err := m.st.Exec(ctx, `
-		INSERT INTO leases (name, owner, expires_at) VALUES (?, ?, ?)
+	var generation int64
+	err := m.st.QueryRow(ctx, `
+		INSERT INTO leases (name, owner, expires_at, generation) VALUES (?, ?, ?, 0)
 		ON CONFLICT (name) DO UPDATE SET
 			owner = excluded.owner,
-			expires_at = excluded.expires_at
-		WHERE leases.expires_at < ? OR leases.owner = ?`,
-		name, m.owner, expires, now, m.owner)
+			expires_at = excluded.expires_at,
+			generation = leases.generation + CASE WHEN leases.owner <> excluded.owner THEN 1 ELSE 0 END
+		WHERE leases.expires_at < ? OR leases.owner = ?
+		RETURNING generation`,
+		name, m.owner, expires, now, m.owner).Scan(&generation)
+	if err == sql.ErrNoRows {
+		return false, 0, nil
+	}
 	if err != nil {
-		return false, fmt.Errorf("lease: acquire %q: %w", name, err)
+		return false, 0, fmt.Errorf("lease: acquire %q: %w", name, err)
 	}
-	n, err := res.RowsAffected()
+	m.log.Debug("lease acquired", "name", name, "ttl", ttl.String(), "generation", generation)
+	return true, generation, nil
+}
+
+// Generation reports the ownership generation of a lease, or 0 when nobody has
+// ever held it. It reads the store rather than local state because the answer
+// is about the conversation, not about this process.
+func (m *Manager) Generation(ctx context.Context, name string) (int64, error) {
+	var generation int64
+	err := m.st.QueryRow(ctx, `SELECT generation FROM leases WHERE name = ?`, name).Scan(&generation)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
 	if err != nil {
-		return false, fmt.Errorf("lease: acquire %q: %w", name, err)
+		return 0, fmt.Errorf("lease: read generation %q: %w", name, err)
 	}
-	if n == 0 {
-		return false, nil
-	}
-	m.log.Debug("lease acquired", "name", name, "ttl", ttl.String())
-	return true, nil
+	return generation, nil
 }
 
 // Held reports whether the named lease is currently held by anyone, from the
@@ -155,9 +194,15 @@ func (m *Manager) Held(ctx context.Context, name string) (bool, error) {
 // immediately rather than waiting for the expiry. Releasing a lease this
 // instance does not hold does nothing: a stale instance cannot evict the live
 // owner.
+//
+// The row is expired rather than deleted. Deleting it would also delete the
+// ownership generation, and the next owner would insert generation 0 again —
+// a session returning after a move would then read the instance-local rows its
+// earlier life wrote. An expired row costs one row per lease name and is
+// overwritten by the next acquire.
 func (m *Manager) Release(ctx context.Context, name string) error {
 	_, err := m.st.Exec(ctx,
-		`DELETE FROM leases WHERE name = ? AND owner = ?`, name, m.owner)
+		`UPDATE leases SET expires_at = 0 WHERE name = ? AND owner = ?`, name, m.owner)
 	if err != nil {
 		return fmt.Errorf("lease: release %q: %w", name, err)
 	}

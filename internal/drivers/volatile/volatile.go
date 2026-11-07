@@ -24,11 +24,34 @@ func (Provider) Features() []string {
 	return []string{"kv", "prefix_scan", "ttl"}
 }
 
-func (Provider) Open(_ map[string]any) (memory.BackendHandle, error) {
+func (Provider) Open(cfg map[string]any) (memory.BackendHandle, error) {
 	return &Handle{
-		tables: map[string]map[string]*entry{},
+		tables:     map[string]map[string]*entry{},
+		maxEntries: maxEntriesFromConfig(cfg),
 	}, nil
 }
+
+// maxEntriesFromConfig reads the optional bound. A non-positive or missing
+// value means unbounded, which is the historical behaviour; config validation
+// refuses a store bound to a volatile backend with neither this nor a TTL.
+func maxEntriesFromConfig(cfg map[string]any) int {
+	switch v := cfg["max_entries"].(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case uint64:
+		return int(v)
+	case float64:
+		return int(v)
+	default:
+		return 0
+	}
+}
+
+// orderRef names one insertion in the FIFO order max_entries evicts from. A
+// ref may be stale (the key was deleted or overwritten); eviction skips those.
+type orderRef struct{ table, key string }
 
 // entry is one stored value with its write time and optional expiry. The
 // value is stored both as the raw Go any and its JSON bytes: Put marshals so
@@ -46,6 +69,14 @@ type entry struct {
 type Handle struct {
 	mu     sync.Mutex
 	tables map[string]map[string]*entry
+	// maxEntries bounds the whole backend (not one table): it is a process
+	// memory ceiling, which is what a volatile store needs. 0 = unbounded.
+	maxEntries int
+	// order is the insertion order evictions take from, oldest first.
+	order []orderRef
+	// count is the number of live entries across every table. order may hold
+	// stale refs, so it is not usable as the count.
+	count int
 }
 
 func (h *Handle) Close() error { return nil }
@@ -73,9 +104,36 @@ func (h *Handle) Put(table, key string, value any, opts memory.PutOpts) error {
 		t = map[string]*entry{}
 		h.tables[table] = t
 	}
+	if _, exists := t[key]; !exists {
+		h.order = append(h.order, orderRef{table: table, key: key})
+		h.count++
+	}
 	t[key] = e
+	h.evictLocked()
 	h.mu.Unlock()
 	return nil
+}
+
+// evictLocked drops the oldest entries until the backend is within
+// maxEntries. Caller holds the lock. Stale order refs — a key deleted or
+// expired since it was inserted — are skipped without touching count.
+func (h *Handle) evictLocked() {
+	if h.maxEntries <= 0 {
+		return
+	}
+	for h.count > h.maxEntries && len(h.order) > 0 {
+		ref := h.order[0]
+		h.order = h.order[1:]
+		t := h.tables[ref.table]
+		if t == nil {
+			continue
+		}
+		if _, ok := t[ref.key]; !ok {
+			continue
+		}
+		delete(t, ref.key)
+		h.count--
+	}
 }
 
 func (h *Handle) Get(table, key string) (any, bool, error) {
@@ -91,6 +149,7 @@ func (h *Handle) Get(table, key string) (any, bool, error) {
 	}
 	if !e.expires.IsZero() && time.Now().After(e.expires) {
 		delete(t, key)
+		h.count--
 		return nil, false, nil
 	}
 	return e.value, true, nil
@@ -100,7 +159,10 @@ func (h *Handle) Delete(table, key string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if t, ok := h.tables[table]; ok {
-		delete(t, key)
+		if _, exists := t[key]; exists {
+			delete(t, key)
+			h.count--
+		}
 	}
 	return nil
 }
@@ -136,6 +198,7 @@ func (h *Handle) snapshot(table string, filter func(key string, e *entry) bool) 
 	for k, e := range t {
 		if !e.expires.IsZero() && now.After(e.expires) {
 			delete(t, k)
+			h.count--
 			continue
 		}
 		if filter != nil && !filter(k, e) {
@@ -178,6 +241,7 @@ func (h *Handle) GC(table string, window int) error {
 	for k, e := range t {
 		if !e.expires.IsZero() && now.After(e.expires) {
 			delete(t, k)
+			h.count--
 		}
 	}
 	if window <= 0 {
@@ -206,7 +270,10 @@ func (h *Handle) GC(table string, window int) error {
 		all[i], all[max] = all[max], all[i]
 	}
 	for i := window; i < len(all); i++ {
-		delete(t, all[i].k)
+		if _, ok := t[all[i].k]; ok {
+			delete(t, all[i].k)
+			h.count--
+		}
 	}
 	return nil
 }

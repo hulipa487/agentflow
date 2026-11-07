@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+
+	"agentflow/internal/core/memory"
 )
 
 // stubSettings stands in for the identity-backed lookup.
@@ -94,5 +96,33 @@ func TestLayeredInstructionsWithNoBase(t *testing.T) {
 	}
 	if got := layerInstructions("Base.", ""); got != "Base." {
 		t.Fatalf("layerInstructions(x, \"\") = %q", got)
+	}
+}
+
+// agent.info exposes each store's locality next to its features, so a loop can
+// tell durable conversation storage from a cache without hard-coding provider
+// names.
+func TestAgentInfoCarriesStoreLocality(t *testing.T) {
+	a := actorForInfo()
+	a.Info.Memory = &memory.AgentMemory{Stores: map[string]memory.StoreBinding{
+		"dialogue": {Backend: "main", Table: "dialogue", Features: []string{"kv"}, Locality: memory.LocalityDeployment},
+		"scratch":  {Backend: "vol", Table: "scratch", Features: []string{"kv"}, Locality: memory.LocalityInstance},
+	}}
+	got := infoOf(t, a, context.Background())
+	mem, ok := got["memory"].(map[string]any)
+	if !ok {
+		t.Fatalf("agent.info has no memory block: %v", got)
+	}
+	stores, ok := mem["stores"].(map[string]any)
+	if !ok {
+		t.Fatalf("agent.info has no stores: %v", mem)
+	}
+	dialogue, _ := stores["dialogue"].(map[string]any)
+	if dialogue["locality"] != "deployment" {
+		t.Fatalf("dialogue locality = %v, want deployment", dialogue["locality"])
+	}
+	scratch, _ := stores["scratch"].(map[string]any)
+	if scratch["locality"] != "instance" {
+		t.Fatalf("scratch locality = %v, want instance", scratch["locality"])
 	}
 }

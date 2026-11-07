@@ -160,3 +160,39 @@ func itoa(n int) string {
 	}
 	return string(b)
 }
+
+// TestMaxEntriesEvictsOldest: the backend-wide ceiling is what keeps a volatile
+// store from growing until the process dies when its stores carry no TTL.
+func TestMaxEntriesEvictsOldest(t *testing.T) {
+	h, err := Provider{}.Open(map[string]any{"max_entries": 3})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer h.Close()
+
+	for _, k := range []string{"a", "b", "c", "d", "e"} {
+		if err := h.Put("t", k, k, memory.PutOpts{}); err != nil {
+			t.Fatalf("put %s: %v", k, err)
+		}
+	}
+	for _, gone := range []string{"a", "b"} {
+		if _, ok, _ := h.Get("t", gone); ok {
+			t.Fatalf("oldest key %q survived the cap", gone)
+		}
+	}
+	for _, live := range []string{"c", "d", "e"} {
+		if _, ok, _ := h.Get("t", live); !ok {
+			t.Fatalf("recent key %q was evicted", live)
+		}
+	}
+	// Deleting and re-inserting must not underflow the live count.
+	if err := h.Delete("t", "e"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Put("t", "f", "f", memory.PutOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := h.Get("t", "c"); !ok {
+		t.Fatal("a stale eviction order ref deleted a live key")
+	}
+}

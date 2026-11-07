@@ -1,4 +1,4 @@
--- af-prelude-version: 1
+-- af-prelude-version: 2
 -- A multi-round tool loop.
 --
 -- The engine executes one tool when asked; driving the conversation is the

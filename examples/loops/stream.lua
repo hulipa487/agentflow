@@ -1,4 +1,4 @@
--- af-prelude-version: 1
+-- af-prelude-version: 2
 -- Streaming text from the model.
 --
 -- Call next_delta directly. A generic `for d in llm.stream(...)` is refused:

@@ -1,4 +1,4 @@
--- af-prelude-version: 1
+-- af-prelude-version: 2
 -- A daemon (agents.<name>.persistent: true).
 --
 -- The supervisor delivers a synthetic boot message at startup:

@@ -311,6 +311,7 @@ func main() {
 	// skips the backend with a warning (honest degradation), never a boot
 	// failure.
 	memReg := memory.NewRegistry(log)
+	memReg.SetTopology(cfg.Topology())
 	memReg.RegisterProvider(sqlite.Provider{})
 	memReg.RegisterProvider(redis.Provider{})
 	memReg.RegisterProvider(postgres.Provider{})
@@ -1396,6 +1397,11 @@ func main() {
 		log.Warn("session lease lost to another instance; stopping the local actor", "session", sessKey)
 		sup.StopSessionForLease(sessKey)
 	})
+	// Instance-local memory is keyed by the ownership generation: when a
+	// session moves to another instance and comes back, the rows its earlier
+	// life wrote here are invisible instead of being mistaken for the current
+	// conversation.
+	memMgr.SetGenerationSource(hub.Generation)
 	// Group-identity validation: the router proposes, the engine resolves.
 	// A proposal naming a group the sender is not active in is refused at the
 	// deliver boundary; an accepted one stamps the derived membership uuid

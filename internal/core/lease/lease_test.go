@@ -213,3 +213,41 @@ func TestOpenRejectsEmptyOwner(t *testing.T) {
 		t.Fatal("an empty owner must not open a lease manager")
 	}
 }
+
+// TestGenerationCountsOwnershipChanges: the generation increments when the
+// owner changes and not when the holder renews. Instance-local memory keys on
+// it, so a renewal that bumped it would hide a live session's own rows.
+func TestGenerationCountsOwnershipChanges(t *testing.T) {
+	a, b := twoManagers(t)
+	ctx := context.Background()
+
+	ok, gen, err := a.AcquireForGen(ctx, "conversation", time.Minute)
+	if err != nil || !ok || gen != 0 {
+		t.Fatalf("first acquire: ok=%v gen=%d err=%v", ok, gen, err)
+	}
+	ok, gen, err = a.AcquireForGen(ctx, "conversation", time.Minute)
+	if err != nil || !ok || gen != 0 {
+		t.Fatalf("renewal bumped the generation: ok=%v gen=%d err=%v", ok, gen, err)
+	}
+	if err := a.Release(ctx, "conversation"); err != nil {
+		t.Fatal(err)
+	}
+	ok, gen, err = b.AcquireForGen(ctx, "conversation", time.Minute)
+	if err != nil || !ok || gen != 1 {
+		t.Fatalf("second owner: ok=%v gen=%d err=%v, want generation 1", ok, gen, err)
+	}
+	if err := b.Release(ctx, "conversation"); err != nil {
+		t.Fatal(err)
+	}
+	ok, gen, err = a.AcquireForGen(ctx, "conversation", time.Minute)
+	if err != nil || !ok || gen != 2 {
+		t.Fatalf("returning owner: ok=%v gen=%d err=%v, want generation 2", ok, gen, err)
+	}
+	got, err := a.Generation(ctx, "conversation")
+	if err != nil || got != 2 {
+		t.Fatalf("Generation = %d, %v; want 2", got, err)
+	}
+	if got, err := a.Generation(ctx, "never-held"); err != nil || got != 0 {
+		t.Fatalf("unknown lease generation = %d, %v; want 0", got, err)
+	}
+}

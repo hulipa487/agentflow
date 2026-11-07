@@ -199,3 +199,66 @@ func TestShutdownGraceDefault(t *testing.T) {
 		t.Fatalf("negative grace err = %v, want a runtime.shutdown_grace refusal", err)
 	}
 }
+
+// TestRegionalDurableStoreLocality: in a regional cell, a conversation store
+// on an instance-local backend is refused unless the store acknowledges it.
+func TestRegionalDurableStoreLocality(t *testing.T) {
+	c := regionalConfig()
+	c.Memory.Backends = map[string]Backend{
+		"vol": {Provider: "volatile", Config: map[string]any{"max_entries": 100}},
+	}
+	c.Profiles.Memory = map[string]MemoryProfile{
+		"p": {
+			Stores: map[string]Store{
+				"dialogue": {Backend: "vol", Table: "dialogue", Retention: "1h"},
+			},
+			Recall: "plugin:recency",
+		},
+	}
+	err := validate("test.yaml", c)
+	if err == nil || !strings.Contains(err.Error(), "instance-local") {
+		t.Fatalf("err = %v, want an instance-local refusal", err)
+	}
+	if !strings.Contains(err.Error(), `"dialogue"`) {
+		t.Fatalf("err = %v, want the store name", err)
+	}
+
+	// locality_ok is the explicit acknowledgement.
+	prof := c.Profiles.Memory["p"]
+	store := prof.Stores["dialogue"]
+	store.LocalityOK = true
+	prof.Stores["dialogue"] = store
+	c.Profiles.Memory["p"] = prof
+	if err := validate("test.yaml", c); err != nil {
+		t.Fatalf("locality_ok was not honoured: %v", err)
+	}
+}
+
+// TestVolatileStoreNeedsABound: volatile memory is process-wide and shared by
+// every session, so a store bound to it needs a TTL or the backend needs a
+// max_entries ceiling.
+func TestVolatileStoreNeedsABound(t *testing.T) {
+	base := func(cfg map[string]any, retention string) *Config {
+		return &Config{
+			Memory: Memory{Backends: map[string]Backend{
+				"vol": {Provider: "volatile", Config: cfg},
+			}},
+			Profiles: Profiles{Memory: map[string]MemoryProfile{
+				"p": {Stores: map[string]Store{
+					"cache": {Backend: "vol", Table: "cache", Retention: retention},
+				}},
+			}},
+		}
+	}
+
+	err := validate("test.yaml", base(nil, ""))
+	if err == nil || !strings.Contains(err.Error(), "max_entries") {
+		t.Fatalf("err = %v, want a volatile bound refusal", err)
+	}
+	if err := validate("test.yaml", base(nil, "1h")); err != nil {
+		t.Fatalf("a store TTL should bound volatile: %v", err)
+	}
+	if err := validate("test.yaml", base(map[string]any{"max_entries": 1000}, "")); err != nil {
+		t.Fatalf("a backend max_entries should bound volatile: %v", err)
+	}
+}

@@ -159,20 +159,45 @@ type ChatEvent struct {
 // ErrEmptyText is refused before a turn is delivered.
 var ErrEmptyText = fmt.Errorf("message is empty")
 
+// LoopError reports that the agent's loop failed while it was answering the
+// turn. The session restarts on its own, but this turn is over: no turn.end
+// will follow, so waiting for one would only run out the chat timeout.
+type LoopError struct{ Reason string }
+
+func (e *LoopError) Error() string { return "the loop failed: " + e.Reason }
+
+// Check refuses a request that can never start a turn: an empty message, or
+// an act-as id that is not a known profile. A streaming caller runs it before
+// committing to a 200, so the refusal reaches the client as a status rather
+// than as a stream that ends without a word. Chat runs it too.
+func (b *Broker) Check(req ChatRequest) error {
+	if strings.TrimSpace(req.Text) == "" {
+		return ErrEmptyText
+	}
+	actAs := strings.TrimSpace(req.ActAs)
+	if actAs != "" && b.cfg.ValidateUser != nil && !b.cfg.ValidateUser(actAs) {
+		return fmt.Errorf("act-as user %s is not a known profile", actAs)
+	}
+	return nil
+}
+
 // Chat delivers one user message to an agent thread and streams the turn.
 // emit is called on the calling goroutine; it must be quick (an SSE write).
+//
+// The stream ends in exactly one of two ways: a "done" event (the turn ended,
+// timed out, or was refused by safety before it began), or an "error" event
+// followed by a non-nil error (the message could not be delivered, or the
+// loop failed mid-turn). A request refused by Check returns its error without
+// emitting anything.
 func (b *Broker) Chat(ctx context.Context, req ChatRequest, emit func(ChatEvent)) (ChatResult, error) {
-	if strings.TrimSpace(req.Text) == "" {
-		return ChatResult{}, ErrEmptyText
+	if err := b.Check(req); err != nil {
+		return ChatResult{}, err
 	}
 	thread := req.Thread
 	if thread == "" {
 		thread = uuid.NewString()
 	}
 	actAs := strings.TrimSpace(req.ActAs)
-	if actAs != "" && b.cfg.ValidateUser != nil && !b.cfg.ValidateUser(actAs) {
-		return ChatResult{}, fmt.Errorf("act-as user %s is not a known profile", actAs)
-	}
 	timeout := req.Timeout
 	if timeout <= 0 {
 		timeout = b.timeout
@@ -228,7 +253,7 @@ func (b *Broker) Chat(ctx context.Context, req ChatRequest, emit func(ChatEvent)
 
 	// Replies and trace events travel on separate channels; drain any reply
 	// that raced with the turn boundary before closing the turn.
-	finish := func() (ChatResult, error) {
+	drain := func() {
 		for {
 			select {
 			case rep := <-pending.replies:
@@ -236,13 +261,21 @@ func (b *Broker) Chat(ctx context.Context, req ChatRequest, emit func(ChatEvent)
 				repCopy := rep
 				emit(ChatEvent{Type: "reply", Reply: &repCopy})
 			default:
-				emit(ChatEvent{Type: "done", Done: &result})
-				return result, nil
+				return
 			}
 		}
 	}
+	finish := func() (ChatResult, error) {
+		drain()
+		emit(ChatEvent{Type: "done", Done: &result})
+		return result, nil
+	}
 
 	sawTurn := false
+	// refused is set when safety ingress turned this message away. A
+	// classifier block skips the turn outright (no turn.start, no turn.end),
+	// so the only sign that it is over is the session going idle again.
+	refused := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -258,6 +291,20 @@ func (b *Broker) Chat(ctx context.Context, req ChatRequest, emit func(ChatEvent)
 			if ev.Turn == msg.ID && ev.Kind == "turn.end" {
 				return finish()
 			}
+			if ev.Turn == msg.ID && ev.Kind == "safety" && ev.Op == "ingress" && !ev.OK {
+				refused = true
+			}
+			// A loop failure carries no turn id, but a session answers one
+			// message at a time: once this turn has started, the failure is
+			// this turn's. Before that it belongs to an earlier message, and
+			// ours is still waiting in the inbox for the restarted loop.
+			if ev.Kind == "error" && sawTurn {
+				metrics.Inc("agentflow_studio_chat_errors")
+				drain()
+				err := &LoopError{Reason: ev.Err}
+				emit(ChatEvent{Type: "error", Err: err.Error()})
+				return result, err
+			}
 		case rep := <-pending.replies:
 			result.Replies = append(result.Replies, rep)
 			repCopy := rep
@@ -270,6 +317,12 @@ func (b *Broker) Chat(ctx context.Context, req ChatRequest, emit func(ChatEvent)
 				return finish()
 			}
 			if sawTurn && !busy && len(result.Replies) > 0 {
+				return finish()
+			}
+			// Safety skipped the turn and the session is parked on its inbox
+			// again. (A legacy drop still starts the turn, with the session
+			// busy throughout, so it never lands here.)
+			if refused && !sawTurn && !busy {
 				return finish()
 			}
 		case <-timer.C:

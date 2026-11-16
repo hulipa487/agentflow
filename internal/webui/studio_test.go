@@ -69,7 +69,9 @@ func newStudioFixture(t *testing.T) *studioFixture {
 	sup.Start(context.Background())
 
 	r := &testRouter{}
-	b := studio.NewBroker(r, nil, studio.Config{}, log)
+	b := studio.NewBroker(r, nil, studio.Config{
+		ValidateUser: func(id string) bool { return id == "u_known" },
+	}, log)
 	r.onDeliver = func(agent, key string, msg session.Message) {
 		sk := agent + "|" + key
 		b.Trace(session.TraceEvent{SessionID: sk, Kind: "turn.start", Turn: msg.ID})
@@ -270,6 +272,73 @@ func TestStudioChatSSE(t *testing.T) {
 	body := rec.Body.String()
 	if !strings.Contains(body, "event: reply") || !strings.Contains(body, "event: done") {
 		t.Fatalf("SSE body = %q", body)
+	}
+}
+
+// TestStudioChatRefusesBeforeTheStreamStarts: an act-as id that is not a
+// profile used to yield a 200 and an empty stream, which a client cannot tell
+// from a dropped connection. It is a 400 with the reason, in both modes.
+func TestStudioChatRefusesBeforeTheStreamStarts(t *testing.T) {
+	f := newStudioFixture(t)
+	for _, stream := range []bool{true, false} {
+		rec := do(t, f.ui.API(), "POST", "/admin/api/studio/chat", map[string]any{
+			"agent": "echo", "text": "hi", "act_as_user": "u_gone", "stream": stream,
+		})
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "u_gone is not a known profile") {
+			t.Fatalf("stream=%v: chat = %d %s", stream, rec.Code, rec.Body.String())
+		}
+		if ct := rec.Header().Get("Content-Type"); strings.Contains(ct, "event-stream") {
+			t.Fatalf("stream=%v: refusal was sent as a stream (%s)", stream, ct)
+		}
+	}
+	// A known profile still chats.
+	rec := do(t, f.ui.API(), "POST", "/admin/api/studio/chat", map[string]any{
+		"agent": "echo", "text": "hi", "act_as_user": "u_known", "stream": false,
+	})
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "echo: hi") {
+		t.Fatalf("known act-as = %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestStudioChatReportsALoopFailure: the stream ends with an error event
+// naming the failure (never a bare close, never "done"), and the non-stream
+// form answers ok=false with the trace of how far the turn got.
+func TestStudioChatReportsALoopFailure(t *testing.T) {
+	f := newStudioFixture(t)
+	f.router.onDeliver = func(agent, key string, msg session.Message) {
+		sk := agent + "|" + key
+		f.broker.Trace(session.TraceEvent{SessionID: sk, Kind: "turn.start", Turn: msg.ID})
+		f.broker.Trace(session.TraceEvent{SessionID: sk, Kind: "error", Err: "llm.chat: connection refused"})
+	}
+
+	req := httptest.NewRequest("POST", "/admin/api/studio/chat", strings.NewReader(`{"agent":"echo","thread":"t3","text":"hi"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	f.ui.API().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if !strings.Contains(body, "event: error") || !strings.Contains(body, "the loop failed: llm.chat: connection refused") {
+		t.Fatalf("SSE body has no error event: %q", body)
+	}
+	if strings.Contains(body, "event: done") {
+		t.Fatalf("a failed turn was also reported done: %q", body)
+	}
+	if n := strings.Count(body, "event: error"); n != 1 {
+		t.Fatalf("error reported %d times: %q", n, body)
+	}
+
+	rec = do(t, f.ui.API(), "POST", "/admin/api/studio/chat", map[string]any{
+		"agent": "echo", "thread": "t4", "text": "hi", "stream": false,
+	})
+	var v struct {
+		OK     bool   `json:"ok"`
+		Error  string `json:"error"`
+		Events []struct {
+			Type string `json:"type"`
+		} `json:"events"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &v)
+	if rec.Code != 200 || v.OK || !strings.Contains(v.Error, "connection refused") || len(v.Events) == 0 {
+		t.Fatalf("non-stream loop failure = %d %s", rec.Code, rec.Body.String())
 	}
 }
 

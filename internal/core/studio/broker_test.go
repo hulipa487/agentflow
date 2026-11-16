@@ -2,8 +2,10 @@ package studio
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -130,6 +132,152 @@ func TestChatRefusesEmptyAndUnknownUser(t *testing.T) {
 	b2 := NewBroker(&fakeRouter{live: true}, nil, Config{ValidateUser: func(string) bool { return false }}, discard())
 	if _, err := b2.Chat(context.Background(), ChatRequest{Agent: "a", Text: "hi", ActAs: "nope"}, func(ChatEvent) {}); err == nil {
 		t.Fatal("unknown act-as user accepted")
+	}
+}
+
+// TestChatEndsWhenTheLoopFails: a loop that fails mid-turn sends no turn.end
+// and no reply. The chat must end on the failure, with an error the caller
+// can show, instead of running out the timeout and reporting "timed out".
+func TestChatEndsWhenTheLoopFails(t *testing.T) {
+	var b *Broker
+	r := &fakeRouter{live: true}
+	b = NewBroker(r, nil, Config{ChatTimeout: 30 * time.Second}, discard())
+	r.onDeliver = func(agent, key string, msg session.Message) {
+		sk := agent + "|" + key
+		b.Trace(session.TraceEvent{SessionID: sk, Kind: "turn.start", Turn: msg.ID})
+		// A reply sent before the failure still belongs to the turn.
+		_ = b.Deliver(msg.ReplyTo, "partial", nil)
+		b.Trace(session.TraceEvent{SessionID: sk, Kind: "error", Err: "attempt to index nil with 'text'"})
+	}
+	var events []string
+	var errText string
+	start := time.Now()
+	res, err := b.Chat(context.Background(), ChatRequest{Agent: "a", Text: "hi"}, func(ev ChatEvent) {
+		events = append(events, ev.Type)
+		if ev.Type == "error" {
+			errText = ev.Err
+		}
+	})
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("chat took %s: it waited for the timeout", took)
+	}
+	var loopErr *LoopError
+	if !errors.As(err, &loopErr) || loopErr.Reason != "attempt to index nil with 'text'" {
+		t.Fatalf("err = %v, want a LoopError carrying the loop's message", err)
+	}
+	if res.TimedOut {
+		t.Fatal("a failed loop was reported as a timeout")
+	}
+	if len(res.Replies) != 1 || res.Replies[0].Text != "partial" {
+		t.Fatalf("replies = %+v, want the one sent before the failure", res.Replies)
+	}
+	// The error is the last word: the reply is flushed before it, and no
+	// "done" follows. (Replies and trace events travel on separate channels,
+	// so their order relative to each other is not fixed.)
+	if len(events) != 4 || events[len(events)-1] != "error" {
+		t.Fatalf("events = %v, want two traces and a reply, then the error", events)
+	}
+	for _, ev := range events {
+		if ev == "done" {
+			t.Fatalf("events = %v: a failed turn was also reported done", events)
+		}
+	}
+	if !strings.Contains(errText, "attempt to index nil") {
+		t.Fatalf("error event = %q", errText)
+	}
+}
+
+// TestChatOutlivesAnEarlierTurnsFailure: a failure traced before this turn
+// started belongs to an earlier message. The loop restarts and then answers
+// ours, so the chat must keep waiting.
+func TestChatOutlivesAnEarlierTurnsFailure(t *testing.T) {
+	var b *Broker
+	r := &fakeRouter{live: true}
+	b = NewBroker(r, nil, Config{ChatTimeout: 5 * time.Second}, discard())
+	r.onDeliver = func(agent, key string, msg session.Message) {
+		sk := agent + "|" + key
+		b.Trace(session.TraceEvent{SessionID: sk, Kind: "error", Err: "left over from the previous turn"})
+		b.Trace(session.TraceEvent{SessionID: sk, Kind: "turn.start", Turn: msg.ID})
+		_ = b.Deliver(msg.ReplyTo, "hello", nil)
+		b.Trace(session.TraceEvent{SessionID: sk, Kind: "turn.end", Turn: msg.ID})
+	}
+	res, err := b.Chat(context.Background(), ChatRequest{Agent: "a", Text: "hi"}, func(ChatEvent) {})
+	if err != nil {
+		t.Fatalf("an earlier turn's failure ended this one: %v", err)
+	}
+	if len(res.Replies) != 1 || res.TimedOut {
+		t.Fatalf("result = %+v, want one reply", res)
+	}
+}
+
+// TestChatEndsWhenSafetySkipsTheTurn: a classifier block skips the turn
+// outright (the refusal is sent, then the session waits for the next
+// message), so neither turn.start nor turn.end is traced.
+func TestChatEndsWhenSafetySkipsTheTurn(t *testing.T) {
+	var b *Broker
+	r := &fakeRouter{live: true} // not busy: parked on the inbox again
+	b = NewBroker(r, nil, Config{ChatTimeout: 30 * time.Second}, discard())
+	r.onDeliver = func(agent, key string, msg session.Message) {
+		sk := agent + "|" + key
+		b.Trace(session.TraceEvent{SessionID: sk, Kind: "safety", Op: "ingress", Turn: msg.ID, Err: "classifier:block"})
+		_ = b.Deliver(msg.ReplyTo, "I can't help with that.", nil)
+	}
+	start := time.Now()
+	res, err := b.Chat(context.Background(), ChatRequest{Agent: "a", Text: "hi"}, func(ChatEvent) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("chat took %s: it waited for the timeout", took)
+	}
+	if res.TimedOut || len(res.Replies) != 1 {
+		t.Fatalf("result = %+v, want the refusal and no timeout", res)
+	}
+}
+
+// TestChatWaitsThroughALegacySafetyDrop: a non-classifier drop empties the
+// message but still runs the turn. The session is busy from dequeue to
+// turn.end, so the refusal trace alone must not end the chat early.
+func TestChatWaitsThroughALegacySafetyDrop(t *testing.T) {
+	var b *Broker
+	r := &fakeRouter{live: true, busy: true}
+	b = NewBroker(r, nil, Config{ChatTimeout: 5 * time.Second}, discard())
+	r.onDeliver = func(agent, key string, msg session.Message) {
+		sk := agent + "|" + key
+		b.Trace(session.TraceEvent{SessionID: sk, Kind: "safety", Op: "ingress", Turn: msg.ID, Err: "signal-gate"})
+		go func() {
+			// Longer than the broker's poll tick: an early finish would
+			// return before any of this is traced.
+			time.Sleep(350 * time.Millisecond)
+			b.Trace(session.TraceEvent{SessionID: sk, Kind: "turn.start", Turn: msg.ID})
+			_ = b.Deliver(msg.ReplyTo, "late", nil)
+			b.Trace(session.TraceEvent{SessionID: sk, Kind: "turn.end", Turn: msg.ID})
+		}()
+	}
+	res, err := b.Chat(context.Background(), ChatRequest{Agent: "a", Text: "hi"}, func(ChatEvent) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Replies) != 1 || res.Replies[0].Text != "late" {
+		t.Fatalf("result = %+v: the chat ended before the dropped turn ran", res)
+	}
+}
+
+// TestCheckIsWhatChatRefuses: Check and Chat agree, so a caller that checked
+// first never sees Chat refuse the same request.
+func TestCheckIsWhatChatRefuses(t *testing.T) {
+	b := NewBroker(&fakeRouter{live: true}, nil, Config{ValidateUser: func(id string) bool { return id == "u_known" }}, discard())
+	if err := b.Check(ChatRequest{Agent: "a", Text: " "}); !errors.Is(err, ErrEmptyText) {
+		t.Fatalf("empty text: %v", err)
+	}
+	if err := b.Check(ChatRequest{Agent: "a", Text: "hi", ActAs: "u_gone"}); err == nil || !strings.Contains(err.Error(), "u_gone") {
+		t.Fatalf("unknown act-as: %v", err)
+	}
+	if err := b.Check(ChatRequest{Agent: "a", Text: "hi", ActAs: " u_known "}); err != nil {
+		t.Fatalf("known act-as refused: %v", err)
+	}
+	if err := b.Check(ChatRequest{Agent: "a", Text: "hi"}); err != nil {
+		t.Fatalf("tenant-less turn refused: %v", err)
 	}
 }
 

@@ -524,11 +524,25 @@ func (u *UI) handleStudioChat(w http.ResponseWriter, r *http.Request) {
 	if req.TimeoutMS > 0 {
 		chatReq.Timeout = time.Duration(req.TimeoutMS) * time.Millisecond
 	}
+	// Refusals that need no turn (an act-as id that is not a profile) are
+	// answered here, while a status code can still say so. Once the stream's
+	// 200 is written, the only channel left is the stream itself.
+	if err := broker.Check(chatReq); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	stream := req.Stream == nil || *req.Stream
 	if !stream {
 		var events []studio.ChatEvent
 		res, err := broker.Chat(r.Context(), chatReq, func(ev studio.ChatEvent) { events = append(events, ev) })
+		var loopErr *studio.LoopError
+		if errors.As(err, &loopErr) {
+			// The request was fine and the turn ran; it is the loop that
+			// failed. The trace of how far it got is the useful part.
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error(), "result": res, "events": events})
+			return
+		}
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, err.Error())
 			return
@@ -548,9 +562,19 @@ func (u *UI) handleStudioChat(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	fl.Flush()
 
-	_, _ = broker.Chat(r.Context(), chatReq, func(ev studio.ChatEvent) {
+	said := false
+	_, err := broker.Chat(r.Context(), chatReq, func(ev studio.ChatEvent) {
+		if ev.Type == "error" {
+			said = true
+		}
 		writeSSE(w, fl, ev.Type, ev)
 	})
+	// Every failure must reach the client as an event: a stream that simply
+	// ends is indistinguishable from a dropped connection. A caller that has
+	// gone away is the one failure with nobody left to tell.
+	if err != nil && !said && r.Context().Err() == nil {
+		writeSSE(w, fl, "error", studio.ChatEvent{Type: "error", Err: err.Error()})
+	}
 }
 
 func (u *UI) handleStudioThreads(w http.ResponseWriter, r *http.Request) {

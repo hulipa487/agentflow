@@ -526,7 +526,7 @@ func bearerToken(r *http.Request) string {
 
 // clientIP is the peer address. Behind a reverse proxy this is the proxy, so a
 // deployment that fronts the listener must rate limit there as well — see the
-// note on trusted proxies in the docs.
+// note on trusted proxies in the AgentFlow Studio docs.
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {

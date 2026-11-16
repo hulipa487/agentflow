@@ -10,7 +10,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -1935,14 +1934,6 @@ func main() {
 			},
 		})
 		admin.Mount("/admin/api/", console.API(), true)
-		// The docs are part of AgentFlow Studio now. Keep a one-release
-		// signpost so old bookmarks and scripts get an explanation instead of
-		// a bare 404; no assets are shipped in this binary.
-		docsGone := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, "documentation moved to AgentFlow Studio (agentflow-studio)", http.StatusGone)
-		})
-		admin.Mount("/docs", docsGone, false)
-		admin.Mount("/docs/", docsGone, false)
 		if consoleEnabled {
 			admin.Mount("/", console.Static(), false)
 			if tcpAdmin {

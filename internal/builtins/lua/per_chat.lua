@@ -15,7 +15,7 @@
 --             membership and stamps the acting identity, or refuses)
 --   router.state.get/set/delete/list                   (durable, fleet-wide;
 --     a handler's Lua state is per process, so anything it must remember goes
---     there instead — see router.state in the docs)
+--     there instead — see router.state in the AgentFlow Studio docs)
 --
 -- Routing key: channel-qualified chat id, plus the acting group when the chat
 -- is in group mode. The mode is durable per chat (B10), stored in

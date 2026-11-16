@@ -82,7 +82,7 @@ func (h *Handle) migrate() error {
 		return fmt.Errorf("create extension vector: %w (is pgvector installed?)", err)
 	}
 	// The embedding column width is fixed at create time; changing dim on an
-	// existing database requires a manual ALTER TABLE (documented in docs).
+	// existing database requires a manual ALTER TABLE (see the memory docs in AgentFlow Studio).
 	// Two statements in one Exec, and a Sprintf'd dimension rather than a bind
 	// parameter — deliberately. pgx uses the simple protocol only when a
 	// statement carries no arguments, and the extended protocol refuses

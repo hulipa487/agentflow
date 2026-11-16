@@ -2,6 +2,7 @@ package chatapi
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -11,14 +12,23 @@ import (
 	"agentflow/internal/core/chatreq"
 	"agentflow/internal/core/gateway"
 	"agentflow/internal/core/media"
+	"agentflow/internal/core/session"
 )
 
 // turn is one in-flight chat completion: the reply the HTTP request is waiting
 // for, and the text that has already gone out. Delivery methods are called by
-// the session actor (one turn at a time); the HTTP handler only reads.
+// the session actor (one turn at a time); HTTP handlers only read.
+//
+// A turn can have more than one HTTP request attached: a retry carrying the
+// same Idempotency-Key joins the turn that is still running. That is why a
+// streaming turn keeps its frames in a log rather than a channel — a channel
+// hands each frame to exactly one reader, so two attached clients would each
+// get a random half of the stream, and a client that joined late would miss
+// the beginning. Every listener reads the log from the start with its own
+// cursor.
 type turn struct {
 	driver         *Driver
-	id             string // request id: also the message id and reply id
+	id             string // request id: also the reply id
 	ref            string // request registry key
 	agent          string // the agent the request named
 	model          string // the client-visible model id (same as agent)
@@ -26,18 +36,23 @@ type turn struct {
 	stream         bool
 	includeUsage   bool
 	created        int64
+	idemKey        string // the scoped Idempotency-Key hash this turn is joined by, or ""
 	log            *slog.Logger
 
 	mu        sync.Mutex
 	sendText  strings.Builder // session.send content
-	deltaText strings.Builder // text already streamed to the client
+	deltaText strings.Builder // text delivered as deltas
 	reply     *gateway.Reply
 	ended     bool
 	endErr    error
-	abandoned bool
+	listeners int // HTTP requests currently attached
 
-	frames chan []byte // streaming frames; closed by finish
-	gone   chan struct{}
+	// Streaming: every SSE frame produced so far, whether the log is complete,
+	// and a channel that is closed (and replaced) whenever either changes.
+	frames [][]byte
+	closed bool
+	wake   chan struct{}
+
 	done   chan struct{} // closed when a buffered result is ready
 	result *bufferedResult
 
@@ -52,7 +67,7 @@ type bufferedResult struct {
 }
 
 func newTurn(d *Driver, req *chatreq.Request) *turn {
-	t := &turn{
+	return &turn{
 		driver:         d,
 		id:             req.ID,
 		ref:            req.Ref,
@@ -63,13 +78,9 @@ func newTurn(d *Driver, req *chatreq.Request) *turn {
 		includeUsage:   req.IncludeUsage,
 		created:        time.Now().Unix(),
 		log:            d.log.With("request", req.ID),
-		gone:           make(chan struct{}),
+		wake:           make(chan struct{}),
 		done:           make(chan struct{}),
 	}
-	if req.Stream {
-		t.frames = make(chan []byte, 128)
-	}
-	return t
 }
 
 // Deliver implements gateway.Driver: on this channel a send appends to the
@@ -102,14 +113,11 @@ func (t *turn) DeliverDelta(replyTo, text string) error {
 	}
 	t.deltaText.WriteString(text)
 	stream := t.stream
-	if !stream {
-		t.sendText.WriteString(text)
-	}
 	t.mu.Unlock()
-	if !stream {
-		return nil
+	if stream {
+		t.writeFrame(sseData(t.dataChunk(map[string]any{"content": text})))
 	}
-	return t.writeFrame(sseData(t.dataChunk(map[string]any{"content": text})))
+	return nil
 }
 
 // DeliverReply stores the structured answer and finalises the turn.
@@ -135,6 +143,7 @@ func (t *turn) EndTurn(replyTo string, err error) { t.finish(err) }
 
 // finish builds the answer and releases the waiter.
 func (t *turn) finish(err error) {
+
 	t.mu.Lock()
 	if t.ended {
 		t.mu.Unlock()
@@ -159,49 +168,104 @@ func (t *turn) forgetRequest() {
 	t.forgetOnce.Do(func() { t.driver.opt.Requests.Remove(t.ref) })
 }
 
-// abandon means the client stopped listening. Frames are dropped rather than
-// blocking the actor; the turn itself is stopped only when it is ephemeral.
-func (t *turn) abandon() {
+// attach counts one more HTTP request waiting on this turn. Callers hold the
+// driver's lock, so an attach cannot race the turn being forgotten.
+func (t *turn) attach() {
 	t.mu.Lock()
-	if !t.abandoned {
-		t.abandoned = true
-		close(t.gone)
+	t.listeners++
+	t.mu.Unlock()
+}
+
+// detach is one HTTP request giving up on the turn (the client went away, or
+// its own deadline passed). It reports whether nobody is listening any more
+// while the turn is still running — the caller then decides whether the work
+// is worth finishing.
+func (t *turn) detach() (orphaned bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.listeners > 0 {
+		t.listeners--
+	}
+	return t.listeners == 0 && !t.ended
+}
+
+// writeFrame appends one SSE frame to the log and wakes every listener. It
+// never blocks the session actor: a slow client costs memory bounded by the
+// size of one answer, not a stalled turn.
+func (t *turn) writeFrame(frame []byte) {
+	t.mu.Lock()
+	if !t.closed {
+		t.frames = append(t.frames, frame)
+		close(t.wake)
+		t.wake = make(chan struct{})
 	}
 	t.mu.Unlock()
 }
 
-// writeFrame hands one SSE frame to the handler, or drops it if the client is
-// gone.
-func (t *turn) writeFrame(frame []byte) error {
+// closeFrames marks the stream complete.
+func (t *turn) closeFrames() {
 	t.mu.Lock()
-	abandoned, ch := t.abandoned, t.frames
-	t.mu.Unlock()
-	if abandoned || ch == nil {
-		return nil
+	if !t.closed {
+		t.closed = true
+		close(t.wake)
+		t.wake = make(chan struct{})
 	}
-	select {
-	case ch <- frame:
-		return nil
-	case <-t.gone:
-		return nil
+	t.mu.Unlock()
+}
+
+// framesFrom returns the frames a listener has not written yet, whether the
+// stream is complete, and the channel that signals the next change.
+func (t *turn) framesFrom(cursor int) (frames [][]byte, closed bool, wake <-chan struct{}) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if cursor < len(t.frames) {
+		frames = t.frames[cursor:len(t.frames):len(t.frames)]
+	}
+	return frames, t.closed, t.wake
+}
+
+// replyTail is what a structured reply adds to text the turn already delivered
+// as deltas. A loop that streams and then replies with the same text (the
+// pass-through does, through llm.forward) must not have it sent twice; a reply
+// that does not continue the streamed text cannot retract what the client has
+// already rendered, so it is not appended to it.
+func replyTail(streamed, reply string) string {
+	switch {
+	case reply == "":
+		return ""
+	case strings.HasPrefix(reply, streamed):
+		return reply[len(streamed):]
+	case streamed == "":
+		return reply
+	default:
+		return ""
 	}
 }
+
+// blockedInput reports whether the turn ended because ingress safety refused
+// the message. That is a refusal of the request, whatever refusal text the
+// profile sent on the way: the contract is 400 content_filter, not an
+// assistant message.
+func blockedInput(err error) bool { return errors.Is(err, session.ErrSafetyBlocked) }
 
 // finishBuffered builds a chat.completion object, or an error envelope when the
 // turn failed before producing anything.
 func (t *turn) finishBuffered(err error) {
 	t.mu.Lock()
 	send := t.sendText.String()
+	streamed := t.deltaText.String()
 	reply := t.reply
 	t.mu.Unlock()
 
-	content := send
+	// The same order a streaming client sees: deltas as they arrived, then
+	// what session.send accumulated, then whatever the reply adds.
+	content := streamed + send
 	finish := "stop"
 	var toolCalls []gateway.ToolCall
 	var usage *gateway.Usage
 	var reasoning string
 	if reply != nil {
-		content += reply.Text
+		content += replyTail(streamed, reply.Text)
 		if reply.FinishReason != "" {
 			finish = reply.FinishReason
 		}
@@ -212,17 +276,24 @@ func (t *turn) finishBuffered(err error) {
 
 	if err != nil {
 		status, typ, code, message := statusForError(err)
+		if blockedInput(err) {
+			// The profile's refusal text, when it sent one, is the most useful
+			// thing the error can say.
+			if send != "" {
+				message = send
+			}
+			t.result = &bufferedResult{status: status, body: errorBody(typ, code, message)}
+			close(t.done)
+			return
+		}
 		if content == "" && len(toolCalls) == 0 {
 			t.result = &bufferedResult{status: status, body: errorBody(typ, code, message)}
 			close(t.done)
 			return
 		}
-		// Output began: finish the stream rather than sending a malformed
+		// Output began: finish the answer rather than sending a malformed
 		// half-answer. The error stays in the log.
 		t.log.Warn("openai turn ended with an error after output", "err", err)
-		finish = "stop"
-	}
-	if reply == nil && err == nil {
 		finish = "stop"
 	}
 
@@ -263,7 +334,6 @@ func (t *turn) finishBuffered(err error) {
 // finishStream writes the tail of the SSE stream: any text not yet relayed,
 // the complete tool calls, the finish reason, usage when asked for, and [DONE].
 func (t *turn) finishStream(err error) {
-	ch := t.frames
 	t.mu.Lock()
 	send := t.sendText.String()
 	streamed := t.deltaText.String()
@@ -273,12 +343,20 @@ func (t *turn) finishStream(err error) {
 	if err != nil {
 		status, typ, code, message := statusForError(err)
 		hasOutput := send != "" || streamed != "" || (reply != nil && (reply.Text != "" || len(reply.ToolCalls) > 0))
+		if blockedInput(err) {
+			// A refused request is an error event even when the profile sent
+			// refusal text: that text is the message, not an answer.
+			if send != "" {
+				message = send
+			}
+			hasOutput = false
+		}
 		if !hasOutput {
-			_ = t.writeFrame(sseData(map[string]any{
+			t.writeFrame(sseData(map[string]any{
 				"error": errorEnvelope(typ, code, message),
 			}))
-			_ = t.writeFrame([]byte("data: [DONE]\n\n"))
-			close(ch)
+			t.writeFrame([]byte("data: [DONE]\n\n"))
+			t.closeFrames()
 			return
 		}
 		if status >= 400 {
@@ -300,19 +378,12 @@ func (t *turn) finishStream(err error) {
 	}
 	// Remaining text: what send() accumulated (never streamed) plus the part of
 	// a reply the deltas did not already carry.
-	remaining := send
-	if replyText != "" {
-		if strings.HasPrefix(replyText, streamed) {
-			remaining += replyText[len(streamed):]
-		} else if streamed == "" {
-			remaining += replyText
-		}
-	}
+	remaining := send + replyTail(streamed, replyText)
 	if remaining != "" {
-		_ = t.writeFrame(sseData(t.dataChunk(map[string]any{"content": remaining})))
+		t.writeFrame(sseData(t.dataChunk(map[string]any{"content": remaining})))
 	}
 	if t.driver.opt.ExposeReasoning && reasoning != "" {
-		_ = t.writeFrame(sseData(map[string]any{
+		t.writeFrame(sseData(map[string]any{
 			"id": "chatcmpl-" + t.id, "object": "chat.completion.chunk", "created": t.createdUnix(), "model": t.model,
 			"choices": []any{map[string]any{
 				"index": 0, "delta": map[string]any{"reasoning_content": reasoning}, "finish_reason": nil,
@@ -320,7 +391,7 @@ func (t *turn) finishStream(err error) {
 		}))
 	}
 	if len(toolCalls) > 0 {
-		_ = t.writeFrame(sseData(map[string]any{
+		t.writeFrame(sseData(map[string]any{
 			"id": "chatcmpl-" + t.id, "object": "chat.completion.chunk", "created": t.createdUnix(), "model": t.model,
 			"choices": []any{map[string]any{
 				"index": 0, "delta": map[string]any{"tool_calls": toolCallsOut(toolCalls, true)}, "finish_reason": nil,
@@ -330,7 +401,7 @@ func (t *turn) finishStream(err error) {
 	if finish == "" {
 		finish = "stop"
 	}
-	_ = t.writeFrame(sseData(map[string]any{
+	t.writeFrame(sseData(map[string]any{
 		"id": "chatcmpl-" + t.id, "object": "chat.completion.chunk", "created": t.createdUnix(), "model": t.model,
 		"choices": []any{map[string]any{
 			"index": 0, "delta": map[string]any{}, "finish_reason": finish,
@@ -340,13 +411,13 @@ func (t *turn) finishStream(err error) {
 		if usage == nil {
 			usage = &gateway.Usage{}
 		}
-		_ = t.writeFrame(sseData(map[string]any{
+		t.writeFrame(sseData(map[string]any{
 			"id": "chatcmpl-" + t.id, "object": "chat.completion.chunk", "created": t.createdUnix(), "model": t.model,
 			"choices": []any{}, "usage": usageObject(usage),
 		}))
 	}
-	_ = t.writeFrame([]byte("data: [DONE]\n\n"))
-	close(ch)
+	t.writeFrame([]byte("data: [DONE]\n\n"))
+	t.closeFrames()
 }
 
 // createdUnix is the turn's timestamp: one value for the whole answer, so every

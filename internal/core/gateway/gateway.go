@@ -165,6 +165,12 @@ func (r *Registry) SendReply(channel, replyTo string, rep Reply) error {
 		metrics.Inc("agentflow_channel_errors")
 		return fmt.Errorf("channel %q does not support structured replies (the reply carried %d tool calls)", channel, len(rep.ToolCalls))
 	}
+	if rep.Text == "" {
+		// A reply with no text and no tool calls has nothing a text channel
+		// can show (a refused answer is the usual case); an empty message
+		// would only confuse the person on the other end.
+		return nil
+	}
 	if err := d.Deliver(replyTo, rep.Text, nil); err != nil {
 		metrics.Inc("agentflow_egress_failed")
 		metrics.Inc("agentflow_channel_errors")

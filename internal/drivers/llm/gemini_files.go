@@ -41,6 +41,12 @@ type geminiFiles struct {
 	client *genai.Client
 	key    string       // cache-key namespace: uploads are per-api-key
 	http   *http.Client // url-source downloads; the SDK never fetches those
+	// noFetch refuses url-sourced parts instead of downloading them. It is set
+	// for a request a client supplied (Opts.Passthrough): fetching a URL a
+	// caller chose, from inside the deployment, would let that caller reach
+	// whatever this host can reach — a metadata service, an internal admin
+	// page — and read it back through the model.
+	noFetch bool
 }
 
 func newGeminiFiles(client *genai.Client, key string, hc *http.Client) *geminiFiles {
@@ -86,6 +92,9 @@ func (f *geminiFiles) reference(ctx context.Context, p media.Part, mime string) 
 		}
 		data = b
 	case p.URL != "":
+		if f.noFetch {
+			return "", fmt.Errorf("gemini: invalid_request: a %s part points at a remote URL; this provider needs the bytes uploaded and the runtime does not fetch a URL a client supplies — send the media inline as a data URL", p.Type)
+		}
 		b, err := f.download(ctx, p.URL)
 		if err != nil {
 			return "", fmt.Errorf("gemini: %s part download failed: %w", p.Type, err)

@@ -72,13 +72,22 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 		}
 		return out
 	}
-	optsOf := func(op session.Op) llm.Opts {
+	// optsOf is the one Op-to-Opts conversion, shared by llm.chat, llm.stream
+	// and llm.forward: an option missing here reaches no provider, whatever the
+	// drivers can serialise.
+	optsOf := func(ctx context.Context, op session.Op) llm.Opts {
 		return llm.Opts{
-			Temperature: op.Temperature,
-			MaxTokens:   op.MaxTokens,
-			Thinking:    op.Thinking,
-			Tools:       toToolDefs(op.Tools),
-			ToolChoice:  op.ToolChoice,
+			Temperature:       op.Temperature,
+			MaxTokens:         op.MaxTokens,
+			Thinking:          op.Thinking,
+			Tools:             toToolDefs(op.Tools),
+			ToolChoice:        op.ToolChoice,
+			ParallelToolCalls: op.ParallelToolCalls,
+			TopP:              op.TopP,
+			Stop:              op.Stop,
+			Seed:              op.Seed,
+			ResponseFormat:    op.ResponseFormat,
+			Passthrough:       forwardedFromCtx(ctx),
 		}
 	}
 	chatOf := func(ctx context.Context, op session.Op) (string, bool) {
@@ -86,7 +95,7 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 		if err != nil {
 			return failJSON(err)
 		}
-		reply, err := m.Chat(ctx, op.Model, msgs, optsOf(op))
+		reply, err := m.Chat(ctx, op.Model, msgs, optsOf(ctx, op))
 		if err != nil {
 			return failJSON(err)
 		}
@@ -96,6 +105,7 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 			"thinking_blocks": reply.ThinkingBlocks,
 			"usage":           reply.Usage,
 			"tool_calls":      reply.ToolCalls,
+			"finish_reason":   finishOf(reply.FinishReason, len(reply.ToolCalls)),
 		})
 		return string(b), true
 	}
@@ -104,7 +114,7 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 		if err != nil {
 			return failJSON(err)
 		}
-		id, err := m.StreamOpen(ctx, op.Model, msgs, optsOf(op))
+		id, err := m.StreamOpen(ctx, op.Model, msgs, optsOf(ctx, op))
 		if err != nil {
 			return failJSON(err)
 		}
@@ -160,6 +170,7 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 				"tool_calls":      frame.ToolCalls,
 				"thinking":        frame.Thinking,
 				"thinking_blocks": frame.ThinkingBlocks,
+				"finish_reason":   frame.FinishReason,
 				"error":           errString(err),
 			})
 			return string(b), true
@@ -476,6 +487,11 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]
 		budget   *budget.Lease
 		quota    *accounting.Lease
 		estimate int64
+		// model and kind are what the terminal frame's ledger row is written
+		// with. The next op carries only a stream handle, so without these a
+		// streamed call would be recorded against no model at all.
+		model string
+		kind  string
 	}
 	var (
 		holdMu sync.Mutex
@@ -518,7 +534,11 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]
 		}
 		if err := json.Unmarshal([]byte(resp), &out); err == nil && out.ID != "" {
 			holdMu.Lock()
-			holds[out.ID] = &streamHold{budget: lease, quota: ql, estimate: estimate}
+			kind := "stream"
+			if forwardedFromCtx(ctx) {
+				kind = "forward"
+			}
+			holds[out.ID] = &streamHold{budget: lease, quota: ql, estimate: estimate, model: op.Model, kind: kind}
 			holdMu.Unlock()
 			return resp, true
 		}
@@ -543,10 +563,15 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]
 				CacheWrite int `json:"cache_write"`
 				Reasoning  int `json:"reasoning"`
 			} `json:"usage"`
+			Error *string `json:"error"`
 		}
 		if err := json.Unmarshal([]byte(resp), &frame); err != nil || !frame.Done {
 			return resp, ok
 		}
+		// A terminal frame can also be a provider failure part-way through the
+		// answer. The call is still recorded — it happened, and whatever usage
+		// arrived is real — but not as a success.
+		succeeded := frame.Error == nil || *frame.Error == ""
 		u := usageCounts{
 			Input:      frame.Usage.Input,
 			Output:     frame.Usage.Output,
@@ -564,7 +589,11 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]
 		}
 		metrics.Inc("agentflow_llm_calls")
 		metrics.Add("agentflow_llm_tokens", actual)
-		mt.record(ctx, op, "stream", u, true)
+		ledgerOp, kind := op, "stream"
+		if h != nil {
+			ledgerOp.Model, kind = h.model, h.kind
+		}
+		mt.record(ctx, ledgerOp, kind, u, succeeded)
 		if h != nil {
 			mt.releaseQuota(h.quota)
 		}
@@ -615,7 +644,9 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]
 			msgs = append(append([]session.ChatMessage{}, op.Prepend...), msgs...)
 		}
 		if len(op.Append) > 0 {
-			msgs = append(msgs, op.Append...)
+			// Full slice expression: msgs may still be the registry's own
+			// slice, and an append with spare capacity would write into it.
+			msgs = append(msgs[:len(msgs):len(msgs)], op.Append...)
 		}
 		var tools []session.ToolSpec
 		if req != nil {
@@ -668,15 +699,20 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]
 			ResponseFormat: responseFormat, MaxTokens: maxTokens, Thinking: op.Thinking,
 		}
 		ledgerOp := session.Op{Type: "llm.forward", Model: model}
+		// From here on the call is a client's request being forwarded: the
+		// drivers drop what they cannot express instead of refusing it, and the
+		// ledger row is a "forward" row.
+		ctx = withForwarded(ctx)
 		resp, ok := base["llm.stream.open"](ctx, openOp)
 		if !ok {
 			// A refusal (quota, budget) writes no ledger row — the call never
 			// happened. A provider failure did happen, and the forward contract
 			// says it is recorded like any other attempt.
-			if !strings.Contains(resp, "user_quota_exhausted") && !strings.Contains(resp, "budget_exhausted") {
-				mt.record(ctx, ledgerOp, "forward", usageCounts{}, false)
+			if isDenial(resp) {
+				return resp, false
 			}
-			return resp, false
+			mt.record(ctx, ledgerOp, "forward", usageCounts{}, false)
+			return forwardFailure(resp), false
 		}
 		var handle struct {
 			ID string `json:"id"`
@@ -691,7 +727,7 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]
 		var text strings.Builder
 		var usage llm.Usage
 		var calls []llm.ToolCall
-		var thinking string
+		var thinking, finishReason string
 		var blocks []map[string]any
 		for {
 			frameResp, ok := base["llm.stream.next"](ctx, session.Op{Type: "llm.stream.next", Stream: handle.ID})
@@ -702,7 +738,7 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]
 				// attempt, and close releases the reservation.
 				mt.record(ctx, ledgerOp, "forward", usageCounts{}, false)
 				closeStream()
-				return frameResp, false
+				return forwardFailure(frameResp), false
 			}
 			var frame struct {
 				Delta          string           `json:"delta"`
@@ -711,6 +747,7 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]
 				ToolCalls      []llm.ToolCall   `json:"tool_calls"`
 				Thinking       string           `json:"thinking"`
 				ThinkingBlocks []map[string]any `json:"thinking_blocks"`
+				FinishReason   string           `json:"finish_reason"`
 				Error          *string          `json:"error"`
 			}
 			if err := json.Unmarshal([]byte(frameResp), &frame); err != nil {
@@ -738,12 +775,12 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]
 				calls = frame.ToolCalls
 				thinking = frame.Thinking
 				blocks = frame.ThinkingBlocks
+				finishReason = frame.FinishReason
 				if frame.Error != nil && *frame.Error != "" {
 					// The metered next handler already wrote the row for this
-					// terminal frame (it cannot tell a provider error from a
-					// normal end); do not write a second.
+					// terminal frame, as a failure; do not write a second.
 					closeStream()
-					return failJSON(errors.New(*frame.Error))
+					return failJSON(errors.New(upstreamErrorMarker + *frame.Error))
 				}
 				break
 			}
@@ -752,16 +789,12 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]
 
 		outCalls := make([]session.ToolCallSpec, len(calls))
 		for i, c := range calls {
-			outCalls[i] = session.ToolCallSpec{ID: c.ID, Name: c.Name, Args: c.Args}
-		}
-		finish := "stop"
-		if len(outCalls) > 0 {
-			finish = "tool_calls"
+			outCalls[i] = session.ToolCallSpec{ID: c.ID, Name: c.Name, Args: c.Args, Arguments: c.Raw}
 		}
 		b, err := json.Marshal(map[string]any{
 			"text":            text.String(),
 			"tool_calls":      outCalls,
-			"finish_reason":   finish,
+			"finish_reason":   finishOf(finishReason, len(outCalls)),
 			"usage":           usage,
 			"thinking":        thinking,
 			"thinking_blocks": blocks,
@@ -795,6 +828,66 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]
 	return base
 }
 
+// finishOf is the finish reason a reply reports: the provider's own when it
+// gave one, else what the reply's shape implies.
+func finishOf(reported string, toolCalls int) string {
+	switch {
+	case reported != "":
+		return reported
+	case toolCalls > 0:
+		return "tool_calls"
+	default:
+		return "stop"
+	}
+}
+
+type forwardedKey struct{}
+
+// withForwarded marks a model call as a client's request being forwarded.
+func withForwarded(ctx context.Context) context.Context {
+	return context.WithValue(ctx, forwardedKey{}, true)
+}
+
+func forwardedFromCtx(ctx context.Context) bool {
+	v, _ := ctx.Value(forwardedKey{}).(bool)
+	return v
+}
+
+// isDenial reports whether an op response is the structured refusal denyJSON
+// produces (quota or budget), as opposed to a provider failure whose message
+// merely mentions one of those words.
+func isDenial(resp string) bool {
+	var d struct {
+		OK    *bool  `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(resp), &d); err != nil || d.OK == nil || *d.OK {
+		return false
+	}
+	return d.Error == "user_quota_exhausted" || d.Error == "budget_exhausted"
+}
+
+// upstreamErrorMarker prefixes a failure of the model call itself. The loop
+// sees it in the error it is raised with, and a channel that reports errors by
+// kind reads it to tell "the model failed" (502 on the OpenAI endpoint) from a
+// failure of the loop's own code.
+const upstreamErrorMarker = "upstream_error: "
+
+// forwardFailure marks an op failure response (a JSON string) as an upstream
+// failure, unless it is a refusal of the request itself, which the drivers mark
+// "invalid_request" and which the client can act on.
+func forwardFailure(resp string) string {
+	var msg string
+	if err := json.Unmarshal([]byte(resp), &msg); err != nil {
+		return resp
+	}
+	if strings.Contains(msg, "invalid_request") || strings.Contains(msg, "has no equivalent") || strings.HasPrefix(msg, "tool_choice") {
+		return resp
+	}
+	b, _ := json.Marshal(upstreamErrorMarker + msg)
+	return string(b)
+}
+
 // maxForwardRequestJSON is the largest request openai.request materialises.
 const maxForwardRequestJSON = 4 << 20
 
@@ -818,6 +911,12 @@ func currentRequest(ctx context.Context, reg *chatreq.Registry, opName string) (
 		return nil, fmt.Errorf("%s: this turn carries no request_ref; the openai channel sets one on every turn it delivers", opName)
 	}
 	req, ok := reg.Get(ref)
+	if ok && req.ID != m.ReplyTo {
+		// The ref is client-visible data in the payload. It must name the
+		// request this turn is answering, not merely some request that is
+		// registered: a ref passed along from another turn does not qualify.
+		return nil, fmt.Errorf("%s: the request_ref on this turn does not belong to it", opName)
+	}
 	if !ok {
 		return nil, fmt.Errorf("%s: the request behind this turn (ref %s) is not in this process — a keyed session that moved instances keeps only the message, not its body; forward with opts.messages, or give the route ephemeral sessions", opName, ref)
 	}

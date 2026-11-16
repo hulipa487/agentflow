@@ -65,6 +65,12 @@ type ToolCall struct {
 	ID   string         `json:"id,omitempty"`
 	Name string         `json:"name"`
 	Args map[string]any `json:"args"`
+	// Raw is the provider's own argument text, when it sent one. Args is the
+	// decoded form a loop reads; Raw is what a channel hands back to a client
+	// that asked for the model's output unchanged — decoding and re-encoding
+	// loses the difference between [] and {} once the value has been a Lua
+	// table, drops nulls, and rounds integers above 2^53.
+	Raw string `json:"arguments,omitempty"`
 }
 
 // ToolDef is the provider-agnostic shape a loop passes in opts.Tools. Each
@@ -92,6 +98,15 @@ type Opts struct {
 	// {"type":"text"|"json_object"|"json_schema", ...}. Providers with no
 	// equivalent refuse it rather than silently dropping the request's shape.
 	ResponseFormat map[string]any
+	// Passthrough marks options and messages that came from a client's request
+	// (llm.forward) rather than from the loop's author. It changes two things.
+	// An option the provider cannot express is dropped instead of refused —
+	// a client that always sends temperature must still get an answer — except
+	// response_format and a named tool choice, where a silent drop would
+	// change what the caller receives. And the runtime does not itself fetch a
+	// media URL the client supplied: a provider that fetches URLs gets the URL,
+	// one that needs the bytes uploaded refuses the part.
+	Passthrough bool
 }
 
 // Usage counts tokens as reported by the provider (0 when unknown).
@@ -125,6 +140,11 @@ type Reply struct {
 	ThinkingBlocks []map[string]any
 	ToolCalls      []ToolCall
 	Usage          Usage
+	// FinishReason is why the model stopped, in the OpenAI vocabulary every
+	// provider's own value is mapped to: "stop", "length" (the output limit
+	// cut the answer short), "tool_calls" or "content_filter". Empty when the
+	// provider did not say.
+	FinishReason string
 }
 
 // Frame is one llm.stream.next step. Delta is a text fragment; on Done the
@@ -137,6 +157,7 @@ type Frame struct {
 	ToolCalls      []ToolCall
 	Thinking       string
 	ThinkingBlocks []map[string]any
+	FinishReason   string // terminal only; see Reply.FinishReason
 }
 
 // event is one normalized provider event: a text delta, terminal usage, an
@@ -152,6 +173,7 @@ type event struct {
 	toolCalls      []ToolCall
 	thinking       string
 	thinkingBlocks []map[string]any
+	finish         string // terminal: the normalised finish reason, when known
 }
 
 // Manager resolves model names to provider clients and owns live streams.
@@ -363,6 +385,9 @@ func (m *Manager) Chat(ctx context.Context, model string, msgs []Message, opts O
 		if len(ev.toolCalls) > 0 {
 			r.ToolCalls = ev.toolCalls
 		}
+		if ev.finish != "" {
+			r.FinishReason = ev.finish
+		}
 	}
 	return r, nil
 }
@@ -379,6 +404,7 @@ type Stream struct {
 	calls    []ToolCall
 	thinking string
 	blocks   []map[string]any
+	finish   string
 }
 
 // StreamOpen starts a completion and returns a stream id for StreamNext.
@@ -431,9 +457,12 @@ func (m *Manager) StreamNext(ctx context.Context, id string) (Frame, error) {
 		select {
 		case ev, open := <-st.ch:
 			if !open {
-				done := Frame{Done: true, Usage: st.usage, ToolCalls: st.calls, Thinking: st.thinking, ThinkingBlocks: st.blocks}
+				done := Frame{Done: true, Usage: st.usage, ToolCalls: st.calls, Thinking: st.thinking, ThinkingBlocks: st.blocks, FinishReason: st.finish}
 				m.StreamClose(id)
 				return done, nil
+			}
+			if ev.finish != "" {
+				st.finish = ev.finish
 			}
 			if ev.usage.Input != 0 || ev.usage.Output != 0 {
 				st.usage = ev.usage
@@ -448,7 +477,7 @@ func (m *Manager) StreamNext(ctx context.Context, id string) (Frame, error) {
 				st.blocks = ev.thinkingBlocks
 			}
 			if ev.err != nil {
-				done := Frame{Done: true, Usage: st.usage, ToolCalls: st.calls, Thinking: st.thinking, ThinkingBlocks: st.blocks}
+				done := Frame{Done: true, Usage: st.usage, ToolCalls: st.calls, Thinking: st.thinking, ThinkingBlocks: st.blocks, FinishReason: st.finish}
 				m.StreamClose(id)
 				return done, ev.err
 			}

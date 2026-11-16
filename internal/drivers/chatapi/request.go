@@ -273,11 +273,27 @@ func (d *Driver) parseContent(raw json.RawMessage) (string, []media.Part, *apiEr
 			}
 			out = append(out, media.Part{Type: "audio", MIME: mime, Data: p.InputAudio.Data})
 		case "file":
+			// file.file_data is a data URL in the OpenAI API, so it takes the
+			// same path as an inline image: the channel's media policy decides
+			// whether it is accepted, and the store holds the bytes.
 			switch {
 			case p.File != nil && p.File.FileData != "":
-				out = append(out, media.Part{Type: "file", MIME: "application/octet-stream", Data: p.File.FileData, Name: p.File.Filename})
+				raw := p.File.FileData
+				if !strings.HasPrefix(raw, "data:") {
+					raw = "data:application/octet-stream;base64," + raw
+				}
+				part, aerr := d.mediaFromURL("file", raw)
+				if aerr != nil {
+					return "", nil, aerr
+				}
+				part.Name = p.File.Filename
+				out = append(out, part)
 			case p.FileURL != nil && p.FileURL.URL != "":
-				out = append(out, media.Part{Type: "file", URL: p.FileURL.URL})
+				part, aerr := d.mediaFromURL("file", p.FileURL.URL)
+				if aerr != nil {
+					return "", nil, aerr
+				}
+				out = append(out, part)
 			default:
 				return "", nil, badRequest("a file part needs file.file_data or file_url.url")
 			}

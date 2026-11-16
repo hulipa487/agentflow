@@ -265,6 +265,11 @@ func cmdValidate(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "loop:", err)
 		return 1
 	}
+	// Warnings do not fail validation: the config loads and runs. They name a
+	// combination that works differently from how it reads.
+	for _, w := range cfg.RegionalReplyWarnings() {
+		fmt.Fprintln(stderr, "warning:", w)
+	}
 	fmt.Fprintf(stdout, "ok: %s (epoch %s, %d agents, %d spawn profiles)\n", used.String(), cfg.Epoch, len(cfg.Agents), len(cfg.Profiles.Agent))
 	return 0
 }
@@ -401,6 +406,9 @@ runtime.topology is regional; -online=false turns it off.`,
 		add("WARN", "channels", "no channels configured; only API/Studio traffic can reach the agents")
 	} else {
 		add("PASS", "channels", fmt.Sprintf("%d configured", len(cfg.Gateway.Channels)))
+	}
+	for _, w := range cfg.RegionalReplyWarnings() {
+		add("WARN", "regional replies", w)
 	}
 	for i, ch := range cfg.Gateway.Channels {
 		if ch.Type != "openai" {
@@ -794,7 +802,9 @@ gateway:
     path: /webhook/local/
 
   # OpenAI-compatible endpoint: point any Chat Completions client at
-  # http://<host>:8080/v1 with the key below. Uncomment and set the key.
+  # http://<host>:8080/v1 with the key below. Uncomment and set the key. An
+  # exposed agent runs its own loop; loop: plugin:openai_passthrough makes it
+  # answer as its model.
   # - name: api
   #   type: openai
   #   path: /v1/
@@ -820,7 +830,9 @@ gateway:
       path: /webhook/local/
 
     # OpenAI-compatible endpoint: point any Chat Completions client at
-    # http://<host>:8080/v1 with the key below. Uncomment and set the key.
+    # http://<host>:8080/v1 with the key below. Uncomment and set the key. An
+    # exposed agent runs its own loop; loop: plugin:openai_passthrough makes it
+    # answer as its model.
     # - name: api
     #   type: openai
     #   path: /v1/

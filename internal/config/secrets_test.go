@@ -163,6 +163,7 @@ gateway:
 channels:
   - { name: tg, type: telegram, agent: bot, token: "${TG_TOKEN}", secret_token: "${TG_SECRET}" }
   - { name: wh, type: webhook, agent: bot, path: /h/ }
+  - { name: api, type: openai, agents: [bot], auth: key, keys: ["${COMPAT_KEY}"] }
 `,
 		"profiles/bot.yaml": `
 name: bot
@@ -216,6 +217,12 @@ triggers:
 	}
 	if got := cfg.Gateway.Channels[0].SecretToken; got != "${TG_SECRET}" {
 		t.Fatalf("channel secret_token must stay raw, got %q", got)
+	}
+	// An openai channel's keys are secrets too, one per list element. Left out
+	// of the registry, an unset ${VAR} expanded to "" at load: the channel
+	// started with an empty key, refused every request, and said nothing.
+	if got := cfg.Gateway.Channels[2].Keys; len(got) != 1 || got[0] != "${COMPAT_KEY}" {
+		t.Fatalf("openai channel keys must stay raw, got %q", got)
 	}
 	// A backend api_key is a secret like url/password: raw here, resolved by
 	// the consumer. Expanding it at load would hand the driver a literal that

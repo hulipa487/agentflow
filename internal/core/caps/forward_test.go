@@ -47,7 +47,7 @@ func TestForwardWritesOneUsageRow(t *testing.T) {
 	rec := &fakeRecorder{}
 	h := MeteredLLMHandlers(mgr, nil, Metering{Agent: "bot", Ledger: rec, Requests: reg})
 
-	resp, ok := h["llm.forward"](forwardCtx(context.Background(), ref), session.Op{Type: "llm.forward"})
+	resp, ok := h["llm.forward"](session.WithAgentModel(forwardCtx(context.Background(), ref), "default"), session.Op{Type: "llm.forward"})
 	if !ok {
 		t.Fatalf("forward: %s", resp)
 	}
@@ -57,8 +57,12 @@ func TestForwardWritesOneUsageRow(t *testing.T) {
 	if len(rec.got) != 1 {
 		t.Fatalf("ledger rows = %d; want 1", len(rec.got))
 	}
-	if rec.got[0].Input != 100 || rec.got[0].Output != 1 || rec.got[0].Kind != "stream" {
-		t.Fatalf("ledger row: %+v", rec.got[0])
+	// The row names the call for what it is and the model it ran on. Recorded
+	// as a generic "stream" against no model, a whole channel's usage could
+	// not be broken down per model.
+	row := rec.got[0]
+	if row.Input != 100 || row.Output != 1 || row.Kind != "forward" || row.Model != "default" || !row.OK {
+		t.Fatalf("ledger row: %+v", row)
 	}
 }
 
@@ -218,8 +222,159 @@ func TestOpenAIRequestCapsTheBody(t *testing.T) {
 		Messages: []session.ChatMessage{{Role: "user", Content: big}},
 	})
 	h := MeteredLLMHandlers(nil, nil, Metering{Requests: reg})
-	resp, ok := h["openai.request"](forwardCtx(context.Background(), ref), session.Op{Type: "openai.request"})
+	ctx := session.WithTurnMessage(context.Background(), &session.Message{
+		ID: "msg-big", Channel: "api", ReplyTo: "req-big",
+		Payload: map[string]any{"request_ref": ref},
+	})
+	resp, ok := h["openai.request"](ctx, session.Op{Type: "openai.request"})
 	if ok || !strings.Contains(resp, "over the") {
 		t.Fatalf("oversized request = %v %s; want a size refusal", ok, resp)
+	}
+}
+
+// recordingProvider is an OpenAI-shaped stream that keeps the request body and
+// answers with the given SSE.
+func recordingProvider(t *testing.T, sse string, body *string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		*body = string(b)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, sse)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+const okSSE = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n" +
+	"data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":1}}\n\n" +
+	"data: [DONE]\n\n"
+
+// TestForwardSendsEveryClientOptionUpstream: the pass-through's whole promise
+// is that the client's request reaches the model. Every sampling option the
+// channel parses has to survive the Op-to-Opts conversion, which once copied
+// only the five options that existed before this channel did.
+func TestForwardSendsEveryClientOptionUpstream(t *testing.T) {
+	var body string
+	srv := recordingProvider(t, okSSE, &body)
+	mgr := llm.NewManager(map[string]config.Model{
+		"default": {Provider: "openai", Model: "m", BaseURL: srv.URL},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	reg := chatreq.NewRegistry()
+	temp, topP, seed, parallel := 0.2, 0.5, int64(42), false
+	ref := reg.Add(&chatreq.Request{
+		ID: "req-1", Model: "coder", MaxTokens: 64,
+		Messages:          []session.ChatMessage{{Role: "user", Content: "hi"}},
+		Tools:             []session.ToolSpec{{Name: "lookup", Parameters: map[string]any{"type": "object"}}},
+		ToolChoice:        "required",
+		Temperature:       &temp,
+		TopP:              &topP,
+		Seed:              &seed,
+		ParallelToolCalls: &parallel,
+		Stop:              []string{"END"},
+		ResponseFormat:    map[string]any{"type": "json_object"},
+	})
+	h := MeteredLLMHandlers(mgr, nil, Metering{Agent: "bot", Requests: reg})
+	if resp, ok := h["llm.forward"](forwardCtx(context.Background(), ref), session.Op{Type: "llm.forward"}); !ok {
+		t.Fatalf("forward: %s", resp)
+	}
+	for _, want := range []string{
+		`"temperature":0.2`, `"top_p":0.5`, `"seed":42`, `"parallel_tool_calls":false`,
+		`"stop":["END"]`, `"response_format":{"type":"json_object"}`, `"tool_choice":"required"`,
+		`"max_tokens":64`, `"name":"lookup"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("upstream request is missing %s\nbody: %s", want, body)
+		}
+	}
+}
+
+// TestChatSendsTheNewOptionsToo: the same conversion serves llm.chat, whose
+// documented options include the new ones.
+func TestChatSendsTheNewOptionsToo(t *testing.T) {
+	var body string
+	srv := recordingProvider(t, okSSE, &body)
+	mgr := llm.NewManager(map[string]config.Model{
+		"default": {Provider: "openai", Model: "m", BaseURL: srv.URL},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h := MeteredLLMHandlers(mgr, nil, Metering{Agent: "bot"})
+	topP, seed := 0.9, int64(7)
+	resp, ok := h["llm.chat"](context.Background(), session.Op{
+		Type: "llm.chat", Model: "default",
+		Messages: []session.ChatMessage{{Role: "user", Content: "hi"}},
+		TopP:     &topP, Seed: &seed, Stop: []string{"X"},
+	})
+	if !ok {
+		t.Fatalf("chat: %s", resp)
+	}
+	for _, want := range []string{`"top_p":0.9`, `"seed":7`, `"stop":["X"]`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("upstream request is missing %s\nbody: %s", want, body)
+		}
+	}
+	if !strings.Contains(resp, `"finish_reason":"stop"`) {
+		t.Errorf("chat reply carries no finish_reason: %s", resp)
+	}
+}
+
+// TestForwardKeepsTheModelsOwnOutput: the finish reason and each tool call's
+// argument text come back as the provider sent them.
+func TestForwardKeepsTheModelsOwnOutput(t *testing.T) {
+	sse := "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"edit\",\"arguments\":\"{\\\"files\\\":[]}\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	var body string
+	srv := recordingProvider(t, sse, &body)
+	mgr := llm.NewManager(map[string]config.Model{
+		"default": {Provider: "openai", Model: "m", BaseURL: srv.URL},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	reg, ref := forwardRegistry(t, 10)
+	h := MeteredLLMHandlers(mgr, nil, Metering{Agent: "bot", Requests: reg})
+	resp, ok := h["llm.forward"](forwardCtx(context.Background(), ref), session.Op{Type: "llm.forward"})
+	if !ok {
+		t.Fatalf("forward: %s", resp)
+	}
+	if !strings.Contains(resp, `"finish_reason":"length"`) {
+		t.Errorf("finish reason was not passed on: %s", resp)
+	}
+	if !strings.Contains(resp, `"arguments":"{\"files\":[]}"`) {
+		t.Errorf("the tool call's own argument text was not kept: %s", resp)
+	}
+}
+
+// TestForwardRefusesARefFromAnotherTurn: the ref is data in the message
+// payload. It has to name the request this turn answers.
+func TestForwardRefusesARefFromAnotherTurn(t *testing.T) {
+	reg, ref := forwardRegistry(t, 10) // registered as request req-1
+	h := MeteredLLMHandlers(nil, nil, Metering{Requests: reg})
+	other := session.WithTurnMessage(context.Background(), &session.Message{
+		ID: "msg-2", Channel: "api", ReplyTo: "req-2",
+		Payload: map[string]any{"request_ref": ref},
+	})
+	resp, ok := h["openai.request"](other, session.Op{Type: "openai.request"})
+	if ok || !strings.Contains(resp, "does not belong") {
+		t.Fatalf("a ref carried over from another turn = %v %s; want a refusal", ok, resp)
+	}
+}
+
+// TestForwardMarksAnUpstreamFailure: a channel has to tell "the model failed"
+// from "the loop failed", and the marker is how.
+func TestForwardMarksAnUpstreamFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	mgr := llm.NewManager(map[string]config.Model{
+		"default": {Provider: "openai", Model: "m", BaseURL: srv.URL},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	reg, ref := forwardRegistry(t, 10)
+	rec := &fakeRecorder{}
+	h := MeteredLLMHandlers(mgr, nil, Metering{Agent: "bot", Ledger: rec, Requests: reg})
+	resp, ok := h["llm.forward"](forwardCtx(context.Background(), ref), session.Op{Type: "llm.forward"})
+	if ok || !strings.Contains(resp, "upstream_error: ") {
+		t.Fatalf("provider failure = %v %s; want an upstream_error marker", ok, resp)
+	}
+	if len(rec.got) != 1 || rec.got[0].OK || rec.got[0].Kind != "forward" {
+		t.Fatalf("ledger rows: %+v; want one failed forward row", rec.got)
 	}
 }

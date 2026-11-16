@@ -265,10 +265,17 @@ func (s *Supervisor) idleJanitor(ctx context.Context) {
 // without waiting for the ticker.
 //
 // A session is unloaded only when all hold: idle longer than the setting, not
-// busy, mailbox empty, not a persistent daemon, not ephemeral, and owning no
-// live resource — a timer, a shell, a live child, or a parked agent.request.
-// The last check is what keeps an unload from severing work the session is
-// waiting on: those four are the only things that outlive a parked actor.
+// busy, mailbox empty, not a persistent daemon, not ephemeral, not a spawned
+// child, and owning no live resource — a timer, a shell, a live child, or a
+// parked agent.request. The last check is what keeps an unload from severing
+// work the session is waiting on: those four are the only things that outlive
+// a parked actor. A child is excluded because it cannot come back: what makes
+// it a child (its parent, the task it was spawned with) is not something the
+// next message could recreate.
+//
+// The sweep only asks. The actor unloads itself, and only if it is still
+// parked on an empty mailbox with the activity stamp seen here — so a message
+// that arrives while the sweep is deciding is served, not lost.
 func (s *Supervisor) SweepIdle() {
 	if s.idleUnload <= 0 {
 		return
@@ -277,7 +284,7 @@ func (s *Supervisor) SweepIdle() {
 	s.mu.Lock()
 	candidates := make([]string, 0, len(s.sessions))
 	for key, a := range s.sessions {
-		if a.Ephemeral || a.Busy() || len(a.Mailbox) > 0 {
+		if a.Ephemeral || a.Identity.ParentID != "" || a.Busy() || len(a.Mailbox) > 0 {
 			continue
 		}
 		if def := s.defs[a.Identity.Agent]; def != nil && def.Persistent {
@@ -296,19 +303,17 @@ func (s *Supervisor) SweepIdle() {
 		}
 		s.mu.Lock()
 		a := s.sessions[key]
-		cancel := s.cancels[key]
-		// Re-check under the lock: the session may have taken a message or a
-		// resource since the snapshot above.
-		eligible := a != nil && !a.Busy() && len(a.Mailbox) == 0 &&
-			time.Since(a.LastActivity()) >= s.idleUnload
 		s.mu.Unlock()
-		if !eligible || cancel == nil {
+		if a == nil {
 			continue
 		}
-		a.Unload()
-		cancel()
-		metrics.Inc("agentflow_sessions_unloaded")
-		s.log.Info("session unloaded after idle", "session", key, "idle_for", time.Since(a.LastActivity()).String())
+		// Re-read after the resource checks: the session may have taken a
+		// message since the snapshot above.
+		seen := a.LastActivity()
+		if a.Busy() || len(a.Mailbox) > 0 || time.Since(seen) < s.idleUnload {
+			continue
+		}
+		a.RequestUnload(seen)
 	}
 }
 
@@ -736,10 +741,31 @@ func (s *Supervisor) StopSessionForLease(sessionID string) {
 
 func (s *Supervisor) onActorExit(id session.Identity, reason session.EndReason) {
 	var parent *session.Actor
+	var unloaded *session.Actor
+
+	// An unloaded conversation gives its lease back, so another instance can
+	// serve the next message instead of waiting out the TTL. The release comes
+	// BEFORE the session leaves the map: while the dead actor is still
+	// registered, a message that arrives is parked in its mailbox and delivered
+	// again below. Releasing after the removal would leave a window in which a
+	// message spawns a fresh actor under the old lease, and the release then
+	// takes the lease away from a session that is running — two instances
+	// could end up serving one conversation. The release gets its own context:
+	// the actor's may already be cancelled.
+	if reason == session.EndUnloaded && s.hub != nil {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := s.hub.ReleaseSession(releaseCtx, id.SessionID); err != nil {
+			s.log.Warn("release of an unloaded session's lease failed", "session", id.SessionID, "err", err)
+		}
+		cancel()
+	}
 
 	s.mu.Lock()
 	current, ok := s.sessions[id.SessionID]
 	if ok && current.Identity.SessionID == id.SessionID {
+		if reason == session.EndUnloaded {
+			unloaded = current
+		}
 		delete(s.sessions, id.SessionID)
 		delete(s.cancels, id.SessionID)
 		delete(s.tenants, id.SessionID)
@@ -790,15 +816,24 @@ func (s *Supervisor) onActorExit(id session.Identity, reason session.EndReason) 
 		// the reap must not be cancelled by whatever cancelled it.
 		s.shellMgr.ReapSession(context.Background(), id.SessionID)
 	}
-	// An unloaded conversation gives its lease back at once, so another instance
-	// can serve the next message instead of waiting out the TTL. The release
-	// gets its own context: the actor's is already cancelled.
-	if reason == session.EndUnloaded && s.hub != nil {
-		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := s.hub.ReleaseSession(releaseCtx, id.SessionID); err != nil {
-			s.log.Warn("release of an unloaded session's lease failed", "session", id.SessionID, "err", err)
+	if unloaded != nil {
+		metrics.Inc("agentflow_sessions_unloaded")
+		// Messages that reached the mailbox after the actor decided to unload
+		// were never served. Deliver them again: the session is gone from the
+		// map now, so this recreates it (or queues for whichever instance owns
+		// the conversation by then). A sender that picked up the old actor just
+		// before the removal and writes after this drain is the one case left
+		// uncovered; every session exit has that window.
+		if left := unloaded.DrainMailbox(); len(left) > 0 {
+			agent, key := splitSessionKey(id.SessionID)
+			go func() {
+				for _, m := range left {
+					if err := s.Deliver(agent, key, m); err != nil {
+						s.log.Warn("redelivery after unload failed", "session", id.SessionID, "id", m.ID, "err", err)
+					}
+				}
+			}()
 		}
-		cancel()
 	}
 
 	if parent != nil {
@@ -828,6 +863,17 @@ func (s *Supervisor) onActorExit(id session.Identity, reason session.EndReason) 
 	}
 
 	s.log.Info("session exited", "session", id.SessionID, "agent", id.Agent, "reason", reason)
+}
+
+// splitSessionKey undoes agent + "|" + key. Agent names cannot contain "|", so
+// the first one is the separator.
+func splitSessionKey(skey string) (agent, key string) {
+	for i := 0; i < len(skey); i++ {
+		if skey[i] == '|' {
+			return skey[:i], skey[i+1:]
+		}
+	}
+	return skey, ""
 }
 
 // ReloadAgent restarts every live session of an agent (loop file changed).

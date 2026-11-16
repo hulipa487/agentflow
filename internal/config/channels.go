@@ -43,6 +43,34 @@ func (ch Channel) JournalMode() string {
 	return "full"
 }
 
+// RegionalReplyWarnings names the channels whose answers can be lost in a
+// regional cell. A channel that answers on the HTTP request it received (a
+// synchronous webhook, the openai channel) holds that request in one process,
+// and a reply is delivered by the instance that owns the session. When a
+// message lands on one instance for a conversation another instance owns, the
+// owner has nowhere to send the answer and the caller waits out its timeout.
+// One-request sessions are unaffected: the instance that receives the request
+// always owns them. The list is empty outside a regional topology.
+func (c *Config) RegionalReplyWarnings() []string {
+	if !c.IsRegional() {
+		return nil
+	}
+	var out []string
+	for i, ch := range c.Gateway.Channels {
+		name := ch.Name
+		if name == "" {
+			name = fmt.Sprintf("%s-%d", ch.Type, i)
+		}
+		switch {
+		case ch.Type == "openai":
+			out = append(out, fmt.Sprintf("channel %q (openai) with runtime.topology: regional: a request that carries a conversation id is answered only when it reaches the instance that owns that conversation, and llm.forward cannot read a request body that arrived on another instance. Requests without a conversation id are unaffected. Pin a conversation to one instance at the load balancer, or leave conversation ids unused.", name))
+		case ch.Type == "webhook" && !ch.Async:
+			out = append(out, fmt.Sprintf("channel %q (synchronous webhook) with runtime.topology: regional: a reply is delivered only by the instance that received the request, so a message for a conversation another instance owns gets no answer before its timeout. Pin each sender to one instance at the load balancer, or set async: true with a deliver_url.", name))
+		}
+	}
+	return out
+}
+
 // ValidateChannels runs the boot-time channel checks against a candidate list.
 // It is what the Studio channel editor calls before persisting, so an edit
 // cannot produce a config the next boot would refuse.

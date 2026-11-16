@@ -163,6 +163,7 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 		}
 		accByIndex := map[int64]*acc{}
 		var order []int64
+		var finish string
 
 		handle := func(c openai.ChatCompletionChunk) bool {
 			reason.WriteString(openaiReasoningDelta(c.RawJSON()))
@@ -177,6 +178,9 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 			}
 			if len(c.Choices) == 0 {
 				return true
+			}
+			if fr := string(c.Choices[0].FinishReason); fr != "" {
+				finish = fr
 			}
 			d := c.Choices[0].Delta
 			if d.Content != "" {
@@ -225,11 +229,11 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 			calls := make([]ToolCall, 0, len(order))
 			for _, i := range order {
 				a := accByIndex[i]
-				calls = append(calls, ToolCall{ID: a.id, Name: a.name, Args: parseArgs(a.args.String())})
+				calls = append(calls, ToolCall{ID: a.id, Name: a.name, Args: parseArgs(a.args.String()), Raw: rawArgs(a.args.String())})
 			}
 			events <- event{toolCalls: calls, thinking: reason.String()}
 		}
-		events <- event{usage: usage, thinking: reason.String()}
+		events <- event{usage: usage, thinking: reason.String(), finish: normalizeFinish(finish)}
 	}()
 	return events, false, nil
 }

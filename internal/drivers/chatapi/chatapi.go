@@ -225,17 +225,27 @@ func (d *Driver) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Idempotency: a retried request joins the turn that is still running; a
-	// retry after that turn finished is a new turn. The derived message id is
-	// what makes the two instances of one request the same message.
-	idemKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	// retry after that turn finished is a new turn. The key is scoped to the
+	// caller and to the request itself: the header is client-chosen, so on its
+	// own it would let one caller attach to another caller's turn and read the
+	// answer, and a different body under a reused key is not a retry.
 	var idemHash string
-	if idemKey != "" {
-		sum := sha256.Sum256([]byte(idemKey))
-		idemHash = hex.EncodeToString(sum[:16])
+	if idemKey := strings.TrimSpace(r.Header.Get("Idempotency-Key")); idemKey != "" {
+		bodySum := sha256.Sum256(body)
+		h := sha256.New()
+		h.Write([]byte(from))
+		h.Write([]byte{0})
+		h.Write([]byte(idemKey))
+		h.Write([]byte{0})
+		h.Write(bodySum[:])
+		idemHash = hex.EncodeToString(h.Sum(nil)[:16])
 	}
 
 	d.mu.Lock()
-	t := d.idem[idemHash]
+	var t *turn
+	if idemHash != "" {
+		t = d.idem[idemHash]
+	}
 	joined := t != nil
 	if t == nil {
 		// A turn is always a fresh request id. The Idempotency-Key joins the
@@ -245,11 +255,13 @@ func (d *Driver) handleChat(w http.ResponseWriter, r *http.Request) {
 		req.ID = "req-" + uuid.NewString()
 		d.opt.Requests.Add(req)
 		t = newTurn(d, req)
+		t.idemKey = idemHash
 		d.pending[req.ID] = t
 		if idemHash != "" {
 			d.idem[idemHash] = t
 		}
 	}
+	t.attach()
 	d.mu.Unlock()
 
 	if !joined {
@@ -266,17 +278,20 @@ func (d *Driver) handleChat(w http.ResponseWriter, r *http.Request) {
 			Agent:   agent,
 			Message: msg,
 			// Delivery happens in the router goroutine. A refusal (ephemeral
-			// cap, unknown agent) comes back here so the request can answer
-			// 429/503 instead of waiting out its timeout.
+			// cap, unknown agent, a route that dropped the message) comes back
+			// here so the request can answer at once instead of waiting out
+			// its timeout.
 			Fail: func(err error) { t.EndTurn(t.id, err) },
 		})
 	}
 
-	if req.Stream {
-		d.serveStream(w, r, t, req)
+	// The turn's own mode decides the wire form. A joined request has the same
+	// body as the one that started the turn, so the two always agree.
+	if t.stream {
+		d.serveStream(w, r, t)
 		return
 	}
-	d.serveBuffered(w, r, t, req)
+	d.serveBuffered(w, r, t)
 }
 
 func (d *Driver) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -461,40 +476,52 @@ func lastUserText(msgs []session.ChatMessage) string {
 	return ""
 }
 
-// drop forgets a turn that never reached the agent.
-func (d *Driver) drop(t *turn) {
-	d.mu.Lock()
-	delete(d.pending, t.id)
-	for k, v := range d.idem {
-		if v == t {
-			delete(d.idem, k)
-		}
-	}
-	d.mu.Unlock()
-	d.opt.Requests.Remove(t.ref)
-}
-
 // remove forgets a finished turn, so a retry after it is a new turn.
 func (d *Driver) remove(t *turn) {
 	d.mu.Lock()
 	delete(d.pending, t.id)
-	for k, v := range d.idem {
-		if v == t {
-			delete(d.idem, k)
-		}
+	if t.idemKey != "" && d.idem[t.idemKey] == t {
+		delete(d.idem, t.idemKey)
 	}
 	d.mu.Unlock()
 	t.forgetRequest()
 }
 
-// stopEphemeral terminates the one-turn session behind a turn whose client has
-// gone. The key is the built-in route's (3.5); a custom route that keys
-// differently makes this a no-op rather than a wrong kill.
-func (d *Driver) stopEphemeral(t *turn) {
-	if d.opt.StopSession == nil || t.agent == "" || t.conversationID != "" {
+// leave is one HTTP request giving up on its turn: the client went away, or
+// the request's deadline passed. When nobody is left listening, a one-turn
+// session has no reason to keep spending tokens, so it is stopped — and taken
+// out of the idempotency table first, so a retry that arrives while it is
+// winding down starts a fresh turn instead of joining one that is being
+// cancelled. A conversation's turn is left to finish: its effects (memory,
+// state) are the conversation's, and a retry can still join it and read the
+// answer from the start.
+func (d *Driver) leave(t *turn) {
+	if !t.detach() {
 		return
 	}
-	d.opt.StopSession(t.agent + "|req:" + t.id)
+	if !d.stoppable(t) {
+		return
+	}
+	d.mu.Lock()
+	// An attach between the detach above and here means a retry joined after
+	// all: the turn has a listener again and must keep running.
+	t.mu.Lock()
+	orphaned := t.listeners == 0 && !t.ended
+	t.mu.Unlock()
+	if orphaned && t.idemKey != "" && d.idem[t.idemKey] == t {
+		delete(d.idem, t.idemKey)
+	}
+	d.mu.Unlock()
+	if orphaned {
+		d.opt.StopSession(t.agent + "|req:" + t.id)
+	}
+}
+
+// stoppable reports whether the session behind a turn is the one-turn session
+// the built-in route gives a request with no conversation id (3.5). A custom
+// route that keys differently makes the stop a no-op rather than a wrong kill.
+func (d *Driver) stoppable(t *turn) bool {
+	return d.opt.StopSession != nil && t.agent != "" && t.conversationID == ""
 }
 
 func writeError(w http.ResponseWriter, status int, typ, code, message string) {
@@ -525,15 +552,30 @@ func statusForError(err error) (status int, typ, code, message string) {
 		return http.StatusGatewayTimeout, "timeout", "timeout", msg
 	case errors.As(err, &unknownAgent):
 		return http.StatusNotFound, "invalid_request_error", "model_not_found", fmt.Sprintf("the model %q does not exist", unknownAgent.Agent)
-	case strings.Contains(msg, "response_format has no equivalent"):
-		return http.StatusBadRequest, "invalid_request_error", "invalid_request_error", msg
+	case errors.Is(err, router.ErrNotRouted):
+		return http.StatusServiceUnavailable, "server_error", "server_unavailable", "the deployment's route did not hand this request to an agent"
 	case errors.Is(err, session.ErrSafetyBlocked) || strings.Contains(msg, "blocked by safety"):
 		return http.StatusBadRequest, "invalid_request_error", "content_filter", msg
 	case strings.Contains(msg, "user_quota_exhausted"):
 		return http.StatusTooManyRequests, "insufficient_quota", "insufficient_quota", "the user's quota is exhausted"
+	case strings.Contains(msg, "budget_exhausted"):
+		return http.StatusTooManyRequests, "insufficient_quota", "insufficient_quota", "the agent's token budget is exhausted"
 	case errors.Is(err, supervisor.ErrTenantBusy), errors.Is(err, supervisor.ErrSessionCap):
 		return http.StatusTooManyRequests, "rate_limit_exceeded", "rate_limit_exceeded", msg
-	default:
+	case strings.Contains(msg, "upstream_error: "):
+		// llm.forward marks a failure of the model call itself. The upstream's
+		// own words stay in the log: they can carry a URL or a key fragment.
 		return http.StatusBadGateway, "upstream_error", "upstream_error", "the model call failed; the upstream error was logged"
+	case strings.Contains(msg, "invalid_request"), strings.Contains(msg, "has no equivalent"), strings.Contains(msg, "tool_choice names function"):
+		// The request asked for something the agent's model cannot do
+		// (a response_format or a named tool choice with no equivalent, a
+		// remote media URL the provider cannot take). The client can act on
+		// the message, so it is passed on.
+		return http.StatusBadRequest, "invalid_request_error", "invalid_request_error", msg
+	default:
+		// Anything else is the agent's own loop failing — a bug in its Lua, a
+		// reload or shutdown mid-turn. Blaming the model for that would send an
+		// operator looking in the wrong place.
+		return http.StatusInternalServerError, "server_error", "server_error", "the agent could not complete this request; the error was logged"
 	}
 }

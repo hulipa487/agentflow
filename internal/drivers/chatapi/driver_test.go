@@ -108,6 +108,7 @@ type canned struct {
 	toolCalls []gateway.ToolCall
 	finish    string
 	usage     *gateway.Usage
+	reasoning string
 }
 
 func cannedFrom(f fixture) canned {
@@ -295,6 +296,9 @@ func (u *stubUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return m
 	}
 	write(withChoices(map[string]any{"role": "assistant", "content": ""}, nil))
+	if c.reasoning != "" {
+		write(withChoices(map[string]any{"reasoning_content": c.reasoning}, nil))
+	}
 	for i := 0; i < len(c.text); i += 24 {
 		end := i + 24
 		if end > len(c.text) {
@@ -390,6 +394,11 @@ type stackOpts struct {
 	mediaAllow   []string
 	safety       *safety.Dispatcher
 	stopHook     func(string)
+	// loopSrc and routeSrc replace the built-in pass-through loop and per_chat
+	// route; exposeReasoning turns the channel setting on.
+	loopSrc         string
+	routeSrc        string
+	exposeReasoning bool
 }
 
 type stack struct {
@@ -419,6 +428,9 @@ func newStack(t *testing.T, opt stackOpts) *stack {
 	if err != nil {
 		t.Fatalf("resolve passthrough: %v", err)
 	}
+	if opt.loopSrc != "" {
+		loopSrc = opt.loopSrc
+	}
 	handlers := caps.MeteredLLMHandlers(llmMgr, nil, caps.Metering{Agent: "coder", Requests: reqs, Log: log})
 	defs := map[string]*supervisor.AgentDef{
 		"coder": {
@@ -438,6 +450,9 @@ func newStack(t *testing.T, opt stackOpts) *stack {
 	routeSrc, _, err := builtins.Resolve("plugin:per_chat")
 	if err != nil {
 		t.Fatalf("resolve route: %v", err)
+	}
+	if opt.routeSrc != "" {
+		routeSrc = opt.routeSrc
 	}
 	store, err := runtime.OpenSQLite(filepath.Join(t.TempDir(), "runtime.db"))
 	if err != nil {
@@ -459,6 +474,7 @@ func newStack(t *testing.T, opt stackOpts) *stack {
 		TokenUser:       opt.tokenUser,
 		Timeout:         opt.timeout,
 		MaxRequestBytes: 1 << 20,
+		ExposeReasoning: opt.exposeReasoning,
 		Ready:           func() bool { return !opt.notReady },
 		StopSession: func(key string) {
 			st.stopped.Add(1)

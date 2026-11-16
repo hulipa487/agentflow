@@ -59,6 +59,25 @@ func maskValue(v any, ctx []string) any {
 					continue
 				}
 			}
+			if lk == "keys" && inChannelContext(ctx) {
+				// An openai channel's shared API keys: a list where every other
+				// secret is a single string, so the key-name test above does
+				// not reach it.
+				if list, ok := val.([]any); ok {
+					masked := make([]any, len(list))
+					for i, item := range list {
+						s, isStr := item.(string)
+						switch {
+						case !isStr, s == "", envPlaceholderRe.MatchString(s):
+							masked[i] = item
+						default:
+							masked[i] = "••••"
+						}
+					}
+					out[k] = masked
+					continue
+				}
+			}
 			out[k] = maskValue(val, append(ctx, lk))
 		}
 		return out
@@ -71,6 +90,16 @@ func maskValue(v any, ctx []string) any {
 	default:
 		return v
 	}
+}
+
+// inChannelContext reports whether the walk is inside gateway.channels.
+func inChannelContext(ctx []string) bool {
+	for _, k := range ctx {
+		if k == "channels" {
+			return true
+		}
+	}
+	return false
 }
 
 // isStoreTargetContext reports whether a "path" here names a store target

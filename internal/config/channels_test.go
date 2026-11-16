@@ -203,3 +203,27 @@ func TestEphemeralCapDefault(t *testing.T) {
 		t.Fatalf("explicit zero = %d; want 0", got)
 	}
 }
+
+// TestRegionalReplyWarnings: in a regional cell a channel that answers on the
+// request it received can lose the answer when another instance owns the
+// conversation. The config still loads; the operator is told.
+func TestRegionalReplyWarnings(t *testing.T) {
+	cfg := &Config{}
+	cfg.Gateway.Channels = []Channel{
+		{Name: "api", Type: "openai", Agents: []string{"coder"}, Auth: "key", Keys: []string{"k"}},
+		{Name: "sync", Type: "webhook", Agent: "coder", Path: "/h/"},
+		{Name: "async", Type: "webhook", Agent: "coder", Path: "/a/", Async: true, DeliverURL: "https://x.example/cb"},
+		{Name: "tg", Type: "telegram", Agent: "coder"},
+	}
+	if w := cfg.RegionalReplyWarnings(); len(w) != 0 {
+		t.Fatalf("a single topology has nothing to warn about: %v", w)
+	}
+	cfg.Runtime.Topology = "regional"
+	w := cfg.RegionalReplyWarnings()
+	if len(w) != 2 {
+		t.Fatalf("warnings = %d (%v); want one for the openai channel and one for the synchronous webhook", len(w), w)
+	}
+	if !strings.Contains(w[0], `"api"`) || !strings.Contains(w[1], `"sync"`) {
+		t.Fatalf("warnings name the wrong channels: %v", w)
+	}
+}

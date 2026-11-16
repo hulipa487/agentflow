@@ -63,10 +63,11 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 	if len(opts.Stop) > 0 {
 		params.StopSequences = opts.Stop
 	}
-	if opts.ResponseFormat != nil {
+	if opts.ResponseFormat != nil && !responseFormatIsText(opts.ResponseFormat) {
 		// The Messages API models no response_format. Refused rather than
 		// dropped: a caller that asked for JSON and silently got prose would
-		// have no way to tell.
+		// have no way to tell. {"type":"text"} is the default spelled out,
+		// which some client libraries always send; that one asks for nothing.
 		return nil, false, errors.New("anthropic: response_format has no equivalent in the Messages API; use a provider that maps it (openai, openai-responses) or instruct the model in the prompt")
 	}
 	if thinking != "" && thinking != ThinkingOff {
@@ -80,8 +81,14 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 	}
 	if len(opts.Tools) > 0 {
 		params.Tools = anthropicTools(opts.Tools)
-		if opts.ToolChoice != "" {
+		switch {
+		case opts.ToolChoice != "":
 			params.ToolChoice = anthropicToolChoice(opts.ToolChoice, opts.ParallelToolCalls)
+		case opts.ParallelToolCalls != nil:
+			// parallel_tool_calls with no tool_choice is the common client
+			// shape. Here the switch lives on the choice object, so the
+			// default choice has to be spelled out to carry it.
+			params.ToolChoice = anthropicToolChoice("auto", opts.ParallelToolCalls)
 		}
 	}
 
@@ -188,7 +195,7 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 				})
 			case "tool_use":
 				tu := b.AsToolUse()
-				calls = append(calls, ToolCall{ID: tu.ID, Name: tu.Name, Args: parseArgs(string(tu.Input))})
+				calls = append(calls, ToolCall{ID: tu.ID, Name: tu.Name, Args: parseArgs(string(tu.Input)), Raw: rawArgs(string(tu.Input))})
 			}
 		}
 		thinkingText := strings.Join(thoughts, "\n\n")
@@ -204,7 +211,7 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 		if len(calls) > 0 {
 			events <- event{toolCalls: calls, thinking: thinkingText, thinkingBlocks: thinkingBlocks}
 		}
-		events <- event{usage: usage, thinking: thinkingText, thinkingBlocks: thinkingBlocks}
+		events <- event{usage: usage, thinking: thinkingText, thinkingBlocks: thinkingBlocks, finish: normalizeFinish(string(acc.StopReason))}
 	}()
 	return events, false, nil
 }
@@ -304,8 +311,11 @@ func anthropicToolChoice(choice string, parallel *bool) anthropic.ToolChoiceUnio
 	}
 }
 
-// anthropicTurns converts the neutral Message list to Anthropic's shape: the
-// leading system message is extracted (returned as the first result), and the
+// anthropicTurns converts the neutral Message list to Anthropic's shape: every
+// system and developer message is extracted (joined, returned as the first
+// result) — the Messages API takes instructions as one top-level field and
+// rejects those roles inside the turn list, while OpenAI-format clients send
+// "developer" turns and more than one system message — and the
 // remaining turns are reshaped so that assistant tool_calls become tool_use
 // content blocks and "tool" role turns become user tool_result blocks. Adjacent
 // tool results are merged into one user message, as Anthropic requires.
@@ -314,12 +324,17 @@ func anthropicToolChoice(choice string, parallel *bool) anthropic.ToolChoiceUnio
 // blocks must open the content array) — required on continuations when
 // thinking is enabled; a thinking-only assistant turn also takes the array form.
 func anthropicTurns(msgs []Message) (system string, turns []anthropic.MessageParam, err error) {
-	if len(msgs) > 0 && msgs[0].Role == "system" {
-		system = msgs[0].Content
-		msgs = msgs[1:]
+	var instructions []string
+	for _, m := range msgs {
+		if (m.Role == "system" || m.Role == "developer") && m.Content != "" {
+			instructions = append(instructions, m.Content)
+		}
 	}
+	system = strings.Join(instructions, "\n\n")
 	for _, m := range msgs {
 		switch {
+		case m.Role == "system" || m.Role == "developer":
+			// Lifted into the system field above.
 		case m.Role == "assistant" && (len(m.ToolCalls) > 0 || len(m.ThinkingBlocks) > 0):
 			content := []anthropic.ContentBlockParamUnion{}
 			// Replayed thinking blocks go first, verbatim (signatures are

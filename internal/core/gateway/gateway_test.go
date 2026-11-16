@@ -229,3 +229,18 @@ func TestDeltaFallbackBuffersUntilEndTurn(t *testing.T) {
 		t.Fatalf("the delta buffer was not cleared: %d deliveries", d.calls)
 	}
 }
+
+// TestEmptyReplyOnATextChannelIsNotDelivered: a reply with no text and no tool
+// calls (a refused answer is the usual case) has nothing a text channel can
+// show. Delivering it would send an empty message.
+func TestEmptyReplyOnATextChannelIsNotDelivered(t *testing.T) {
+	d := &fakeDriver{name: "telegram"}
+	r := NewRegistry(discardLog())
+	r.Register(d)
+	if err := r.SendReply("telegram", "r1", Reply{FinishReason: "content_filter"}); err != nil {
+		t.Fatalf("empty reply: %v", err)
+	}
+	if d.calls != 0 {
+		t.Fatalf("an empty reply was delivered %d time(s)", d.calls)
+	}
+}

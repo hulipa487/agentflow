@@ -43,6 +43,7 @@
 ---@field id? string
 ---@field name string
 ---@field args? table
+---@field arguments? string the model's own argument JSON, when the provider sent it; session.reply sends it in preference to args (clear it on a call whose args you edit)
 
 ---@class Usage
 ---@field input integer
@@ -63,7 +64,7 @@
 ---@field tool_calls? ToolCall[]
 ---@field finish_reason? string "stop" | "tool_calls" | "length" | "content_filter"
 ---@field usage? Usage
----@field reasoning? string sent only by a channel configured to expose it
+---@field reasoning? string sent only by a channel configured to expose it; `thinking` (the name on an llm.forward or llm.chat result) is read when this is absent
 
 ---@class ForwardOpts
 ---@field model? string a models: key; default is the agent's model
@@ -75,7 +76,7 @@
 ---@field max_tokens_cap? integer clamps the client's max_tokens
 
 ---@class ChatMessage
----@field role string "system" | "user" | "assistant" | "tool"
+---@field role string "system" | "developer" | "user" | "assistant" | "tool"
 ---@field content? string
 ---@field parts? MediaPart[]
 ---@field tool_calls? ToolCall[]
@@ -89,10 +90,10 @@
 ---@field max_tokens? integer
 ---@field thinking? string "off" | "low" | "medium" | "high" | "xhigh" | "max"
 ---@field tools? table[] {name, description, parameters} or tools.list() entries
----@field tool_choice? string "auto" | "none" | "required" | "function:<name>"
+---@field tool_choice? string|{ name: string } "auto" | "none" | "required" | "function:<name>", or { name = "<name>" } for a named function
 ---@field parallel_tool_calls? boolean
 ---@field top_p? number
----@field stop? string[]
+---@field stop? string|string[]
 ---@field seed? integer
 ---@field response_format? table {"type":"text"|"json_object"|"json_schema", ...}; providers with no equivalent refuse it
 
@@ -367,16 +368,6 @@ function llm.stream(messages, opts) end
 ---@return { text: string, tool_calls: ToolCall[], finish_reason: string, usage: Usage, thinking?: string, thinking_blocks?: table[] }
 function llm.forward(opts) end
 
--- openai ----------------------------------------------------------------------
-
---- The full request the current turn arrived with: { model, messages, tools,
---- tool_choice, params, metadata, user, stream }. Refused above 4 MiB of JSON —
---- forward it with llm.forward instead of materialising a body that large.
---- Outside an openai-channel turn it returns an error naming the limitation.
----@return table
-openai = {}
-function openai.request() end
-
 ---@param inputs string|string[]|(string|MediaPart)[]
 ---@param opts? { model?: string, task?: string, dimensions?: integer, merged?: boolean }
 ---@return { vectors: number[][], usage?: Usage }
@@ -388,6 +379,18 @@ function llm.embed(inputs, opts) end
 ---@param opts? { model?: string, top_n?: integer }
 ---@return { results: { index: integer, score: number }[] }
 function llm.rerank(query, documents, opts) end
+
+-- openai ----------------------------------------------------------------------
+
+openai = {}
+
+--- The full request the current turn arrived with: { model, messages, tools,
+--- tool_choice, params, metadata, user, stream }. Refused above 4 MiB of JSON —
+--- forward it with llm.forward instead of materialising a body that large.
+--- Outside an openai-channel turn it returns an error naming the limitation.
+--- Capability: llm.chat.
+---@return table
+function openai.request() end
 
 -- tools -----------------------------------------------------------------------
 

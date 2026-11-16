@@ -198,6 +198,42 @@ func mustJSON(v any) []byte {
 
 // parseArgs unmarshals a tool-call arguments JSON string into a map. An empty
 // or malformed body yields an empty map (the loop still sees the call name).
+// responseFormatIsText reports whether a response_format asks for plain text,
+// which is every provider's default and therefore needs no mapping.
+func responseFormatIsText(rf map[string]any) bool {
+	typ, _ := rf["type"].(string)
+	return typ == "text"
+}
+
+// rawArgs is a tool call's argument text as the provider sent it, kept only
+// when it is a JSON object: that is the one shape every client accepts back,
+// and anything else (empty, truncated by an output limit) is better served by
+// the decoded map, which is always an object.
+func rawArgs(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw[0] != '{' || !json.Valid([]byte(raw)) {
+		return ""
+	}
+	return raw
+}
+
+// normalizeFinish maps a provider's stop reason onto the OpenAI vocabulary:
+// stop, length, tool_calls, content_filter. An unknown or empty value is ""
+// (not known), which callers read as "stop, unless there are tool calls".
+func normalizeFinish(reason string) string {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "stop", "end_turn", "stop_sequence":
+		return "stop"
+	case "length", "max_tokens", "max_output_tokens":
+		return "length"
+	case "tool_calls", "tool_use", "function_call":
+		return "tool_calls"
+	case "content_filter", "refusal":
+		return "content_filter"
+	}
+	return ""
+}
+
 func parseArgs(raw string) map[string]any {
 	args := map[string]any{}
 	raw = strings.TrimSpace(raw)

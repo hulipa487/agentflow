@@ -86,7 +86,7 @@ func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs
 	// the SDK marshals only the fields it declares, so there is nowhere to put
 	// it. Refused rather than dropped for the same reason as the tools above —
 	// a knob that silently does nothing reads as a working config.
-	if opts.Temperature != nil {
+	if opts.Temperature != nil && !opts.Passthrough {
 		return nil, false, errors.New("gemini: the interactions request models no temperature; unset it, or use a provider that maps it (anthropic, openai, openai-responses)")
 	}
 	thinking, err := thinkingOf(cfg, opts)
@@ -130,15 +130,18 @@ func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs
 		return nil, false, fmt.Errorf("gemini: init client: %w", err)
 	}
 
-	input, err := geminiInput(ctx, newGeminiFiles(gc, cfg.APIKey, client), msgs)
+	files := newGeminiFiles(gc, cfg.APIKey, client)
+	files.noFetch = opts.Passthrough
+	input, err := geminiInput(ctx, files, msgs)
 	if err != nil {
 		return nil, false, err
 	}
 
-	if opts.ResponseFormat != nil {
+	if opts.ResponseFormat != nil && !responseFormatIsText(opts.ResponseFormat) {
 		// The interactions request models no response_format; refused for the
 		// same reason as temperature — a knob that silently does nothing reads
-		// as a working config.
+		// as a working config. {"type":"text"} is the default and asks for
+		// nothing.
 		return nil, false, errors.New("gemini: response_format has no equivalent in the interactions provider; use a provider that maps it (openai, openai-responses)")
 	}
 
@@ -146,9 +149,10 @@ func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs
 		Model: interactions.Model(cfg.Model),
 		Input: input,
 	}
-	// Seed and stop_sequences are expressible; temperature, top_p and
-	// parallel_tool_calls are not, and are dropped silently (D7's rule: only
-	// response_format and a named tool choice are worth refusing).
+	// Seed and stop_sequences are expressible; top_p and parallel_tool_calls
+	// are not, and are dropped silently. Temperature is refused above when the
+	// loop's author set it and dropped when a client's request did
+	// (Opts.Passthrough).
 	gen := &interactions.GenerationConfig{}
 	hasGen := false
 	if opts.Seed != nil {

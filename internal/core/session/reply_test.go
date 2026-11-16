@@ -162,3 +162,23 @@ end
 		}
 	})
 }
+
+// TestARetriedMessageIdStillEndsItsTurn: a retried request is the same message
+// (same id) served as a new turn. End-of-turn is single-shot per turn, not per
+// message id, or the second turn would never be closed and its caller would
+// wait out its timeout.
+func TestARetriedMessageIdStillEndsItsTurn(t *testing.T) {
+	gw := &fakeGW{}
+	a, _ := newSafetyActor(t, gw, safety.New(safety.None), `
+function loop()
+  while true do
+    local m = session.inbox()
+    session.send(m.text)
+  end
+end
+`)
+	a.Mailbox <- Message{ID: "msg-same", Type: "user", From: "u", Text: "one", Channel: "test", ReplyTo: "r1"}
+	waitFor(t, "the first EndTurn", 5*time.Second, func() bool { return len(gw.turnsSnapshot()) == 1 })
+	a.Mailbox <- Message{ID: "msg-same", Type: "user", From: "u", Text: "two", Channel: "test", ReplyTo: "r2"}
+	waitFor(t, "the second EndTurn", 5*time.Second, func() bool { return len(gw.turnsSnapshot()) == 2 })
+}

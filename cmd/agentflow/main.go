@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -1733,9 +1734,10 @@ func main() {
 	httpdLog := log.With("module", "httpd")
 	httpSrv := httpd.New(cfg.Gateway.Listen, httpdLog)
 	// The OpenAI channel refuses requests while the instance drains. The admin
-	// server is constructed later in this function (it needs the stores), so
-	// the closure reads a variable assigned there.
-	readyFn := func() bool { return true }
+	// server is constructed later in this function (it needs the stores), after
+	// the listener is already serving, so the check is published atomically:
+	// a request can arrive between the two.
+	var readyFn atomic.Pointer[func() bool]
 
 	// User-facing profile API (opt-in): registration and channel linking on
 	// the same public listener the HTTP channels attach to. Off by default —
@@ -1892,11 +1894,16 @@ func main() {
 				Timeout:         timeout,
 				MaxRequestBytes: ch.MaxRequestBytes,
 				ExposeReasoning: ch.ExposeReasoning,
-				Ready:           func() bool { return readyFn() },
-				StopSession:     sup.StopSession,
-				Store:           mstore,
-				Policy:          mpol,
-				Requests:        openaiRequests,
+				Ready: func() bool {
+					if fn := readyFn.Load(); fn != nil {
+						return (*fn)()
+					}
+					return true // still booting: the admin plane is not up yet
+				},
+				StopSession: sup.StopSession,
+				Store:       mstore,
+				Policy:      mpol,
+				Requests:    openaiRequests,
 			}
 			if ch.Auth == "user_token" {
 				if identReg == nil {
@@ -1969,7 +1976,8 @@ func main() {
 		exit(1)
 	}
 	admin := metrics.NewAdminServer("", adminToken, metricReg, log)
-	readyFn = admin.Ready
+	adminReady := admin.Ready
+	readyFn.Store(&adminReady)
 	admin.SetCORS(cfg.Runtime.Admin.CORSOrigins)
 	if len(ops) > 0 {
 		admin.SetOperators(ops)

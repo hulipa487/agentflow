@@ -84,11 +84,23 @@ type Router struct {
 
 	// failures carries the per-message delivery-failure callback between
 	// Submit (any goroutine) and the deliver op (router goroutine). An entry is
-	// removed on delivery success or failure; a route that drops a message
-	// leaves one behind, which is bounded by the traffic of a broken route.
+	// removed on delivery success or failure, and when the handler asks for the
+	// next message without having delivered this one (see lastInbound).
 	fmu      sync.Mutex
 	failures map[string]func(error)
+	// lastInbound is the id of the message the handler was last handed. It is
+	// touched only by the router goroutine. When the handler comes back for
+	// another message, the previous one is settled: delivered, refused, or —
+	// if its callback is still registered — dropped by the route (a filter, a
+	// handler that crashed mid-message). Without that last case a dropped
+	// request would leave its callback registered forever and its HTTP client
+	// waiting out the whole request timeout.
+	lastInbound string
 }
+
+// ErrNotRouted is what a channel's Fail callback receives when the route
+// handler moved on to the next message without delivering this one.
+var ErrNotRouted = errors.New("the route did not deliver this message to an agent")
 
 // New builds the router. triggersResp is the runtime.triggers op body shared
 // with the agent surface (caps.TriggersResponse(cfg.Triggers)); pass "" when
@@ -301,8 +313,13 @@ func (r *Router) runOnce(ctx context.Context) runOutcome {
 		ok := true
 		switch op.Type {
 		case "inbox":
+			if r.lastInbound != "" {
+				r.failDelivery(r.lastInbound, ErrNotRouted)
+				r.lastInbound = ""
+			}
 			select {
 			case in := <-r.mailbox:
+				r.lastInbound = in.Message.ID
 				b, _ := json.Marshal(map[string]any{"message": in.Message, "agent": in.Agent})
 				resp = string(b)
 			case <-r.reload:

@@ -353,6 +353,13 @@ func channelFromDraft(d ChannelDraft, existing *config.Channel) config.Channel {
 	if existing != nil {
 		ch.Token, ch.Secret, ch.SecretToken = existing.Token, existing.Secret, existing.SecretToken
 		ch.Keys = existing.Keys
+		// A draft that does not mention the audit mode keeps the stored one.
+		// The setting exists on every channel type, but an editor may only
+		// show it for some: saving a webhook from a form with no journal field
+		// must not quietly turn its journal back to full.
+		if ch.Journal == "" && existing.Type == ch.Type {
+			ch.Journal = existing.Journal
+		}
 	}
 	if d.Token != "" {
 		ch.Token = d.Token
@@ -372,6 +379,12 @@ func channelFromDraft(d ChannelDraft, existing *config.Channel) config.Channel {
 	if len(d.Keys) > 0 {
 		ch.Keys = d.Keys
 	} else if d.ClearKeys {
+		ch.Keys = nil
+	}
+	// Shared keys mean something only to an openai channel with auth: key.
+	// Left behind after a switch to another auth mode they would sit in the
+	// file as live-looking secrets that nothing reads.
+	if ch.Type != "openai" || ch.Auth != "key" {
 		ch.Keys = nil
 	}
 	return ch

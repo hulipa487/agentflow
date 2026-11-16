@@ -243,3 +243,60 @@ func TestChannelsBridge(t *testing.T) {
 		t.Fatalf("bridge update lost data:\n%s", raw)
 	}
 }
+
+// TestChannelSaveKeepsTheAuditModeAndDropsUnusedKeys: the audit mode exists on
+// every channel type, but an editor may show it only for some. A draft that
+// does not mention it must keep the stored value — saving a webhook from a form
+// with no journal field used to turn its journal back to full. And shared keys
+// that no longer apply (the channel moved off auth: key) are removed rather
+// than left in the file as secrets nothing reads.
+func TestChannelSaveKeepsTheAuditModeAndDropsUnusedKeys(t *testing.T) {
+	t.Setenv("HOOK_TOKEN", "resolved-secret")
+	dir := writeFiles(t, map[string]string{
+		"system.yaml":           channelSystem + "  identity: { enabled: true }\n",
+		"profiles/greeter.yaml": greeterProfile,
+		"channels.yaml": `
+channels:
+  - { name: wh, type: webhook, agent: greeter, path: /hook/, journal: off }
+  - { name: api, type: openai, agents: [greeter], auth: key, keys: ["${HOOK_TOKEN}"] }
+`,
+	})
+	cfg, err := config.LoadDir(dir, testLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewChannels(cfg, dir, "", agentsFor("greeter"), testLog())
+	list, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A webhook saved by a form that has no journal field.
+	saved, err := store.Save(0, ChannelDraft{Name: "wh", Type: "webhook", Agent: "greeter", Path: "/hook/", Timeout: "45s"}, list.MTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := saved.Channels[0].Journal; got != "off" {
+		t.Fatalf("journal after an unrelated edit = %q; want off", got)
+	}
+	// An explicit value still changes it.
+	saved, err = store.Save(0, ChannelDraft{Name: "wh", Type: "webhook", Agent: "greeter", Path: "/hook/", Journal: "full"}, saved.MTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := saved.Channels[0].Journal; got != "full" {
+		t.Fatalf("journal after an explicit change = %q; want full", got)
+	}
+
+	// The openai channel moves to per-user tokens: its shared keys go.
+	saved, err = store.Save(1, ChannelDraft{Name: "api", Type: "openai", Agents: []string{"greeter"}, Auth: "user_token"}, saved.MTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Channels[1].HasKeys {
+		t.Fatal("shared keys were kept on a channel that no longer uses auth: key")
+	}
+	if raw := string(mustRead(t, filepath.Join(dir, "channels.yaml"))); strings.Contains(raw, "HOOK_TOKEN") {
+		t.Fatalf("the unused key reference is still in channels.yaml:\n%s", raw)
+	}
+}

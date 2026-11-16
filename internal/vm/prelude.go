@@ -240,7 +240,12 @@ end
 -- {text, tool_calls, finish_reason, usage, reasoning}. It is the op behind the
 -- OpenAI channel's chat.completion answer: tool_calls are passed through
 -- unchanged, usage becomes the client-visible token counts, and reasoning is
--- only sent by a channel configured to expose it. At most one reply per turn;
+-- only sent by a channel configured to expose it (an llm.forward or llm.chat
+-- result calls it thinking, which is read when reasoning is absent, so
+-- session.reply(reply) carries it). A tool call's arguments string, when
+-- present, is sent as it is — it is the model's own text, and unlike the args
+-- table it survives Lua intact; clear it on a call whose args you edit. At
+-- most one reply per turn;
 -- the text goes through the same safety and journal path as session.send.
 -- Channels that cannot express a structured reply fall back to the text (and
 -- refuse tool calls rather than dropping them).
@@ -250,7 +255,7 @@ function session.reply(t)
     type = "reply",
     text = t.text,
     finish_reason = t.finish_reason,
-    reasoning = t.reasoning,
+    reasoning = t.reasoning or t.thinking,
   }
   -- An empty Lua table encodes as {} (an object), which the Go side cannot
   -- decode into a slice; omit empty arrays rather than crash the loop.
@@ -871,8 +876,29 @@ function mail.smtp_send(opts)
   })
 end
 
+-- tool_choice and stop each have a second, friendlier spelling. The engine
+-- takes tool_choice as one string ("auto" | "none" | "required" |
+-- "function:<name>") and stop as an array; a named choice written as
+-- { name = "x" } and a single stop string are normalised here, because a value
+-- of the wrong shape would make the whole op undecodable.
+local function norm_tool_choice(v)
+  if type(v) == "table" then
+    local name = v.name or (type(v["function"]) == "table" and v["function"].name)
+    if type(name) == "string" and name ~= "" then return "function:" .. name end
+    error("tool_choice: a table must name a function, e.g. { name = \"lookup\" }", 3)
+  end
+  return v
+end
+local function norm_stop(v)
+  if type(v) == "string" then return { v } end
+  -- An empty table would encode as {} (an object); no stop sequences is nil.
+  if type(v) == "table" and #v == 0 then return nil end
+  return v
+end
 local function with_opts(req, opts)
   if opts then for k, v in pairs(opts) do req[k] = v end end
+  req.tool_choice = norm_tool_choice(req.tool_choice)
+  req.stop = norm_stop(req.stop)
   return req
 end
 
@@ -925,11 +951,11 @@ function llm.forward(opts)
     req.temperature = p.temperature
     req.max_tokens = p.max_tokens
     req.top_p = p.top_p
-    req.stop = p.stop
+    req.stop = norm_stop(p.stop)
     req.seed = p.seed
     req.response_format = p.response_format
     req.parallel_tool_calls = p.parallel_tool_calls
-    req.tool_choice = p.tool_choice
+    req.tool_choice = norm_tool_choice(p.tool_choice)
     req.thinking = p.thinking
   end
   return op(req)

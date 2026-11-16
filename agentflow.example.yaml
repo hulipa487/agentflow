@@ -241,10 +241,11 @@ gateway:
     #   token: ${BRIDGE_TOKEN}
     #
     # OpenAI-compatible channel: any Chat Completions client works with only a
-    # base URL and a key. `model` names one of the exposed agents; the default
-    # loop forwards the client's messages, tools and sampling parameters
-    # unchanged (plugin:openai_passthrough). Use auth: user_token for per-user
-    # identity, or auth: none only on a loopback listener.
+    # base URL and a key. `model` names one of the exposed agents, and each
+    # runs its own loop: give an agent `loop: plugin:openai_passthrough` to
+    # forward the client's messages, tools and sampling parameters to its model
+    # unchanged. Use auth: user_token for per-user identity, or auth: none only
+    # on a loopback listener.
     # - type: openai
     #   name: api
     #   path: /v1/                 # serves <path>chat/completions and <path>models

@@ -289,3 +289,25 @@ agents:
 		t.Fatal("expected an unresolvable prompt file to fail from a foreign directory")
 	}
 }
+
+// TestMaskTreeRedactsChannelKeys: an openai channel's shared API keys are a
+// list, where every other secret is a single string, so the key-name test does
+// not reach them. A literal key must not appear in the view the console labels
+// "secrets masked".
+func TestMaskTreeRedactsChannelKeys(t *testing.T) {
+	in := map[string]any{
+		"gateway": map[string]any{
+			"channels": []any{
+				map[string]any{"name": "api", "type": "openai", "keys": []any{"sk-literal-key", "${COMPAT_API_KEY}"}},
+			},
+		},
+	}
+	got := maskTree(in).(map[string]any)
+	keys := got["gateway"].(map[string]any)["channels"].([]any)[0].(map[string]any)["keys"].([]any)
+	if keys[0] != "••••" {
+		t.Fatalf("a literal channel key is shown in clear: %v", keys[0])
+	}
+	if keys[1] != "${COMPAT_API_KEY}" {
+		t.Fatalf("a placeholder reveals nothing and must stay readable: %v", keys[1])
+	}
+}

@@ -166,6 +166,7 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 		}
 		accByIndex := map[int64]*acc{}
 		var order []int64
+		var finish string
 		getAcc := func(i int64) *acc {
 			a, ok := accByIndex[i]
 			if !ok {
@@ -238,6 +239,11 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 				}
 			case "response.completed":
 				applyResponsesUsage(&usage, ev)
+			case "response.incomplete":
+				// The answer was cut short. Usage arrives on this event too,
+				// and the reason is what tells a client "length" from "stop".
+				applyResponsesUsage(&usage, ev)
+				finish = normalizeFinish(ev.Response.IncompleteDetails.Reason)
 			case "error":
 				events <- event{err: fmt.Errorf("openai-responses stream error: %s", ev.RawJSON())}
 				return false
@@ -271,11 +277,11 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 			calls := make([]ToolCall, 0, len(order))
 			for _, i := range order {
 				a := accByIndex[i]
-				calls = append(calls, ToolCall{ID: a.id, Name: a.name, Args: parseArgs(a.args.String())})
+				calls = append(calls, ToolCall{ID: a.id, Name: a.name, Args: parseArgs(a.args.String()), Raw: rawArgs(a.args.String())})
 			}
 			events <- event{toolCalls: calls, thinking: thinking, thinkingBlocks: reasoningItems}
 		}
-		events <- event{usage: usage, thinking: thinking, thinkingBlocks: reasoningItems}
+		events <- event{usage: usage, thinking: thinking, thinkingBlocks: reasoningItems, finish: finish}
 	}()
 	return events, false, nil
 }

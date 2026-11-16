@@ -3,14 +3,12 @@ package chatapi
 import (
 	"net/http"
 	"time"
-
-	"agentflow/internal/core/chatreq"
 )
 
 // serveBuffered waits for the turn and writes one chat.completion object. The
 // wait is bounded by the channel timeout, which is the whole request, not one
 // model call.
-func (d *Driver) serveBuffered(w http.ResponseWriter, r *http.Request, t *turn, req *chatreq.Request) {
+func (d *Driver) serveBuffered(w http.ResponseWriter, r *http.Request, t *turn) {
 	timer := time.NewTimer(d.opt.Timeout)
 	defer timer.Stop()
 	select {
@@ -28,19 +26,18 @@ func (d *Driver) serveBuffered(w http.ResponseWriter, r *http.Request, t *turn, 
 	case <-r.Context().Done():
 		// The client went away. The answer has nowhere to go, and an ephemeral
 		// session has no reason to keep spending tokens for it.
-		t.abandon()
-		d.stopEphemeral(t)
+		d.leave(t)
 	case <-timer.C:
-		t.abandon()
-		d.stopEphemeral(t)
+		d.leave(t)
 		writeError(w, http.StatusGatewayTimeout, "timeout", "timeout", "the agent did not answer within the request timeout")
 	}
 }
 
 // serveStream speaks SSE: the role chunk first, a comment heartbeat while the
-// model is quiet, then the fragments the driver relays and the tail finish,
-// usage and [DONE] frames.
-func (d *Driver) serveStream(w http.ResponseWriter, r *http.Request, t *turn, req *chatreq.Request) {
+// model is quiet, then the frames the turn has logged — from the beginning, so
+// a retry that joined a running turn receives the whole answer — and the tail
+// finish, usage and [DONE] frames.
+func (d *Driver) serveStream(w http.ResponseWriter, r *http.Request, t *turn) {
 	flusher, _ := w.(http.Flusher)
 	flush := func() {
 		if flusher != nil {
@@ -62,27 +59,32 @@ func (d *Driver) serveStream(w http.ResponseWriter, r *http.Request, t *turn, re
 	timer := time.NewTimer(d.opt.Timeout)
 	defer timer.Stop()
 
+	cursor := 0
 	for {
-		select {
-		case frame, ok := <-t.frames:
-			if !ok {
-				return
-			}
+		frames, closed, wake := t.framesFrom(cursor)
+		for _, frame := range frames {
 			_, _ = w.Write(frame)
+		}
+		if len(frames) > 0 {
+			cursor += len(frames)
 			flush()
+		}
+		if closed {
+			return
+		}
+		select {
+		case <-wake:
 		case <-heartbeat.C:
 			// A comment line is valid SSE and keeps proxies from closing an
 			// idle connection.
 			_, _ = w.Write([]byte(": keepalive\n\n"))
 			flush()
 		case <-r.Context().Done():
-			t.abandon()
-			d.stopEphemeral(t)
+			d.leave(t)
 			return
 		case <-timer.C:
-			t.abandon()
-			d.stopEphemeral(t)
-			if t.hasOutput() {
+			d.leave(t)
+			if cursor > 0 {
 				// Output already went out: finish the stream cleanly rather
 				// than sending a malformed one.
 				_, _ = w.Write(sseData(map[string]any{
@@ -104,17 +106,3 @@ func (d *Driver) serveStream(w http.ResponseWriter, r *http.Request, t *turn, re
 type turnTimeout struct{}
 
 func (*turnTimeout) Error() string { return "the agent did not answer within the request timeout" }
-
-// hasOutput reports whether anything reached the client, which decides whether
-// a timeout can still be an error event or must finish the stream.
-func (t *turn) hasOutput() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.sendText.Len() > 0 || t.deltaText.Len() > 0 {
-		return true
-	}
-	if t.reply != nil && (t.reply.Text != "" || len(t.reply.ToolCalls) > 0) {
-		return true
-	}
-	return false
-}

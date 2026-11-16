@@ -124,6 +124,12 @@ type ToolCallSpec struct {
 	ID   string         `json:"id,omitempty"`
 	Name string         `json:"name"`
 	Args map[string]any `json:"args,omitempty"`
+	// Arguments is the model's own argument JSON, when the provider sent it.
+	// It rides through Lua as a string, so it survives the trip intact where
+	// Args does not (a Lua table cannot tell [] from {}, drops nulls, and
+	// rounds large integers). session.reply sends it in preference to Args; a
+	// loop that edits a call's args must clear it.
+	Arguments string `json:"arguments,omitempty"`
 }
 
 // ToolSpec is a provider-agnostic tool definition a loop passes via llm.chat
@@ -800,17 +806,26 @@ type Actor struct {
 	// lastActivity is the unix-nanos of the last turn start or end. The
 	// supervisor's idle janitor reads it; the actor writes it.
 	lastActivity atomic.Int64
-	// unloaded marks a stop requested by the idle janitor, so Run reports
-	// EndUnloaded instead of EndShutdown and onActorExit does not retire it.
-	unloaded atomic.Bool
+	// unloadReq carries the idle janitor's request to unload. The actor honours
+	// it only while parked on an empty mailbox, and only if nothing has happened
+	// since the janitor looked — see RequestUnload. unloaded is set when it
+	// does, so Run reports EndUnloaded and onActorExit does not retire the id.
+	unloadReq chan int64
+	unloaded  atomic.Bool
 
 	// turnReplied is set once session.reply finishes a turn. A second reply is
 	// an error: the channel has one answer to send.
 	turnReplied atomic.Bool
 	// turnEndedFor is the message id whose turn has already been closed. It
 	// keeps EndTurn single-shot when a crash and a cancellation race the same
-	// turn.
+	// turn. It is cleared when the next turn starts: two turns may carry the
+	// same message id (a retried request is the same message).
 	turnEndedFor string
+	// turnBlocked is set when egress safety refused text this turn produced.
+	// If the turn then ends without a structured reply, closeTurn sends one
+	// saying so, so a channel that reports a finish reason can report
+	// content_filter instead of an answer that merely looks empty.
+	turnBlocked atomic.Bool
 	// deltaMu guards the delta accumulators below. Deltas arrive from worker
 	// goroutines (llm.forward relays there) while the actor goroutine reads
 	// them at end of turn.
@@ -848,6 +863,7 @@ func New(name string, identity Identity, info *Info, gw Gateway, agents AgentSer
 		handlers:    handlers,
 		pool:        p,
 		reload:      make(chan struct{}, 1),
+		unloadReq:   make(chan int64, 1),
 		log:         log.With("session", name),
 	}
 	a.touch()
@@ -870,9 +886,33 @@ func (a *Actor) LastActivity() time.Time {
 	return time.Unix(0, ns)
 }
 
-// Unload marks the coming stop as an idle unload. The caller cancels the
-// actor's context; Run reads the flag when it reports its end reason.
-func (a *Actor) Unload() { a.unloaded.Store(true) }
+// RequestUnload asks the actor to unload itself. seen is the LastActivity the
+// caller judged idle. The actor decides: it unloads only if it is parked
+// waiting for a message, its mailbox is empty, and its activity stamp is still
+// the one the caller saw. Deciding here rather than cancelling from outside is
+// what keeps an unload from killing a turn that started in between, or from
+// swallowing the message that started it.
+func (a *Actor) RequestUnload(seen time.Time) {
+	select {
+	case a.unloadReq <- seen.UnixNano():
+	default: // a request is already pending
+	}
+}
+
+// DrainMailbox removes and returns whatever is still queued. The supervisor
+// calls it after an unloaded actor has exited, to deliver again the messages
+// that reached the mailbox too late to be served.
+func (a *Actor) DrainMailbox() []Message {
+	var out []Message
+	for {
+		select {
+		case m := <-a.Mailbox:
+			out = append(out, m)
+		default:
+			return out
+		}
+	}
+}
 
 // Reload requests a fresh-state restart at the next safe point.
 func (a *Actor) Reload() {
@@ -963,6 +1003,9 @@ func (a *Actor) Run(ctx context.Context) {
 		}
 		if a.exiting {
 			a.log.Info("session exited via session.exit")
+			return
+		}
+		if a.unloaded.Load() {
 			return
 		}
 		if crashed {
@@ -1176,6 +1219,8 @@ func (a *Actor) dispatchInline(ctx context.Context, op Op, current *Message) (re
 			a.turnServed = true
 			// The previous turn is closed; this one starts clean.
 			a.turnReplied.Store(false)
+			a.turnBlocked.Store(false)
+			a.turnEndedFor = ""
 			a.resetTurnDeltas()
 			// Stamp the turn's identity before safety so a classifier can
 			// attribute usage and apply tenant policy. The op context is also
@@ -1300,6 +1345,12 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 		ctx = WithAgentModel(ctx, a.Info.Model)
 	}
 	if op.Type == "llm.forward" {
+		// "The agent's model" for a forwarded request is the model this
+		// person's turns run on: a profile's model override applies here
+		// exactly as it does to a loop that reads agent.info().model.
+		if a.Info != nil {
+			ctx = WithAgentModel(ctx, a.turnModel(ctx))
+		}
 		// Only llm.forward relays deltas; stamping the sink for every op would
 		// let a custom handler stream without the actor deciding whether the
 		// answer can still be vetoed.
@@ -1314,7 +1365,11 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 		if current.Channel == "" {
 			return `"no active message to reply to"`, false
 		}
-		return a.egress(ctx, current.Channel, current.ReplyTo, op.Text, op.Attachments, current.ID)
+		resp, ok := a.egress(ctx, current.Channel, current.ReplyTo, op.Text, op.Attachments, current.ID)
+		if !ok && resp == egressBlocked {
+			a.turnBlocked.Store(true)
+		}
+		return resp, ok
 	}
 	if op.Type == "reply" {
 		return a.replyOp(ctx, current, op)
@@ -1569,7 +1624,7 @@ func (a *Actor) egress(ctx context.Context, channel, replyTo, text string, attac
 	}
 	text, allowed := a.checkEgress(ctx, channel, replyTo, text, inReplyTo, journal)
 	if !allowed {
-		return `"reply blocked by safety filter"`, false
+		return egressBlocked, false
 	}
 	if a.gw != nil {
 		if err := a.gw.Send(channel, replyTo, text, attachments); err != nil {
@@ -1588,6 +1643,9 @@ func (a *Actor) egress(ctx context.Context, channel, replyTo, text string, attac
 	a.trace(ev)
 	return "true", true
 }
+
+// egressBlocked is the op result for text the egress safety chain refused.
+const egressBlocked = `"reply blocked by safety filter"`
 
 // checkEgress runs the egress safety chain and the refusal/fallback policy.
 // It returns the text to send and whether sending is allowed; a drop journals
@@ -1645,6 +1703,15 @@ func (a *Actor) closeTurn(ctx context.Context, m *Message, turnErr error) {
 		return
 	}
 	a.flushTurnDeltas(ctx, m, turnErr)
+	if turnErr == nil && a.turnBlocked.Load() && !a.turnReplied.Load() {
+		// Safety refused what this turn tried to say and the loop sent no
+		// structured reply. Say so in one: on a channel that reports a finish
+		// reason the client sees content_filter, and on any other channel an
+		// empty reply is nothing to deliver.
+		if err := a.gw.SendReply(m.Channel, m.ReplyTo, gateway.Reply{FinishReason: "content_filter"}); err != nil {
+			a.log.Warn("content_filter reply failed", "err", err, "channel", m.Channel)
+		}
+	}
 	a.gw.EndTurn(m.Channel, m.ReplyTo, turnErr)
 }
 
@@ -1691,6 +1758,7 @@ func (a *Actor) flushTurnDeltas(ctx context.Context, m *Message, turnErr error) 
 		if res.Drop {
 			blocked = true
 			reason = res.Reason
+			a.turnBlocked.Store(true)
 			metrics.Inc("agentflow_safety_drops")
 			a.trace(TraceEvent{Kind: "safety", Op: "egress", Turn: m.ID, Err: res.Reason, Safety: res.Meta})
 		} else {
@@ -1805,15 +1873,25 @@ func (a *Actor) replyOp(ctx context.Context, current *Message, op Op) (string, b
 	}
 	var allowed bool
 	text, allowed = a.checkEgress(ctx, current.Channel, current.ReplyTo, text, current.ID, journal)
-	rep := gateway.Reply{
-		FinishReason: op.FinishReason,
-		Reasoning:    op.Reasoning,
+	// Usage is reported either way: the tokens were spent whether or not the
+	// answer may be shown. Reasoning is not: a refused answer's reasoning is
+	// the same content by another route.
+	rep := gateway.Reply{FinishReason: op.FinishReason}
+	if op.Usage != nil {
+		rep.Usage = &gateway.Usage{
+			Input: op.Usage.Input, Output: op.Usage.Output, Cached: op.Usage.Cached,
+			CacheWrite: op.Usage.CacheWrite, Reasoning: op.Usage.Reasoning,
+		}
 	}
 	if allowed {
 		rep.Text = text
+		rep.Reasoning = op.Reasoning
 		for _, tc := range op.ToolCalls {
 			args := "{}"
-			if tc.Args != nil {
+			if raw := strings.TrimSpace(tc.Arguments); raw != "" && json.Valid([]byte(raw)) {
+				// The model's own text: what a pass-through must return.
+				args = raw
+			} else if tc.Args != nil {
 				if b, err := json.Marshal(tc.Args); err == nil {
 					args = string(b)
 				}
@@ -1825,12 +1903,6 @@ func (a *Actor) replyOp(ctx context.Context, current *Message, op Op) (string, b
 				rep.FinishReason = "tool_calls"
 			} else {
 				rep.FinishReason = "stop"
-			}
-		}
-		if op.Usage != nil {
-			rep.Usage = &gateway.Usage{
-				Input: op.Usage.Input, Output: op.Usage.Output, Cached: op.Usage.Cached,
-				CacheWrite: op.Usage.CacheWrite, Reasoning: op.Usage.Reasoning,
 			}
 		}
 	} else {
@@ -1854,6 +1926,17 @@ func (a *Actor) replyOp(ctx context.Context, current *Message, op Op) (string, b
 	}
 	a.trace(ev)
 	return "true", true
+}
+
+// turnModel is the model this turn runs on: the agent's, unless the person the
+// turn acts for has a profile override.
+func (a *Actor) turnModel(ctx context.Context) string {
+	if u := PersonalUUIDFromCtx(ctx); u != "" && a.profileSettings != nil {
+		if m, _, err := a.profileSettings.Settings(ctx, u); err == nil && m != "" {
+			return m
+		}
+	}
+	return a.Info.Model
 }
 
 // configJSON answers the agent.config op: this agent's own profile as Lua
@@ -2031,16 +2114,27 @@ func (a *Actor) SetProfileSettings(p ProfileSettings) { a.profileSettings = p }
 // waitInbox blocks for the next message, a reload signal, or shutdown.
 func (a *Actor) waitInbox(ctx context.Context) (Message, bool) {
 	a.busy.Store(false) // idle while parked on the mailbox
-	select {
-	case m := <-a.Mailbox:
-		a.busy.Store(true)
-		a.touch()
-		return m, true
-	case <-a.reload:
-		a.log.Info("hot reload: restarting loop")
-		return Message{}, false
-	case <-ctx.Done():
-		return Message{}, false
+	for {
+		select {
+		case m := <-a.Mailbox:
+			a.busy.Store(true)
+			a.touch()
+			return m, true
+		case seen := <-a.unloadReq:
+			// Stale if anything happened since the janitor looked, or if a
+			// message is already waiting (select picks at random among ready
+			// cases, so both can be ready at once).
+			if seen != a.lastActivity.Load() || len(a.Mailbox) > 0 {
+				continue
+			}
+			a.unloaded.Store(true)
+			return Message{}, false
+		case <-a.reload:
+			a.log.Info("hot reload: restarting loop")
+			return Message{}, false
+		case <-ctx.Done():
+			return Message{}, false
+		}
 	}
 }
 

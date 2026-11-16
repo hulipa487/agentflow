@@ -66,33 +66,22 @@ func TestWarnInertConfig(t *testing.T) {
 	}
 }
 
-// TestResolveAdminTokenRegional: a regional cell shares one admin token. With
-// no ADMIN_TOKEN it may use named operators, and must not mint a per-boot token
-// that no peer knows; with neither it refuses rather than minting.
+// TestResolveAdminTokenRegional: a regional cell shares one admin credential.
+// With no ADMIN_TOKEN it may use named operators, and must not mint a per-boot
+// token that no peer knows; with neither it refuses rather than minting.
 func TestResolveAdminTokenRegional(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	got, err := resolveAdminTokenForTopology("pinned", "0.0.0.0:9090", false, true, log)
-	if err != nil || got != "pinned" {
-		t.Fatalf("pinned regional token: got %q, %v; want %q, nil", got, err, "pinned")
+	got, minted, err := resolveAdminToken("pinned", false, true, log)
+	if err != nil || got != "pinned" || minted {
+		t.Fatalf("pinned regional token: got %q, minted=%v, %v", got, minted, err)
 	}
-
-	got, err = resolveAdminTokenForTopology("", "127.0.0.1:9090", true, true, log)
-	if err != nil {
-		t.Fatalf("regional with operators: unexpected error %v", err)
+	got, minted, err = resolveAdminToken("", true, true, log)
+	if err != nil || got != "" || minted {
+		t.Fatalf("regional with operators: got %q, minted=%v, %v; want no token", got, minted, err)
 	}
-	if got != "" {
-		t.Fatalf("regional with operators minted a token %q; want none", got)
-	}
-
-	if _, err := resolveAdminTokenForTopology("", "127.0.0.1:9090", false, true, log); err == nil {
+	if _, _, err := resolveAdminToken("", false, true, log); err == nil {
 		t.Fatal("regional with no token and no operators must be refused")
-	}
-
-	// Single keeps the old behaviour: a loopback listen gets a per-boot token.
-	got, err = resolveAdminTokenForTopology("", "127.0.0.1:9090", false, false, log)
-	if err != nil || len(got) != 32 {
-		t.Fatalf("single loopback token: got %q, %v; want 32 hex chars, nil", got, err)
 	}
 }
 
@@ -200,41 +189,35 @@ func TestLoopbackListen(t *testing.T) {
 	}
 }
 
-// TestResolveAdminToken: ADMIN_TOKEN wins outright and may be paired with any
-// listen address. With no ADMIN_TOKEN a loopback listen gets a generated
-// token, and a reachable one is refused rather than served unauthenticated —
-// an empty token is "no auth required" as far as metrics.AdminServer.auth is
-// concerned, which is how the admin plane used to end up open under -no-webui.
+// TestResolveAdminToken: a configured credential wins and is usable remotely.
+// With none, a token is minted, and minted says so: the caller serves the admin
+// plane local-only, because a minted token is written to the log. An empty
+// token is "no auth" to metrics.AdminServer.auth, which is how the admin plane
+// once ended up open under -no-webui, so the single topology always gets one.
 func TestResolveAdminToken(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	got, err := resolveAdminToken("pinned", "0.0.0.0:9090", log)
-	if err != nil || got != "pinned" {
-		t.Fatalf("pinned token on a public listen: got %q, %v; want %q, nil", got, err, "pinned")
+	got, minted, err := resolveAdminToken("pinned", false, false, log)
+	if err != nil || got != "pinned" || minted {
+		t.Fatalf("pinned token: got %q, minted=%v, %v", got, minted, err)
 	}
 
-	got, err = resolveAdminToken("", "127.0.0.1:9090", log)
-	if err != nil {
-		t.Fatalf("loopback listen: unexpected error %v", err)
+	got, minted, err = resolveAdminToken("", false, false, log)
+	if err != nil || !minted {
+		t.Fatalf("no credential: minted=%v, %v; want a minted token", minted, err)
 	}
 	if len(got) != 32 { // hex of 16 random bytes
 		t.Fatalf("generated token = %q (len %d); want 32 hex chars", got, len(got))
 	}
-
-	// Two boots must not share a token.
-	other, err := resolveAdminToken("", "127.0.0.1:9090", log)
-	if err != nil {
-		t.Fatalf("second generation: %v", err)
-	}
-	if other == got {
-		t.Fatal("two boots generated the same token")
+	other, _, err := resolveAdminToken("", false, false, log)
+	if err != nil || other == got {
+		t.Fatalf("two boots must not share a token (%v)", err)
 	}
 
-	// The pairing this exists to refuse: a token minted per boot is not a
-	// secret once the port is reachable from elsewhere.
-	for _, addr := range []string{"0.0.0.0:9090", ":9090", "192.168.1.5:9090"} {
-		if _, err := resolveAdminToken("", addr, log); err == nil {
-			t.Errorf("listen %q with no ADMIN_TOKEN must be refused", addr)
-		}
+	// Operators are a configured credential: no logged break-glass token is
+	// minted beside them, so nothing weaker than them guards a remote client.
+	got, minted, err = resolveAdminToken("", true, false, log)
+	if err != nil || got != "" || minted {
+		t.Fatalf("operators: got %q, minted=%v, %v; want operators only", got, minted, err)
 	}
 }

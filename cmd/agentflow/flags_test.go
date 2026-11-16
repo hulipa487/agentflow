@@ -193,7 +193,7 @@ func TestInitIntoADirectoryTheEngineCanFind(t *testing.T) {
 func TestResolveAdminPrecedence(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "agentflow.yaml")
-	if err := os.WriteFile(cfgPath, []byte("version: \"1\"\nruntime:\n  admin:\n    listen: \":9191\"\n"), 0o644); err != nil {
+	if err := os.WriteFile(cfgPath, []byte("version: \"1\"\ngateway:\n  listen: \":9191\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Chdir(t.TempDir()) // nothing to discover
@@ -226,15 +226,15 @@ func TestResolveAdminPrecedence(t *testing.T) {
 func TestAdminURLFromConfig(t *testing.T) {
 	no := false
 	cases := map[string]string{
-		"":               "http://127.0.0.1:9090",
-		"127.0.0.1:9090": "http://127.0.0.1:9090",
+		"":               "http://127.0.0.1:8080",
+		"127.0.0.1:8080": "http://127.0.0.1:8080",
 		"0.0.0.0:8000":   "http://127.0.0.1:8000",
 		"[::]:8000":      "http://[::1]:8000",
 		"admin.lan:9000": "http://admin.lan:9000",
 	}
 	for listen, want := range cases {
 		cfg := &config.Config{}
-		cfg.Runtime.Admin.Listen = listen
+		cfg.Gateway.Listen = listen
 		got, err := adminURLFromConfig(cfg)
 		if err != nil || got != want {
 			t.Errorf("listen %q = %q, %v; want %q", listen, got, err, want)

@@ -386,16 +386,22 @@ func (c ClusterConfig) ClusterPollInterval() time.Duration {
 	return d
 }
 
-// AdminConfig configures the metrics/admin HTTP endpoint.
+// AdminConfig configures the admin plane: health, readiness, metrics, the admin
+// API and the console. Its HTTP routes are served on gateway.listen, the
+// engine's one HTTP port, under /admin/ plus /healthz, /readyz and /metrics.
 type AdminConfig struct {
-	Listen string `yaml:"listen"` // default 127.0.0.1:9090 (loopback only)
+	// Listen is retired: the admin plane has no port of its own any more. It
+	// stays in the struct only so a config that still sets it is refused with
+	// a message that says where the admin API went, instead of a decode error.
+	Listen string `yaml:"listen"`
 	// Socket adds a local-only admin listener: a unix domain socket path on
 	// Unix, or a named pipe such as \.\pipegentflow-admin on Windows.
 	// It is intended for Studio/admin clients on the same machine; the bearer
 	// token is still required. Empty disables it.
 	Socket string `yaml:"socket"`
-	// TCP is the loopback HTTP listener above. nil means enabled; set false to
-	// run the admin plane only on Socket. At least one transport must remain.
+	// TCP serves the admin plane on the shared HTTP listener. nil means
+	// enabled; set false to serve it only on Socket. At least one transport
+	// must remain.
 	TCP *bool `yaml:"tcp"`
 	// CORSOrigins is the allow-list for browser clients of the admin API. The
 	// standalone Studio app is the reason it exists: it runs on its own origin
@@ -413,7 +419,7 @@ type AdminConfig struct {
 // namedPipePrefix is the Windows named pipe namespace.
 const namedPipePrefix = `\\.\pipe\`
 
-// TCPEnabled reports whether the admin HTTP listener is enabled.
+// TCPEnabled reports whether the admin plane is served on the HTTP listener.
 func (c AdminConfig) TCPEnabled() bool { return c.TCP == nil || *c.TCP }
 
 // StudioConfig configures the admin API that backs the standalone Studio app
@@ -1875,6 +1881,9 @@ func validate(path string, c *Config) error {
 		if d < 0 {
 			return fmt.Errorf("%s: runtime.shutdown_grace must be >= 0", path)
 		}
+	}
+	if strings.TrimSpace(c.Runtime.Admin.Listen) != "" {
+		return fmt.Errorf("%s: runtime.admin.listen was removed: the admin API is served on gateway.listen (under /admin/), so delete the key; to keep it off the network, set runtime.admin.tcp: false and use runtime.admin.socket", path)
 	}
 	if !c.Runtime.Admin.TCPEnabled() && strings.TrimSpace(c.Runtime.Admin.Socket) == "" {
 		return fmt.Errorf("%s: runtime.admin.tcp is false but no runtime.admin.socket is configured", path)

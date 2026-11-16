@@ -120,7 +120,7 @@ func TestAPIRequiresTokenWhenMounted(t *testing.T) {
 	reg := metrics.NewRegistry()
 	admin := metrics.NewAdminServer("127.0.0.1:0", "tok123", reg, nil)
 	admin.Mount("/admin/api/", f.ui.API(), true)
-	admin.Mount("/", f.ui.Static(), false)
+	admin.Mount("/admin/", http.StripPrefix("/admin", f.ui.Static()), false)
 	srv := httptest.NewServer(admin.Handler())
 	defer srv.Close()
 
@@ -133,13 +133,15 @@ func TestAPIRequiresTokenWhenMounted(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("unauthed API: got %d", resp.StatusCode)
 	}
-	resp, err = http.Get(srv.URL + "/")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("static: got %d", resp.StatusCode)
+	for _, p := range []string{"/admin/", "/admin/app.js", "/admin/shared/theme.js"} {
+		resp, err = http.Get(srv.URL + p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("static %s: got %d", p, resp.StatusCode)
+		}
 	}
 
 	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/admin/api/state", nil)

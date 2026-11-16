@@ -137,7 +137,7 @@ Edit the loop while it runs and every live session switches to the new code at i
 - Every message carries where it came from, and tenancy is checked from that record, never from what the Lua claims.
 
 **📊 Operations**
-- An admin API for state, metrics, logs, agents, models, users, credentials and usage, plus a small web console.
+- One HTTP port for everything: the channels, and the admin plane under `/admin/` - an API for state, metrics, logs, agents, models, users, credentials and usage, plus a small web console.
 - A terminal dashboard, `doctor` checks (with `-online` probes of every backend), redacted support bundles.
 - Hot reload of loops and config; live model edits from Studio.
 

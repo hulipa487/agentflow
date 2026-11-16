@@ -22,10 +22,12 @@
 #   curl -X POST localhost:8080/webhook/local/ \
 #        -d '{"from":"alice","text":"hello"}'
 #
-# Connect the AgentFlow Studio desktop app (the sibling agentflow-studio
-# repository) to http://127.0.0.1:9090 with the admin token. The browser
-# operator console is at /; `-no-console` serves the API without its static
-# files, and `/docs` now answers 410 because the documentation lives in Studio.
+# Everything is on the one HTTP port, gateway.listen: the channels, and the
+# admin plane under /admin/ (plus /healthz, /readyz and /metrics). Connect the
+# AgentFlow Studio desktop app to http://127.0.0.1:8080 with the admin token;
+# the browser operator console is at /admin/, and `-no-console` serves the API
+# without it. Without ADMIN_TOKEN (or operators) the token is minted per boot
+# and the admin API answers only clients on this machine.
 #
 # Run `agentflow help` for commands and flags. The optional sections at the
 # bottom are comments: uncomment only what your deployment has.
@@ -67,10 +69,10 @@ runtime:
   persistence: sqlite://./data/agentflow.db
 
   admin:
-    # listen: 127.0.0.1:9090
-    # Local-only transport for Studio on this machine. To drop the HTTP
-    # listener, set tcp: false and name the platform's socket instead; the
-    # bearer token is required either way:
+    # The admin plane has no port of its own; it is served on gateway.listen.
+    # Local-only transport for Studio on this machine. To take the admin API
+    # off the HTTP listener, set tcp: false and name the platform's socket
+    # instead; the bearer token is required either way:
     #   Windows: socket: '\\.\pipe\agentflow-admin'
     #   Unix:    socket: /run/agentflow/admin.sock
     # Named operator tokens have the same authority as ADMIN_TOKEN and are

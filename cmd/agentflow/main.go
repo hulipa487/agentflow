@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -1812,24 +1813,14 @@ func main() {
 	watcher.SetPackages(&reload.PackageSource{Paths: builtins.PackagePaths(), Reload: sup.ReloadAll})
 	watcher.Start()
 
-	// Metrics/admin: authenticated HTTP endpoint with health/readiness/metrics
-	// and a read-only sessions view. Binds to loopback by default.
-	adminAddr := cfg.Runtime.Admin.Listen
-	if adminAddr == "" {
-		adminAddr = "127.0.0.1:9090"
-	}
+	// The admin plane: health, readiness, metrics, the admin API and the
+	// console. It is served on the shared HTTP listener (and on the optional
+	// local socket); it has no port of its own.
 	adminSocket := strings.TrimSpace(cfg.Runtime.Admin.Socket)
 	if adminSocket != "" && stdruntime.GOOS != "windows" && !filepath.IsAbs(adminSocket) {
 		adminSocket = filepath.Join(cfgSource.Dir, adminSocket)
 	}
 	tcpAdmin := cfg.Runtime.Admin.TCPEnabled()
-	authListen := adminAddr
-	if !tcpAdmin {
-		// A socket-only admin plane is local by construction; the loopback
-		// sentinel keeps the non-loopback token guard from firing on a
-		// disabled TCP address.
-		authListen = "127.0.0.1:9090"
-	}
 	// Named operator tokens are resolved before the break-glass token decision:
 	// "has operators" has to mean tokens that actually resolved, or a regional
 	// cell whose every operator credential is missing would believe it has
@@ -1843,12 +1834,12 @@ func main() {
 		}
 		ops[name] = v
 	}
-	adminToken, tokErr := resolveAdminTokenForTopology(os.Getenv("ADMIN_TOKEN"), authListen, len(ops) > 0, cfg.IsRegional(), log)
+	adminToken, adminLocalOnly, tokErr := resolveAdminToken(os.Getenv("ADMIN_TOKEN"), len(ops) > 0, cfg.IsRegional(), log)
 	if tokErr != nil {
 		log.Error("admin plane has no usable authentication", "err", tokErr)
 		exit(1)
 	}
-	admin := metrics.NewAdminServer(adminAddr, adminToken, metricReg, log)
+	admin := metrics.NewAdminServer("", adminToken, metricReg, log)
 	admin.SetCORS(cfg.Runtime.Admin.CORSOrigins)
 	if len(ops) > 0 {
 		admin.SetOperators(ops)
@@ -1935,9 +1926,11 @@ func main() {
 		})
 		admin.Mount("/admin/api/", console.API(), true)
 		if consoleEnabled {
-			admin.Mount("/", console.Static(), false)
+			// The console lives under /admin/, not at the root: the root of the
+			// shared listener is the public side, and channels mount there.
+			admin.Mount("/admin/", http.StripPrefix("/admin", console.Static()), false)
 			if tcpAdmin {
-				log.Info("web console enabled", "url", "http://"+adminAddr+"/")
+				log.Info("web console enabled", "url", localURL(cfg.Gateway.Listen)+"/admin/")
 			} else {
 				log.Info("web console HTTP disabled; the API is served on the local admin socket")
 			}
@@ -1946,11 +1939,18 @@ func main() {
 		}
 	}
 	if tcpAdmin {
-		go func() {
-			if err := admin.Start(); err != nil {
-				log.Warn("admin server stopped", "err", err)
-			}
-		}()
+		// Mounted after the listener is bound: the stdlib mux takes
+		// registrations while serving, and binding first is what lets the
+		// telegram auto probe run before this point.
+		shared := admin.SharedHandler(adminLocalOnly)
+		for _, p := range metrics.SharedPaths {
+			httpSrv.Mount(p, shared)
+		}
+		where := "any client with the token"
+		if adminLocalOnly {
+			where = "local clients only"
+		}
+		log.Info("admin API on the shared listener", "listen", cfg.Gateway.Listen, "prefix", "/admin/", "reachable", where)
 	}
 	if adminSocket != "" {
 		l, err := metrics.ListenLocalAdmin(adminSocket)
@@ -2190,11 +2190,27 @@ func warnUnenforceableGC(cfg *config.Config, log *slog.Logger) {
 	}
 }
 
+// localURL is the URL a client on this host dials for a listen address: an
+// unspecified host (":8080", "0.0.0.0:8080") is reached on loopback.
+func localURL(listen string) string {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return "http://" + listen
+	}
+	switch host {
+	case "", "0.0.0.0":
+		host = "127.0.0.1"
+	case "::":
+		host = "::1"
+	}
+	return "http://" + net.JoinHostPort(host, port)
+}
+
 // loopbackListen reports whether an admin listen address is reachable only
 // from this host, which is what makes a per-boot token a secret worth having.
 //
 // It is deliberately strict, and answers from the address text alone rather
-// than resolving anything: an empty host (":9090") binds every interface, a
+// than resolving anything: an empty host (":8080") binds every interface, a
 // bare port or an unparseable address is not vouched for, and a name other
 // than "localhost" is not assumed to resolve to a loopback address. Anything
 // this cannot vouch for is treated as reachable and requires a real token.
@@ -2221,66 +2237,47 @@ func loopbackListen(addr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// resolveAdminToken returns the bearer token the admin plane will require.
+// resolveAdminToken decides how the admin plane authenticates. It returns the
+// break-glass bearer token ("" when named operators are the only credentials)
+// and whether that token was minted for this boot.
 //
-// It mints a per-boot token whenever ADMIN_TOKEN is unset — not only when the
-// console is on, which is what it used to do. Generating it inside
-// `if !*noWebUI` meant `-no-webui` with no ADMIN_TOKEN left an empty token, and
-// metrics.AdminServer.auth reads an empty token as "no auth required": /metrics,
-// /admin/sessions and credential provisioning were then served to anything that
-// could reach the port.
+// A token is always required: one is minted whenever none is configured. That
+// used to depend on the console being on, and `-no-webui` with no ADMIN_TOKEN
+// left an empty token, which metrics.AdminServer.auth reads as "no auth": the
+// admin routes were served to anything that could reach them.
 //
-// A generated token is only a secret if nothing else can reach that port, so a
-// non-loopback listen with no ADMIN_TOKEN is refused rather than quietly
-// served. envToken is a parameter rather than read here so both branches are
-// testable.
-func resolveAdminToken(envToken, listen string, log *slog.Logger) (string, error) {
-	return resolveAdminTokenWithOperators(envToken, listen, false, log)
-}
-
-// resolveAdminTokenForTopology applies the regional tier's token rule before
-// delegating to resolveAdminTokenWithOperators.
+// A minted token is written to the log, so it is not a secret from anyone who
+// can read the log; the caller serves the admin plane local-only while minted
+// is true. A configured credential (ADMIN_TOKEN, or named operators) is what
+// opens the admin plane to remote clients. With operators and no ADMIN_TOKEN,
+// nothing is minted: a logged break-glass token beside them would be the
+// weakest credential on a reachable port.
 //
-// A regional cell shares one admin token. A per-boot token minted here is
-// unknown to every peer, so the rule refuses to mint one: either ADMIN_TOKEN is
-// set (one token for the cell) or named operators authenticate every request.
-// With operators configured the cell needs no break-glass token at all, and the
-// admin server treats "empty token plus operators" as operators-only, not as
-// "no auth" — that distinction is enforced in metrics.AdminServer.auth.
-func resolveAdminTokenForTopology(envToken, listen string, hasOperators, regional bool, log *slog.Logger) (string, error) {
-	if regional && envToken == "" {
-		if !hasOperators {
-			return "", fmt.Errorf("regional topology: ADMIN_TOKEN is unset and no runtime.admin.operators resolved; every instance would mint its own per-boot token and reject the others'. Set ADMIN_TOKEN or name runtime.admin.operators")
-		}
-		if log != nil {
-			log.Info("regional topology: admin authentication uses runtime.admin.operators; no per-boot token minted")
-		}
-		return "", nil
-	}
-	return resolveAdminTokenWithOperators(envToken, listen, hasOperators, log)
-}
-
-// resolveAdminTokenWithOperators is the boot path: named operator tokens make
-// a non-loopback admin listener authenticatable without a shared ADMIN_TOKEN.
-// The break-glass token is still minted and logged once.
-func resolveAdminTokenWithOperators(envToken, listen string, hasOperators bool, log *slog.Logger) (string, error) {
+// A regional cell shares one admin credential. A per-boot token is unknown to
+// every peer, so regional refuses to mint: ADMIN_TOKEN or operators it is.
+// envToken is a parameter rather than read here so every branch is testable.
+func resolveAdminToken(envToken string, hasOperators, regional bool, log *slog.Logger) (token string, minted bool, err error) {
 	if log == nil {
 		log = slog.Default()
 	}
 	if envToken != "" {
-		return envToken, nil
+		return envToken, false, nil
 	}
-	if !loopbackListen(listen) && !hasOperators {
-		return "", fmt.Errorf("runtime.admin.listen %q is not loopback and ADMIN_TOKEN is unset; set ADMIN_TOKEN, name runtime.admin.operators, or bind runtime.admin.listen to a loopback address", listen)
+	if hasOperators {
+		log.Info("admin authentication uses runtime.admin.operators; no break-glass token minted")
+		return "", false, nil
+	}
+	if regional {
+		return "", false, fmt.Errorf("regional topology: ADMIN_TOKEN is unset and no runtime.admin.operators resolved; every instance would mint its own per-boot token and reject the others'. Set ADMIN_TOKEN or name runtime.admin.operators")
 	}
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		return "", fmt.Errorf("admin token generation: %w", err)
+		return "", false, fmt.Errorf("admin token generation: %w", err)
 	}
-	token := hex.EncodeToString(b)
+	token = hex.EncodeToString(b)
 	log.Info("admin token (set ADMIN_TOKEN to pin it)", "token", token)
-	log.Warn("admin token is per-boot and per-instance: a fleet must set ADMIN_TOKEN, or every instance rejects the others' tokens")
-	return token, nil
+	log.Warn("the admin API answers only local clients while its token is minted per boot; set ADMIN_TOKEN or runtime.admin.operators to reach it remotely")
+	return token, true, nil
 }
 
 func capabilitySet(caps []string) map[string]bool {

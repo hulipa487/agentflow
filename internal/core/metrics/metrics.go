@@ -357,8 +357,9 @@ func DefaultCounters() map[string]*Counter {
 	}
 }
 
-// AdminServer is the HTTP admin/metrics endpoint. It binds to loopback by
-// default; remote binding requires a bearer token.
+// AdminServer is the admin plane: health, readiness, metrics, the admin API and
+// the console. Its routes are served on the engine's one HTTP listener through
+// SharedHandler, and on the optional local socket or pipe through Serve.
 type AdminServer struct {
 	srv       *http.Server
 	mux       *http.ServeMux
@@ -451,6 +452,47 @@ func (s *AdminServer) withCORS(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// SharedPaths are the patterns the admin plane owns on the shared listener.
+// Channels may not mount under them (config validation refuses it).
+var SharedPaths = []string{"/healthz", "/readyz", "/metrics", "/admin/"}
+
+// SharedHandler is the admin plane as the shared HTTP listener serves it. With
+// localOnly, every route except /healthz and /readyz answers only a client on
+// this host that did not come through a proxy: that is the mode for a token
+// minted per boot, which is written to the log and so is not a secret from
+// anyone who can read it. A token the operator configured (ADMIN_TOKEN, named
+// operators) turns localOnly off, and the bearer token alone guards the routes.
+func (s *AdminServer) SharedHandler(localOnly bool) http.Handler {
+	h := s.Handler()
+	if !localOnly {
+		return h
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz" && r.URL.Path != "/readyz" && !localRequest(r) {
+			http.Error(w, "the admin API answers only local clients until ADMIN_TOKEN or runtime.admin.operators is set", http.StatusForbidden)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// localRequest reports whether r came from a loopback address directly. A
+// request carrying a forwarding header came through a proxy, and a proxy on the
+// same host makes every remote client look local, so it does not count.
+func localRequest(r *http.Request) bool {
+	for _, h := range []string{"Forwarded", "X-Forwarded-For", "X-Real-Ip"} {
+		if r.Header.Get(h) != "" {
+			return false
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // Token returns the configured bearer token ("" when auth is disabled).

@@ -355,17 +355,25 @@ runtime.topology is regional; -online=false turns it off.`,
 		add("SKIP", "identity", "identity layer disabled (anonymous/service stratum)")
 	}
 
-	adminListen := cfg.Runtime.Admin.Listen
-	if adminListen == "" {
-		adminListen = "127.0.0.1:9090"
+	// The admin API is on the shared listener. Without a configured
+	// credential it runs on a per-boot token and answers local clients only.
+	listen := cfg.Gateway.Listen
+	if listen == "" {
+		listen = ":8080"
 	}
-	if !loopbackListen(adminListen) && os.Getenv("ADMIN_TOKEN") == "" {
-		add("FAIL", "admin", "runtime.admin.listen is not loopback and ADMIN_TOKEN is unset")
+	hasToken := os.Getenv("ADMIN_TOKEN") != "" || len(cfg.Runtime.Admin.Operators) > 0
+	switch {
+	case hasToken:
+		add("PASS", "admin", "a configured token guards the admin API on "+listen+" (/admin/)")
+	case cfg.IsRegional():
+		add("FAIL", "admin", "regional topology needs ADMIN_TOKEN or runtime.admin.operators: a per-boot token is unknown to the other instances")
 		exit = 1
-	} else if os.Getenv("ADMIN_TOKEN") == "" {
-		add("WARN", "admin", "ADMIN_TOKEN is unset; the console mints a per-boot token")
-	} else {
-		add("PASS", "admin", "ADMIN_TOKEN is set")
+	case !cfg.Runtime.Admin.TCPEnabled():
+		add("WARN", "admin", "ADMIN_TOKEN is unset; the socket-only admin API mints a per-boot token")
+	case loopbackListen(listen):
+		add("WARN", "admin", "ADMIN_TOKEN is unset; the admin API mints a per-boot token")
+	default:
+		add("WARN", "admin", "ADMIN_TOKEN is unset: the admin API on "+listen+" answers local clients only, on a per-boot token")
 	}
 
 	for _, name := range sortedKeys(cfg.Models) {
@@ -499,8 +507,8 @@ type configSummary struct {
 	Channels    int            `json:"channels"`
 	Models      []summaryModel `json:"models"`
 	Loops       []summaryLoop  `json:"loops"`
-	AdminListen string         `json:"admin_listen"`
-	AdminTCP    bool           `json:"admin_tcp"`
+	Listen      string         `json:"listen"`    // gateway.listen: the one HTTP port
+	AdminTCP    bool           `json:"admin_tcp"` // admin API served on it, under /admin/
 	AdminSocket string         `json:"admin_socket,omitempty"`
 }
 
@@ -542,7 +550,7 @@ func cmdConfigShow(args []string, stdout, stderr io.Writer) int {
 		Channels:    len(cfg.Gateway.Channels),
 		Models:      []summaryModel{},
 		Loops:       []summaryLoop{},
-		AdminListen: cfg.Runtime.Admin.Listen,
+		Listen:      cfg.Gateway.Listen,
 		AdminTCP:    cfg.Runtime.Admin.TCPEnabled(),
 		AdminSocket: cfg.Runtime.Admin.Socket,
 	}
@@ -556,8 +564,8 @@ func cmdConfigShow(args []string, stdout, stderr io.Writer) int {
 	if sum.Persistence == "" {
 		sum.Persistence = "default"
 	}
-	if sum.AdminListen == "" {
-		sum.AdminListen = "127.0.0.1:9090"
+	if sum.Listen == "" {
+		sum.Listen = ":8080"
 	}
 	for _, name := range sortedKeys(cfg.Models) {
 		sum.Models = append(sum.Models, summaryModel{name, cfg.Models[name].Provider, cfg.Models[name].Model})
@@ -590,7 +598,7 @@ func cmdConfigShow(args []string, stdout, stderr io.Writer) int {
 	if socket == "" {
 		socket = "(disabled)"
 	}
-	fmt.Fprintf(stdout, "admin.listen: %s (tcp: %v)\nadmin.socket: %s\n", sum.AdminListen, sum.AdminTCP, socket)
+	fmt.Fprintf(stdout, "listen: %s\nadmin: /admin/ (on the listener: %v)\nadmin.socket: %s\n", sum.Listen, sum.AdminTCP, socket)
 	return 0
 }
 

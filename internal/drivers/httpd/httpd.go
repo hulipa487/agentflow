@@ -1,5 +1,6 @@
-// Package httpd is the shared HTTP server that all webhook-style channel drivers
-// attach to. Instead of each driver spinning up its own http.Server on its own
+// Package httpd is the engine's one HTTP listener. Every webhook-style channel
+// driver attaches to it, and so does the admin plane (under /admin/, plus
+// /healthz, /readyz and /metrics), mounted by main. Instead of each driver spinning up its own http.Server on its own
 // port (which forced a unique port per channel and clashed when two wanted the
 // same default), every HTTP channel registers its path on this one mux. The
 // listener is started once, in main, and shut down once.
@@ -78,6 +79,13 @@ func (s *Server) Handle(path string, fn http.HandlerFunc) {
 	}
 	s.paths[path] = true
 	s.mux.HandleFunc(path, fn)
+}
+
+// Mount registers an http.Handler at pattern, with the same duplicate check as
+// Handle. The admin plane uses it: its server keeps its own mux (it also serves
+// the local socket), and the shared listener forwards its paths there.
+func (s *Server) Mount(pattern string, h http.Handler) {
+	s.Handle(pattern, h.ServeHTTP)
 }
 
 // Handler returns the underlying mux, so embedders and tests can serve it

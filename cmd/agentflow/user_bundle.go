@@ -30,19 +30,20 @@ func cmdUser(args []string, stdout, stderr io.Writer) int {
 	}, args, stdout, stderr)
 }
 
-// defaultAdminURL is where the admin API listens when nothing says otherwise.
-const defaultAdminURL = "http://127.0.0.1:9090"
+// defaultAdminURL is where the admin API is when nothing says otherwise: the
+// shared listener's default port, on this host.
+const defaultAdminURL = "http://127.0.0.1:8080"
 
 // addAdminFlags registers the flags every admin-API client command shares.
 func addAdminFlags(fs *flag.FlagSet) (url, token, cfgPath *string) {
-	url = fs.String("url", "", "admin API base URL (default: $AGENTFLOW_URL, then the config's admin address, then "+defaultAdminURL+")")
+	url = fs.String("url", "", "admin API base URL (default: $AGENTFLOW_URL, then the config's gateway.listen, then "+defaultAdminURL+")")
 	token = fs.String("token", "", "admin bearer token (default: $ADMIN_TOKEN)")
 	cfgPath = addConfigFlag(fs)
 	return url, token, cfgPath
 }
 
 // resolveAdmin picks the admin API base URL and token. The URL comes from
-// -url, then $AGENTFLOW_URL, then the config's runtime.admin.listen: the
+// -url, then $AGENTFLOW_URL, then the config's gateway.listen: the
 // config named by -config, or the one discovery finds in the working
 // directory. A named config that does not load is an error; a discovered one
 // is only a guess, so it falls through to the default instead.
@@ -71,19 +72,20 @@ func resolveAdmin(url, token, cfgPath string) (string, string, error) {
 	return strings.TrimSuffix(url, "/"), token, nil
 }
 
-// adminURLFromConfig turns runtime.admin.listen into a URL a client on this
-// host can dial: an unspecified host (":9090", "0.0.0.0:9090") is loopback.
+// adminURLFromConfig turns gateway.listen, where the admin API is served, into
+// a URL a client on this host can dial: an unspecified host (":8080",
+// "0.0.0.0:8080") is loopback.
 func adminURLFromConfig(cfg *config.Config) (string, error) {
 	if !cfg.Runtime.Admin.TCPEnabled() {
-		return "", fmt.Errorf("the admin API listens only on its socket (runtime.admin.tcp: false); pass -url")
+		return "", fmt.Errorf("the admin API is served only on its socket (runtime.admin.tcp: false); pass -url")
 	}
-	listen := cfg.Runtime.Admin.Listen
+	listen := cfg.Gateway.Listen
 	if listen == "" {
 		return defaultAdminURL, nil
 	}
 	host, port, err := net.SplitHostPort(listen)
 	if err != nil {
-		return "", fmt.Errorf("runtime.admin.listen %q: %w", listen, err)
+		return "", fmt.Errorf("gateway.listen %q: %w", listen, err)
 	}
 	switch host {
 	case "", "0.0.0.0":

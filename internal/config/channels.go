@@ -35,6 +35,16 @@ func ValidateStudioChannels(c *Config, channels []Channel) error {
 	return nil
 }
 
+// reservedChannelPath reports whether a channel path would land on a route the
+// engine itself serves on the shared listener.
+func reservedChannelPath(p string) bool {
+	switch strings.TrimSuffix(p, "/") {
+	case "", "/health", "/healthz", "/readyz", "/metrics":
+		return p != "" && p != "/"
+	}
+	return strings.HasPrefix(p, "/admin/") || p == "/admin" || strings.HasPrefix(p, "/v1/users/") || p == "/v1/users"
+}
+
 // validateChannelList is the single channel validator shared by boot and the
 // Studio. path is the config label used in messages.
 func validateChannelList(path string, c *Config, channels []Channel) error {
@@ -126,6 +136,9 @@ func validateChannelList(path string, c *Config, channels []Channel) error {
 				return fmt.Errorf("%s: channels %q and %q mount the same path %q", path, prev, ch.Name, key)
 			}
 			seenPaths[key] = ch.Name
+			if reservedChannelPath(key) {
+				return fmt.Errorf("%s: channel %q path %q is reserved: the admin plane owns /admin/, /healthz, /readyz and /metrics, and the engine /health and /v1/users/ on the shared listener", path, ch.Name, key)
+			}
 		}
 	}
 	return nil

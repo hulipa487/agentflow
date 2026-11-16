@@ -4,12 +4,18 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"agentflow/internal/core/scheduler"
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/sessionhub"
 )
+
+// timerFireSeq numbers timer fires within this process. The clock alone does
+// not make a fire id unique: Windows reads time in 100ns steps and macOS in
+// microseconds, so two fires in quick succession can share a timestamp.
+var timerFireSeq atomic.Uint64
 
 // schedulerAdapter adapts the scheduler.Service to the session.SchedulerService
 // interface. Timer fires are delivered as core-stamped timer messages into the
@@ -31,10 +37,11 @@ func (a *schedulerAdapter) deliver(owner string, timerID scheduler.TimerID, scop
 	}
 	msg := session.Message{
 		// One id per fire, not per timer. The inbox deduplicates on
-		// (session, origin|id), so a stable id would make every tick after the
-		// first look like a retry and silently drop it. The timestamp keeps the
-		// id unique without a second counter to persist.
-		ID:   fmt.Sprintf("timer:%s:%s:%d", owner, timerID, time.Now().UnixNano()),
+		// (session, origin|id), so a repeated id would make a tick look like a
+		// retry and silently drop it. The counter makes ids unique within the
+		// process whatever the clock's resolution; the timestamp keeps them
+		// unique across restarts, when the counter starts again.
+		ID:   fmt.Sprintf("timer:%s:%s:%d.%d", owner, timerID, time.Now().UnixNano(), timerFireSeq.Add(1)),
 		Type: "timer",
 		From: "system:scheduler",
 		Ts:   time.Now().Unix(),

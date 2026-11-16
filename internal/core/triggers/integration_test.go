@@ -24,7 +24,7 @@ import (
 func directive() string { return fmt.Sprintf("-- af-prelude-version: %d\n", vm.PreludeVersion) }
 
 // TestConfigDirEveryTriggerReachesItsAgent is the end-to-end check for engine
-// scheduling: a -configdir deployment whose triggers/tick.yaml declares
+// scheduling: a config-directory deployment whose triggers/tick.yaml declares
 // every: "2s" fires with no agent (and no capability) involved, and the
 // target agent's loop receives an ordinary Message{type:"cron"} carrying the
 // trigger's payload. This is the shape a deployment that deletes its

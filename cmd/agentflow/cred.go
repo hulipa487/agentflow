@@ -1,5 +1,5 @@
 // The credential CLI: `agentflow cred set|get|list|delete <name>`, operating
-// on the store path from the loaded config (configdir or -config). Values
+// on the store path from the loaded config (-config). Values
 // enter through a prompt or stdin — never argv. Engine-wide credentials are
 // stored under the empty user UUID; list shows names only.
 package main
@@ -8,7 +8,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -22,87 +21,77 @@ import (
 	"agentflow/internal/llog"
 )
 
-const credUsage = `usage: agentflow cred <command> [flags] <name>
+func cmdCred(args []string, stdout, stderr io.Writer) int {
+	return credMain(args, os.Stdin, stdout, stderr)
+}
 
-commands:
-  set <name>     store a credential (value from a prompt or stdin, never argv)
-  get <name>     print a credential value
-  list           list credential names (never values)
-  delete <name>  remove a credential
-
-flags:
-  -config <path>      config file or directory (default: agentflow.yaml, then config.yaml)
-  -configdir <dir>    deprecated: config directory (use -config DIR)
-  -user <uuid>        store/list this profile's credential (default: engine-wide)
-  -kind <kind>        credential kind for set (default "api")
-  -header <name>      request header the secret is injected into (default Authorization)
-  -scheme <scheme>    header scheme prefix (default Bearer)
-  -format text|json   output format for get/list (default text)
-
-the master key is read from the env var named by
-runtime.credentials.master_key_env (default CREDENTIALS_MASTER_KEY).
-
-examples:
-  printf %s "$TOKEN" | agentflow cred set github_token -config deploy/system.yaml
-  agentflow cred get github_token
-  agentflow cred list
-`
-
-// credMain runs the credential CLI and returns the process exit code.
+// credMain runs the credential CLI and returns the process exit code. Each
+// command has its own flags, so a flag that does nothing for it is an error
+// rather than silently ignored.
 func credMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("cred", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	cfgPath := fs.String("config", "", "config file or directory")
-	configDir := fs.String("configdir", "", "deprecated: config directory (use -config DIR)")
-	user := fs.String("user", "", "profile uuid (default: engine-wide)")
-	kind := fs.String("kind", "api", "credential kind")
-	header := fs.String("header", "Authorization", "request header")
-	scheme := fs.String("scheme", "Bearer", "header scheme")
-	format := fs.String("format", "text", "text or json")
-	if err := fs.Parse(hoistFlags(args)); err != nil {
-		io.WriteString(stderr, credUsage)
-		return 2
+	run := func(name string) func([]string, io.Writer, io.Writer) int {
+		return func(a []string, o, e io.Writer) int { return credCommand(name, a, stdin, o, e) }
 	}
-	rest := fs.Args()
-	if len(rest) == 0 {
-		io.WriteString(stderr, credUsage)
-		return 2
-	}
-	cmd, name := rest[0], ""
-	if len(rest) > 1 {
-		name = rest[1]
-	}
+	return runGroup("cred", []subcommand{
+		{"set", "store a credential; the value comes from a prompt or stdin, never argv", run("set")},
+		{"get", "print a credential's value", run("get")},
+		{"list", "list credential names (never values)", run("list")},
+		{"delete", "remove a credential", run("delete")},
+	}, args, stdout, stderr)
+}
+
+func credCommand(cmd string, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	info := cmdInfo{Name: "cred " + cmd, Args: "NAME"}
+	const keyNote = "The master key is read from the env var named by runtime.credentials.master_key_env\n(default CREDENTIALS_MASTER_KEY)."
 	switch cmd {
-	case "set", "get", "list", "delete":
-	default:
-		fmt.Fprintf(stderr, "agentflow cred: unknown command %q\n\n", cmd)
-		io.WriteString(stderr, credUsage)
+	case "set":
+		info.Summary = "Store a credential. The value is read from a prompt, or from stdin when piped; never from argv."
+		info.Detail = "example: printf %s \"$TOKEN\" | agentflow cred set github_token -config deploy/\n\n" + keyNote
+	case "get":
+		info.Summary = "Print a credential's value."
+		info.Detail = keyNote
+	case "list":
+		info.Args = ""
+		info.Summary = "List credential names. Values are never printed."
+		info.Detail = keyNote
+	case "delete":
+		info.Summary = "Remove a credential."
+		info.Detail = keyNote
+	}
+	fs := newCommand(info, stderr)
+	cfgPath := addConfigFlag(fs)
+	user := fs.String("user", "", "a profile's credential (profile uuid, u_...); default: engine-wide")
+	var kind, header, scheme *string
+	if cmd == "set" {
+		kind = fs.String("kind", "api", "credential kind")
+		header = fs.String("header", "Authorization", "request header the secret is sent in")
+		scheme = fs.String("scheme", "Bearer", "header scheme prefix")
+	}
+	asJSON := new(bool)
+	if cmd == "get" || cmd == "list" {
+		asJSON = fs.Bool("json", false, "print as JSON")
+	}
+	if code, ok := parseArgs(fs, args, map[string]string{"format": "use -json"}); !ok {
+		return code
+	}
+	want := 1
+	if cmd == "list" {
+		want = 0
+	}
+	if !positionals(fs, info, want) {
 		return 2
 	}
-	if (cmd == "set" || cmd == "get" || cmd == "delete") && name == "" {
-		fmt.Fprintln(stderr, "agentflow cred: command", cmd, "requires a name")
-		return 2
-	}
-	if cmd == "list" && name != "" {
-		fmt.Fprintln(stderr, "agentflow cred: list takes no name")
-		return 2
-	}
-	if *format != "text" && *format != "json" {
-		fmt.Fprintln(stderr, "agentflow cred: -format must be text or json")
-		return 2
-	}
-	if *user != "" && cmd == "set" {
+	name := fs.Arg(0)
+	if *user != "" && !strings.HasPrefix(*user, "u_") {
 		// The identity store may not be enabled; a uuid is still a valid key.
-		if !strings.HasPrefix(*user, "u_") {
-			fmt.Fprintln(stderr, "agentflow cred: -user must be a profile uuid (u_...)")
-			return 2
-		}
+		fmt.Fprintln(stderr, "agentflow cred: -user must be a profile uuid (u_...)")
+		return 2
 	}
 
 	lvl, _ := llog.ParseLevel("error") // CLI: quiet by default, errors only
 	log := slog.New(llog.NewTextHandler(stderr, lvl))
 
-	src, err := config.ResolveSource(*cfgPath, *configDir)
+	src, err := config.ResolveSource(*cfgPath)
 	if err != nil {
 		fmt.Fprintln(stderr, "agentflow cred:", err)
 		return 1
@@ -139,7 +128,6 @@ func credMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return 1
 		}
 		fmt.Fprintf(stdout, "stored %s (user %q)\n", name, *user)
-		return 0
 
 	case "get":
 		sec, ok, err := store.Get(ctx, *user, name)
@@ -151,7 +139,7 @@ func credMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "agentflow cred: no credential named %s\n", name)
 			return 1
 		}
-		if *format == "json" {
+		if *asJSON {
 			_ = json.NewEncoder(stdout).Encode(map[string]any{
 				"service": name, "user": *user, "value": sec.Value,
 				"header": sec.Header, "scheme": sec.Scheme,
@@ -159,7 +147,6 @@ func credMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		} else {
 			fmt.Fprintln(stdout, sec.Value)
 		}
-		return 0
 
 	case "list":
 		refs, err := store.List(ctx, *user)
@@ -167,14 +154,13 @@ func credMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "agentflow cred:", err)
 			return 1
 		}
-		if *format == "json" {
+		if *asJSON {
 			_ = json.NewEncoder(stdout).Encode(refs)
 			return 0
 		}
 		for _, r := range refs {
 			fmt.Fprintln(stdout, r.Service) // names only, never values
 		}
-		return 0
 
 	case "delete":
 		if err := store.Delete(ctx, *user, name); err != nil {
@@ -182,29 +168,8 @@ func credMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return 1
 		}
 		fmt.Fprintf(stdout, "deleted %s (user %q)\n", name, *user)
-		return 0
 	}
-
-	io.WriteString(stderr, credUsage)
-	return 2
-}
-
-// hoistFlags moves flag arguments (and their values) ahead of the positional
-// arguments, so `cred set NAME -config X` parses like `cred -config X set
-// NAME`. Go's flag package stops at the first non-flag argument; operators
-// naturally write the command first. The CLI's flags all take values.
-func hoistFlags(args []string) []string {
-	var flags, rest []string
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if strings.HasPrefix(a, "-") && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
-			flags = append(flags, a, args[i+1])
-			i++
-			continue
-		}
-		rest = append(rest, a)
-	}
-	return append(flags, rest...)
+	return 0
 }
 
 // readCredentialValue reads the secret from stdin: an interactive prompt when

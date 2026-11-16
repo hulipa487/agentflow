@@ -36,7 +36,7 @@ const managedMarker = "# managed by agentflow studio — edits may be overwritte
 
 var studioNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
-// Workspace persists agents into the deployment's own config. In a -configdir
+// Workspace persists agents into the deployment's own config. In a config-directory
 // deployment that is profiles/*.yaml plus loops/ and prompts/; in a single-file
 // deployment it is the agents: map of that file plus a studio/ directory for
 // the loop and prompt.

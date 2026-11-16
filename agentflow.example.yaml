@@ -9,7 +9,7 @@
 # Or point at this file directly, from any directory:
 #
 #   ./agentflow validate -config path/to/agentflow.example.yaml
-#   ./agentflow -config path/to/agentflow.example.yaml -log-level debug -no-tui
+#   ./agentflow run -config path/to/agentflow.example.yaml -log-level debug -no-tui
 #
 # Relative paths resolve against this file's directory, not the shell's
 # working directory, so the two commands above behave the same.
@@ -81,7 +81,7 @@ runtime:
     # refused. Vite's two spellings are different origins.
     # cors_origins: ["http://127.0.0.1:5173", "http://localhost:5173"]
 
-  # Op-pool size. An explicit -workers flag overrides this; unset uses 8.
+  # Op-pool size, and the only place it is set; unset uses 8.
   scheduler:
     workers: 8
 
@@ -296,12 +296,10 @@ gateway:
 #
 # Config-directory layout (preferred for larger deployments):
 #
-#   agentflow -config ./deploy          # directory, not a file
+#   agentflow run -config ./deploy      # directory, not a file
 #   deploy/system.yaml                  # runtime, models, memory, gateway
 #   deploy/channels.yaml                # gateway.channels
 #   deploy/profiles/*.yaml              # one agent per file; spawn: true = template
 #   deploy/loops/, deploy/prompts/      # paths relative to deploy/
-#
-# The deprecated -configdir DIR flag is an alias for -config DIR.
 #
 # Each optional surface above needs its own backend or environment variable.

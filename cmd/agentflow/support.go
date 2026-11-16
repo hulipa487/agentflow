@@ -36,16 +36,21 @@ func redactConfig(b []byte) []byte {
 }
 
 func cmdSupport(args []string, stdout, stderr io.Writer) int {
-	fs, cfgPath, configDir := cliConfigFlags("support-bundle", stderr)
+	info := cmdInfo{
+		Name:    "support-bundle",
+		Summary: "Collect a redacted diagnostic archive for a support request.",
+		Detail:  "Unlike other commands, it writes a file by default: a zip is no use on a terminal.",
+	}
+	fs := newCommand(info, stderr)
+	cfgPath := addConfigFlag(fs)
 	out := fs.String("out", "", "output zip path (default agentflow-support-<timestamp>.zip)")
-	if err := fs.Parse(args); err != nil {
+	if code, ok := parseArgs(fs, args, nil); !ok {
+		return code
+	}
+	if !positionals(fs, info, 0) {
 		return 2
 	}
-	if fs.NArg() > 0 {
-		fmt.Fprintln(stderr, "support-bundle: unexpected argument:", fs.Arg(0))
-		return 2
-	}
-	cfg, src, err := loadConfigForCLI(*cfgPath, *configDir, stderr)
+	cfg, src, err := loadConfigForCLI(*cfgPath, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, "support-bundle: config:", err)
 		return 1

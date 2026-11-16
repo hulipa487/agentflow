@@ -214,7 +214,7 @@ func (u UsageConfig) UsageRetention() int {
 type Runtime struct {
 	// Pointers distinguish "unset" from an explicit zero. vm.memory_limit and
 	// scheduler.workers are live: the first caps each Luau state, the second is
-	// the op-pool size unless -workers overrides it.
+	// the op-pool size (default 8); there is no flag for it.
 	//
 	// vm.instruction_budget and reload.watch do nothing. They are parsed so a
 	// configuration that sets them keeps booting, and main warns when one is
@@ -1798,7 +1798,7 @@ func validate(path string, c *Config) error {
 	// triggers that name an agent still fail below, so "no agents" cannot hide
 	// a reference to one that does not exist.
 	// runtime.scheduler.workers is not defaulted here: main treats unset as
-	// "use the -workers flag", so writing 8 here would make the flag's default
+	// "use 8", so writing 8 here would make the default
 	// look like an explicit config choice.
 	if c.Runtime.Persistence == "" {
 		c.Runtime.Persistence = "sqlite://./data/agentflow.db"

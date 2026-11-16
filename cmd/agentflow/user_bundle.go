@@ -13,28 +13,85 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"os"
 	"strings"
 	"time"
+
+	"agentflow/internal/config"
 )
 
 func cmdUser(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: agentflow user <export|import|keygen> [flags]")
-		return 2
+	return runGroup("user", []subcommand{
+		{"keygen", "write an X25519 key pair for sealing a bundle's credentials", cmdUserKeygen},
+		{"export", "download one profile's bundle from a cell's admin API", cmdUserExport},
+		{"import", "post a bundle to another cell's admin API", cmdUserImport},
+	}, args, stdout, stderr)
+}
+
+// defaultAdminURL is where the admin API listens when nothing says otherwise.
+const defaultAdminURL = "http://127.0.0.1:9090"
+
+// addAdminFlags registers the flags every admin-API client command shares.
+func addAdminFlags(fs *flag.FlagSet) (url, token, cfgPath *string) {
+	url = fs.String("url", "", "admin API base URL (default: $AGENTFLOW_URL, then the config's admin address, then "+defaultAdminURL+")")
+	token = fs.String("token", "", "admin bearer token (default: $ADMIN_TOKEN)")
+	cfgPath = addConfigFlag(fs)
+	return url, token, cfgPath
+}
+
+// resolveAdmin picks the admin API base URL and token. The URL comes from
+// -url, then $AGENTFLOW_URL, then the config's runtime.admin.listen: the
+// config named by -config, or the one discovery finds in the working
+// directory. A named config that does not load is an error; a discovered one
+// is only a guess, so it falls through to the default instead.
+func resolveAdmin(url, token, cfgPath string) (string, string, error) {
+	if token == "" {
+		token = os.Getenv("ADMIN_TOKEN")
 	}
-	switch args[0] {
-	case "export":
-		return cmdUserExport(args[1:], stdout, stderr)
-	case "import":
-		return cmdUserImport(args[1:], stdout, stderr)
-	case "keygen":
-		return cmdUserKeygen(args[1:], stdout, stderr)
-	default:
-		fmt.Fprintln(stderr, "user: unknown command", args[0])
-		return 2
+	if url == "" {
+		url = os.Getenv("AGENTFLOW_URL")
 	}
+	if url == "" {
+		src, err := config.ResolveSource(cfgPath)
+		if err == nil {
+			var cfg *config.Config
+			if cfg, err = src.Load(discardLogger()); err == nil {
+				url, err = adminURLFromConfig(cfg)
+			}
+		}
+		if err != nil && cfgPath != "" {
+			return "", "", fmt.Errorf("admin address from %s: %w", cfgPath, err)
+		}
+	}
+	if url == "" {
+		url = defaultAdminURL
+	}
+	return strings.TrimSuffix(url, "/"), token, nil
+}
+
+// adminURLFromConfig turns runtime.admin.listen into a URL a client on this
+// host can dial: an unspecified host (":9090", "0.0.0.0:9090") is loopback.
+func adminURLFromConfig(cfg *config.Config) (string, error) {
+	if !cfg.Runtime.Admin.TCPEnabled() {
+		return "", fmt.Errorf("the admin API listens only on its socket (runtime.admin.tcp: false); pass -url")
+	}
+	listen := cfg.Runtime.Admin.Listen
+	if listen == "" {
+		return defaultAdminURL, nil
+	}
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return "", fmt.Errorf("runtime.admin.listen %q: %w", listen, err)
+	}
+	switch host {
+	case "", "0.0.0.0":
+		host = "127.0.0.1"
+	case "::":
+		host = "::1"
+	}
+	return "http://" + net.JoinHostPort(host, port), nil
 }
 
 func adminRequest(method, url, token string, body io.Reader, contentType string) (*http.Response, error) {
@@ -65,12 +122,27 @@ func readKey(path string) ([]byte, error) {
 }
 
 func cmdUserKeygen(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("user keygen", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	prefix := fs.String("out", "agentflow-bundle", "output prefix; writes <prefix>.pub and <prefix>.key")
-	if err := fs.Parse(args); err != nil {
+	info := cmdInfo{
+		Name:    "user keygen",
+		Args:    "[PREFIX]",
+		Summary: "Write an X25519 key pair to PREFIX.pub and PREFIX.key (default prefix: agentflow-bundle).",
+		Detail:  "Give the public key to the exporting cell; keep the private key for the import.",
+	}
+	fs := newCommand(info, stderr)
+	if code, ok := parseArgs(fs, args, map[string]string{
+		"out": "pass the prefix as an argument: agentflow user keygen PREFIX",
+	}); !ok {
+		return code
+	}
+	if fs.NArg() > 1 {
+		positionals(fs, info, 1)
 		return 2
 	}
+	name := "agentflow-bundle"
+	if fs.NArg() == 1 {
+		name = fs.Arg(0)
+	}
+	prefix := &name
 	k, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		fmt.Fprintln(stderr, "keygen:", err)
@@ -92,21 +164,32 @@ func cmdUserKeygen(args []string, stdout, stderr io.Writer) int {
 }
 
 func cmdUserExport(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("user export", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	base := fs.String("url", "http://127.0.0.1:9090", "admin API base URL")
-	token := fs.String("token", os.Getenv("ADMIN_TOKEN"), "admin bearer token (default $ADMIN_TOKEN)")
-	id := fs.String("id", "", "user id to export")
-	pubPath := fs.String("pubkey", "", "X25519 public key file (omit to export credential metadata only)")
-	out := fs.String("out", "", "write the bundle zip here (default stdout)")
-	if err := fs.Parse(args); err != nil {
+	info := cmdInfo{
+		Name:    "user export",
+		Args:    "USER",
+		Summary: "Download a full-fidelity bundle of one profile: identity, handles, memory, files and credentials.",
+		Detail:  "With -pubkey the credentials are sealed to that key; without it only their metadata is exported.",
+	}
+	fs := newCommand(info, stderr)
+	pubPath := fs.String("pubkey", "", "X25519 public key file to seal the credentials to")
+	out := fs.String("out", "", "write the bundle zip to this file instead of stdout")
+	urlFlag, tokenFlag, cfgPath := addAdminFlags(fs)
+	if code, ok := parseArgs(fs, args, map[string]string{
+		"id": "pass the user id as an argument: agentflow user export USER",
+	}); !ok {
+		return code
+	}
+	if !positionals(fs, info, 1) {
 		return 2
 	}
-	if *id == "" {
-		fmt.Fprintln(stderr, "user export: -id is required")
-		return 2
+	id := fs.Arg(0)
+	base, tok, err := resolveAdmin(*urlFlag, *tokenFlag, *cfgPath)
+	if err != nil {
+		fmt.Fprintln(stderr, "user export:", err)
+		return 1
 	}
-	url := strings.TrimSuffix(*base, "/") + "/admin/api/users/" + *id + "/bundle"
+	token := &tok
+	url := base + "/admin/api/users/" + id + "/bundle"
 	if *pubPath != "" {
 		pub, err := readKey(*pubPath)
 		if err != nil {
@@ -135,32 +218,39 @@ func cmdUserExport(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "user export:", err)
 		return 1
 	}
-	if *out == "" {
-		_, _ = stdout.Write(doc)
-		return 0
-	}
-	if err := os.WriteFile(*out, doc, 0o600); err != nil {
+	if err := writeOutput(*out, doc, 0o600, stdout); err != nil {
 		fmt.Fprintln(stderr, "user export:", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "wrote %s (%d bytes)\n", *out, len(doc))
+	if *out != "" {
+		fmt.Fprintf(stdout, "wrote %s (%d bytes)\n", *out, len(doc))
+	}
 	return 0
 }
 
 func cmdUserImport(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("user import", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	base := fs.String("url", "http://127.0.0.1:9090", "admin API base URL")
-	token := fs.String("token", os.Getenv("ADMIN_TOKEN"), "admin bearer token (default $ADMIN_TOKEN)")
-	keyPath := fs.String("key", "", "X25519 private key file (required when credentials are sealed)")
-	if err := fs.Parse(args); err != nil {
-		return 2
+	info := cmdInfo{
+		Name:    "user import",
+		Args:    "BUNDLE.zip",
+		Summary: "Post a bundle to a cell's admin API, which re-encrypts its credentials with that cell's master key.",
+		Detail:  "Without -key, sealed credentials are skipped and only their metadata is imported.",
 	}
-	if fs.NArg() != 1 {
-		fmt.Fprintln(stderr, "user import: exactly one bundle zip argument is required")
+	fs := newCommand(info, stderr)
+	keyPath := fs.String("key", "", "X25519 private key file the bundle's credentials are sealed to")
+	urlFlag, tokenFlag, cfgPath := addAdminFlags(fs)
+	if code, ok := parseArgs(fs, args, nil); !ok {
+		return code
+	}
+	if !positionals(fs, info, 1) {
 		return 2
 	}
 	bundlePath := fs.Arg(0)
+	base, tok, err := resolveAdmin(*urlFlag, *tokenFlag, *cfgPath)
+	if err != nil {
+		fmt.Fprintln(stderr, "user import:", err)
+		return 1
+	}
+	token := &tok
 	doc, err := os.ReadFile(bundlePath)
 	if err != nil {
 		fmt.Fprintln(stderr, "user import:", err)
@@ -193,7 +283,7 @@ func cmdUserImport(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "user import:", err)
 		return 1
 	}
-	resp, err := adminRequest(http.MethodPost, strings.TrimSuffix(*base, "/")+"/admin/api/users/import", *token, &body, mw.FormDataContentType())
+	resp, err := adminRequest(http.MethodPost, base+"/admin/api/users/import", *token, &body, mw.FormDataContentType())
 	if err != nil {
 		fmt.Fprintln(stderr, "user import:", err)
 		return 1

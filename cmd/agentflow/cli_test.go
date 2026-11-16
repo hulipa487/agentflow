@@ -23,10 +23,16 @@ func TestHoistConfigFlags(t *testing.T) {
 		t.Fatalf("engine args changed: %v", got)
 	}
 
-	// init owns -configdir as a boolean alias; do not reorder it.
-	got = hoistConfigFlags([]string{"-configdir", "x", "init"})
-	if strings.Join(got, " ") != "-configdir x init" {
+	// init takes no -config, so a leading one is left for init to refuse.
+	got = hoistConfigFlags([]string{"-config", "x", "init"})
+	if strings.Join(got, " ") != "-config x init" {
 		t.Fatalf("init args changed: %v", got)
+	}
+
+	// Group commands get it after the whole subcommand.
+	got = hoistConfigFlags([]string{"-config", "d/", "config", "show"})
+	if strings.Join(got, " ") != "config show -config d/" {
+		t.Fatalf("group hoist = %v", got)
 	}
 }
 
@@ -35,17 +41,34 @@ func TestHelp(t *testing.T) {
 	if code := cmdHelp(nil, &out, &errOut); code != 0 {
 		t.Fatalf("help exit = %d", code)
 	}
-	for _, want := range []string{"agentflow help", "-config PATH", "-no-console", "commands:"} {
+	for _, want := range []string{"agentflow help", "commands:", "run ", "support-bundle"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("general help missing %q", want)
+		}
+	}
+	// The engine's flags are run's help, generated from its flag set.
+	out.Reset()
+	if code := cmdHelp([]string{"run"}, &out, &errOut); code != 0 {
+		t.Fatalf("run help exit = %d", code)
+	}
+	for _, want := range []string{"usage: agentflow run [flags]", "-config", "-no-console", "-force-single"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("run help missing %q:\n%s", want, out.String())
 		}
 	}
 	out.Reset()
 	if code := cmdHelp([]string{"config"}, &out, &errOut); code != 0 {
 		t.Fatalf("config help exit = %d", code)
 	}
-	if !strings.Contains(out.String(), "config schema") {
-		t.Errorf("config help missing schema: %s", out.String())
+	if !strings.Contains(out.String(), "schema") || !strings.Contains(out.String(), "show") {
+		t.Errorf("config help missing its commands: %s", out.String())
+	}
+	out.Reset()
+	if code := cmdHelp([]string{"config", "show"}, &out, &errOut); code != 0 {
+		t.Fatalf("config show help exit = %d", code)
+	}
+	if !strings.Contains(out.String(), "usage: agentflow config show [flags]") || !strings.Contains(out.String(), "-json") {
+		t.Errorf("config show help: %s", out.String())
 	}
 
 	handled, code := runSubcommand([]string{"nonsense"}, &out, &errOut)
@@ -91,7 +114,7 @@ agents:
 func TestInitLayout(t *testing.T) {
 	dir := t.TempDir()
 	var out, errOut bytes.Buffer
-	if code := cmdInit([]string{"-dir", dir, "-layout", "dir"}, &out, &errOut); code != 0 {
+	if code := cmdInit([]string{dir, "-layout", "dir"}, &out, &errOut); code != 0 {
 		t.Fatalf("init exit = %d: %s", code, errOut.String())
 	}
 	for _, name := range []string{"system.yaml", "channels.yaml", filepath.Join("profiles", "echo.yaml")} {
@@ -99,8 +122,8 @@ func TestInitLayout(t *testing.T) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
-	if !strings.Contains(out.String(), "agentflow -config") {
-		t.Errorf("init output does not point at -config: %s", out.String())
+	if !strings.Contains(out.String(), "agentflow run -config "+dir) {
+		t.Errorf("init output does not point at run -config: %s", out.String())
 	}
 
 }
@@ -112,13 +135,12 @@ func TestInitOutputValidates(t *testing.T) {
 		t.Run(layout, func(t *testing.T) {
 			dir := t.TempDir()
 			var out, errOut bytes.Buffer
-			if code := cmdInit([]string{"-dir", dir, "-layout", layout}, &out, &errOut); code != 0 {
+			if code := cmdInit([]string{dir, "-layout", layout}, &out, &errOut); code != 0 {
 				t.Fatalf("init exit = %d: %s", code, errOut.String())
 			}
-			args := []string{"-config", filepath.Join(dir, "agentflow.yaml")}
-			if layout == "dir" {
-				args = []string{"-configdir", dir}
-			}
+			// -config DIR loads either layout: the file inside it, or the
+			// config directory.
+			args := []string{"-config", dir}
 			out.Reset()
 			errOut.Reset()
 			if code := cmdValidate(args, &out, &errOut); code != 0 {

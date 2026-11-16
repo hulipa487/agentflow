@@ -29,80 +29,96 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// runSubcommand handles the standalone commands. It returns handled=false for
-// the engine path, which keeps `agentflow -config ...` behaving exactly as it
-// did before.
+// topCommand is one entry of `agentflow help`.
+type topCommand struct {
+	name, summary string
+	run           func(args []string, stdout, stderr io.Writer) int
+	// config reports whether the command takes -config, which is what lets
+	// `agentflow -config X <command>` move the flag after the command.
+	config bool
+}
+
+// topCommands is the command list, in the order help shows it. run, version
+// and help are handled before the table is consulted.
+var topCommands = []topCommand{
+	{"run", "run the engine (also what `agentflow [flags]` does)", nil, true},
+	{"init", "write a starter deployment", cmdInit, false},
+	{"validate", "load a config and compile every loop", cmdValidate, true},
+	{"doctor", "check config, loops, credentials, models and backends", cmdDoctor, true},
+	{"config", "schema | path | show", cmdConfig, true},
+	{"loop", "check | test: compile a loop or run a scenario", cmdLoop, false},
+	{"tools", "import-openapi: turn an OpenAPI spec into HTTP tools", cmdTools, false},
+	{"migrate", "store | blobs: copy state to another backend", cmdMigrate, true},
+	{"user", "keygen | export | import: move one profile between cells", cmdUser, true},
+	{"cred", "set | get | list | delete: manage stored credentials", cmdCred, true},
+	{"support-bundle", "collect a redacted diagnostic archive", cmdSupport, true},
+	{"version", "print version information", nil, false},
+	{"help", "show a command's usage and flags", nil, false},
+}
+
+func lookupCommand(name string) (topCommand, bool) {
+	for _, c := range topCommands {
+		if c.name == name {
+			return c, true
+		}
+	}
+	return topCommand{}, false
+}
+
+// runSubcommand handles every command except the engine. It returns
+// handled=false when the arguments run the engine: none at all, `run ...`, or
+// flags first.
 func runSubcommand(args []string, stdout, stderr io.Writer) (bool, int) {
 	if len(args) == 0 {
 		return false, 0
 	}
 	switch args[0] {
+	case "run":
+		return false, 0
+	case "-h", "-help", "--help":
+		printUsage(stdout)
+		return true, 0
+	case "version", "-version", "--version":
+		printVersion(stdout)
+		return true, 0
 	case "help":
 		return true, cmdHelp(args[1:], stdout, stderr)
-	case "version", "--version":
-		fmt.Fprintf(stdout, "agentflow %s\nprelude %d\ngo %s\n", version, vm.PreludeVersion, runtime.Version())
-		return true, 0
-	case "cred":
-		return true, credMain(args[1:], os.Stdin, stdout, stderr)
-	case "validate":
-		return true, cmdValidate(args[1:], stdout, stderr)
-	case "doctor":
-		return true, cmdDoctor(args[1:], stdout, stderr)
-	case "init":
-		return true, cmdInit(args[1:], stdout, stderr)
-	case "config":
-		return true, cmdConfig(args[1:], stdout, stderr)
-	case "loop":
-		return true, cmdLoop(args[1:], stdout, stderr)
-	case "tools":
-		return true, cmdTools(args[1:], stdout, stderr)
-	case "migrate":
-		return true, cmdMigrate(args[1:], stdout, stderr)
-	case "user":
-		return true, cmdUser(args[1:], stdout, stderr)
-	case "support-bundle":
-		return true, cmdSupport(args[1:], stdout, stderr)
-	default:
-		// A flag-first invocation is the engine. A bare unknown word is a
-		// command typo; booting the engine instead would be a surprising
-		// listening process.
-		if !strings.HasPrefix(args[0], "-") {
-			fmt.Fprintf(stderr, "agentflow: unknown command %q\n\n", args[0])
-			printUsage(stderr)
-			return true, 2
-		}
+	}
+	if c, ok := lookupCommand(args[0]); ok && c.run != nil {
+		return true, c.run(args[1:], stdout, stderr)
+	}
+	// A flag-first invocation is the engine. A bare unknown word is a command
+	// typo; booting the engine instead would be a surprising listening process.
+	if strings.HasPrefix(args[0], "-") {
 		return false, 0
 	}
+	fmt.Fprintf(stderr, "agentflow: unknown command %q\n\n", args[0])
+	printUsage(stderr)
+	return true, 2
 }
 
-// hoistConfigFlags lets `agentflow -config deploy/agentflow.yaml validate`
-// work as well as `agentflow validate -config ...`. Only the two config flags
-// are hoisted; engine-only flags stay on the engine path, and init is excluded
-// because its -configdir is a different (deprecated boolean) flag.
+func printVersion(w io.Writer) {
+	fmt.Fprintf(w, "agentflow %s\nprelude %d\ngo %s\n", version, vm.PreludeVersion, runtime.Version())
+}
+
+// hoistConfigFlags lets `agentflow -config deploy/ validate` work as well as
+// `agentflow validate -config deploy/`: a leading -config moves after the
+// command, for the commands that take one.
 func hoistConfigFlags(args []string) []string {
-	if len(args) == 0 || args[0] != "-config" && args[0] != "--config" &&
-		args[0] != "-configdir" && args[0] != "--configdir" &&
-		!strings.HasPrefix(args[0], "-config=") && !strings.HasPrefix(args[0], "--config=") &&
-		!strings.HasPrefix(args[0], "-configdir=") && !strings.HasPrefix(args[0], "--configdir=") {
-		return args
-	}
 	var flags []string
-	i := 0
-	for i < len(args) {
+	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
-		case a == "-config" || a == "--config" || a == "-configdir" || a == "--configdir":
+		case a == "-config" || a == "--config":
 			if i+1 >= len(args) {
 				return args
 			}
 			flags = append(flags, a, args[i+1])
-			i += 2
-		case strings.HasPrefix(a, "-config=") || strings.HasPrefix(a, "--config=") ||
-			strings.HasPrefix(a, "-configdir=") || strings.HasPrefix(a, "--configdir="):
-			flags = append(flags, a)
 			i++
+		case strings.HasPrefix(a, "-config=") || strings.HasPrefix(a, "--config="):
+			flags = append(flags, a)
 		default:
-			if i < len(args) && isCommand(a) && a != "init" && a != "help" {
+			if c, ok := lookupCommand(a); len(flags) > 0 && ok && c.config {
 				return append(append([]string{}, args[i:]...), flags...)
 			}
 			return args
@@ -111,180 +127,68 @@ func hoistConfigFlags(args []string) []string {
 	return args
 }
 
-func isCommand(name string) bool {
-	switch name {
-	case "help", "version", "cred", "validate", "doctor", "init", "config", "loop", "tools", "migrate", "user", "support-bundle":
-		return true
-	}
-	return false
-}
-
-// printUsage is both `agentflow -h` and `agentflow help`. `-config` is
-// deliberately shown first: it is the one flag every mode shares.
+// printUsage is `agentflow help` and `agentflow -h`.
 func printUsage(w io.Writer) {
-	fmt.Fprint(w, `agentflow — self-hosted LLM agent runtime
+	fmt.Fprint(w, `agentflow: self-hosted LLM agent runtime
 
 usage:
-  agentflow [flags]                 run the engine
-  agentflow <command> [flags]       run a standalone command
-  agentflow help [command]          show this help or one command's usage
+  agentflow [run] [flags]            run the engine
+  agentflow <command> [flags] ...    run a command
+  agentflow help <command>           show a command's usage and flags
 
 commands:
-  init          write a starter deployment (single file or config directory)
-  validate      load a config and compile every loop
-  doctor        check config, loops, credentials and model references
-  config        schema | path | show
-  loop          check <file|dir|plugin:name> | test <scenario.yaml>
-  tools         import-openapi <spec> [-out dir]
-  migrate       store|blobs — copy state to another backend
-  user          export|import|keygen — move one profile between cells
-  cred          set|get|list|delete <name>
-  support-bundle  collect diagnostics for a support request
-  version       print version information
-  help          show help for a command
-
-engine flags:
-  -config PATH        config file or directory (default: agentflow.yaml, then config.yaml)
-  -configdir DIR      deprecated alias for -config DIR
-  -workers N          op pool size; overrides runtime.scheduler.workers
-  -log-level LEVEL    dev|debug|info|warn|error (default info)
-  -log-format FORMAT  text|json (default text)
-  -log-file PATH      append logs to a file as well as stderr
-  -log-json           deprecated alias for -log-format json
-  -no-tui             disable the terminal dashboard
-  -no-console         serve the admin and Studio APIs without the static web console
-  -no-webui           deprecated alias for -no-console
-  -version            print version and exit
-
+`)
+	for _, c := range topCommands {
+		fmt.Fprintf(w, "  %-16s %s\n", c.name, c.summary)
+	}
+	fmt.Fprint(w, `
 examples:
-  agentflow init
-  agentflow validate -config deploy/agentflow.yaml
-  agentflow doctor -config deploy/
-  agentflow -config deploy/agentflow.yaml validate
-  agentflow help config
+  agentflow init mydeploy
+  agentflow doctor -config mydeploy
+  agentflow run -config mydeploy
+  agentflow help run
 `)
 }
 
-var commandHelp = map[string]string{
-	"init": `usage: agentflow init [-dir DIR] [-layout file|dir] [-force]
-
-Write a runnable starter deployment. The default layout is one agentflow.yaml;
--layout dir writes system.yaml, channels.yaml and profiles/*.yaml instead.
--configdir is accepted as a deprecated boolean alias for -layout dir.
-`,
-	"validate": `usage: agentflow validate [-config PATH | -configdir DIR]
-
-Load the config, compile every agent and spawn-profile loop, and check the
-gateway route. Relative paths resolve against the config file or directory.
-`,
-	"doctor": `usage: agentflow doctor [-config PATH | -configdir DIR] [-online]
-
-Offline checks: config load, loop compilation, credentials, identity, admin
-authentication, models and channels. -online also connects to the runtime
-store, checks the pgvector extension, and probes each S3 bucket, Redis and
-Qdrant backend. -online is the default when runtime.topology is regional.
-`,
-	"config": `usage: agentflow config <command> [-config PATH | -configdir DIR]
-
-commands:
-  agentflow config schema [-out FILE]   print the JSON schema for agentflow.yaml
-  agentflow config path                 print the resolved config file or directory
-  agentflow config show                 summarize the resolved config (paths, epoch, counts)
-`,
-	"loop": `usage: agentflow loop check <file|dir|plugin:name>
-       agentflow loop test <scenario.yaml>
-`,
-	"tools": `usage: agentflow tools import-openapi <spec> [-out DIR]
-
-Convert an OpenAPI document into declarative tools.http entries.
-`,
-	"migrate": `usage: agentflow migrate store -from <target> -to <target> [-tables LIST] [-append]
-       agentflow migrate blobs -from fs:<dir> [-kind media|files] [-config PATH]
-
-store copies the runtime, identity, credential and memory tables between
-SQLite and PostgreSQL (credentials stay ciphertext; both stores need the same
-master key). Memory keeps its embeddings, recency and TTLs; a PostgreSQL
-destination needs the vector extension when the source has embeddings.
-blobs copies a local media/files directory into the S3 bucket configured for
-the chosen kind. Both are idempotent: rerunning skips what is already there.
-`,
-	"user": `usage: agentflow user keygen [-out PREFIX]
-       agentflow user export -id USER [-pubkey FILE.pub] [-out bundle.zip] [-url URL] [-token TOKEN]
-       agentflow user import [-key FILE.key] bundle.zip [-url URL] [-token TOKEN]
-
-keygen writes an X25519 key pair. export downloads a full-fidelity bundle from
-the admin API; with -pubkey the credentials inside are sealed to that key.
-import posts the bundle to another cell and re-encrypts its credentials with
-that cell's master key. Without -key only credential metadata is imported.
-`,
-	"support-bundle": `usage: agentflow support-bundle [-config PATH | -configdir DIR] [-out FILE]
-
-Collect a redacted diagnostic archive for a support request.
-`,
-	"cred": `usage: agentflow cred <command> [flags] <name>
-
-commands: set, get, list, delete. Values are read from a prompt or stdin,
-never argv.
-`,
-	"version": "usage: agentflow version\n",
-	"help":    "usage: agentflow help [command]\n",
-}
-
+// cmdHelp prints a command's help by running it with -h, so the text comes
+// from the flags the command really defines. `help config show` works the
+// same way, one level down.
 func cmdHelp(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		printUsage(stdout)
 		return 0
 	}
-	text, ok := commandHelp[args[0]]
-	if !ok {
+	switch args[0] {
+	case "run":
+		_, code, _ := parseRunFlags([]string{"-h"}, stdout)
+		return code
+	case "version":
+		fmt.Fprintln(stdout, "usage: agentflow version\n\nPrint the agentflow version, the prelude API version and the Go version.")
+		return 0
+	case "help":
+		fmt.Fprintln(stdout, "usage: agentflow help [command [subcommand]]")
+		return 0
+	}
+	c, ok := lookupCommand(args[0])
+	if !ok || c.run == nil {
 		fmt.Fprintf(stderr, "agentflow: unknown command %q\n\n", args[0])
 		printUsage(stderr)
 		return 2
 	}
-	fmt.Fprint(stdout, text)
-	return 0
-}
-
-// hoistFlagsWithBools moves flags ahead of positionals, like cred's hoistFlags,
-// but knows which flags are boolean so it does not swallow the next argument.
-func hoistFlagsWithBools(args []string, bools map[string]bool) []string {
-	var flags, rest []string
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if strings.HasPrefix(a, "-") {
-			if bools[a] {
-				flags = append(flags, a)
-				continue
-			}
-			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
-				flags = append(flags, a, args[i+1])
-				i++
-				continue
-			}
-		}
-		rest = append(rest, a)
+	rest := append(append([]string{}, args[1:]...), "-h")
+	if code := c.run(rest, stdout, stdout); code != 0 {
+		return code
 	}
-	return append(flags, rest...)
-}
-
-func cliConfigFlags(name string, stderr io.Writer) (*flag.FlagSet, *string, *string) {
-	fs := flag.NewFlagSet(name, flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	cfg := fs.String("config", "", "config file or directory (default: agentflow.yaml, then config.yaml)")
-	dir := fs.String("configdir", "", "deprecated: config directory (use -config DIR)")
-	return fs, cfg, dir
+	return 0
 }
 
 // loadConfigForCLI resolves and loads the same source the engine would use. It
 // deliberately does not chdir: relative paths are rebased onto the config
 // source during load, so validation and boot cannot disagree.
-func loadConfigForCLI(cfgPath, configDir string, stderr io.Writer) (*config.Config, config.Source, error) {
-	src, err := config.ResolveSource(cfgPath, configDir)
+func loadConfigForCLI(cfgPath string, stderr io.Writer) (*config.Config, config.Source, error) {
+	src, err := config.ResolveSource(cfgPath)
 	if err != nil {
 		return nil, config.Source{}, err
-	}
-	if configDir != "" {
-		fmt.Fprintln(stderr, "warning: -configdir is deprecated; use -config DIR")
 	}
 	if src.Legacy {
 		fmt.Fprintln(stderr, "warning: using config.yaml; rename it to agentflow.yaml")
@@ -337,15 +241,20 @@ func validateLoops(cfg *config.Config) error {
 }
 
 func cmdValidate(args []string, stdout, stderr io.Writer) int {
-	fs, cfgPath, configDir := cliConfigFlags("validate", stderr)
-	if err := fs.Parse(args); err != nil {
+	info := cmdInfo{
+		Name:    "validate",
+		Summary: "Load the config, compile every agent and spawn-profile loop, and check the gateway route.",
+		Detail:  "Relative paths resolve against the config file or directory.",
+	}
+	fs := newCommand(info, stderr)
+	cfgPath := addConfigFlag(fs)
+	if code, ok := parseArgs(fs, args, nil); !ok {
+		return code
+	}
+	if !positionals(fs, info, 0) {
 		return 2
 	}
-	if fs.NArg() > 0 {
-		fmt.Fprintln(stderr, "validate: unexpected argument:", fs.Arg(0))
-		return 2
-	}
-	cfg, used, err := loadConfigForCLI(*cfgPath, *configDir, stderr)
+	cfg, used, err := loadConfigForCLI(*cfgPath, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, "config:", err)
 		return 1
@@ -361,30 +270,47 @@ func cmdValidate(args []string, stdout, stderr io.Writer) int {
 }
 
 type doctorResult struct {
-	Status string // PASS | WARN | FAIL | SKIP
-	Name   string
-	Detail string
+	Status string `json:"status"` // PASS | WARN | FAIL | SKIP
+	Name   string `json:"name"`
+	Detail string `json:"detail"`
 }
 
 func cmdDoctor(args []string, stdout, stderr io.Writer) int {
-	fs, cfgPath, configDir := cliConfigFlags("doctor", stderr)
-	online := fs.Bool("online", false, "also check runtime store, vector extension, S3, Redis and Qdrant (default on for regional)")
-	if err := fs.Parse(args); err != nil {
-		return 2
+	info := cmdInfo{
+		Name:    "doctor",
+		Summary: "Check the config, loops, credentials, identity, admin authentication, models and channels.",
+		Detail: `-online also connects to the runtime store, checks the pgvector extension,
+and probes each S3 bucket, Redis and Qdrant backend. It is on by default when
+runtime.topology is regional; -online=false turns it off.`,
 	}
-	if fs.NArg() > 0 {
-		fmt.Fprintln(stderr, "doctor: unexpected argument:", fs.Arg(0))
+	fs := newCommand(info, stderr)
+	cfgPath := addConfigFlag(fs)
+	online := fs.Bool("online", false, "also check the runtime store, vector extension, S3, Redis and Qdrant (default on for regional)")
+	asJSON := fs.Bool("json", false, "print the results as JSON")
+	if code, ok := parseArgs(fs, args, nil); !ok {
+		return code
+	}
+	if !positionals(fs, info, 0) {
 		return 2
 	}
 	var results []doctorResult
+	report := func() {
+		if *asJSON {
+			enc := json.NewEncoder(stdout)
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(results)
+			return
+		}
+		printDoctor(stdout, results)
+	}
 	add := func(status, name, detail string) {
 		results = append(results, doctorResult{status, name, detail})
 	}
 	exit := 0
-	cfg, used, err := loadConfigForCLI(*cfgPath, *configDir, stderr)
+	cfg, used, err := loadConfigForCLI(*cfgPath, stderr)
 	if err != nil {
 		add("FAIL", "configuration", err.Error())
-		printDoctor(stdout, results)
+		report()
 		return 1
 	}
 	builtins.SetPluginDir(cfg.Plugins.Dir)
@@ -475,11 +401,8 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) int {
 	} else {
 		add("SKIP", "network", "no provider connectivity was attempted; pass -online to check backends")
 	}
-	printDoctor(stdout, results)
-	if exit != 0 {
-		return exit
-	}
-	return 0
+	report()
+	return exit
 }
 
 func printDoctor(w io.Writer, results []doctorResult) {
@@ -500,28 +423,21 @@ func sortedKeys[V any](m map[string]V) []string {
 func sortedAgentNames(cfg *config.Config) []string { return sortedKeys(cfg.Agents) }
 
 func cmdConfig(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: agentflow config <schema|path|show> [flags]")
-		return 2
+	return runGroup("config", []subcommand{
+		{"schema", "print the JSON schema for agentflow.yaml", cmdConfigSchema},
+		{"path", "print the resolved config file or directory", cmdConfigPath},
+		{"show", "summarize the resolved config (paths, epoch, counts)", cmdConfigShow},
+	}, args, stdout, stderr)
+}
+
+func cmdConfigSchema(args []string, stdout, stderr io.Writer) int {
+	info := cmdInfo{Name: "config schema", Summary: "Print the JSON schema for agentflow.yaml, for editor validation."}
+	fs := newCommand(info, stderr)
+	out := fs.String("out", "", "write to this file instead of stdout")
+	if code, ok := parseArgs(fs, args, nil); !ok {
+		return code
 	}
-	switch args[0] {
-	case "path":
-		return cmdConfigPath(args[1:], stdout, stderr)
-	case "show":
-		return cmdConfigShow(args[1:], stdout, stderr)
-	case "schema":
-	default:
-		fmt.Fprintln(stderr, "usage: agentflow config <schema|path|show> [flags]")
-		return 2
-	}
-	fs := flag.NewFlagSet("config schema", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	out := fs.String("out", "", "write the schema to this file instead of stdout")
-	if err := fs.Parse(args[1:]); err != nil {
-		return 2
-	}
-	if fs.NArg() > 0 {
-		fmt.Fprintln(stderr, "config schema: unexpected argument:", fs.Arg(0))
+	if !positionals(fs, info, 0) {
 		return 2
 	}
 	reflector := &jsonschema.Reflector{
@@ -540,34 +456,30 @@ func cmdConfig(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	b = append(b, '\n')
-	if *out == "" {
-		_, _ = stdout.Write(b)
-		return 0
-	}
-	if err := os.WriteFile(*out, b, 0o644); err != nil {
+	if err := writeOutput(*out, b, 0o644, stdout); err != nil {
 		fmt.Fprintln(stderr, "schema:", err)
 		return 1
 	}
-	fmt.Fprintln(stdout, "wrote", *out)
+	if *out != "" {
+		fmt.Fprintln(stdout, "wrote", *out)
+	}
 	return 0
 }
 
 func cmdConfigPath(args []string, stdout, stderr io.Writer) int {
-	fs, cfgPath, configDir := cliConfigFlags("config path", stderr)
-	if err := fs.Parse(args); err != nil {
+	info := cmdInfo{Name: "config path", Summary: "Print the config file or directory the engine would load."}
+	fs := newCommand(info, stderr)
+	cfgPath := addConfigFlag(fs)
+	if code, ok := parseArgs(fs, args, nil); !ok {
+		return code
+	}
+	if !positionals(fs, info, 0) {
 		return 2
 	}
-	if fs.NArg() > 0 {
-		fmt.Fprintln(stderr, "config path: unexpected argument:", fs.Arg(0))
-		return 2
-	}
-	src, err := config.ResolveSource(*cfgPath, *configDir)
+	src, err := config.ResolveSource(*cfgPath)
 	if err != nil {
 		fmt.Fprintln(stderr, "config path:", err)
 		return 1
-	}
-	if *configDir != "" {
-		fmt.Fprintln(stderr, "warning: -configdir is deprecated; use -config DIR")
 	}
 	if src.Legacy {
 		fmt.Fprintln(stderr, "warning: using config.yaml; rename it to agentflow.yaml")
@@ -576,58 +488,109 @@ func cmdConfigPath(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// configSummary is what `config show` reports. It holds no value from a
+// secret-bearing field.
+type configSummary struct {
+	Source      string         `json:"source"`
+	Kind        string         `json:"kind"`
+	Epoch       string         `json:"epoch"`
+	Persistence string         `json:"persistence"`
+	Agents      int            `json:"agents"`
+	Channels    int            `json:"channels"`
+	Models      []summaryModel `json:"models"`
+	Loops       []summaryLoop  `json:"loops"`
+	AdminListen string         `json:"admin_listen"`
+	AdminTCP    bool           `json:"admin_tcp"`
+	AdminSocket string         `json:"admin_socket,omitempty"`
+}
+
+type summaryModel struct {
+	Name     string `json:"name"`
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+}
+
+type summaryLoop struct {
+	Name string `json:"name"` // agent name, spawn:<profile> or gateway.route
+	Path string `json:"path"`
+}
+
 // cmdConfigShow answers the question operators actually have: which config did
-// this process resolve, and where did its relative loop paths land? It prints
-// no values from secret-bearing fields.
+// this process resolve, and where did its relative loop paths land?
 func cmdConfigShow(args []string, stdout, stderr io.Writer) int {
-	fs, cfgPath, configDir := cliConfigFlags("config show", stderr)
-	if err := fs.Parse(args); err != nil {
+	info := cmdInfo{Name: "config show", Summary: "Summarize the resolved config: source, epoch, counts, models, loop paths and admin address."}
+	fs := newCommand(info, stderr)
+	cfgPath := addConfigFlag(fs)
+	asJSON := fs.Bool("json", false, "print the summary as JSON")
+	if code, ok := parseArgs(fs, args, nil); !ok {
+		return code
+	}
+	if !positionals(fs, info, 0) {
 		return 2
 	}
-	if fs.NArg() > 0 {
-		fmt.Fprintln(stderr, "config show: unexpected argument:", fs.Arg(0))
-		return 2
-	}
-	cfg, src, err := loadConfigForCLI(*cfgPath, *configDir, stderr)
+	cfg, src, err := loadConfigForCLI(*cfgPath, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, "config show:", err)
 		return 1
 	}
-	kind := "file"
+	sum := configSummary{
+		Source:      src.String(),
+		Kind:        "file",
+		Epoch:       cfg.Epoch,
+		Persistence: cfg.Runtime.Persistence,
+		Agents:      len(cfg.Agents),
+		Channels:    len(cfg.Gateway.Channels),
+		Models:      []summaryModel{},
+		Loops:       []summaryLoop{},
+		AdminListen: cfg.Runtime.Admin.Listen,
+		AdminTCP:    cfg.Runtime.Admin.TCPEnabled(),
+		AdminSocket: cfg.Runtime.Admin.Socket,
+	}
 	if src.IsDir {
-		kind = "directory"
+		sum.Kind = "directory"
 	}
-	fmt.Fprintf(stdout, "source: %s\nkind: %s\nepoch: %s\n", src.String(), kind, cfg.Epoch)
-	scheme := cfg.Runtime.Persistence
-	if i := strings.IndexByte(scheme, ':'); i >= 0 {
-		scheme = scheme[:i]
+	// The scheme only: a DSN carries a password.
+	if i := strings.IndexByte(sum.Persistence, ':'); i >= 0 {
+		sum.Persistence = sum.Persistence[:i]
 	}
-	if scheme == "" {
-		scheme = "default"
+	if sum.Persistence == "" {
+		sum.Persistence = "default"
 	}
-	fmt.Fprintf(stdout, "persistence: %s\n", scheme)
-	fmt.Fprintf(stdout, "agents: %d\nchannels: %d\n", len(cfg.Agents), len(cfg.Gateway.Channels))
+	if sum.AdminListen == "" {
+		sum.AdminListen = "127.0.0.1:9090"
+	}
 	for _, name := range sortedKeys(cfg.Models) {
-		fmt.Fprintf(stdout, "model: %s (%s/%s)\n", name, cfg.Models[name].Provider, cfg.Models[name].Model)
+		sum.Models = append(sum.Models, summaryModel{name, cfg.Models[name].Provider, cfg.Models[name].Model})
 	}
 	for _, name := range sortedAgentNames(cfg) {
-		fmt.Fprintf(stdout, "loop.%s: %s\n", name, cfg.Agents[name].Loop)
+		sum.Loops = append(sum.Loops, summaryLoop{name, cfg.Agents[name].Loop})
 	}
 	for _, name := range sortedKeys(cfg.Profiles.Agent) {
-		fmt.Fprintf(stdout, "loop.spawn:%s: %s\n", name, cfg.Profiles.Agent[name].Loop)
+		sum.Loops = append(sum.Loops, summaryLoop{"spawn:" + name, cfg.Profiles.Agent[name].Loop})
 	}
 	if cfg.Gateway.Route != "" {
-		fmt.Fprintf(stdout, "loop.gateway.route: %s\n", cfg.Gateway.Route)
+		sum.Loops = append(sum.Loops, summaryLoop{"gateway.route", cfg.Gateway.Route})
 	}
-	listen := cfg.Runtime.Admin.Listen
-	if listen == "" {
-		listen = "127.0.0.1:9090"
+	if *asJSON {
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(sum)
+		return 0
 	}
-	socket := cfg.Runtime.Admin.Socket
+	fmt.Fprintf(stdout, "source: %s\nkind: %s\nepoch: %s\n", sum.Source, sum.Kind, sum.Epoch)
+	fmt.Fprintf(stdout, "persistence: %s\n", sum.Persistence)
+	fmt.Fprintf(stdout, "agents: %d\nchannels: %d\n", sum.Agents, sum.Channels)
+	for _, m := range sum.Models {
+		fmt.Fprintf(stdout, "model: %s (%s/%s)\n", m.Name, m.Provider, m.Model)
+	}
+	for _, l := range sum.Loops {
+		fmt.Fprintf(stdout, "loop.%s: %s\n", l.Name, l.Path)
+	}
+	socket := sum.AdminSocket
 	if socket == "" {
 		socket = "(disabled)"
 	}
-	fmt.Fprintf(stdout, "admin.listen: %s (tcp: %v)\nadmin.socket: %s\n", listen, cfg.Runtime.Admin.TCPEnabled(), socket)
+	fmt.Fprintf(stdout, "admin.listen: %s (tcp: %v)\nadmin.socket: %s\n", sum.AdminListen, sum.AdminTCP, socket)
 	return 0
 }
 
@@ -674,30 +637,54 @@ func dropRequired(s *jsonschema.Schema) {
 }
 
 func cmdLoop(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 || (args[0] != "check" && args[0] != "test") {
-		fmt.Fprintln(stderr, "usage: agentflow loop check <file|dir|plugin:name>")
-		fmt.Fprintln(stderr, "       agentflow loop test <scenario.yaml>")
+	return runGroup("loop", []subcommand{
+		{"check", "compile a loop file, a directory of loops, or a builtin plugin", cmdLoopCheck},
+		{"test", "run a loop test scenario", cmdLoopTest},
+	}, args, stdout, stderr)
+}
+
+func cmdLoopCheck(args []string, stdout, stderr io.Writer) int {
+	info := cmdInfo{
+		Name:    "loop check",
+		Args:    "FILE|DIR|plugin:NAME",
+		Summary: "Compile a loop and check the prelude version it declares.",
+	}
+	fs := newCommand(info, stderr)
+	if code, ok := parseArgs(fs, args, nil); !ok {
+		return code
+	}
+	if !positionals(fs, info, 1) {
 		return 2
 	}
-	if len(args) != 2 {
-		fmt.Fprintln(stderr, "usage: agentflow loop check <file|dir|plugin:name>")
-		fmt.Fprintln(stderr, "       agentflow loop test <scenario.yaml>")
+	ref := fs.Arg(0)
+	if err := checkLoop(ref, ref); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	fmt.Fprintln(stdout, "ok:", ref)
+	return 0
+}
+
+func cmdLoopTest(args []string, stdout, stderr io.Writer) int {
+	info := cmdInfo{
+		Name:    "loop test",
+		Args:    "SCENARIO.yaml",
+		Summary: "Run a loop against the scripted messages and expectations in a scenario file.",
+	}
+	fs := newCommand(info, stderr)
+	if code, ok := parseArgs(fs, args, nil); !ok {
+		return code
+	}
+	if !positionals(fs, info, 1) {
 		return 2
 	}
-	if args[0] == "check" {
-		if err := checkLoop(args[1], args[1]); err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
-		}
-		fmt.Fprintln(stdout, "ok:", args[1])
-		return 0
-	}
-	b, err := os.ReadFile(args[1])
+	path := fs.Arg(0)
+	b, err := os.ReadFile(path)
 	if err != nil {
 		fmt.Fprintln(stderr, "loop test:", err)
 		return 1
 	}
-	sc, err := looptest.LoadFile(args[1], b)
+	sc, err := looptest.LoadFile(path, b)
 	if err != nil {
 		fmt.Fprintln(stderr, "loop test:", err)
 		return 1
@@ -710,27 +697,36 @@ func cmdLoop(args []string, stdout, stderr io.Writer) int {
 }
 
 func cmdInit(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("init", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	dir := fs.String("dir", ".", "directory to initialize")
-	layout := fs.String("layout", "file", "file (one agentflow.yaml) or dir (system.yaml + profiles/)")
-	legacyDir := fs.Bool("configdir", false, "deprecated: same as -layout dir")
+	info := cmdInfo{
+		Name:    "init",
+		Args:    "[DIR]",
+		Summary: "Write a runnable starter deployment into DIR (default: the current directory).",
+		Detail: `The default layout is one agentflow.yaml; -layout dir writes system.yaml,
+channels.yaml and profiles/*.yaml instead. Either way, -config DIR loads it.`,
+	}
+	fs := newCommand(info, stderr)
+	layout := fs.String("layout", "file", "file (one agentflow.yaml) or dir (system.yaml, channels.yaml, profiles/)")
 	force := fs.Bool("force", false, "overwrite existing files")
-	if err := fs.Parse(args); err != nil {
+	if code, ok := parseArgs(fs, args, map[string]string{
+		"dir":       "pass the directory as an argument: agentflow init DIR",
+		"configdir": "use -layout dir",
+	}); !ok {
+		return code
+	}
+	if fs.NArg() > 1 {
+		positionals(fs, info, 1)
 		return 2
 	}
-	if fs.NArg() > 0 {
-		fmt.Fprintln(stderr, "init: unexpected argument:", fs.Arg(0))
-		return 2
+	target := "."
+	if fs.NArg() == 1 {
+		target = fs.Arg(0)
 	}
-	useDir := *layout == "dir" || *legacyDir
+	dir := &target
 	if *layout != "file" && *layout != "dir" {
-		fmt.Fprintln(stderr, "init: -layout must be file or dir")
+		fmt.Fprintln(stderr, "agentflow init: -layout must be file or dir")
 		return 2
 	}
-	if *legacyDir {
-		fmt.Fprintln(stderr, "warning: init -configdir is deprecated; use -layout dir")
-	}
+	useDir := *layout == "dir"
 	if err := os.MkdirAll(*dir, 0o755); err != nil {
 		fmt.Fprintln(stderr, "init:", err)
 		return 1
@@ -809,12 +805,54 @@ agents:
 	}
 	if useDir {
 		fmt.Fprintln(stdout, "initialized config directory in", *dir)
-		fmt.Fprintln(stdout, "next: agentflow doctor -config", *dir)
-		fmt.Fprintln(stdout, "then:  agentflow -config", *dir)
 	} else {
 		fmt.Fprintln(stdout, "initialized", filepath.Join(*dir, "agentflow.yaml"))
+	}
+	if filepath.Clean(*dir) == "." {
 		fmt.Fprintln(stdout, "next: agentflow doctor")
-		fmt.Fprintln(stdout, "then:  agentflow")
+		fmt.Fprintln(stdout, "then: agentflow run")
+	} else {
+		fmt.Fprintln(stdout, "next: agentflow doctor -config", *dir)
+		fmt.Fprintln(stdout, "then: agentflow run -config", *dir)
 	}
 	return 0
+}
+
+// runFlags are the engine's flags: `agentflow run [flags]`, or the same flags
+// with no command.
+type runFlags struct {
+	config      string
+	logLevel    string
+	logFormat   string
+	logFile     string
+	noTUI       bool
+	noConsole   bool
+	forceSingle bool
+}
+
+func parseRunFlags(args []string, w io.Writer) (runFlags, int, bool) {
+	info := cmdInfo{
+		Name:    "run",
+		Summary: "Run the engine. `agentflow [flags]` with no command does the same.",
+		Detail: `The worker pool size is runtime.scheduler.workers in the config (default 8).
+Set ADMIN_TOKEN to fix the admin API token; without it a loopback-only
+console mints one per boot.`,
+	}
+	fs := newCommand(info, w)
+	var f runFlags
+	fs.StringVar(&f.config, "config", "", "config file or directory (default: agentflow.yaml, then config.yaml)")
+	fs.StringVar(&f.logLevel, "log-level", "info", "minimum log level: dev, debug, info, warn or error")
+	fs.StringVar(&f.logFormat, "log-format", "text", "log format: text or json")
+	fs.StringVar(&f.logFile, "log-file", "", "also append logs to this file")
+	fs.BoolVar(&f.noTUI, "no-tui", false, "no terminal dashboard; plain logs on stderr")
+	fs.BoolVar(&f.noConsole, "no-console", false, "serve the admin API without the static web console")
+	fs.BoolVar(&f.forceSingle, "force-single", false, "start even if another instance looks live on the store (single topology; only after a crash)")
+	code, ok := parseArgs(fs, args, map[string]string{"version": "run `agentflow version`"})
+	if !ok {
+		return f, code, false
+	}
+	if !positionals(fs, info, 0) {
+		return f, 2, false
+	}
+	return f, 0, true
 }

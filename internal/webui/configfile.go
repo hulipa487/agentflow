@@ -88,11 +88,11 @@ func isStoreTargetContext(ctx []string) bool {
 // configFilePath returns the config file the console edits, or a named reason
 // it cannot edit one.
 //
-// A -configdir instance has no single config file: it is several fragments
+// A config-directory instance has no single config file: it is several fragments
 // (system.yaml, channels.yaml, profiles/*.yaml, triggers/*.yaml), and both the
 // editor and the model-persist path assume one file to swap. Before this the
 // console silently pointed at the -config default ("agentflow.yaml"), which
-// under -configdir is a file that usually does not exist — so the Config tab
+// under a config directory is a file that usually does not exist — so the Config tab
 // 500ed, and if a stray agentflow.yaml happened to be in the working directory
 // the console would have edited that instead.
 func (u *UI) configFilePath() (string, error) {

@@ -13,7 +13,7 @@ func TestResolveSourceFileAndDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := ResolveSource(file, "")
+	got, err := ResolveSource(file)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -24,24 +24,29 @@ func TestResolveSourceFileAndDir(t *testing.T) {
 		t.Fatalf("file accessors = %q/%q", got.ConfigDir(), got.ConfigPath())
 	}
 
-	got, err = ResolveSource("", dir)
+	// A directory holding only agentflow.yaml is that file: `init DIR` writes
+	// one, and -config DIR has to load it.
+	got, err = ResolveSource(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.IsDir || got.Path != file {
+		t.Fatalf("directory with agentflow.yaml = %+v", got)
+	}
+
+	// A directory with system.yaml is a config directory.
+	if err := os.WriteFile(filepath.Join(dir, "system.yaml"), []byte("version: \"1\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err = ResolveSource(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !got.IsDir || got.Dir != dir {
-		t.Fatalf("dir source = %+v", got)
+		t.Fatalf("config directory = %+v", got)
 	}
 	if got.ConfigDir() != dir || got.ConfigPath() != "" {
 		t.Fatalf("dir accessors = %q/%q", got.ConfigDir(), got.ConfigPath())
-	}
-
-	// -config accepts a directory too, so the two spellings agree.
-	got, err = ResolveSource(dir, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !got.IsDir || got.Dir != dir {
-		t.Fatalf("-config directory = %+v", got)
 	}
 }
 
@@ -49,14 +54,14 @@ func TestResolveSourceDiscovery(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 
-	if _, err := ResolveSource("", ""); err == nil {
+	if _, err := ResolveSource(""); err == nil {
 		t.Fatal("ResolveSource succeeded with no config present")
 	}
 
 	if err := os.WriteFile("config.yaml", []byte("version: \"1\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got, err := ResolveSource("", "")
+	got, err := ResolveSource("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +73,7 @@ func TestResolveSourceDiscovery(t *testing.T) {
 	if err := os.WriteFile("agentflow.yaml", []byte("version: \"1\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got, err = ResolveSource("", "")
+	got, err = ResolveSource("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,11 +82,8 @@ func TestResolveSourceDiscovery(t *testing.T) {
 	}
 }
 
-func TestResolveSourceRejectsConflictAndMissing(t *testing.T) {
-	if _, err := ResolveSource("a", "b"); err == nil {
-		t.Fatal("both -config and -configdir accepted")
-	}
-	if _, err := ResolveSource(filepath.Join(t.TempDir(), "missing.yaml"), ""); err == nil {
+func TestResolveSourceRejectsMissing(t *testing.T) {
+	if _, err := ResolveSource(filepath.Join(t.TempDir(), "missing.yaml")); err == nil {
 		t.Fatal("missing explicit config accepted")
 	}
 }

@@ -39,7 +39,7 @@ var staticFS embed.FS
 type Deps struct {
 	ConfigPath string
 	// ConfigDir is set instead of ConfigPath when the instance runs from a
-	// config directory (-configdir): such an instance has several fragments
+	// config directory: such an instance has several fragments
 	// rather than one file, so the Config tab and the model persist/revert
 	// paths — all of which swap a single file — report a named reason instead
 	// of editing the wrong one.
@@ -291,7 +291,7 @@ func (u *UI) handleState(w http.ResponseWriter, r *http.Request) {
 	}
 	// config_path reports what this instance actually runs from — a config
 	// file, or the directory whose fragments it was built from. Reporting the
-	// -config default in both cases is what made a -configdir instance look
+	// -config default in both cases is what made a config-directory instance look
 	// like it was reading a file that does not exist.
 	configPath := d.ConfigPath
 	if d.ConfigDir != "" {

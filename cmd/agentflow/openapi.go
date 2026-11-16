@@ -5,7 +5,6 @@ package main
 // commits the YAML, and the runtime never fetches a spec at boot.
 
 import (
-	"flag"
 	"fmt"
 	"io"
 	"net/url"
@@ -19,26 +18,27 @@ import (
 )
 
 func cmdTools(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 || args[0] != "import-openapi" {
-		fmt.Fprintln(stderr, "usage: agentflow tools import-openapi <spec.yaml|spec.json> [-out file] [-base-url url] [-auth service] [-prefix p]")
-		return 2
+	return runGroup("tools", []subcommand{
+		{"import-openapi", "turn an OpenAPI document into tools.http entries", cmdToolsImportOpenAPI},
+	}, args, stdout, stderr)
+}
+
+func cmdToolsImportOpenAPI(args []string, stdout, stderr io.Writer) int {
+	info := cmdInfo{
+		Name:    "tools import-openapi",
+		Args:    "SPEC",
+		Summary: "Convert an OpenAPI document (YAML or JSON) into a tools.http block for the config.",
 	}
-	fs := flag.NewFlagSet("tools import-openapi", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	out := fs.String("out", "", "write the generated tools block to this file instead of stdout")
+	fs := newCommand(info, stderr)
+	out := fs.String("out", "", "write to this file instead of stdout")
 	baseURL := fs.String("base-url", "", "override the server URL from the spec")
 	auth := fs.String("auth", "", "credential service to reference as auth.service")
 	prefix := fs.String("prefix", "", "prefix every generated tool name")
 	readOnly := fs.Bool("read-only", false, "only import GET and HEAD operations")
-	if err := fs.Parse(hoistFlagsWithBools(args[1:], map[string]bool{"-read-only": true})); err != nil {
-		return 2
+	if code, ok := parseArgs(fs, args, nil); !ok {
+		return code
 	}
-	if fs.NArg() == 0 {
-		fmt.Fprintln(stderr, "tools import-openapi: a spec file is required")
-		return 2
-	}
-	if fs.NArg() > 1 {
-		fmt.Fprintln(stderr, "tools import-openapi: unexpected argument:", fs.Arg(1))
+	if !positionals(fs, info, 1) {
 		return 2
 	}
 	b, err := os.ReadFile(fs.Arg(0))
@@ -66,15 +66,13 @@ func cmdTools(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "tools import-openapi:", err)
 		return 1
 	}
-	if *out == "" {
-		_, _ = stdout.Write(outBytes)
-		return 0
-	}
-	if err := os.WriteFile(*out, outBytes, 0o644); err != nil {
+	if err := writeOutput(*out, outBytes, 0o644, stdout); err != nil {
 		fmt.Fprintln(stderr, "tools import-openapi:", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "wrote %d tools to %s\n", len(defs), *out)
+	if *out != "" {
+		fmt.Fprintf(stdout, "wrote %d tools to %s\n", len(defs), *out)
+	}
 	return 0
 }
 

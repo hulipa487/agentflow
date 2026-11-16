@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -86,7 +85,6 @@ import (
 	"agentflow/internal/drivers/webhook"
 	"agentflow/internal/llog"
 	"agentflow/internal/tui"
-	"agentflow/internal/vm"
 	"agentflow/internal/webui"
 )
 
@@ -94,53 +92,30 @@ import (
 var version = "dev"
 
 func main() {
-	// Standalone commands (version, validate, doctor, init, config schema,
-	// loop check, tools import-openapi, cred) never boot the engine. The
-	// no-subcommand path below is unchanged.
-	if handled, code := runSubcommand(hoistConfigFlags(os.Args[1:]), os.Stdout, os.Stderr); handled {
+	// Every command but run is standalone and never boots the engine.
+	args := hoistConfigFlags(os.Args[1:])
+	if handled, code := runSubcommand(args, os.Stdout, os.Stderr); handled {
 		os.Exit(code)
 	}
-
-	cfgPath := flag.String("config", "", "config file or directory (default: agentflow.yaml, then config.yaml)")
-	configDir := flag.String("configdir", "", "deprecated: config directory (use -config DIR)")
-	workers := flag.Int("workers", 8, "op worker pool size (overrides runtime.scheduler.workers)")
-	logLevel := flag.String("log-level", "info", "minimum log level: dev|debug|info|warn|error (additive)")
-	logFormat := flag.String("log-format", "", "log format: text|json (default text)")
-	logJSON := flag.Bool("log-json", false, "deprecated: use -log-format json")
-	logFile := flag.String("log-file", "", "append logs to this file as well as stderr")
-	noTUI := flag.Bool("no-tui", false, "disable the terminal dashboard (plain stderr logs)")
-	noConsole := flag.Bool("no-console", false, "serve the admin API without the static web console")
-	noWebUI := flag.Bool("no-webui", false, "deprecated: use -no-console")
-	forceSingle := flag.Bool("force-single", false, "start despite another live instance using the store (single topology; use only after a crash)")
-	showVersion := flag.Bool("version", false, "print version and exit")
-	flag.Usage = func() { printUsage(os.Stderr) }
-	flag.Parse()
-
-	if *showVersion {
-		fmt.Printf("agentflow %s\nprelude %d\ngo %s\n", version, vm.PreludeVersion, stdruntime.Version())
-		return
+	if len(args) > 0 && args[0] == "run" {
+		args = args[1:]
 	}
-	// A positional argument is almost always a subcommand typo or a stray
-	// shell argument. Refusing it is safer than silently booting an engine the
-	// caller did not mean to start.
-	if flag.NArg() > 0 {
-		fmt.Fprintf(os.Stderr, "agentflow: unexpected argument %q\nrun `agentflow help` for commands and examples\n", flag.Arg(0))
-		os.Exit(2)
+	flags, code, ok := parseRunFlags(args, os.Stderr)
+	if !ok {
+		os.Exit(code)
 	}
-
-	explicit := map[string]bool{}
-	flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+	cfgPath, noTUI, noConsole, forceSingle := &flags.config, &flags.noTUI, &flags.noConsole, &flags.forceSingle
 
 	startedAt := time.Now()
 
-	lvl, err := llog.ParseLevel(*logLevel)
+	lvl, err := llog.ParseLevel(flags.logLevel)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "agentflow:", err)
 		os.Exit(2)
 	}
 	var logOut io.Writer = os.Stderr
-	if *logFile != "" {
-		f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if flags.logFile != "" {
+		f, err := os.OpenFile(flags.logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "agentflow: log file:", err)
 			os.Exit(1)
@@ -148,17 +123,7 @@ func main() {
 		defer f.Close()
 		logOut = io.MultiWriter(os.Stderr, f)
 	}
-	format := strings.ToLower(strings.TrimSpace(*logFormat))
-	if format == "" {
-		format = "text"
-		if *logJSON {
-			format = "json"
-		}
-	}
-	if *logJSON && *logFormat != "" && format != "json" {
-		fmt.Fprintln(os.Stderr, "agentflow: -log-json conflicts with -log-format", *logFormat)
-		os.Exit(2)
-	}
+	format := strings.ToLower(strings.TrimSpace(flags.logFormat))
 	var log *slog.Logger
 	switch format {
 	case "text":
@@ -170,18 +135,12 @@ func main() {
 		os.Exit(2)
 	}
 
-	cfgSource, err := config.ResolveSource(*cfgPath, *configDir)
+	cfgSource, err := config.ResolveSource(*cfgPath)
 	if err != nil {
 		log.Error("config source", "err", err)
 		os.Exit(2)
 	}
-	if explicit["configdir"] {
-		log.Warn("-configdir is deprecated; use -config DIR")
-	}
-	if explicit["no-webui"] {
-		log.Warn("-no-webui is deprecated; use -no-console (the admin and Studio APIs stay available)")
-	}
-	consoleEnabled := !*noConsole && !*noWebUI
+	consoleEnabled := !*noConsole
 	if cfgSource.Legacy {
 		log.Warn("using config.yaml; rename it to agentflow.yaml so both the engine and the CLI discover the same file")
 	}
@@ -362,14 +321,10 @@ func main() {
 	llmMgr.SetSecretResolver(func(raw string) (string, bool) {
 		return credResolver.Resolve(ctx, raw)
 	})
-	// runtime.scheduler.workers and -workers are one setting with one
-	// precedence rule: the flag wins when given, otherwise the config decides,
-	// otherwise the flag's default (8) stands.
-	workerCount := *workers
-	if !explicit["workers"] {
-		if w := cfg.Runtime.Scheduler.Workers; w != nil && *w > 0 {
-			workerCount = *w
-		}
+	// runtime.scheduler.workers is the one place the pool size is set.
+	workerCount := 8
+	if w := cfg.Runtime.Scheduler.Workers; w != nil {
+		workerCount = *w
 	}
 	if workerCount <= 0 {
 		log.Error("worker pool size must be positive", "value", workerCount)

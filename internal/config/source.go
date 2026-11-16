@@ -53,30 +53,13 @@ func (s Source) Load(log *slog.Logger) (*Config, error) {
 	return Load(s.Path)
 }
 
-// ResolveSource turns the -config / -configdir pair into one absolute source.
-// -config accepts either a file or a directory. When neither flag names a
-// source, it discovers agentflow.yaml and then config.yaml in the working
-// directory, and reports which legacy name it used. The engine and every CLI
-// subcommand use this function, so they cannot disagree about what "the
-// config" is.
-func ResolveSource(path, dir string) (Source, error) {
-	if path != "" && dir != "" {
-		return Source{}, fmt.Errorf("-config and -configdir are mutually exclusive")
-	}
-	if dir != "" {
-		abs, err := filepath.Abs(dir)
-		if err != nil {
-			return Source{}, err
-		}
-		info, err := os.Stat(abs)
-		if err != nil {
-			return Source{}, fmt.Errorf("configdir %s: %w", abs, err)
-		}
-		if !info.IsDir() {
-			return Source{}, fmt.Errorf("configdir %s: not a directory", abs)
-		}
-		return Source{Dir: abs, IsDir: true}, nil
-	}
+// ResolveSource turns -config into one absolute source. The path may name a
+// file, a config directory (system.yaml + profiles/), or a directory holding an
+// agentflow.yaml. With no path it discovers agentflow.yaml and then config.yaml
+// in the working directory, and reports when it used the legacy name. The
+// engine and every CLI command use this function, so they cannot disagree
+// about what "the config" is.
+func ResolveSource(path string) (Source, error) {
 	if path != "" {
 		return resolvePath(path, false)
 	}
@@ -100,9 +83,20 @@ func resolvePath(path string, legacy bool) (Source, error) {
 		return Source{}, fmt.Errorf("config %s: %w", abs, err)
 	}
 	if info.IsDir() {
+		// `init DIR` writes DIR/agentflow.yaml, so -config DIR has to find it.
+		// A directory with a system.yaml is a config directory either way.
+		if !fileExists(filepath.Join(abs, "system.yaml")) && fileExists(filepath.Join(abs, "agentflow.yaml")) {
+			file := filepath.Join(abs, "agentflow.yaml")
+			return Source{Path: file, Dir: abs}, nil
+		}
 		return Source{Dir: abs, IsDir: true}, nil
 	}
 	return Source{Path: abs, Dir: filepath.Dir(abs), Legacy: legacy}, nil
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 func mustGetwd() string {

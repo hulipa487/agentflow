@@ -14,11 +14,11 @@ import (
 	"agentflow/internal/drivers/llm"
 )
 
-// TestConfigDirDegradesWithANamedReason: an instance started with -configdir
+// TestConfigDirDegradesWithANamedReason: an instance started on a config directory
 // has several fragments rather than one file, so the Config tab and the model
 // persist/revert paths — all of which swap a single file — must say so. Before
 // this they silently pointed at the -config default ("agentflow.yaml"), which
-// under -configdir is a file that usually does not exist: the Config tab 500ed,
+// under a config directory is a file that usually does not exist: the Config tab 500ed,
 // and a stray agentflow.yaml in the working directory would have been edited
 // instead of the deployment's own config.
 func TestConfigDirDegradesWithANamedReason(t *testing.T) {
@@ -61,7 +61,7 @@ func TestConfigDirDegradesWithANamedReason(t *testing.T) {
 }
 
 // TestConfigDirStillServesTheModelsTab: hot-applying a model to this process
-// needs no file, so it keeps working under -configdir. Only the file-touching
+// needs no file, so it keeps working under a config directory. Only the file-touching
 // operations degrade; the list reports the file as unavailable rather than
 // pretending the (nonexistent) config file has no models.
 func TestConfigDirStillServesTheModelsTab(t *testing.T) {

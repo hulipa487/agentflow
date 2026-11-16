@@ -143,20 +143,8 @@ func TestCredUsageErrors(t *testing.T) {
 	}
 }
 
-// TestHoistFlags: flags after the positional command still parse.
-func TestHoistFlags(t *testing.T) {
-	got := hoistFlags([]string{"set", "name", "-config", "cfg.yaml", "-configdir", "d"})
-	want := "-config cfg.yaml -configdir d set name"
-	if strings.Join(got, " ") != want {
-		t.Fatalf("hoistFlags = %v, want [%s]", got, want)
-	}
-	if got := hoistFlags([]string{"get", "-h"}); strings.Join(got, " ") != "get -h" {
-		t.Fatalf("lone trailing flag must stay: %v", got)
-	}
-}
-
 // TestCredFlagsAfterCommand: the natural CLI spelling works — the store path
-// comes from -configdir even though it follows the positional name.
+// comes from -config even though it follows the positional name.
 func TestCredFlagsAfterCommand(t *testing.T) {
 	cfg := credTestEnv(t)
 	var out, errOut bytes.Buffer

@@ -1,6 +1,6 @@
 // Config directories: an alternative to the single agentflow.yaml file.
 //
-// A deployment may instead pass -configdir <dir> and lay its configuration
+// A deployment may instead pass -config <dir> and lay its configuration
 // out as fragments:
 //
 //	system.yaml     -> the top-level Config minus agents/channels (required)

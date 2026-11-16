@@ -287,7 +287,7 @@ async function loadConfig() {
   const c = await res.json();
   if (!c.ok) {
     // A named reason this pane cannot be used here rather than a blank
-    // editor — a -configdir instance has fragments, not one file to swap.
+    // editor — a config-directory instance has fragments, not one file to swap.
     configMtime = 0;
     document.getElementById("configPath").textContent = "";
     document.getElementById("configEditor").value = "";

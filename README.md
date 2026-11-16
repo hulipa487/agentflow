@@ -41,7 +41,7 @@ Build from binary:
 git clone --recurse-submodules https://github.com/hulipa487/agentflow.git
 cd agentflow
 make
-./agentflow -config agentflow.example.yaml
+./agentflow run -config agentflow.example.yaml
 ```
 
 ## Why exactly AgentFlow?

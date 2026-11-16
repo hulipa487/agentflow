@@ -9,7 +9,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -48,33 +47,33 @@ var storeTables = []string{
 }
 
 func cmdMigrate(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: agentflow migrate <store|blobs> [flags]")
-		return 2
-	}
-	switch args[0] {
-	case "store":
-		return cmdMigrateStore(args[1:], stdout, stderr)
-	case "blobs":
-		return cmdMigrateBlobs(args[1:], stdout, stderr)
-	default:
-		fmt.Fprintln(stderr, "migrate: unknown target", args[0], "(want store or blobs)")
-		return 2
-	}
+	return runGroup("migrate", []subcommand{
+		{"store", "copy runtime, identity, credential and memory tables between SQLite and PostgreSQL", cmdMigrateStore},
+		{"blobs", "copy a local media or files directory into S3", cmdMigrateBlobs},
+	}, args, stdout, stderr)
 }
 
 func cmdMigrateStore(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("migrate store", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	from := fs.String("from", "", "source store target (sqlite path or postgres DSN)")
-	to := fs.String("to", "", "destination store target (sqlite path or postgres DSN)")
-	tablesFlag := fs.String("tables", "", "comma-separated table subset (default: every known table)")
-	appendRows := fs.Bool("append", false, "copy into a non-empty destination")
-	if err := fs.Parse(args); err != nil {
-		return 2
+	info := cmdInfo{
+		Name:    "migrate store",
+		Summary: "Copy the runtime, identity, credential and memory tables from one store to another.",
+		Detail: `A target is a SQLite path or a PostgreSQL DSN. Credentials stay ciphertext, so
+both stores need the same master key. Memory keeps its embeddings, recency and
+TTLs; a PostgreSQL destination needs the vector extension when the source has
+embeddings. The source is never modified, and a rerun into an empty
+destination is safe.
+
+tables: ` + strings.Join(storeTables, ", "),
 	}
-	if fs.NArg() > 0 {
-		fmt.Fprintln(stderr, "migrate store: unexpected argument:", fs.Arg(0))
+	fs := newCommand(info, stderr)
+	from := fs.String("from", "", "source store: SQLite path or PostgreSQL DSN")
+	to := fs.String("to", "", "destination store: SQLite path or PostgreSQL DSN")
+	tablesFlag := fs.String("tables", "", "comma-separated subset of the tables (default: all)")
+	appendRows := fs.Bool("append", false, "copy into a destination that already has rows")
+	if code, ok := parseArgs(fs, args, nil); !ok {
+		return code
+	}
+	if !positionals(fs, info, 0) {
 		return 2
 	}
 	if *from == "" || *to == "" {
@@ -275,30 +274,29 @@ func copyTable(ctx context.Context, src, dst *storedb.DB, table string) (int64, 
 }
 
 func cmdMigrateBlobs(args []string, stdout, stderr io.Writer) int {
-	fs, cfgPath, configDir := cliConfigFlags("migrate blobs", stderr)
-	from := fs.String("from", "", "source directory (fs:<dir> or a bare path)")
+	info := cmdInfo{
+		Name:    "migrate blobs",
+		Args:    "DIR",
+		Summary: "Copy a local media or files directory into the S3 bucket the config sets for that kind.",
+		Detail:  "Blobs are content-addressed, so a rerun skips what is already in the bucket.",
+	}
+	fs := newCommand(info, stderr)
+	cfgPath := addConfigFlag(fs)
 	kind := fs.String("kind", "media", "which S3 settings to use: media or files")
-	if err := fs.Parse(args); err != nil {
+	if code, ok := parseArgs(fs, args, map[string]string{
+		"from": "pass the directory as an argument: agentflow migrate blobs DIR",
+	}); !ok {
+		return code
+	}
+	if !positionals(fs, info, 1) {
 		return 2
 	}
-	if fs.NArg() > 0 {
-		fmt.Fprintln(stderr, "migrate blobs: unexpected argument:", fs.Arg(0))
-		return 2
-	}
-	if *from == "" {
-		fmt.Fprintln(stderr, "migrate blobs: -from is required")
-		return 2
-	}
-	dir := strings.TrimSpace(strings.TrimPrefix(*from, "fs:"))
-	if dir == "" {
-		fmt.Fprintln(stderr, "migrate blobs: -from names no directory")
-		return 2
-	}
+	dir := fs.Arg(0)
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
 		fmt.Fprintf(stderr, "migrate blobs: %s is not a directory\n", dir)
 		return 1
 	}
-	cfg, _, err := loadConfigForCLI(*cfgPath, *configDir, stderr)
+	cfg, _, err := loadConfigForCLI(*cfgPath, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, "config:", err)
 		return 1

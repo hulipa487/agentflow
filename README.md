@@ -113,7 +113,7 @@ Edit the loop while it runs and every live session switches to the new code at i
 **🔌 Models and channels**
 - Anthropic, OpenAI (Chat Completions and Responses), Gemini, and anything OpenAI-compatible (Ollama, vLLM, LiteLLM, OpenRouter...).
 - Streaming, tool calls, thinking/reasoning capture, prompt-cache accounting, multimodal input.
-- Telegram, generic webhooks (sync or async with a callback), GitHub webhooks, and a `bridge` channel for forwarding between deployments.
+- Telegram, generic webhooks (sync or async with a callback), GitHub webhooks, a `bridge` channel for forwarding between deployments, and an `openai` channel that makes an agent answer the OpenAI Chat Completions API — clients need only a base URL and a key.
 
 **🗄️ Memory**
 - SQLite (vectors built in), PostgreSQL (with or without pgvector), Qdrant, Redis, Redis vector search, and an in-process volatile store.

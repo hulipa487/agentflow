@@ -243,7 +243,19 @@ type Runtime struct {
 		// EgressPerMinute caps http.request and mail.send ops per tenant per
 		// minute. A fixed window resets each minute.
 		EgressPerMinute int `yaml:"egress_per_minute"`
+		// EphemeralPerTenant caps concurrent one-turn sessions per tenant. It is
+		// separate from sessions_per_tenant — stateless traffic must not consume
+		// the conversation slots — and unset means 16, the default the OpenAI
+		// channel documents. An explicit 0 disables the bound.
+		EphemeralPerTenant *int `yaml:"ephemeral_per_tenant"`
 	} `yaml:"limits"`
+	// Sessions is the conversation lifecycle. idle_unload unloads a session
+	// after that long without activity; its Lua locals are gone after that, so
+	// a loop keeps durable state in session.state.* — the documented contract
+	// (D10). Unset is 30m; "0" disables unloading.
+	Sessions struct {
+		IdleUnload string `yaml:"idle_unload"`
+	} `yaml:"sessions"`
 	Persistence string            `yaml:"persistence"` // e.g. sqlite://./data/agentflow.db
 	Admin       AdminConfig       `yaml:"admin"`
 	Studio      StudioConfig      `yaml:"studio"`
@@ -290,6 +302,33 @@ type Runtime struct {
 // saving, matching how deployments describe "09:00 local" for a single region.
 func (r Runtime) TimezoneOffset() time.Duration {
 	return time.Duration(r.TimezoneOffsetHours * float64(time.Hour))
+}
+
+// EphemeralCap is the effective per-tenant bound on concurrent ephemeral
+// sessions. Unset means 16 — the default the OpenAI channel documents — and an
+// explicit 0 disables the bound. The pointer is what keeps those two apart: an
+// int alone cannot tell "not configured" from "disabled".
+func (r Runtime) EphemeralCap() int {
+	if r.Limits.EphemeralPerTenant == nil {
+		return 16
+	}
+	return *r.Limits.EphemeralPerTenant
+}
+
+// IdleUnload is how long a conversation may sit idle before the supervisor
+// unloads it. Unset means 30m; an explicit 0 disables unloading. The session
+// id and its durable state survive — the next message recreates the actor and
+// the loop starts from the top.
+func (r Runtime) IdleUnload() time.Duration {
+	raw := strings.TrimSpace(r.Sessions.IdleUnload)
+	if raw == "" {
+		return 30 * time.Minute
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d < 0 {
+		return 0
+	}
+	return d
 }
 
 // CredentialsConfig controls the encrypted per-tenant credential store. When
@@ -1197,13 +1236,30 @@ type Gateway struct {
 }
 
 type Channel struct {
-	Name   string `yaml:"name"`
-	Type   string `yaml:"type"` // webhook | telegram | ghhook | bridge
-	Mode   string `yaml:"mode"` // telegram: polling (default) | webhook | auto
-	Agent  string `yaml:"agent"`
-	Path   string `yaml:"path"` // route mounted on the shared server, e.g. /webhook/<chan>/<uuid>/
-	Token  string `yaml:"token"`
-	Secret string `yaml:"secret"` // ghhook: webhook secret for HMAC verification (env-interpolated)
+	Name   string   `yaml:"name"`
+	Type   string   `yaml:"type"` // webhook | telegram | ghhook | bridge | openai
+	Mode   string   `yaml:"mode"` // telegram: polling (default) | webhook | auto
+	Agent  string   `yaml:"agent"`
+	Agents []string `yaml:"agents"` // openai: the agents exposed as model ids
+	Path   string   `yaml:"path"`   // route mounted on the shared server, e.g. /webhook/<chan>/<uuid>/
+	Token  string   `yaml:"token"`
+	Secret string   `yaml:"secret"` // ghhook: webhook secret for HMAC verification (env-interpolated)
+	// Auth is the openai channel's credential mode: user_token (a per-user
+	// bearer token, requires runtime.identity.enabled), key (a shared key from
+	// keys:), or none (loopback listeners only).
+	Auth string `yaml:"auth"`
+	// Keys are the accepted shared keys for auth: key. Like every secret field
+	// they may be ${VAR} or cred:<service> references, resolved at construction.
+	Keys []string `yaml:"keys"`
+	// MaxRequestBytes bounds an openai request body (default 32 MiB).
+	MaxRequestBytes int `yaml:"max_request_bytes"`
+	// ExposeReasoning sends model reasoning as reasoning_content. Off by
+	// default: it leaks the model's thinking to the caller.
+	ExposeReasoning bool `yaml:"expose_reasoning"`
+	// Journal is the audit mode for this channel: full | metadata | off.
+	// Empty means full, except for type: openai, whose default is metadata
+	// because coding contexts are large and private.
+	Journal string `yaml:"journal"`
 	// SecretToken is the telegram webhook secret (env-interpolated or cred:
 	// reference, resolved like Token). Telegram presents it as the
 	// X-Telegram-Bot-Api-Secret-Token header on every delivery. Empty with
@@ -1847,6 +1903,18 @@ func validate(path string, c *Config) error {
 	default:
 		return fmt.Errorf("%s: runtime.topology %q is not a tier (want \"single\" or \"regional\")", path, c.Runtime.Topology)
 	}
+	// Limits are counts and rates: a negative value is meaningless, and the
+	// difference between "unset" (the default) and 0 (disabled) is carried by
+	// the pointer on ephemeral_per_tenant.
+	if n := c.Runtime.Limits.SessionsPerTenant; n < 0 {
+		return fmt.Errorf("%s: runtime.limits.sessions_per_tenant must be >= 0 (0 disables the bound)", path)
+	}
+	if n := c.Runtime.Limits.EgressPerMinute; n < 0 {
+		return fmt.Errorf("%s: runtime.limits.egress_per_minute must be >= 0 (0 disables the bound)", path)
+	}
+	if p := c.Runtime.Limits.EphemeralPerTenant; p != nil && *p < 0 {
+		return fmt.Errorf("%s: runtime.limits.ephemeral_per_tenant must be >= 0 (0 disables the bound; unset means 16)", path)
+	}
 	for key, raw := range map[string]string{
 		"runtime.cluster.session_ttl":   c.Runtime.Cluster.SessionTTL,
 		"runtime.cluster.poll_interval": c.Runtime.Cluster.PollInterval,
@@ -1880,6 +1948,17 @@ func validate(path string, c *Config) error {
 		}
 		if d < 0 {
 			return fmt.Errorf("%s: runtime.shutdown_grace must be >= 0", path)
+		}
+	}
+	// idle_unload 0 is meaningful (disabled), so this cannot join the
+	// positive-only duration loop either.
+	if raw := strings.TrimSpace(c.Runtime.Sessions.IdleUnload); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("%s: runtime.sessions.idle_unload: %v", path, err)
+		}
+		if d < 0 {
+			return fmt.Errorf("%s: runtime.sessions.idle_unload must be >= 0 (0 disables unloading)", path)
 		}
 	}
 	if strings.TrimSpace(c.Runtime.Admin.Listen) != "" {

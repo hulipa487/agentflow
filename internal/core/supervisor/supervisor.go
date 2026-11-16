@@ -6,6 +6,7 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -95,6 +96,27 @@ type Supervisor struct {
 	sessionCap     int
 	tenants        map[string]string
 	pushSameTenant bool
+
+	// ephemeralCap bounds one tenant's concurrent ephemeral sessions. It is
+	// separate from sessionCap: an ephemeral session costs a VM and a goroutine
+	// for the length of one request, and counting it against the conversation
+	// cap would let a burst of stateless traffic lock a tenant out of its own
+	// chats. 0 disables the bound. ephemeralTenants counts the live ones;
+	// ephemeralTenant remembers each one's tenant so the count can be undone
+	// when it exits.
+	ephemeralCap     int
+	ephemeralTenants map[string]int
+	ephemeralTenant  map[string]string
+
+	// journalMode resolves a channel's journal mode for every spawned actor.
+	// Nil is full.
+	journalMode func(channel string) session.JournalMode
+
+	// idleUnload is how long a conversation may sit idle before the janitor
+	// unloads it. 0 disables the janitor. janitorEvery is the sweep period
+	// (a minute), lowered by tests.
+	idleUnload   time.Duration
+	janitorEvery time.Duration
 	// vmMemory is the per-state allocation cap new sessions get (0 =
 	// uncapped). See SetVMMemory.
 	vmMemory int64
@@ -134,19 +156,22 @@ func New(defs map[string]*AgentDef, gw *gateway.Registry, p *pool.Pool, shellMgr
 		}
 	}
 	return &Supervisor{
-		defs:            defs,
-		gw:              gw,
-		pool:            p,
-		shellMgr:        shellMgr,
-		sessions:        map[string]*session.Actor{},
-		cancels:         map[string]context.CancelFunc{},
-		retired:         map[string]struct{}{},
-		leaseLost:       map[string]struct{}{},
-		templates:       templates,
-		safetyBySession: map[string]*safety.Dispatcher{},
-		tenants:         map[string]string{},
-		requests:        request.New(),
-		log:             log.With("module", "supervisor"),
+		defs:             defs,
+		gw:               gw,
+		pool:             p,
+		shellMgr:         shellMgr,
+		sessions:         map[string]*session.Actor{},
+		cancels:          map[string]context.CancelFunc{},
+		retired:          map[string]struct{}{},
+		leaseLost:        map[string]struct{}{},
+		templates:        templates,
+		safetyBySession:  map[string]*safety.Dispatcher{},
+		tenants:          map[string]string{},
+		ephemeralTenants: map[string]int{},
+		ephemeralTenant:  map[string]string{},
+		requests:         request.New(),
+		janitorEvery:     time.Minute,
+		log:              log.With("module", "supervisor"),
 	}
 }
 
@@ -170,6 +195,23 @@ func (s *Supervisor) SetProfileSettings(p session.ProfileSettings) { s.profileSe
 // whose sessions are all busy with it cannot spawn actors without bound. 0
 // (the default) disables the bound. Called by main from runtime.limits.
 func (s *Supervisor) SetSessionCap(n int) { s.sessionCap = n }
+
+// SetEphemeralCap sets the per-tenant bound on concurrent ephemeral sessions.
+// 0 disables it. It is a separate budget from SetSessionCap: a stateless
+// request's session lives for one turn and must not consume a conversation
+// slot. Called by main from runtime.limits.
+func (s *Supervisor) SetEphemeralCap(n int) { s.ephemeralCap = n }
+
+// SetJournalMode installs the channel→journal-mode lookup every spawned actor
+// uses. Nil (the default) journals every channel in full.
+func (s *Supervisor) SetJournalMode(fn func(channel string) session.JournalMode) {
+	s.journalMode = fn
+}
+
+// SetIdleUnload sets how long a conversation may sit idle before it is
+// unloaded. 0 (the default at this layer) disables the janitor; main passes
+// runtime.sessions.idle_unload, whose own default is 30m. Call before Start.
+func (s *Supervisor) SetIdleUnload(d time.Duration) { s.idleUnload = d }
 
 // SetVMMemory sets the per-Luau-state allocation cap every new session gets
 // (runtime.vm.memory_limit, now live). 0 = uncapped. With the session cap it
@@ -195,7 +237,113 @@ func tenantOf(msg session.Message) string {
 }
 
 // Start fixes the context used for lazily spawned actors.
-func (s *Supervisor) Start(ctx context.Context) { s.ctx = ctx }
+func (s *Supervisor) Start(ctx context.Context) {
+	s.ctx = ctx
+	if s.idleUnload > 0 {
+		go s.idleJanitor(ctx)
+	}
+}
+
+// idleJanitor unloads conversations that have been idle past the configured
+// window. One goroutine per process, once a minute: unloading is housekeeping,
+// not a per-message cost.
+func (s *Supervisor) idleJanitor(ctx context.Context) {
+	tick := time.NewTicker(s.janitorEvery)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			s.SweepIdle()
+		}
+	}
+}
+
+// SweepIdle unloads every conversation that qualifies right now. It is the
+// janitor's whole pass, exported so tests (and an operator tool) can run it
+// without waiting for the ticker.
+//
+// A session is unloaded only when all hold: idle longer than the setting, not
+// busy, mailbox empty, not a persistent daemon, not ephemeral, and owning no
+// live resource — a timer, a shell, a live child, or a parked agent.request.
+// The last check is what keeps an unload from severing work the session is
+// waiting on: those four are the only things that outlive a parked actor.
+func (s *Supervisor) SweepIdle() {
+	if s.idleUnload <= 0 {
+		return
+	}
+	now := time.Now()
+	s.mu.Lock()
+	candidates := make([]string, 0, len(s.sessions))
+	for key, a := range s.sessions {
+		if a.Ephemeral || a.Busy() || len(a.Mailbox) > 0 {
+			continue
+		}
+		if def := s.defs[a.Identity.Agent]; def != nil && def.Persistent {
+			continue
+		}
+		if now.Sub(a.LastActivity()) < s.idleUnload {
+			continue
+		}
+		candidates = append(candidates, key)
+	}
+	s.mu.Unlock()
+
+	for _, key := range candidates {
+		if s.ownsLiveResource(key) {
+			continue
+		}
+		s.mu.Lock()
+		a := s.sessions[key]
+		cancel := s.cancels[key]
+		// Re-check under the lock: the session may have taken a message or a
+		// resource since the snapshot above.
+		eligible := a != nil && !a.Busy() && len(a.Mailbox) == 0 &&
+			time.Since(a.LastActivity()) >= s.idleUnload
+		s.mu.Unlock()
+		if !eligible || cancel == nil {
+			continue
+		}
+		a.Unload()
+		cancel()
+		metrics.Inc("agentflow_sessions_unloaded")
+		s.log.Info("session unloaded after idle", "session", key, "idle_for", time.Since(a.LastActivity()).String())
+	}
+}
+
+// ownsLiveResource reports whether a session holds anything that outlives its
+// parked actor. Call without s.mu held.
+func (s *Supervisor) ownsLiveResource(skey string) bool {
+	if s.sched != nil && s.sched.OwnerPending(skey) > 0 {
+		return true
+	}
+	if s.shellMgr != nil && s.shellMgr.Owned(skey) > 0 {
+		return true
+	}
+	if s.requests.PendingFor(skey) > 0 {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range s.sessions {
+		if a.Identity.ParentID == skey {
+			return true
+		}
+	}
+	return false
+}
+
+// LiveLocal reports whether this instance holds a live actor for sessKey. It
+// is the liveness function for shell reclaim in a single topology, where there
+// is no lease table to ask: a handle whose session is not here belongs to a
+// process that is gone.
+func (s *Supervisor) LiveLocal(sessKey string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.sessions[sessKey]
+	return ok
+}
 
 // BootPersistent delivers a synthetic boot message to every agent definition
 // marked persistent, so daemon agents (cron schedulers, queue consumers)
@@ -284,6 +432,10 @@ type SessionRouter interface {
 	// failover loop asks it before re-booting a daemon; a store that cannot
 	// answer makes the loop skip rather than risk a second copy.
 	Live(ctx context.Context, sessKey string) (bool, error)
+	// ReleaseSession gives up this instance's claim on one session, so the next
+	// owner does not wait out the lease. The idle janitor uses it after
+	// unloading a conversation.
+	ReleaseSession(ctx context.Context, sessKey string) error
 }
 
 // SetHub installs the router that decides whether a delivered message is this
@@ -316,11 +468,48 @@ func (s *Supervisor) DeliverLocal(agent, key string, msg session.Message) error 
 	}
 	skey := agent + "|" + key
 
-	a, err := s.ensureSession(agent, skey, def, tenantOf(msg))
+	a, err := s.ensureSession(agent, skey, def, tenantOf(msg), false)
 	if err != nil {
 		return err
 	}
 
+	select {
+	case a.Mailbox <- msg:
+		return nil
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	}
+}
+
+// ErrTenantBusy is what DeliverEphemeral returns when a tenant is at its
+// concurrent ephemeral-session bound. The channel maps it to HTTP 429, so the
+// error is a refusal rather than a runtime failure.
+var ErrTenantBusy = errors.New("ephemeral session cap reached")
+
+// ErrSessionCap is the keyed-session cap's refusal. The channel maps it to 429
+// like ErrTenantBusy; both are "retry shortly", not "something broke".
+var ErrSessionCap = errors.New("live-session cap reached")
+
+// DeliverEphemeral delivers one message to a one-turn session for (agent, key).
+//
+// It never calls the hub: an ephemeral key is unique per request, so two
+// instances cannot both own it, and a lease row would exist only to say so.
+// The actor serves exactly one message, asks for the inbox again, and exits;
+// nothing of it survives the request.
+//
+// A key that already has a session attaches to it rather than starting a second
+// one — the Idempotency-Key retry path relies on that: a repeat while the first
+// request is still running joins it.
+func (s *Supervisor) DeliverEphemeral(agent, key string, msg session.Message) error {
+	def, ok := s.defs[agent]
+	if !ok {
+		return &UnknownAgentError{Agent: agent}
+	}
+	skey := agent + "|" + key
+	a, err := s.ensureSession(agent, skey, def, tenantOf(msg), true)
+	if err != nil {
+		return err
+	}
 	select {
 	case a.Mailbox <- msg:
 		return nil
@@ -348,9 +537,15 @@ func (s *Supervisor) DeliverLocal(agent, key string, msg session.Message) error 
 //
 // tenant is the first message's tenant, for the per-tenant session cap (E18):
 // the one place actors are created is where the bound applies.
-func (s *Supervisor) ensureSession(agent, skey string, def *AgentDef, tenant string) (*session.Actor, error) {
+func (s *Supervisor) ensureSession(agent, skey string, def *AgentDef, tenant string, ephemeral bool) (*session.Actor, error) {
 	s.mu.Lock()
 	if a, ok := s.sessions[skey]; ok {
+		// An ephemeral key is unique per request, so a hit is an idempotent
+		// retry joining the running request; it does not re-bind or re-count.
+		if ephemeral {
+			s.mu.Unlock()
+			return a, nil
+		}
 		err := s.bindTenantLocked(skey, tenant)
 		s.mu.Unlock()
 		if err != nil {
@@ -358,10 +553,19 @@ func (s *Supervisor) ensureSession(agent, skey string, def *AgentDef, tenant str
 		}
 		return a, nil
 	}
-	if tenant != "" && s.sessionCap > 0 && s.countTenantLocked(tenant) >= s.sessionCap {
+	if ephemeral {
+		if tenant != "" && s.ephemeralCap > 0 && s.ephemeralTenants[tenant] >= s.ephemeralCap {
+			s.mu.Unlock()
+			metrics.Inc("agentflow_ephemeral_cap_drops")
+			return nil, fmt.Errorf("%w: tenant %s has %d ephemeral sessions in flight (limit %d); retry shortly or raise runtime.limits.ephemeral_per_tenant",
+				ErrTenantBusy, tenant, s.ephemeralTenants[tenant], s.ephemeralCap)
+		}
+	} else if tenant != "" && s.sessionCap > 0 && s.countTenantLocked(tenant) >= s.sessionCap {
+		n := s.countTenantLocked(tenant)
 		s.mu.Unlock()
 		metrics.Inc("agentflow_session_cap_drops")
-		return nil, fmt.Errorf("tenant %s is at the live-session cap (%d); refusing to spawn another session", tenant, s.sessionCap)
+		return nil, fmt.Errorf("%w: tenant %s has %d live sessions (limit %d); wait for one to end or raise runtime.limits.sessions_per_tenant",
+			ErrSessionCap, tenant, n, s.sessionCap)
 	}
 	s.mu.Unlock()
 
@@ -376,6 +580,7 @@ func (s *Supervisor) ensureSession(agent, skey string, def *AgentDef, tenant str
 		CanContact:     def.CanContact,
 		Capabilities:   def.Capabilities,
 		PushSameTenant: s.pushSameTenant,
+		Ephemeral:      ephemeral,
 	}
 	a := session.New(skey, identity, def.Info, s.gw, s, s.sched, s.users, def.Safety, def.Handlers, s.pool, s.log)
 	a.LoopFile = def.LoopFile
@@ -384,6 +589,8 @@ func (s *Supervisor) ensureSession(agent, skey string, def *AgentDef, tenant str
 	a.OnExit = s.onActorExit
 	a.SetProfileSettings(s.profileSettings)
 	a.Journal = s.EgressJournal
+	a.JournalModeOf = s.journalMode
+	a.Ephemeral = ephemeral
 	a.MemBudget = s.vmMemory
 	a.Tracer = s.tracer
 	a.TracePayloads = s.tracePayloads
@@ -395,6 +602,9 @@ func (s *Supervisor) ensureSession(agent, skey string, def *AgentDef, tenant str
 		// Lost the race: the actor built above was never started, so its
 		// context is the only thing to release.
 		cancel()
+		if ephemeral {
+			return existing, nil
+		}
 		if err := s.bindTenantLocked(skey, tenant); err != nil {
 			return nil, err
 		}
@@ -403,12 +613,20 @@ func (s *Supervisor) ensureSession(agent, skey string, def *AgentDef, tenant str
 	s.sessions[skey] = a
 	s.cancels[skey] = cancel
 	s.safetyBySession[skey] = def.Safety
-	if tenant != "" {
-		s.tenants[skey] = tenant
+	if ephemeral {
+		if tenant != "" {
+			s.ephemeralTenant[skey] = tenant
+			s.ephemeralTenants[tenant]++
+		}
+		metrics.Inc("agentflow_ephemeral_sessions")
+	} else {
+		if tenant != "" {
+			s.tenants[skey] = tenant
+		}
+		metrics.Inc("agentflow_sessions_active")
 	}
 	go a.Run(actorCtx)
-	metrics.Inc("agentflow_sessions_active")
-	s.log.Info("session spawned", "session", skey)
+	s.log.Info("session spawned", "session", skey, "ephemeral", ephemeral)
 	return a, nil
 }
 
@@ -526,18 +744,38 @@ func (s *Supervisor) onActorExit(id session.Identity, reason session.EndReason) 
 		delete(s.cancels, id.SessionID)
 		delete(s.tenants, id.SessionID)
 		delete(s.safetyBySession, id.SessionID)
-		metrics.Add("agentflow_sessions_active", -1)
-		metrics.Inc("agentflow_children_died")
-		if _, lost := s.leaseLost[id.SessionID]; lost {
-			// The lease moved to a peer. Retiring the id here would make every
-			// later send to this conversation fail if this instance wins it
-			// back, so the loss marker is consumed without retiring.
-			delete(s.leaseLost, id.SessionID)
-		} else if s.retired != nil {
-			s.retired[id.SessionID] = struct{}{}
+		if id.Ephemeral {
+			// An ephemeral id is unique per request and never comes back, so
+			// retiring it would grow the map by one entry per request forever.
+			// It cannot have lost a lease (it never took one), and it is not a
+			// child whose death a parent should hear about.
+			if t, had := s.ephemeralTenant[id.SessionID]; had {
+				if s.ephemeralTenants[t] <= 1 {
+					delete(s.ephemeralTenants, t)
+				} else {
+					s.ephemeralTenants[t]--
+				}
+				delete(s.ephemeralTenant, id.SessionID)
+			}
+			metrics.Add("agentflow_ephemeral_sessions", -1)
+		} else {
+			metrics.Add("agentflow_sessions_active", -1)
+			if reason != session.EndUnloaded {
+				metrics.Inc("agentflow_children_died")
+			}
+			if _, lost := s.leaseLost[id.SessionID]; lost {
+				// The lease moved to a peer. Retiring the id here would make every
+				// later send to this conversation fail if this instance wins it
+				// back, so the loss marker is consumed without retiring.
+				delete(s.leaseLost, id.SessionID)
+			} else if reason != session.EndUnloaded && s.retired != nil {
+				// An unloaded conversation is not dead: the next message
+				// recreates it, so its id must stay resolvable.
+				s.retired[id.SessionID] = struct{}{}
+			}
 		}
 	}
-	if id.ParentID != "" {
+	if id.ParentID != "" && reason != session.EndUnloaded {
 		parent = s.sessions[id.ParentID]
 	}
 	s.mu.Unlock()
@@ -551,6 +789,16 @@ func (s *Supervisor) onActorExit(id session.Identity, reason session.EndReason) 
 		// The context is detached on purpose: the session is already gone, and
 		// the reap must not be cancelled by whatever cancelled it.
 		s.shellMgr.ReapSession(context.Background(), id.SessionID)
+	}
+	// An unloaded conversation gives its lease back at once, so another instance
+	// can serve the next message instead of waiting out the TTL. The release
+	// gets its own context: the actor's is already cancelled.
+	if reason == session.EndUnloaded && s.hub != nil {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := s.hub.ReleaseSession(releaseCtx, id.SessionID); err != nil {
+			s.log.Warn("release of an unloaded session's lease failed", "session", id.SessionID, "err", err)
+		}
+		cancel()
 	}
 
 	if parent != nil {

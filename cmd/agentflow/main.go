@@ -33,6 +33,7 @@ import (
 	"agentflow/internal/core/budget"
 	"agentflow/internal/core/bundle"
 	"agentflow/internal/core/caps"
+	"agentflow/internal/core/chatreq"
 	"agentflow/internal/core/credentials"
 	"agentflow/internal/core/files"
 	"agentflow/internal/core/fleet"
@@ -64,6 +65,7 @@ import (
 	"agentflow/internal/core/users"
 	"agentflow/internal/drivers/bridge"
 	"agentflow/internal/drivers/browser"
+	"agentflow/internal/drivers/chatapi"
 	"agentflow/internal/drivers/fetch"
 	"agentflow/internal/drivers/ghhook"
 	"agentflow/internal/drivers/httpd"
@@ -318,6 +320,11 @@ func main() {
 
 	// Drivers and shared infrastructure.
 	llmMgr := llm.NewManager(cfg.Models, log)
+	// The OpenAI channel's parsed requests live here, in Go, not in Lua (D6).
+	// The channel writes; llm.forward and openai.request read. One registry
+	// per process is enough: refs are UUIDs, and every channel shares the same
+	// op handler maps.
+	openaiRequests := chatreq.NewRegistry()
 	llmMgr.SetSecretResolver(func(raw string) (string, bool) {
 		return credResolver.Resolve(ctx, raw)
 	})
@@ -948,12 +955,13 @@ func main() {
 			}
 		}
 		llmHandlers := caps.MeteredLLMHandlers(llmMgr, mediaStore, caps.Metering{
-			Pool:   pool,
-			Quota:  userQuota,
-			Agent:  name,
-			Ledger: usageWriter,
-			Events: usageEvents,
-			Log:    log,
+			Pool:     pool,
+			Quota:    userQuota,
+			Agent:    name,
+			Ledger:   usageWriter,
+			Events:   usageEvents,
+			Log:      log,
+			Requests: openaiRequests,
 		})
 		for k, h := range gateOps(enforce, name, effectiveCaps, "llm.chat", llmHandlers, &withheld) {
 			handlers[k] = h
@@ -1122,12 +1130,13 @@ func main() {
 			}
 		}
 		llmHandlers := caps.MeteredLLMHandlers(llmMgr, mediaStore, caps.Metering{
-			Pool:   pool,
-			Quota:  userQuota,
-			Agent:  pname,
-			Ledger: usageWriter,
-			Events: usageEvents,
-			Log:    log,
+			Pool:     pool,
+			Quota:    userQuota,
+			Agent:    pname,
+			Ledger:   usageWriter,
+			Events:   usageEvents,
+			Log:      log,
+			Requests: openaiRequests,
 		})
 		for k, h := range gateOps(enforce, pname, profileCaps, "llm.chat", llmHandlers, &withheld) {
 			handlers[k] = h
@@ -1319,6 +1328,13 @@ func main() {
 	// pool's fairness, the sharpest bound, is not here — it is how the pool
 	// works now, not a setting.
 	sup.SetSessionCap(cfg.Runtime.Limits.SessionsPerTenant)
+	// Ephemeral sessions have their own bound: a burst of stateless requests
+	// must not consume the tenant's conversation slots.
+	sup.SetEphemeralCap(cfg.Runtime.EphemeralCap())
+	// Idle conversations are unloaded after runtime.sessions.idle_unload
+	// (default 30m, 0 disables). The loop starts from the top on the next
+	// message; durable state belongs in session.state.*.
+	sup.SetIdleUnload(cfg.Runtime.IdleUnload())
 	if mem, err := parseByteSize(cfg.Runtime.VM.MemoryLimit); err != nil {
 		log.Error("runtime.vm.memory_limit is not a size", "value", *cfg.Runtime.VM.MemoryLimit, "err", err)
 		exit(1)
@@ -1334,37 +1350,52 @@ func main() {
 	// take it) delivers the message itself, and one that does not queues it for
 	// the owner. Without a shared store both are local, the lease is
 	// uncontended, and this behaves exactly as it did before.
-	hubQueue, err := inbox.Open(cfg.ClusterStore(), leaseMgr.Owner(), log)
-	if err != nil {
-		log.Error("session inbox failed", "err", err)
-		exit(1)
+	// A single process that is the only process needs no per-session lease: the
+	// lease exists to decide which instance runs a conversation, and there is
+	// only one. -force-single keeps it, because the flag's whole point is that
+	// two processes may share the store after all — and then the lease is the
+	// only thing keeping a session from running twice.
+	useHub := useSessionHub(cfg, *forceSingle)
+	var hub *sessionhub.Hub
+	var hubQueue *inbox.Queue
+	if useHub {
+		hubQueue, err = inbox.Open(cfg.ClusterStore(), leaseMgr.Owner(), log)
+		if err != nil {
+			log.Error("session inbox failed", "err", err)
+			exit(1)
+		}
+		defer hubQueue.Close()
+		hub = sessionhub.New(leaseMgr, hubQueue, sup.DeliverLocal, log)
+		// A store in another region makes the hub's two periods a deployment's
+		// business: the poll is the added latency a message pays when it arrives
+		// on the wrong instance, and the TTL is how long a killed instance's
+		// sessions stay unavailable. Unset, the hub's own defaults (250ms, 30s)
+		// stand.
+		if d := cfg.Runtime.Cluster.ClusterPollInterval(); d > 0 {
+			hub.SetPoll(d)
+		}
+		if d := cfg.Runtime.Cluster.ClusterSessionTTL(); d > 0 {
+			hub.SetSessionTTL(d)
+		}
+		sup.SetHub(hub)
+		// A session this instance loses to a peer must stop locally at once, not
+		// keep running turns the new owner is also running. StopSessionForLease
+		// cancels the actor without retiring the id, so this instance can run the
+		// conversation again if it later wins the lease back.
+		hub.SetOnLost(func(sessKey string) {
+			log.Warn("session lease lost to another instance; stopping the local actor", "session", sessKey)
+			sup.StopSessionForLease(sessKey)
+		})
+		// Instance-local memory is keyed by the ownership generation: when a
+		// session moves to another instance and comes back, the rows its earlier
+		// life wrote here are invisible instead of being mistaken for the current
+		// conversation. A single process has one generation (0), so the source
+		// stays unset.
+		memMgr.SetGenerationSource(hub.Generation)
+		go hub.Drain(ctx)
+	} else {
+		log.Info("single topology: session leases and the shared inbox are off")
 	}
-	defer hubQueue.Close()
-	hub := sessionhub.New(leaseMgr, hubQueue, sup.DeliverLocal, log)
-	// A store in another region makes the hub's two periods a deployment's
-	// business: the poll is the added latency a message pays when it arrives on
-	// the wrong instance, and the TTL is how long a killed instance's sessions
-	// stay unavailable. Unset, the hub's own defaults (250ms, 30s) stand.
-	if d := cfg.Runtime.Cluster.ClusterPollInterval(); d > 0 {
-		hub.SetPoll(d)
-	}
-	if d := cfg.Runtime.Cluster.ClusterSessionTTL(); d > 0 {
-		hub.SetSessionTTL(d)
-	}
-	sup.SetHub(hub)
-	// A session this instance loses to a peer must stop locally at once, not
-	// keep running turns the new owner is also running. StopSessionForLease
-	// cancels the actor without retiring the id, so this instance can run the
-	// conversation again if it later wins the lease back.
-	hub.SetOnLost(func(sessKey string) {
-		log.Warn("session lease lost to another instance; stopping the local actor", "session", sessKey)
-		sup.StopSessionForLease(sessKey)
-	})
-	// Instance-local memory is keyed by the ownership generation: when a
-	// session moves to another instance and comes back, the rows its earlier
-	// life wrote here are invisible instead of being mistaken for the current
-	// conversation.
-	memMgr.SetGenerationSource(hub.Generation)
 	// Group-identity validation: the router proposes, the engine resolves.
 	// A proposal naming a group the sender is not active in is refused at the
 	// deliver boundary; an accepted one stamps the derived membership uuid
@@ -1379,18 +1410,19 @@ func main() {
 		}
 		return tenancy.MembershipUUID(personalUUID, groupUUID), nil
 	})
-	go hub.Drain(ctx)
 
 	// Daemon failover. BootPersistent runs once per instance at startup, so a
 	// daemon whose instance is killed stays down until some instance restarts.
 	// Check every half session TTL: FailoverPersistent asks the lease table
 	// whether anyone owns the daemon and claims it when nobody does, so a peer
 	// that also notices still runs the boot turn once.
-	failoverEvery := hub.SessionTTL() / 2
-	if failoverEvery < time.Second {
-		failoverEvery = time.Second
+	if hub != nil {
+		failoverEvery := hub.SessionTTL() / 2
+		if failoverEvery < time.Second {
+			failoverEvery = time.Second
+		}
+		every(ctx, failoverEvery, func() { sup.FailoverPersistent(ctx) })
 	}
-	every(ctx, failoverEvery, func() { sup.FailoverPersistent(ctx) })
 
 	// Shell handle reclaim. A session that ends reaps its own shells, but an
 	// instance that is killed never runs that, and its containers would stay on
@@ -1399,8 +1431,17 @@ func main() {
 	// grace window, is released. A handle whose session is alive is left alone —
 	// and has its clock refreshed, which is what makes the window a grace period
 	// for a failover rather than a countdown from creation.
+	//
+	// The liveness question is asked of the lease in a fleet, and of this
+	// process's session map in single: there is no other process to ask about.
+	liveSession := func(ctx context.Context, sessKey string) (bool, error) {
+		if hub != nil {
+			return hub.Live(ctx, sessKey)
+		}
+		return sup.LiveLocal(sessKey), nil
+	}
 	reclaim := func() {
-		n, err := shellMgr.Sweep(ctx, shell.ReclaimGrace, hub.Live)
+		n, err := shellMgr.Sweep(ctx, shell.ReclaimGrace, liveSession)
 		if err != nil {
 			log.Warn("shell reclaim failed", "err", err)
 			return
@@ -1433,10 +1474,12 @@ func main() {
 		if err := tenReg.Sweep(ctx); err != nil {
 			log.Warn("tenancy sweep failed", "err", err)
 		}
-		if n, err := hubQueue.Sweep(ctx); err != nil {
-			log.Warn("inbox sweep failed", "err", err)
-		} else if n > 0 {
-			log.Info("delivered inbox rows reclaimed", "rows", n)
+		if hubQueue != nil {
+			if n, err := hubQueue.Sweep(ctx); err != nil {
+				log.Warn("inbox sweep failed", "err", err)
+			} else if n > 0 {
+				log.Info("delivered inbox rows reclaimed", "rows", n)
+			}
 		}
 		if n, err := fleetReg.Sweep(ctx, time.Now().Add(-fleet.SweepAfter)); err != nil {
 			log.Warn("instance registry sweep failed", "err", err)
@@ -1487,6 +1530,25 @@ func main() {
 	// Message journal (core-owned audit). Every inbound event is recorded at
 	// the router and every egress at the session actor; loops and channels
 	// can neither skip nor forge it. Journal errors are logged, never fatal.
+	//
+	// The mode is per channel and both call sites apply it: the supervisor's
+	// lookup serves every actor's egress, and the inbound callback below reads
+	// the same map. A channel with type: openai defaults to metadata, so its
+	// coding context is never written to the audit trail.
+	journalModes := make(map[string]session.JournalMode, len(cfg.Gateway.Channels))
+	for i, ch := range cfg.Gateway.Channels {
+		name := ch.Name
+		if name == "" {
+			name = fmt.Sprintf("%s-%d", ch.Type, i)
+		}
+		journalModes[name] = session.ParseJournalMode(ch.JournalMode())
+	}
+	sup.SetJournalMode(func(channel string) session.JournalMode {
+		if m, ok := journalModes[channel]; ok {
+			return m
+		}
+		return session.JournalFull
+	})
 	if cfg.Audit.AuditEnabled() {
 		if days := cfg.Audit.AuditRetention(); days > 0 {
 			prune := func() {
@@ -1506,19 +1568,21 @@ func main() {
 		sup.EgressJournal = func(rec session.EgressRecord) {
 			errStr := rec.Err
 			entry := runtime.JournalEntry{
-				ID:          rec.InReplyTo,
-				Direction:   "out",
-				Status:      rec.Status,
-				Channel:     rec.Channel,
-				Chat:        rec.ReplyTo,
-				Sender:      rec.ReplyTo,
-				UserUUID:    rec.UserUUID,
-				Agent:       rec.Agent,
-				SessionID:   rec.SessionID,
-				Type:        "agent",
-				Text:        rec.Text,
-				Attachments: rec.Attachments,
-				Err:         errStr,
+				ID:              rec.InReplyTo,
+				Direction:       "out",
+				Status:          rec.Status,
+				Channel:         rec.Channel,
+				Chat:            rec.ReplyTo,
+				Sender:          rec.ReplyTo,
+				UserUUID:        rec.UserUUID,
+				Agent:           rec.Agent,
+				SessionID:       rec.SessionID,
+				Type:            "agent",
+				Text:            rec.Text,
+				Attachments:     rec.Attachments,
+				TextBytes:       rec.TextBytes,
+				AttachmentBytes: rec.AttachmentBytes,
+				Err:             errStr,
 			}
 			if entry.ID == "" {
 				entry.ID = uuid.NewString()
@@ -1587,21 +1651,35 @@ func main() {
 			if msg.Provenance != nil && msg.Provenance.UserUUID != nil {
 				userUUID = *msg.Provenance.UserUUID
 			}
-			if err := journalSink.RecordMessage(ctx, runtime.JournalEntry{
-				ID:          msg.ID,
-				Ts:          ts,
-				Direction:   "in",
-				Status:      status,
-				Channel:     in.Channel,
-				Chat:        chat,
-				Sender:      msg.From,
-				UserUUID:    userUUID,
-				Agent:       in.Agent,
-				Type:        msg.Type,
-				Text:        msg.Text,
-				Attachments: msg.Attachments,
-				Provenance:  prov,
-			}); err != nil {
+			mode := journalModes[in.Channel]
+			if mode == session.JournalOff {
+				return
+			}
+			entry := runtime.JournalEntry{
+				ID:              msg.ID,
+				Ts:              ts,
+				Direction:       "in",
+				Status:          status,
+				Channel:         in.Channel,
+				Chat:            chat,
+				Sender:          msg.From,
+				UserUUID:        userUUID,
+				Agent:           in.Agent,
+				Type:            msg.Type,
+				Text:            msg.Text,
+				Attachments:     msg.Attachments,
+				TextBytes:       len(msg.Text),
+				AttachmentBytes: session.AttachmentBytes(msg.Attachments),
+				Provenance:      prov,
+			}
+			// metadata keeps the row and its sizes and drops the payload; off
+			// keeps nothing. For a channel that processes private code, a row
+			// nobody can read is worse than no row.
+			if mode == session.JournalMetadata {
+				entry.Text = ""
+				entry.Attachments = nil
+			}
+			if err := journalSink.RecordMessage(ctx, entry); err != nil {
 				log.Warn("journal ingress write failed", "err", err)
 			}
 		}
@@ -1654,6 +1732,10 @@ func main() {
 
 	httpdLog := log.With("module", "httpd")
 	httpSrv := httpd.New(cfg.Gateway.Listen, httpdLog)
+	// The OpenAI channel refuses requests while the instance drains. The admin
+	// server is constructed later in this function (it needs the stores), so
+	// the closure reads a variable assigned there.
+	readyFn := func() bool { return true }
 
 	// User-facing profile API (opt-in): registration and channel linking on
 	// the same public listener the HTTP channels attach to. Off by default —
@@ -1778,6 +1860,53 @@ func main() {
 				Timeout:    timeout,
 			}, sink, httpSrv, mstore, mpol, log)
 			gw.Register(d)
+		case "openai":
+			agents := ch.Agents
+			if len(agents) == 0 && ch.Agent != "" {
+				agents = []string{ch.Agent}
+			}
+			keys := make([]string, 0, len(ch.Keys))
+			unresolved := false
+			for _, raw := range ch.Keys {
+				v, ok := credResolver.Resolve(ctx, raw)
+				if !ok {
+					log.Warn("channel skipped: unresolved credential",
+						"channel", name, "field", "keys", "credential", config.CredentialName(raw))
+					unresolved = true
+					break
+				}
+				keys = append(keys, v)
+			}
+			if unresolved {
+				continue
+			}
+			var timeout time.Duration
+			if ch.Timeout != "" {
+				timeout, _ = time.ParseDuration(ch.Timeout) // validated at config load
+			}
+			opts := chatapi.Options{
+				Path:            ch.Path,
+				Agents:          agents,
+				Auth:            ch.Auth,
+				Keys:            keys,
+				Timeout:         timeout,
+				MaxRequestBytes: ch.MaxRequestBytes,
+				ExposeReasoning: ch.ExposeReasoning,
+				Ready:           func() bool { return readyFn() },
+				StopSession:     sup.StopSession,
+				Store:           mstore,
+				Policy:          mpol,
+				Requests:        openaiRequests,
+			}
+			if ch.Auth == "user_token" {
+				if identReg == nil {
+					log.Warn("channel skipped: auth user_token requires runtime.identity.enabled", "channel", name)
+					continue
+				}
+				opts.TokenUser = identReg.TokenUser
+			}
+			d := chatapi.New(name, opts, sink, httpSrv, log)
+			gw.Register(d)
 		}
 	}
 	// Bind the shared listener now that every path is mounted, BEFORE the
@@ -1840,6 +1969,7 @@ func main() {
 		exit(1)
 	}
 	admin := metrics.NewAdminServer("", adminToken, metricReg, log)
+	readyFn = admin.Ready
 	admin.SetCORS(cfg.Runtime.Admin.CORSOrigins)
 	if len(ops) > 0 {
 		admin.SetOperators(ops)
@@ -2027,7 +2157,9 @@ func main() {
 	// cancelled by now, and the store refuses a cancelled context, so the
 	// release gets its own.
 	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	hub.Release(releaseCtx)
+	if hub != nil {
+		hub.Release(releaseCtx)
+	}
 	releaseCancel()
 	watcher.Stop()
 	memMgr.Stop()
@@ -2226,15 +2358,7 @@ func hostIsLoopback(host string) bool {
 }
 
 func loopbackListen(addr string) bool {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return false
-	}
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return config.LoopbackListen(addr)
 }
 
 // resolveAdminToken decides how the admin plane authenticates. It returns the
@@ -2696,4 +2820,15 @@ func shellProfileMap(cfg *config.Config, name string) map[string]any {
 		"password":  p.Password,
 		"key_file":  p.KeyFile,
 	}
+}
+
+// useSessionHub reports whether this process installs the session hub. A
+// regional cell always does: the hub is how a message that lands on the wrong
+// instance reaches the one that owns the session. A single instance does not,
+// because there is no other owner to hand it to and the lease would be a row
+// per conversation bought for nothing. -force-single is the exception: an
+// operator using it is saying two processes share the store, and then the lease
+// is the only thing keeping one conversation from running twice.
+func useSessionHub(cfg *config.Config, forceSingle bool) bool {
+	return cfg.IsRegional() || forceSingle
 }

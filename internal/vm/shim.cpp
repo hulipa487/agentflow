@@ -196,6 +196,42 @@ int afvm_eval(afvm* v, const char* name, const char* code, size_t len,
     return 0;
 }
 
+// afvm_compile is the one entry point that separates compiling from loading, so
+// the Go side can keep a process-lifetime cache: a session spawn compiles the
+// prelude, the support chunks and the loop anew, and that cost is paid once per
+// distinct source instead of once per spawn.
+//
+// The result lives in a thread-local buffer: a cgo call returns to a goroutine
+// that may resume on another OS thread, so the caller copies the bytes before
+// it returns to Go. Error bytecode (BytecodeBuilder::getError) is a leading NUL
+// marker followed by the message; it is reported as an error here rather than
+// cached and re-reported by luau_load on every spawn.
+const char* afvm_compile(const char* code, size_t len, size_t* outlen,
+                         char* err, size_t errlen) {
+    static thread_local std::string bc;
+    bc = Luau::compile(std::string(code, len));
+    if (!bc.empty() && bc[0] == 0) {
+        snprintf(err, errlen, "%s", bc.c_str() + 1);
+        *outlen = 0;
+        return nullptr;
+    }
+    *outlen = bc.size();
+    return bc.data();
+}
+
+// eval_bytecode is the load+run half shared by both eval entry points.
+static int eval_bytecode(lua_State* L, const char* name, const char* bc, size_t len,
+                         char* err, size_t errlen) {
+    if (luau_load(L, name, bc, len, 0) != 0) return copy_err(L, err, errlen);
+    if (lua_pcall(L, 0, 0, 0) != 0) return copy_err(L, err, errlen);
+    return 0;
+}
+
+int afvm_eval_bytecode(afvm* v, const char* name, const char* bc, size_t len,
+                       char* err, size_t errlen) {
+    return eval_bytecode(v->L, name, bc, len, err, errlen);
+}
+
 static int do_resume(afvm* v, int nargs) {
     v->budget = v->budget_max; // per-resume budget
     int status = lua_resume(v->T, v->L, nargs);
@@ -237,6 +273,29 @@ int afvm_start(afvm* v, const char* fn, const char* code, size_t len,
     // the same yield/resume driving as the loop itself
     std::string bc = Luau::compile(std::string(code, len));
     if (luau_load(v->T, "@plugin", bc.data(), bc.size(), 0) != 0) {
+        copy_err(v->T, err, errlen);
+        return AF_ERROR;
+    }
+
+    int st = drive(v, 0);
+    if (st == AF_ERROR) {
+        copy_err(v->T, err, errlen);
+        return AF_ERROR;
+    }
+    return st;
+}
+
+int afvm_start_bytecode(afvm* v, const char* fn, const char* bc, size_t len,
+                        char* err, size_t errlen) {
+    luaL_sandbox(v->L);
+
+    v->T = lua_newthread(v->L);
+    luaL_sandboxthread(v->T);
+
+    snprintf(v->fn, sizeof(v->fn), "%s", fn);
+    v->phase = 0;
+
+    if (luau_load(v->T, "@plugin", bc, len, 0) != 0) {
         copy_err(v->T, err, errlen);
         return AF_ERROR;
     }

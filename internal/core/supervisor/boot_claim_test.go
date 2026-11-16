@@ -41,6 +41,8 @@ func (f *fakeRouter) Live(ctx context.Context, sessKey string) (bool, error) {
 	return f.live, f.liveErr
 }
 
+func (f *fakeRouter) ReleaseSession(ctx context.Context, sessKey string) error { return nil }
+
 // A daemon is one session, so a fleet boots it once. The instance that cannot
 // claim the session must not spawn the actor at all — a second copy of a
 // conversation is the failure the hub exists to prevent, and a boot push is the

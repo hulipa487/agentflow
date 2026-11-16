@@ -44,13 +44,17 @@ var semantic string
 //go:embed lua/fact_extractor.lua
 var factExtractor string
 
+//go:embed lua/openai_passthrough.lua
+var openaiPassthrough string
+
 var sources = map[string]string{
-	"per_chat":       perChat,
-	"token_budget":   tokenBudget,
-	"routing_table":  routingTable,
-	"recency":        recency,
-	"semantic":       semantic,
-	"fact_extractor": factExtractor,
+	"per_chat":           perChat,
+	"token_budget":       tokenBudget,
+	"routing_table":      routingTable,
+	"recency":            recency,
+	"semantic":           semantic,
+	"fact_extractor":     factExtractor,
+	"openai_passthrough": openaiPassthrough,
 }
 
 // supportOrder fixes the evaluation order of support chunks in every session.

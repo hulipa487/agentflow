@@ -135,19 +135,44 @@ func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs
 		return nil, false, err
 	}
 
+	if opts.ResponseFormat != nil {
+		// The interactions request models no response_format; refused for the
+		// same reason as temperature — a knob that silently does nothing reads
+		// as a working config.
+		return nil, false, errors.New("gemini: response_format has no equivalent in the interactions provider; use a provider that maps it (openai, openai-responses)")
+	}
+
 	interaction := interactions.CreateModelInteraction{
 		Model: interactions.Model(cfg.Model),
 		Input: input,
 	}
+	// Seed and stop_sequences are expressible; temperature, top_p and
+	// parallel_tool_calls are not, and are dropped silently (D7's rule: only
+	// response_format and a named tool choice are worth refusing).
+	gen := &interactions.GenerationConfig{}
+	hasGen := false
+	if opts.Seed != nil {
+		seed := int(*opts.Seed)
+		gen.Seed = &seed
+		hasGen = true
+	}
+	if len(opts.Stop) > 0 {
+		gen.StopSequences = opts.Stop
+		hasGen = true
+	}
 	if level, ok := geminiThinkingLevel[thinking]; ok {
-		interaction.GenerationConfig = &interactions.GenerationConfig{ThinkingLevel: &level}
+		gen.ThinkingLevel = &level
+		hasGen = true
 		if thinking != ThinkingOff {
 			// Thought summaries are returned only when asked for; ask whenever
 			// thinking is actually on. With off there is nothing to summarize,
 			// so the summaries knob stays unset.
 			summaries := interactions.ThinkingSummariesAuto
-			interaction.GenerationConfig.ThinkingSummaries = &summaries
+			gen.ThinkingSummaries = &summaries
 		}
+	}
+	if hasGen {
+		interaction.GenerationConfig = gen
 	}
 	if len(cfg.ServerTools) > 0 {
 		interaction.Tools = geminiTools(cfg.ServerTools)

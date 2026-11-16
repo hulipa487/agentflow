@@ -15,6 +15,16 @@ type Catalog struct {
 	PromptKeys     []string   `json:"prompt_keys"`
 	PreludeVersion int        `json:"prelude_version"`
 	Templates      []Template `json:"templates"`
+	// LuaOps names the ops this core exposes that the editor's static API
+	// table may not know about yet (the OpenAI channel's reply/stream set).
+	// Additive: the app can ignore it and keep using its own table.
+	LuaOps []string `json:"lua_ops,omitempty"`
+}
+
+// NewLuaOps is every op this core added after the editor's original table, in
+// the order docs should present them.
+var NewLuaOps = []string{
+	"session.reply", "session.send_delta", "llm.forward", "openai.request",
 }
 
 // CapabilityNames is every capability the gate families understand. The
@@ -38,6 +48,7 @@ func NewCatalog(models, tools, safety, memory, prompts, defaultCaps []string) Ca
 		PromptKeys:     sorted(prompts),
 		PreludeVersion: vm.PreludeVersion,
 		Templates:      Templates(),
+		LuaOps:         append([]string(nil), NewLuaOps...),
 	}
 	return c
 }

@@ -21,6 +21,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"agentflow/internal/builtins"
+	"agentflow/internal/core/gateway"
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/pool"
 	"agentflow/internal/core/safety"
@@ -237,6 +238,24 @@ func (r *recorder) Send(channel, replyTo, text string, attachments []media.Part)
 	r.sends = append(r.sends, text)
 	return nil
 }
+
+// SendReply records a structured answer the same way as Send: a scenario's
+// expect list is about the text the loop produced.
+func (r *recorder) SendReply(channel, replyTo string, rep gateway.Reply) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sends = append(r.sends, rep.Text)
+	return nil
+}
+
+func (r *recorder) SendDelta(channel, replyTo, text string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sends = append(r.sends, text)
+	return nil
+}
+
+func (r *recorder) EndTurn(channel, replyTo string, err error) {}
 
 func (r *recorder) count() int {
 	r.mu.Lock()

@@ -236,6 +236,36 @@ function session.send(text, opts)
   if opts and opts.attachments then req.attachments = opts.attachments end
   op(req)
 end
+-- session.reply(t) finishes the turn with a structured assistant message:
+-- {text, tool_calls, finish_reason, usage, reasoning}. It is the op behind the
+-- OpenAI channel's chat.completion answer: tool_calls are passed through
+-- unchanged, usage becomes the client-visible token counts, and reasoning is
+-- only sent by a channel configured to expose it. At most one reply per turn;
+-- the text goes through the same safety and journal path as session.send.
+-- Channels that cannot express a structured reply fall back to the text (and
+-- refuse tool calls rather than dropping them).
+function session.reply(t)
+  t = t or {}
+  local req = {
+    type = "reply",
+    text = t.text,
+    finish_reason = t.finish_reason,
+    reasoning = t.reasoning,
+  }
+  -- An empty Lua table encodes as {} (an object), which the Go side cannot
+  -- decode into a slice; omit empty arrays rather than crash the loop.
+  if t.tool_calls and #t.tool_calls > 0 then req.tool_calls = t.tool_calls end
+  if t.usage then req.usage = t.usage end
+  return op(req)
+end
+-- session.send_delta(text) sends one fragment of the answer. The engine relays
+-- it live only when nothing can veto the text afterwards; otherwise it holds
+-- the fragments and releases the checked answer at the end of the turn. A loop
+-- that streams and also calls session.reply should let reply carry the text —
+-- the channel sends only what it has not already received.
+function session.send_delta(text)
+  return op({ type = "send.delta", text = text })
+end
 -- session.push sends to an explicit channel/recipient without an active
 -- inbound message (proactive/background egress). Requires the channel.push
 -- capability. reply_to is the channel-specific recipient (e.g. telegram
@@ -863,6 +893,56 @@ llm = {}
 -- to continue Anthropic tool loops with thinking enabled.
 function llm.chat(messages, opts)
   return op(with_opts({ type = "llm.chat", messages = messages }, opts))
+end
+
+-- llm.forward(opts?) -> { text, tool_calls, finish_reason, usage, thinking,
+-- thinking_blocks } forwards the current turn's request to a model. With no
+-- arguments it is the client's own request: its messages, tools, tool_choice
+-- and sampling parameters. opts may override any of them:
+--   model             use another model entry
+--   messages          replace the client's message list
+--   prepend / append  add turns before / after the client's
+--   tools             add tool definitions to the client's
+--   params            override sampling: temperature, max_tokens, top_p, stop,
+--                     seed, response_format, parallel_tool_calls, tool_choice,
+--                     thinking
+--   max_tokens_cap    clamp the client's max_tokens
+-- It uses the same metered path as llm.stream (budget, quota, usage ledger).
+-- If the client asked for a stream and the safety profile cannot veto the
+-- answer, text deltas are relayed as they arrive; otherwise the whole text is
+-- returned for session.reply to send. It does not finish the HTTP response.
+-- Outside an openai-channel turn with no opts.messages it returns an error.
+function llm.forward(opts)
+  local req = { type = "llm.forward" }
+  if opts then
+    req.model = opts.model
+    req.messages = opts.messages
+    req.prepend = opts.prepend
+    req.append = opts.append
+    req.tools = opts.tools
+    req.max_tokens_cap = opts.max_tokens_cap
+    local p = opts.params or {}
+    req.temperature = p.temperature
+    req.max_tokens = p.max_tokens
+    req.top_p = p.top_p
+    req.stop = p.stop
+    req.seed = p.seed
+    req.response_format = p.response_format
+    req.parallel_tool_calls = p.parallel_tool_calls
+    req.tool_choice = p.tool_choice
+    req.thinking = p.thinking
+  end
+  return op(req)
+end
+
+-- openai.request() -> the full request the current turn arrived with, as Lua
+-- data: { model, messages, tools, tool_choice, params, metadata, user,
+-- stream }. It is refused above 4 MiB of JSON — forward the request with
+-- llm.forward instead of materialising a body that large. Outside an
+-- openai-channel turn it returns an error naming the limitation.
+openai = {}
+function openai.request()
+  return op({ type = "openai.request" })
 end
 
 -- llm.embed(inputs, opts) -> { vectors = { {..}, .. }, usage = { input = n } }

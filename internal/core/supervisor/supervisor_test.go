@@ -49,7 +49,16 @@ func newTestSupervisor(t *testing.T) *Supervisor {
 		},
 	}
 	sup := New(defs, gw, p, nil, log)
-	sup.Start(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	sup.Start(ctx)
+	t.Cleanup(func() {
+		cancel()
+		// Wait for every actor to leave before the next test touches shared
+		// globals (builtins.SetPluginDir) that a running actor reads.
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer waitCancel()
+		sup.Wait(waitCtx)
+	})
 	return sup
 }
 

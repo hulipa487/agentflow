@@ -10,9 +10,93 @@ import (
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/packages/param"
+	"github.com/openai/openai-go/responses"
+	"github.com/openai/openai-go/shared"
 
 	"agentflow/internal/config"
 )
+
+// toolChoiceName splits Opts.ToolChoice into a provider mode and a function
+// name. "function:get_weather" is the named form; every other value is a mode
+// the provider translates itself.
+func toolChoiceName(choice string) (mode, name string) {
+	if n, ok := strings.CutPrefix(choice, "function:"); ok {
+		return "function", n
+	}
+	return choice, ""
+}
+
+// openaiResponseFormat translates the OpenAI-shaped response_format object to
+// the Chat Completions SDK union. An object it cannot express is an error: the
+// caller asked for a structured answer, and sending the request without it
+// would produce an unstructured one while looking successful.
+func openaiResponseFormat(m map[string]any) (openai.ChatCompletionNewParamsResponseFormatUnion, error) {
+	var out openai.ChatCompletionNewParamsResponseFormatUnion
+	typ, _ := m["type"].(string)
+	switch typ {
+	case "text":
+		out.OfText = &shared.ResponseFormatTextParam{}
+	case "json_object":
+		out.OfJSONObject = &shared.ResponseFormatJSONObjectParam{}
+	case "json_schema":
+		js, ok := m["json_schema"].(map[string]any)
+		if !ok {
+			return out, fmt.Errorf("response_format.type is json_schema but response_format.json_schema is missing")
+		}
+		name, _ := js["name"].(string)
+		if name == "" {
+			return out, fmt.Errorf("response_format.json_schema.name is required")
+		}
+		p := shared.ResponseFormatJSONSchemaJSONSchemaParam{Name: name, Schema: js["schema"]}
+		if strict, ok := js["strict"].(bool); ok {
+			p.Strict = param.NewOpt(strict)
+		}
+		if desc, ok := js["description"].(string); ok && desc != "" {
+			p.Description = param.NewOpt(desc)
+		}
+		out.OfJSONSchema = &shared.ResponseFormatJSONSchemaParam{JSONSchema: p}
+	default:
+		return out, fmt.Errorf("response_format.type %q is not supported (use text, json_object or json_schema)", typ)
+	}
+	return out, nil
+}
+
+// responsesResponseFormat translates the same object to the Responses API's
+// text.format union. The shape is flatter there: json_schema's fields sit at
+// the top of the format object.
+func responsesResponseFormat(m map[string]any) (responses.ResponseFormatTextConfigUnionParam, error) {
+	var out responses.ResponseFormatTextConfigUnionParam
+	typ, _ := m["type"].(string)
+	switch typ {
+	case "text":
+		out.OfText = &shared.ResponseFormatTextParam{}
+	case "json_object":
+		out.OfJSONObject = &shared.ResponseFormatJSONObjectParam{}
+	case "json_schema":
+		js, ok := m["json_schema"].(map[string]any)
+		if !ok {
+			// Accept the flat Responses shape too.
+			js = m
+		}
+		name, _ := js["name"].(string)
+		if name == "" {
+			return out, fmt.Errorf("response_format.json_schema.name is required")
+		}
+		schema, _ := js["schema"].(map[string]any)
+		p := responses.ResponseFormatTextJSONSchemaConfigParam{Name: name, Schema: schema}
+		if strict, ok := js["strict"].(bool); ok {
+			p.Strict = param.NewOpt(strict)
+		}
+		if desc, ok := js["description"].(string); ok && desc != "" {
+			p.Description = param.NewOpt(desc)
+		}
+		out.OfJSONSchema = &p
+	default:
+		return out, fmt.Errorf("response_format.type %q is not supported (use text, json_object or json_schema)", typ)
+	}
+	return out, nil
+}
 
 // resolveBase returns the configured base URL (trailing slash trimmed so the
 // provider path joins cleanly), falling back to the provider's official host
@@ -32,6 +116,14 @@ func resolveBase(cfg config.Model, def string) string {
 //   - "openai-responses" — OpenAI Responses API (/v1/responses)
 //   - "gemini"       — Gemini Interactions API (/v1beta/interactions)
 func openProvider(ctx context.Context, client *http.Client, cfg config.Model, msgs []Message, opts Opts) (<-chan event, bool, error) {
+	if mode, name := toolChoiceName(opts.ToolChoice); mode == "function" {
+		if name == "" {
+			return nil, false, fmt.Errorf("tool_choice function: needs a tool name (function:<name>)")
+		}
+		if len(opts.Tools) == 0 {
+			return nil, false, fmt.Errorf("tool_choice names function %q but no tools were supplied", name)
+		}
+	}
 	switch cfg.Provider {
 	case "anthropic":
 		return anthropicOpen(ctx, client, cfg, msgs, opts)

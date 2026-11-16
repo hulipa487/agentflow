@@ -58,6 +58,22 @@
 ---@field tool_calls? ToolCall[]
 ---@field usage? Usage
 
+---@class Reply
+---@field text? string
+---@field tool_calls? ToolCall[]
+---@field finish_reason? string "stop" | "tool_calls" | "length" | "content_filter"
+---@field usage? Usage
+---@field reasoning? string sent only by a channel configured to expose it
+
+---@class ForwardOpts
+---@field model? string a models: key; default is the agent's model
+---@field messages? ChatMessage[] replaces the client's messages
+---@field prepend? ChatMessage[] turns added before the client's
+---@field append? ChatMessage[] turns added after the client's
+---@field tools? table[] adds tool definitions to the client's
+---@field params? ChatOpts overrides sampling parameters
+---@field max_tokens_cap? integer clamps the client's max_tokens
+
 ---@class ChatMessage
 ---@field role string "system" | "user" | "assistant" | "tool"
 ---@field content? string
@@ -73,7 +89,12 @@
 ---@field max_tokens? integer
 ---@field thinking? string "off" | "low" | "medium" | "high" | "xhigh" | "max"
 ---@field tools? table[] {name, description, parameters} or tools.list() entries
----@field tool_choice? string
+---@field tool_choice? string "auto" | "none" | "required" | "function:<name>"
+---@field parallel_tool_calls? boolean
+---@field top_p? number
+---@field stop? string[]
+---@field seed? integer
+---@field response_format? table {"type":"text"|"json_object"|"json_schema", ...}; providers with no equivalent refuse it
 
 ---@class MemoryStoreBinding
 ---@field backend string
@@ -114,6 +135,19 @@ function session.inbox() end
 ---@param text string
 ---@param opts? { attachments?: MediaPart[] }
 function session.send(text, opts) end
+
+--- Finish the turn with a structured assistant message. At most one per turn;
+--- the text goes through the same safety and journal path as session.send.
+--- On a channel that cannot express tool calls, a reply carrying them is
+--- refused rather than silently reduced to its text.
+---@param reply Reply
+function session.reply(reply) end
+
+--- Send one text fragment of the answer. The engine relays it live only when
+--- the safety profile cannot veto the answer afterwards; otherwise it holds
+--- the fragments and releases the checked whole at end of turn.
+---@param text string
+function session.send_delta(text) end
 
 --- Proactive send to a channel recipient. Capability: channel.push.
 ---@param channel string
@@ -323,6 +357,25 @@ function llm.chat(messages, opts) end
 ---@return fun(): string? next_delta
 ---@return fun() close
 function llm.stream(messages, opts) end
+
+--- Forward the current OpenAI-channel turn's request to a model. Uses the same
+--- metered path as llm.stream (budget, quota, usage ledger). With no arguments
+--- it forwards the client's own messages, tools, tool_choice and sampling
+--- parameters. It does not finish the HTTP response; session.reply does.
+--- Outside an openai-channel turn with no opts.messages it returns an error.
+---@param opts? ForwardOpts
+---@return { text: string, tool_calls: ToolCall[], finish_reason: string, usage: Usage, thinking?: string, thinking_blocks?: table[] }
+function llm.forward(opts) end
+
+-- openai ----------------------------------------------------------------------
+
+--- The full request the current turn arrived with: { model, messages, tools,
+--- tool_choice, params, metadata, user, stream }. Refused above 4 MiB of JSON —
+--- forward it with llm.forward instead of materialising a body that large.
+--- Outside an openai-channel turn it returns an error naming the limitation.
+---@return table
+openai = {}
+function openai.request() end
 
 ---@param inputs string|string[]|(string|MediaPart)[]
 ---@param opts? { model?: string, task?: string, dimensions?: integer, merged?: boolean }

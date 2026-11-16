@@ -9,6 +9,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"agentflow/internal/builtins"
 	"agentflow/internal/config"
 	"agentflow/internal/core/address"
+	"agentflow/internal/core/gateway"
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/memory"
 	"agentflow/internal/core/metrics"
@@ -75,6 +77,11 @@ type Identity struct {
 	// PushSameTenant refuses session.push_user targets other than the current
 	// turn's tenant. It is a deployment policy, set by the supervisor.
 	PushSameTenant bool
+	// Ephemeral marks a one-turn session. It is set by the supervisor, never by
+	// Lua, and is what tells onActorExit not to retire the id: an ephemeral key
+	// is unique per request, so one entry per request in the retired map would
+	// grow it forever.
+	Ephemeral bool
 }
 
 // Message is the unified mailbox envelope (user/timer/agent/confirm/system).
@@ -143,6 +150,26 @@ type Op struct {
 	Tools       []ToolSpec    `json:"tools,omitempty"`
 	ToolChoice  string        `json:"tool_choice,omitempty"`
 	Thinking    string        `json:"thinking,omitempty"` // off|low|medium|high|xhigh|max
+
+	// Structured replies (session.reply). ToolCalls reuse the chat-turn spec so
+	// a loop can hand an llm.forward result straight back.
+	ToolCalls    []ToolCallSpec `json:"tool_calls,omitempty"`
+	FinishReason string         `json:"finish_reason,omitempty"`
+	Usage        *UsageCounts   `json:"usage,omitempty"`
+	Reasoning    string         `json:"reasoning,omitempty"`
+
+	// llm.forward options. Messages replaces the client's list; Prepend and
+	// Append add turns around it; Tools adds definitions to the client's;
+	// MaxTokensCap clamps the client's max_tokens. The sampling overrides reuse
+	// the fields above.
+	Prepend           []ChatMessage  `json:"prepend,omitempty"`
+	Append            []ChatMessage  `json:"append,omitempty"`
+	MaxTokensCap      int            `json:"max_tokens_cap,omitempty"`
+	ParallelToolCalls *bool          `json:"parallel_tool_calls,omitempty"`
+	TopP              *float64       `json:"top_p,omitempty"`
+	Stop              []string       `json:"stop,omitempty"`
+	Seed              *int64         `json:"seed,omitempty"`
+	ResponseFormat    map[string]any `json:"response_format,omitempty"`
 
 	// User surface (user.*): a credential service name, and the profile a
 	// maintenance loop asks about.
@@ -315,6 +342,106 @@ type ScopedSchedulerService interface {
 // media returns an error rather than silently dropping it.
 type Gateway interface {
 	Send(channel, replyTo, text string, attachments []media.Part) error
+	// SendReply delivers a structured assistant message. Channels without
+	// structured support judge it in the registry (text only, or an error for
+	// tool calls).
+	SendReply(channel, replyTo string, r gateway.Reply) error
+	// SendDelta delivers one text fragment of a stream.
+	SendDelta(channel, replyTo, text string) error
+	// EndTurn closes one turn, with the error that ended it or nil.
+	EndTurn(channel, replyTo string, err error)
+}
+
+// UsageCounts is the token accounting a reply or an llm.forward result carries
+// across the Lua bridge. It mirrors llm.Usage without importing the driver.
+type UsageCounts struct {
+	Input      int `json:"input"`
+	Output     int `json:"output"`
+	Cached     int `json:"cached,omitempty"`
+	CacheWrite int `json:"cache_write,omitempty"`
+	Reasoning  int `json:"reasoning,omitempty"`
+}
+
+// DeltaSink receives one text fragment of a stream that should reach the
+// channel. It is stamped into the op context by the actor: the actor knows
+// whether the profile can still veto the answer, and a handler must not.
+type DeltaSink func(text string) error
+
+type deltaSinkKeyType struct{}
+
+var deltaSinkKey deltaSinkKeyType
+
+// WithDeltaSink returns a context carrying the turn's delta sink.
+func WithDeltaSink(ctx context.Context, sink DeltaSink) context.Context {
+	return context.WithValue(ctx, deltaSinkKey, sink)
+}
+
+// DeltaSinkFromCtx extracts the delta sink stamped for this turn.
+func DeltaSinkFromCtx(ctx context.Context) (DeltaSink, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	s, ok := ctx.Value(deltaSinkKey).(DeltaSink)
+	return s, ok
+}
+
+type streamsLiveKeyType struct{}
+
+var streamsLiveKey streamsLiveKeyType
+
+// WithStreamsLive reports whether this turn may relay deltas live: the client
+// asked for a stream and nothing can veto the text afterwards (D9).
+func WithStreamsLive(ctx context.Context, live bool) context.Context {
+	return context.WithValue(ctx, streamsLiveKey, live)
+}
+
+// StreamsLiveFromCtx reports whether the current turn may relay deltas live.
+func StreamsLiveFromCtx(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(streamsLiveKey).(bool)
+	return v
+}
+
+type turnMessageKeyType struct{}
+
+var turnMessageKey turnMessageKeyType
+
+// WithTurnMessage stamps the inbound message being served. HTTP-shaped ops
+// (openai.request, llm.forward) read the request handle from it; it is a
+// pointer, so a handler must not retain it past the op.
+func WithTurnMessage(ctx context.Context, m *Message) context.Context {
+	return context.WithValue(ctx, turnMessageKey, m)
+}
+
+// TurnMessageFromCtx returns the inbound message currently being served, or nil.
+func TurnMessageFromCtx(ctx context.Context) *Message {
+	if ctx == nil {
+		return nil
+	}
+	m, _ := ctx.Value(turnMessageKey).(*Message)
+	return m
+}
+
+type agentModelKeyType struct{}
+
+var agentModelKey agentModelKeyType
+
+// WithAgentModel stamps the agent's configured model. llm.forward uses it when
+// the caller did not name one: "forward to the agent's model" has to mean the
+// model the agent runs on, not the manager's "default" entry.
+func WithAgentModel(ctx context.Context, model string) context.Context {
+	return context.WithValue(ctx, agentModelKey, model)
+}
+
+// AgentModelFromCtx returns the agent's configured model ("" when unset).
+func AgentModelFromCtx(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	s, _ := ctx.Value(agentModelKey).(string)
+	return s
 }
 
 // UserResolver resolves a user UUID to a delivery target for proactive push
@@ -489,9 +616,12 @@ func (r *PromptRegistry) Get(key string) (string, bool) {
 // blockingOps run on the worker pool; everything else is inline.
 var blockingOps = map[string]bool{
 	"send":                 true,
+	"reply":                true,
+	"send.delta":           true,
 	"session.push":         true,
 	"session.push_user":    true,
 	"llm.chat":             true,
+	"llm.forward":          true,
 	"llm.embed":            true,
 	"llm.rerank":           true,
 	"llm.stream.open":      true,
@@ -545,7 +675,63 @@ type EndReason string
 const (
 	EndShutdown   EndReason = "shutdown"
 	EndTerminated EndReason = "terminated"
+	// EndUnloaded is an idle conversation the supervisor unloaded. It is not a
+	// death: the id is not retired, the lease is released, and the next message
+	// recreates the actor with its session.state intact.
+	EndUnloaded EndReason = "unloaded"
 )
+
+// ErrSafetyBlocked is the end-of-turn error when ingress safety refused the
+// message before the loop saw it. A channel maps it to its own "input blocked"
+// answer (400 content_filter on the OpenAI endpoint).
+var ErrSafetyBlocked = errors.New("input blocked by safety")
+
+// JournalMode controls what an audit journal row keeps for one channel. It is
+// per channel because a coding client's traffic is large and private: a
+// deployment may keep full audit for chat channels and ids-and-sizes only for
+// an API channel.
+type JournalMode string
+
+const (
+	// JournalFull is the historical behaviour: text and attachment descriptors.
+	JournalFull JournalMode = "full"
+	// JournalMetadata keeps ids, sizes, user and timings, and never the message
+	// text — not even truncated.
+	JournalMetadata JournalMode = "metadata"
+	// JournalOff writes no journal row at all.
+	JournalOff JournalMode = "off"
+)
+
+// ParseJournalMode maps the config spelling to a mode. An empty or unknown
+// value is full: validation refuses unknown spellings, and an embedder that
+// constructs a channel without one gets the behaviour every channel had.
+func ParseJournalMode(s string) JournalMode {
+	switch JournalMode(strings.ToLower(strings.TrimSpace(s))) {
+	case JournalMetadata:
+		return JournalMetadata
+	case JournalOff:
+		return JournalOff
+	default:
+		return JournalFull
+	}
+}
+
+// AllowsText reports whether the mode may store message text.
+func (m JournalMode) AllowsText() bool { return m == JournalFull }
+
+// AttachmentBytes estimates the wire size of a set of attachment descriptors.
+// Inline base64 is counted at its decoded size; a handle or a remote URL has no
+// bytes here to count, so it contributes zero — metadata mode is about what the
+// engine held, not what a provider fetched later.
+func AttachmentBytes(parts []media.Part) int {
+	n := 0
+	for _, p := range parts {
+		if p.Data != "" {
+			n += len(p.Data) * 3 / 4
+		}
+	}
+	return n
+}
 
 // Actor is a single agent session.
 type Actor struct {
@@ -570,6 +756,9 @@ type Actor struct {
 	// supervisor at spawn; loops cannot touch it, which is what makes the
 	// journal an audit trail.
 	Journal EgressJournalFunc
+	// JournalModeOf resolves the journal mode for a channel. Nil is full, the
+	// behaviour every channel had before journal modes existed.
+	JournalModeOf func(channel string) JournalMode
 
 	// Tracer, when set, receives execution events (turn/op/reply/safety) for
 	// an observing console. Set by the supervisor; loops cannot touch it.
@@ -596,10 +785,42 @@ type Actor struct {
 	// checks it after runOnce returns so an exited session is not restarted.
 	exiting bool
 
+	// Ephemeral marks a one-turn session spawned by DeliverEphemeral. Run does
+	// not restart it after a crash, and its second inbox request ends it.
+	Ephemeral bool
+	// turnServed is true once an ephemeral actor's one inbox request has
+	// returned a message. Written and read on the actor goroutine only.
+	turnServed bool
+
 	// busy reports whether the actor is actively processing a message (vs.
 	// blocked waiting for the next inbox). Read by the supervisor's status
 	// snapshot for the TUI; written only by the actor goroutine.
 	busy atomic.Bool
+
+	// lastActivity is the unix-nanos of the last turn start or end. The
+	// supervisor's idle janitor reads it; the actor writes it.
+	lastActivity atomic.Int64
+	// unloaded marks a stop requested by the idle janitor, so Run reports
+	// EndUnloaded instead of EndShutdown and onActorExit does not retire it.
+	unloaded atomic.Bool
+
+	// turnReplied is set once session.reply finishes a turn. A second reply is
+	// an error: the channel has one answer to send.
+	turnReplied atomic.Bool
+	// turnEndedFor is the message id whose turn has already been closed. It
+	// keeps EndTurn single-shot when a crash and a cancellation race the same
+	// turn.
+	turnEndedFor string
+	// deltaMu guards the delta accumulators below. Deltas arrive from worker
+	// goroutines (llm.forward relays there) while the actor goroutine reads
+	// them at end of turn.
+	deltaMu sync.Mutex
+	// turnDeltaText is every fragment the turn produced, for the audit trail:
+	// a live streamed answer still needs one journal row.
+	turnDeltaText strings.Builder
+	// pendingDeltas holds fragments the channel must not see yet because the
+	// safety profile can still drop the answer (D9).
+	pendingDeltas strings.Builder
 
 	// Refusals and fallbacks are core-authored replies to blocked traffic.
 	// Rate-limit them so a flood of blocked messages cannot turn into an
@@ -613,7 +834,7 @@ type Actor struct {
 }
 
 func New(name string, identity Identity, info *Info, gw Gateway, agents AgentService, sched SchedulerService, users UserResolver, safe *safety.Dispatcher, handlers map[string]OpHandler, p *pool.Pool, log *slog.Logger) *Actor {
-	return &Actor{
+	a := &Actor{
 		Name:        name,
 		Identity:    identity,
 		Info:        info,
@@ -629,7 +850,29 @@ func New(name string, identity Identity, info *Info, gw Gateway, agents AgentSer
 		reload:      make(chan struct{}, 1),
 		log:         log.With("session", name),
 	}
+	a.touch()
+	return a
 }
+
+// Busy reports whether the actor is actively processing a message rather than
+// blocked waiting for the next inbox. Safe for concurrent reads (TUI snapshot).
+func (a *Actor) Busy() bool { return a.busy.Load() }
+
+// touch records activity at the current instant.
+func (a *Actor) touch() { a.lastActivity.Store(time.Now().UnixNano()) }
+
+// LastActivity is when this session last started or ended a turn.
+func (a *Actor) LastActivity() time.Time {
+	ns := a.lastActivity.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+// Unload marks the coming stop as an idle unload. The caller cancels the
+// actor's context; Run reads the flag when it reports its end reason.
+func (a *Actor) Unload() { a.unloaded.Store(true) }
 
 // Reload requests a fresh-state restart at the next safe point.
 func (a *Actor) Reload() {
@@ -690,10 +933,6 @@ func (a *Actor) applyDefAtRestart() {
 	a.LoopFile = u.LoopFile
 }
 
-// Busy reports whether the actor is actively processing a message rather than
-// blocked waiting for the next inbox. Safe for concurrent reads (TUI snapshot).
-func (a *Actor) Busy() bool { return a.busy.Load() }
-
 // Run is the actor's main loop. It owns the Luau state; call from one
 // goroutine only. It restarts the loop on crashes and reload signals until
 // ctx is done.
@@ -703,7 +942,9 @@ func (a *Actor) Run(ctx context.Context) {
 			return
 		}
 		reason := EndTerminated
-		if ctx.Err() != nil {
+		if a.unloaded.Load() {
+			reason = EndUnloaded
+		} else if ctx.Err() != nil {
 			reason = EndShutdown
 		}
 		a.OnExit(a.Identity, reason)
@@ -714,6 +955,12 @@ func (a *Actor) Run(ctx context.Context) {
 			return
 		}
 		crashed := a.runOnce(ctx)
+		if a.Ephemeral {
+			// A one-turn session is not restarted, on a clean exit or a crash:
+			// there is no conversation to recover, and the request that spawned
+			// it is waiting on the end-of-turn signal, not on a retry.
+			return
+		}
 		if a.exiting {
 			a.log.Info("session exited via session.exit")
 			return
@@ -814,10 +1061,15 @@ func (a *Actor) runOnce(ctx context.Context) (crashed bool) {
 		switch status {
 		case vm.Finished:
 			a.log.Info("loop finished")
+			// A loop that returns instead of parking has produced what it is
+			// going to produce. Close the turn: the channel is waiting, and the
+			// session may restart.
+			a.closeTurn(ctx, &current, nil)
 			return false
 		case vm.Failed:
 			a.log.Warn("loop error", "err", msg)
 			a.trace(TraceEvent{Kind: "error", Err: truncateTrace(msg)})
+			a.closeTurn(ctx, &current, errors.New(msg))
 			return true
 		}
 
@@ -862,6 +1114,16 @@ func (a *Actor) runOnce(ctx context.Context) (crashed bool) {
 			a.trace(ev)
 		}
 		if !proceed {
+			if op.Type != "inbox" {
+				// The turn was interrupted mid-flight: a reload, a shutdown or a
+				// cancelled request. The channel is told, or it would wait for an
+				// answer that can never come.
+				err := errors.New("turn interrupted")
+				if ctx.Err() != nil {
+					err = ctx.Err()
+				}
+				a.closeTurn(ctx, &current, err)
+			}
 			return false // shutdown or reload
 		}
 
@@ -888,14 +1150,33 @@ func (a *Actor) dispatchInline(ctx context.Context, op Op, current *Message) (re
 		// answering and asked for the next message.
 		if current != nil && current.ID != "" {
 			a.trace(TraceEvent{Kind: "turn.end", Turn: current.ID})
+			a.closeTurn(ctx, current, nil)
+		}
+		// An ephemeral session serves exactly one message: the second request
+		// for the inbox ends it, after the turn.end above so the channel sees
+		// the turn finish rather than a session that vanished mid-turn.
+		if a.Ephemeral && a.turnServed {
+			a.exiting = true
+			return "", true, false
 		}
 		var m Message
 		var goOn bool
 		for {
+			// A safety skip continues this loop rather than ending it; an
+			// ephemeral actor has already consumed its one message by then, so
+			// the skip ends the turn instead of parking for a second one.
+			if a.Ephemeral && a.turnServed {
+				a.exiting = true
+				return "", true, false
+			}
 			m, goOn = a.waitInbox(ctx)
 			if !goOn {
 				return "", false, false
 			}
+			a.turnServed = true
+			// The previous turn is closed; this one starts clean.
+			a.turnReplied.Store(false)
+			a.resetTurnDeltas()
 			// Stamp the turn's identity before safety so a classifier can
 			// attribute usage and apply tenant policy. The op context is also
 			// what the loop's later handlers see.
@@ -918,6 +1199,10 @@ func (a *Actor) dispatchInline(ctx context.Context, op Op, current *Message) (re
 					a.sendRefusal(turnCtx, m, res.Refusal, res.Reason)
 				}
 				if res.Skip {
+					// The turn is over before it began. The channel is told:
+					// a synchronous client would otherwise wait out its
+					// timeout for an answer that can never come.
+					a.closeTurn(turnCtx, &m, ErrSafetyBlocked)
 					continue // wait for the next message; this turn is over
 				}
 				m.Text = "" // legacy drop: loop sees an empty message
@@ -952,7 +1237,10 @@ func (a *Actor) dispatchInline(ctx context.Context, op Op, current *Message) (re
 
 	case "session.exit":
 		// The coroutine is never resumed; Run sees the flag and lets the
-		// actor terminate instead of restarting the loop.
+		// actor terminate instead of restarting the loop. A turn in progress is
+		// closed first: the channel is waiting for an answer, and exit means
+		// "this is all there is".
+		a.closeTurn(ctx, current, nil)
 		a.exiting = true
 		return "true", true, false
 
@@ -1007,6 +1295,17 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 	ctx = a.stampIdentity(ctx, current)
 	ctx = WithSessionKey(ctx, a.Identity.SessionID)
 	ctx = WithProvenanceKind(ctx, provenanceKindOf(current))
+	ctx = WithTurnMessage(ctx, current)
+	if a.Info != nil {
+		ctx = WithAgentModel(ctx, a.Info.Model)
+	}
+	if op.Type == "llm.forward" {
+		// Only llm.forward relays deltas; stamping the sink for every op would
+		// let a custom handler stream without the actor deciding whether the
+		// answer can still be vetoed.
+		ctx = WithDeltaSink(ctx, a.deltaSink(current))
+		ctx = WithStreamsLive(ctx, a.streamsLive(current))
+	}
 	op.Owner = a.Identity.SessionID
 	if a.Info != nil {
 		ctx = WithShell(ctx, a.Info.Shell)
@@ -1016,6 +1315,12 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 			return `"no active message to reply to"`, false
 		}
 		return a.egress(ctx, current.Channel, current.ReplyTo, op.Text, op.Attachments, current.ID)
+	}
+	if op.Type == "reply" {
+		return a.replyOp(ctx, current, op)
+	}
+	if op.Type == "send.delta" {
+		return a.deltaOp(current, op)
 	}
 	if op.Type == "session.push" {
 		// Proactive egress: send to an explicit channel/recipient without an
@@ -1164,6 +1469,10 @@ type EgressRecord struct {
 	InReplyTo   string // inbound message id, when this is a reply
 	Status      string // delivered | failed | blocked_safety
 	Err         string
+	// Sizes are always filled in, so a metadata-mode row keeps the shape of the
+	// traffic it chose not to store.
+	TextBytes       int
+	AttachmentBytes int
 }
 
 // EgressJournalFunc records one egress to the message journal. Implementations
@@ -1195,19 +1504,47 @@ func (a *Actor) sendRefusal(ctx context.Context, m Message, text, reason string)
 		a.log.Warn("safety refusal send failed", "err", err, "channel", m.Channel)
 		return
 	}
-	if a.Journal != nil {
-		a.Journal(EgressRecord{
-			SessionID: a.Identity.SessionID,
-			Agent:     a.Identity.Agent,
-			Channel:   m.Channel,
-			ReplyTo:   m.ReplyTo,
-			UserUUID:  PersonalUUIDFromCtx(ctx),
-			Text:      text,
-			InReplyTo: m.ID,
-			Status:    "blocked_safety",
-			Err:       reason,
-		})
+	a.writeEgressJournal(EgressRecord{
+		SessionID: a.Identity.SessionID,
+		Agent:     a.Identity.Agent,
+		Channel:   m.Channel,
+		ReplyTo:   m.ReplyTo,
+		UserUUID:  PersonalUUIDFromCtx(ctx),
+		Text:      text,
+		InReplyTo: m.ID,
+		Status:    "blocked_safety",
+		Err:       reason,
+	})
+}
+
+// journalModeOf resolves a channel's journal mode. Nil is full, so an actor
+// built without a supervisor lookup behaves exactly as it did before modes
+// existed.
+func (a *Actor) journalModeOf(channel string) JournalMode {
+	if a.JournalModeOf == nil {
+		return JournalFull
 	}
+	return a.JournalModeOf(channel)
+}
+
+// writeEgressJournal records one egress under the channel's journal mode. The
+// sizes are filled in for every mode; metadata drops the payload after they are
+// measured, so even a truncated copy of the text can never reach the journal.
+func (a *Actor) writeEgressJournal(rec EgressRecord) {
+	if a.Journal == nil {
+		return
+	}
+	mode := a.journalModeOf(rec.Channel)
+	if mode == JournalOff {
+		return
+	}
+	rec.TextBytes = len(rec.Text)
+	rec.AttachmentBytes = AttachmentBytes(rec.Attachments)
+	if !mode.AllowsText() {
+		rec.Text = ""
+		rec.Attachments = nil
+	}
+	a.Journal(rec)
 }
 
 // egress runs text through the safety dispatcher and delivers it to a
@@ -1217,54 +1554,22 @@ func (a *Actor) sendRefusal(ctx context.Context, m Message, text, reason string)
 // Every outcome is journaled when a Journal is set.
 func (a *Actor) egress(ctx context.Context, channel, replyTo, text string, attachments []media.Part, inReplyTo string) (string, bool) {
 	journal := func(status, errStr string) {
-		if a.Journal != nil {
-			a.Journal(EgressRecord{
-				SessionID:   a.Identity.SessionID,
-				Agent:       a.Identity.Agent,
-				Channel:     channel,
-				ReplyTo:     replyTo,
-				UserUUID:    PersonalUUIDFromCtx(ctx),
-				Text:        text,
-				Attachments: attachments,
-				InReplyTo:   inReplyTo,
-				Status:      status,
-				Err:         errStr,
-			})
-		}
-	}
-	if a.safety != nil {
-		res := a.safety.Egress(ctx, safety.EgressInput{
-			Text:   text,
-			Source: "agent",
+		a.writeEgressJournal(EgressRecord{
+			SessionID:   a.Identity.SessionID,
+			Agent:       a.Identity.Agent,
+			Channel:     channel,
+			ReplyTo:     replyTo,
+			UserUUID:    PersonalUUIDFromCtx(ctx),
+			Text:        text,
+			Attachments: attachments,
+			InReplyTo:   inReplyTo,
+			Status:      status,
+			Err:         errStr,
 		})
-		if res.Drop {
-			a.log.Info("safety egress dropped reply", "reason", res.Reason)
-			metrics.Inc("agentflow_safety_drops")
-			journal("blocked_safety", res.Reason)
-			a.trace(TraceEvent{Kind: "safety", Op: "egress", Turn: inReplyTo, Err: res.Reason, Safety: res.Meta})
-			if res.Fallback != "" && a.gw != nil && a.allowRefusal() {
-				if err := a.gw.Send(channel, replyTo, res.Fallback, nil); err != nil {
-					a.log.Warn("safety fallback send failed", "err", err, "channel", channel)
-				} else if a.Journal != nil {
-					a.Journal(EgressRecord{
-						SessionID: a.Identity.SessionID,
-						Agent:     a.Identity.Agent,
-						Channel:   channel,
-						ReplyTo:   replyTo,
-						UserUUID:  PersonalUUIDFromCtx(ctx),
-						Text:      res.Fallback,
-						InReplyTo: inReplyTo,
-						Status:    "blocked_safety",
-						Err:       res.Reason,
-					})
-				}
-			}
-			return `"reply blocked by safety filter"`, false
-		}
-		text = res.Text
-		if res.Meta != nil {
-			a.trace(TraceEvent{Kind: "safety", Op: "egress", Turn: inReplyTo, OK: true, Err: res.Reason, Safety: res.Meta})
-		}
+	}
+	text, allowed := a.checkEgress(ctx, channel, replyTo, text, inReplyTo, journal)
+	if !allowed {
+		return `"reply blocked by safety filter"`, false
 	}
 	if a.gw != nil {
 		if err := a.gw.Send(channel, replyTo, text, attachments); err != nil {
@@ -1279,6 +1584,273 @@ func (a *Actor) egress(ctx context.Context, channel, replyTo, text string, attac
 	ev := TraceEvent{Kind: "reply", Turn: inReplyTo, OK: true}
 	if a.TracePayloads {
 		ev.Text = truncateTrace(text)
+	}
+	a.trace(ev)
+	return "true", true
+}
+
+// checkEgress runs the egress safety chain and the refusal/fallback policy.
+// It returns the text to send and whether sending is allowed; a drop journals
+// through the caller's callback and delivers the profile's fallback, if any.
+func (a *Actor) checkEgress(ctx context.Context, channel, replyTo, text, inReplyTo string, journal func(status, errStr string)) (string, bool) {
+	if a.safety == nil || text == "" {
+		return text, true
+	}
+	res := a.safety.Egress(ctx, safety.EgressInput{Text: text, Source: "agent"})
+	if res.Drop {
+		a.log.Info("safety egress dropped reply", "reason", res.Reason)
+		metrics.Inc("agentflow_safety_drops")
+		journal("blocked_safety", res.Reason)
+		a.trace(TraceEvent{Kind: "safety", Op: "egress", Turn: inReplyTo, Err: res.Reason, Safety: res.Meta})
+		if res.Fallback != "" && a.gw != nil && a.allowRefusal() {
+			if err := a.gw.Send(channel, replyTo, res.Fallback, nil); err != nil {
+				a.log.Warn("safety fallback send failed", "err", err, "channel", channel)
+			} else {
+				a.writeEgressJournal(EgressRecord{
+					SessionID: a.Identity.SessionID,
+					Agent:     a.Identity.Agent,
+					Channel:   channel,
+					ReplyTo:   replyTo,
+					UserUUID:  PersonalUUIDFromCtx(ctx),
+					Text:      res.Fallback,
+					InReplyTo: inReplyTo,
+					Status:    "blocked_safety",
+					Err:       res.Reason,
+				})
+			}
+		}
+		return "", false
+	}
+	if res.Meta != nil {
+		a.trace(TraceEvent{Kind: "safety", Op: "egress", Turn: inReplyTo, OK: true, Err: res.Reason, Safety: res.Meta})
+	}
+	return res.Text, true
+}
+
+// closeTurn is the one end-of-turn path: it releases any buffered deltas, then
+// tells the channel the turn is over exactly once — success, error, crash or
+// cancellation. The channel is what the HTTP/SSE side waits on; without this a
+// turn that ends without a reply would park until its timeout.
+func (a *Actor) closeTurn(ctx context.Context, m *Message, turnErr error) {
+	if m == nil || m.ID == "" {
+		return
+	}
+	if a.turnEndedFor == m.ID {
+		return
+	}
+	a.turnEndedFor = m.ID
+	a.touch()
+	if a.gw == nil || m.Channel == "" {
+		a.resetTurnDeltas()
+		return
+	}
+	a.flushTurnDeltas(ctx, m, turnErr)
+	a.gw.EndTurn(m.Channel, m.ReplyTo, turnErr)
+}
+
+// flushTurnDeltas finishes a turn that produced text without session.reply.
+// Live fragments already reached the channel; buffered ones (D9) are released
+// here as one fragment after the whole answer is checked. A turn that failed
+// releases nothing — partial text is not an answer — but it stays in the audit
+// trail with the error.
+func (a *Actor) flushTurnDeltas(ctx context.Context, m *Message, turnErr error) {
+	a.deltaMu.Lock()
+	all := a.turnDeltaText.String()
+	pending := a.pendingDeltas.String()
+	a.turnDeltaText.Reset()
+	a.pendingDeltas.Reset()
+	a.deltaMu.Unlock()
+	if all == "" {
+		return
+	}
+	if a.turnReplied.Load() {
+		// The structured reply carries the answer and was journaled by replyOp;
+		// relaying the fragments as well would duplicate it.
+		return
+	}
+	record := EgressRecord{
+		SessionID: a.Identity.SessionID,
+		Agent:     a.Identity.Agent,
+		Channel:   m.Channel,
+		ReplyTo:   m.ReplyTo,
+		UserUUID:  PersonalUUIDFromCtx(ctx),
+		Text:      all,
+		InReplyTo: m.ID,
+	}
+	if turnErr != nil {
+		record.Status = "failed"
+		record.Err = turnErr.Error()
+		a.writeEgressJournal(record)
+		return
+	}
+	text := all
+	reason := ""
+	blocked := false
+	if a.safety != nil {
+		res := a.safety.Egress(ctx, safety.EgressInput{Text: text, Source: "agent"})
+		if res.Drop {
+			blocked = true
+			reason = res.Reason
+			metrics.Inc("agentflow_safety_drops")
+			a.trace(TraceEvent{Kind: "safety", Op: "egress", Turn: m.ID, Err: res.Reason, Safety: res.Meta})
+		} else {
+			text = res.Text
+		}
+	}
+	if pending != "" && !blocked && text != "" {
+		if err := a.gw.SendDelta(m.Channel, m.ReplyTo, text); err != nil {
+			a.log.Warn("delta flush failed", "err", err, "channel", m.Channel)
+			record.Status = "failed"
+			record.Err = err.Error()
+			a.writeEgressJournal(record)
+			return
+		}
+	}
+	record.Status = "delivered"
+	if blocked {
+		record.Status = "blocked_safety"
+		record.Err = reason
+		record.Text = ""
+	}
+	a.writeEgressJournal(record)
+}
+
+// resetTurnDeltas clears the per-turn delta accumulators. Caller starts a turn.
+func (a *Actor) resetTurnDeltas() {
+	a.deltaMu.Lock()
+	a.turnDeltaText.Reset()
+	a.pendingDeltas.Reset()
+	a.deltaMu.Unlock()
+}
+
+// streamsLive reports whether deltas may go to the channel as they arrive. D9:
+// if the profile can still drop the answer, the engine waits until the whole
+// text exists and checks it once; otherwise a stream can be relayed live.
+func (a *Actor) streamsLive(current *Message) bool {
+	if a.gw == nil || current == nil || current.Channel == "" {
+		return false
+	}
+	return a.safety == nil || !a.safety.CanDropEgress()
+}
+
+// deltaSink builds the relay function stamped into the turn's op context.
+func (a *Actor) deltaSink(current *Message) DeltaSink {
+	if current == nil || current.Channel == "" {
+		return nil
+	}
+	return func(text string) error { return a.emitDelta(current, text) }
+}
+
+// emitDelta records one fragment and, when the turn may stream live, sends it.
+// A buffered fragment is held until closeTurn, which checks the whole answer.
+func (a *Actor) emitDelta(current *Message, text string) error {
+	if text == "" {
+		return nil
+	}
+	live := a.streamsLive(current)
+	a.deltaMu.Lock()
+	a.turnDeltaText.WriteString(text)
+	if !live {
+		a.pendingDeltas.WriteString(text)
+	}
+	a.deltaMu.Unlock()
+	if !live {
+		return nil
+	}
+	return a.gw.SendDelta(current.Channel, current.ReplyTo, text)
+}
+
+// deltaOp is session.send_delta: one fragment of the answer. The actor decides
+// whether it can go now (see streamsLive), so the loop never has to know.
+func (a *Actor) deltaOp(current *Message, op Op) (string, bool) {
+	if current == nil || current.Channel == "" {
+		return `"session.send_delta needs an active inbound message"`, false
+	}
+	if a.turnReplied.Load() {
+		return `"session.send_delta: this turn already has a reply"`, false
+	}
+	if err := a.emitDelta(current, op.Text); err != nil {
+		r, _ := jsonString(err.Error())
+		return r, false
+	}
+	return "true", true
+}
+
+// replyOp is session.reply: finish the turn with a structured assistant
+// message. The text goes through the same safety and journal path as
+// session.send; tool calls are not text-screened (the filters are text-only by
+// design). A blocked answer is delivered as an empty content_filter reply —
+// the HTTP contract's way of saying "the model produced something the safety
+// profile refused to show".
+func (a *Actor) replyOp(ctx context.Context, current *Message, op Op) (string, bool) {
+	if current == nil || current.Channel == "" {
+		return `"session.reply needs an active inbound message"`, false
+	}
+	if !a.turnReplied.CompareAndSwap(false, true) {
+		return `"session.reply: a reply was already sent this turn"`, false
+	}
+	text := op.Text
+	journal := func(status, errStr string) {
+		a.writeEgressJournal(EgressRecord{
+			SessionID: a.Identity.SessionID,
+			Agent:     a.Identity.Agent,
+			Channel:   current.Channel,
+			ReplyTo:   current.ReplyTo,
+			UserUUID:  PersonalUUIDFromCtx(ctx),
+			Text:      text,
+			InReplyTo: current.ID,
+			Status:    status,
+			Err:       errStr,
+		})
+	}
+	var allowed bool
+	text, allowed = a.checkEgress(ctx, current.Channel, current.ReplyTo, text, current.ID, journal)
+	rep := gateway.Reply{
+		FinishReason: op.FinishReason,
+		Reasoning:    op.Reasoning,
+	}
+	if allowed {
+		rep.Text = text
+		for _, tc := range op.ToolCalls {
+			args := "{}"
+			if tc.Args != nil {
+				if b, err := json.Marshal(tc.Args); err == nil {
+					args = string(b)
+				}
+			}
+			rep.ToolCalls = append(rep.ToolCalls, gateway.ToolCall{ID: tc.ID, Name: tc.Name, Arguments: args})
+		}
+		if rep.FinishReason == "" {
+			if len(rep.ToolCalls) > 0 {
+				rep.FinishReason = "tool_calls"
+			} else {
+				rep.FinishReason = "stop"
+			}
+		}
+		if op.Usage != nil {
+			rep.Usage = &gateway.Usage{
+				Input: op.Usage.Input, Output: op.Usage.Output, Cached: op.Usage.Cached,
+				CacheWrite: op.Usage.CacheWrite, Reasoning: op.Usage.Reasoning,
+			}
+		}
+	} else {
+		rep.FinishReason = "content_filter"
+	}
+	if a.gw == nil {
+		return "true", true
+	}
+	if err := a.gw.SendReply(current.Channel, current.ReplyTo, rep); err != nil {
+		a.log.Warn("reply delivery failed", "err", err)
+		journal("failed", err.Error())
+		r, _ := jsonString(err.Error())
+		return r, false
+	}
+	if allowed {
+		journal("delivered", "")
+	}
+	ev := TraceEvent{Kind: "reply", Turn: current.ID, OK: true}
+	if a.TracePayloads {
+		ev.Text = truncateTrace(rep.Text)
 	}
 	a.trace(ev)
 	return "true", true
@@ -1417,6 +1989,10 @@ func layerInstructions(base, added string) string {
 func (a *Actor) opContext(ctx context.Context, current *Message) context.Context {
 	ctx = a.stampIdentity(ctx, current)
 	ctx = WithSessionKey(ctx, a.Identity.SessionID)
+	ctx = WithTurnMessage(ctx, current)
+	if a.Info != nil {
+		ctx = WithAgentModel(ctx, a.Info.Model)
+	}
 	return WithProvenanceKind(ctx, provenanceKindOf(current))
 }
 
@@ -1458,6 +2034,7 @@ func (a *Actor) waitInbox(ctx context.Context) (Message, bool) {
 	select {
 	case m := <-a.Mailbox:
 		a.busy.Store(true)
+		a.touch()
 		return m, true
 	case <-a.reload:
 		a.log.Info("hot reload: restarting loop")
@@ -1480,6 +2057,7 @@ func (a *Actor) waitInboxOrTimeout(ctx context.Context, d time.Duration) (Messag
 	select {
 	case m := <-a.Mailbox:
 		a.busy.Store(true)
+		a.touch()
 		return m, true, false
 	case <-t.C:
 		return Message{}, false, true

@@ -68,6 +68,19 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 	if opts.Temperature != nil {
 		params.Temperature = param.NewOpt(*opts.Temperature)
 	}
+	if opts.TopP != nil {
+		params.TopP = param.NewOpt(*opts.TopP)
+	}
+	if opts.ParallelToolCalls != nil {
+		params.ParallelToolCalls = param.NewOpt(*opts.ParallelToolCalls)
+	}
+	if opts.ResponseFormat != nil {
+		rf, err := responsesResponseFormat(opts.ResponseFormat)
+		if err != nil {
+			return nil, false, err
+		}
+		params.Text = responses.ResponseTextConfigParam{Format: rf}
+	}
 	if mt := maxTokensOf(cfg, opts); mt > 0 {
 		params.MaxOutputTokens = param.NewOpt(int64(mt))
 	}
@@ -91,8 +104,14 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 		}
 		params.Tools = tools
 		if opts.ToolChoice != "" {
-			params.ToolChoice = responses.ResponseNewParamsToolChoiceUnion{
-				OfToolChoiceMode: param.NewOpt(responses.ToolChoiceOptions(opts.ToolChoice)),
+			if mode, name := toolChoiceName(opts.ToolChoice); mode == "function" {
+				params.ToolChoice = responses.ResponseNewParamsToolChoiceUnion{
+					OfFunctionTool: &responses.ToolChoiceFunctionParam{Name: name},
+				}
+			} else {
+				params.ToolChoice = responses.ResponseNewParamsToolChoiceUnion{
+					OfToolChoiceMode: param.NewOpt(responses.ToolChoiceOptions(opts.ToolChoice)),
+				}
 			}
 		}
 	}

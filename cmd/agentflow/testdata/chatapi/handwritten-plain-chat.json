@@ -1,0 +1,28 @@
+{
+  "sequence": 1,
+  "recorded_at": "2026-11-17T00:00:00Z",
+  "handwritten": true,
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "Content-Type": [
+        "application/json"
+      ],
+      "Authorization": [
+        "Bearer REDACTED"
+      ]
+    },
+    "body": "{\"model\":\"coder\",\"messages\":[{\"role\":\"system\",\"content\":\"You are a careful coding assistant.\"},{\"role\":\"user\",\"content\":\"Say hello in one sentence.\"}],\"temperature\":0.2,\"max_tokens\":64}"
+  },
+  "response": {
+    "status": 200,
+    "content_type": "application/json",
+    "headers": {
+      "Content-Type": [
+        "application/json"
+      ]
+    },
+    "body": "{\"id\":\"chatcmpl-hw-plain-001\",\"object\":\"chat.completion\",\"created\":1763400000,\"model\":\"gpt-4o-mini-2024-07-18\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Hello! How can I help you today?\"},\"finish_reason\":\"stop\",\"logprobs\":null}],\"usage\":{\"prompt_tokens\":24,\"completion_tokens\":9,\"total_tokens\":33}}"
+  }
+}

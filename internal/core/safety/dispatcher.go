@@ -155,3 +155,12 @@ func (d *Dispatcher) Profile() string {
 	}
 	return d.profile.Name
 }
+
+// CanDropEgress reports whether an outbound reply can be vetoed after it was
+// produced. It is what decides whether a stream may be relayed live: a
+// channel that streams must not have sent the first half of an answer before
+// the filter sees the second half. Any filter in a non-empty profile can, in
+// principle, drop — the conservative answer is the correct one here.
+func (d *Dispatcher) CanDropEgress() bool {
+	return d.profile != nil && d.profile != None && len(d.profile.Filters) > 0
+}

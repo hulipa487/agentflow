@@ -66,7 +66,11 @@ func runConfigLoop(t *testing.T, loopSrc string, info *session.Info, store *cred
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go a.Run(ctx)
+	done := make(chan struct{})
+	go func() {
+		a.Run(ctx)
+		close(done)
+	}()
 	a.Mailbox <- session.Message{ID: "m1", Type: "user", From: "u", Text: "go", Channel: "webhook", ReplyTo: "1"}
 
 	deadline := time.Now().Add(5 * time.Second)
@@ -78,6 +82,14 @@ func runConfigLoop(t *testing.T, loopSrc string, info *session.Info, store *cred
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	// Stop the actor before the caller reads its log buffer: the loop logs
+	// while it runs, and a bytes.Buffer is not safe for concurrent reads.
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("actor did not stop")
 	}
 	gw.mu.Lock()
 	defer gw.mu.Unlock()

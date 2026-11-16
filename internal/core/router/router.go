@@ -41,6 +41,12 @@ type Inbound struct {
 	Channel string          `json:"channel"`
 	Agent   string          `json:"agent"`
 	Message session.Message `json:"message"`
+	// Fail, when set, is called if routing cannot deliver the message: the
+	// ephemeral cap, an unknown agent, a refused group. It is in-process only
+	// (a channel driver sets it and never crosses a wire), and it is what lets
+	// a synchronous HTTP channel answer 429/503 instead of waiting out its
+	// timeout for a turn that never started.
+	Fail func(error) `json:"-"`
 }
 
 // Sink is the inbound side of the router (implemented by Router).
@@ -75,6 +81,13 @@ type Router struct {
 	// the core-owned message journal. Set once at boot; channel drivers never
 	// see it, so a misbehaving channel cannot bypass the audit trail.
 	Journal func(in Inbound, status string)
+
+	// failures carries the per-message delivery-failure callback between
+	// Submit (any goroutine) and the deliver op (router goroutine). An entry is
+	// removed on delivery success or failure; a route that drops a message
+	// leaves one behind, which is bounded by the traffic of a broken route.
+	fmu      sync.Mutex
+	failures map[string]func(error)
 }
 
 // New builds the router. triggersResp is the runtime.triggers op body shared
@@ -90,6 +103,7 @@ func New(src, triggersResp string, sup *supervisor.Supervisor, log *slog.Logger)
 		mailbox:  make(chan Inbound, 256),
 		reload:   make(chan struct{}, 1),
 		triggers: triggersResp,
+		failures: map[string]func(error){},
 		log:      log.With("module", "router"),
 	}
 }
@@ -135,6 +149,11 @@ func (r *Router) Submit(in Inbound) {
 	if in.Message.Channel == "" {
 		in.Message.Channel = in.Channel
 	}
+	if in.Fail != nil {
+		r.fmu.Lock()
+		r.failures[in.Message.ID] = in.Fail
+		r.fmu.Unlock()
+	}
 	select {
 	case r.mailbox <- in:
 		metrics.Inc("agentflow_ingress_total")
@@ -142,12 +161,30 @@ func (r *Router) Submit(in Inbound) {
 			r.Journal(in, "routed")
 		}
 	default:
+		r.takeFailure(in.Message.ID) // the message never started; do not leak the hook
 		r.log.Warn("router queue full, dropping event", "channel", in.Channel)
 		metrics.Inc("agentflow_ingress_total")
 		metrics.Inc("agentflow_ingress_dropped")
 		if r.Journal != nil {
 			r.Journal(in, "dropped_queue")
 		}
+	}
+}
+
+// takeFailure removes and returns one message's delivery-failure callback.
+func (r *Router) takeFailure(id string) func(error) {
+	r.fmu.Lock()
+	fn := r.failures[id]
+	delete(r.failures, id)
+	r.fmu.Unlock()
+	return fn
+}
+
+// failDelivery reports a delivery failure to the channel that submitted the
+// message, if it asked to hear about one.
+func (r *Router) failDelivery(id string, err error) {
+	if fn := r.takeFailure(id); fn != nil {
+		fn(err)
 	}
 }
 
@@ -239,10 +276,16 @@ func (r *Router) runOnce(ctx context.Context) runOutcome {
 			Agent   string          `json:"agent"`
 			Key     string          `json:"key"`
 			Message session.Message `json:"message"`
+			// Kind selects the session lifecycle: "" is a normal keyed session,
+			// "ephemeral" is one that serves this turn only. An unknown value is
+			// refused rather than treated as the default, so a typo cannot turn
+			// a stateless request into a session that lives forever.
+			Kind string `json:"kind"`
 			// IdentityGroup proposes that the turn act in a group context. It
 			// is a proposal only: DeliverAs validates the membership and
 			// stamps the derived uuid onto the message's provenance before the
-			// session sees it (§5.7).
+			// session sees it (§5.7). Ephemeral delivery has no group form: a
+			// one-turn session never acts in a group context.
 			IdentityGroup string `json:"identity_group"`
 			// route.state.set carries the handler's value through untouched and
 			// an optional lifetime in seconds.
@@ -277,13 +320,32 @@ func (r *Router) runOnce(ctx context.Context) runOutcome {
 			// A refused group proposal is the same: logged, and the message
 			// does not reach a session acting under an identity it lacks.
 			var err error
-			if op.IdentityGroup != "" {
-				err = r.sup.DeliverAs(op.Agent, op.Key, op.Message, op.IdentityGroup)
-			} else {
-				err = r.sup.Deliver(op.Agent, op.Key, op.Message)
+			switch op.Kind {
+			case "":
+				if op.IdentityGroup != "" {
+					err = r.sup.DeliverAs(op.Agent, op.Key, op.Message, op.IdentityGroup)
+				} else {
+					err = r.sup.Deliver(op.Agent, op.Key, op.Message)
+				}
+			case "ephemeral":
+				if op.IdentityGroup != "" {
+					r.log.Warn("ephemeral delivery does not support identity_group; message not delivered",
+						"agent", op.Agent, "key", op.Key, "group", op.IdentityGroup)
+					err = fmt.Errorf("ephemeral delivery does not support identity_group")
+					break
+				}
+				err = r.sup.DeliverEphemeral(op.Agent, op.Key, op.Message)
+			default:
+				r.log.Warn("unknown delivery kind; message not delivered",
+					"agent", op.Agent, "key", op.Key, "kind", op.Kind)
+				err = fmt.Errorf("unknown delivery kind %q", op.Kind)
 			}
 			if err != nil {
 				r.log.Warn("deliver failed", "agent", op.Agent, "key", op.Key, "err", err)
+				r.failDelivery(op.Message.ID, err)
+			} else {
+				// Delivered: the channel's callback is done with.
+				r.takeFailure(op.Message.ID)
 			}
 		case "runtime.triggers":
 			// Same response shape as the agent-facing op, so route Lua and loop

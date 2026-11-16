@@ -10,9 +10,13 @@
 --
 -- Router op contract (service-state ops, distinct from session ops):
 --   inbox   -> { message = Message, agent = string }   (next inbound event)
---   deliver { agent, key, message, identity_group? }   (resolve/forward;
+--   deliver { agent, key, message, identity_group?, kind? }   (resolve/forward;
 --             identity_group is a PROPOSAL — the engine validates the
---             membership and stamps the acting identity, or refuses)
+--             membership and stamps the acting identity, or refuses;
+--             kind = "ephemeral" gives the message a session of its own that
+--             serves exactly one turn and exists nowhere afterwards — use it
+--             for stateless traffic, with a key unique per request; an absent
+--             kind is a normal keyed session, and an unknown value is refused)
 --   router.state.get/set/delete/list                   (durable, fleet-wide;
 --     a handler's Lua state is per process, so anything it must remember goes
 --     there instead — see router.state in the AgentFlow Studio docs)
@@ -38,7 +42,7 @@ local function mode_key(msg)
   return "mode:" .. (msg.channel or "?") .. ":" .. chat_of(msg)
 end
 
-local function deliver(item, key, group)
+local function deliver(item, key, group, kind)
   local op = {
     type = "deliver",
     agent = item.agent,
@@ -46,6 +50,7 @@ local function deliver(item, key, group)
     message = item.message,
   }
   if group then op.identity_group = group end
+  if kind then op.kind = kind end
   af.op(op)
 end
 
@@ -55,37 +60,52 @@ function loop()
     local msg = item.message
     local channel = msg.channel or "?"
     local base = channel .. ":" .. chat_of(msg)
-    local mk = mode_key(msg)
-    local group
 
-    -- Toggle commands, resolved before routing so the message itself lands
-    -- in the context it selects.
-    if msg.text then
-      local picked = msg.text:match("^/group%s+([%w%-]+)$")
-      if picked then
-        af.op({ type = "router.state.set", key = mk, value = picked })
-        group = picked
-      elseif msg.text == "/personal" then
-        af.op({ type = "router.state.delete", key = mk })
+    -- OpenAI-compatible traffic is stateless by default: one session per
+    -- request, which costs almost nothing and exists only for this turn. A
+    -- client that wants a conversation opts in with a conversation id
+    -- (metadata.conversation_id or X-AgentFlow-Conversation); then the
+    -- conversation is the key, exactly as a chat id is for a chat channel.
+    if msg.payload and msg.payload.api == "openai.chat" then
+      local conv = msg.payload.conversation_id
+      if conv ~= nil and conv ~= "" then
+        deliver(item, "conv:" .. channel .. ":" .. tostring(conv))
+      else
+        deliver(item, "req:" .. tostring(msg.payload.request_id), nil, "ephemeral")
       end
-    end
-
-    -- Durable mode: a chat in group mode routes to the group's session and
-    -- proposes the group; the engine validates the sender's membership.
-    -- af.op already decodes the response; decoding it a second time turned a
-    -- missing key (null) into nil, which json.decode rejects, and crashed the
-    -- router on the first message of a new chat.
-    if group == nil then
-      local mode = af.op({ type = "router.state.get", key = mk })
-      if mode ~= nil and mode ~= "" then
-        group = tostring(mode)
-      end
-    end
-
-    if group then
-      deliver(item, base .. ":" .. group, group)
     else
-      deliver(item, base)
+      local mk = mode_key(msg)
+      local group
+
+      -- Toggle commands, resolved before routing so the message itself lands
+      -- in the context it selects.
+      if msg.text then
+        local picked = msg.text:match("^/group%s+([%w%-]+)$")
+        if picked then
+          af.op({ type = "router.state.set", key = mk, value = picked })
+          group = picked
+        elseif msg.text == "/personal" then
+          af.op({ type = "router.state.delete", key = mk })
+        end
+      end
+
+      -- Durable mode: a chat in group mode routes to the group's session and
+      -- proposes the group; the engine validates the sender's membership.
+      -- af.op already decodes the response; decoding it a second time turned a
+      -- missing key (null) into nil, which json.decode rejects, and crashed the
+      -- router on the first message of a new chat.
+      if group == nil then
+        local mode = af.op({ type = "router.state.get", key = mk })
+        if mode ~= nil and mode ~= "" then
+          group = tostring(mode)
+        end
+      end
+
+      if group then
+        deliver(item, base .. ":" .. group, group)
+      else
+        deliver(item, base)
+      end
     end
   end
 end

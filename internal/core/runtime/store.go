@@ -75,6 +75,8 @@ func (s *sqliteStore) migrate() error {
 			session_id TEXT,
 			type TEXT,
 			text TEXT,
+			text_bytes INTEGER NOT NULL DEFAULT 0,
+			attachment_bytes INTEGER NOT NULL DEFAULT 0,
 			attachments_json TEXT,
 			provenance_json TEXT,
 			err TEXT
@@ -100,6 +102,14 @@ func (s *sqliteStore) migrate() error {
 	// needs an explicit ALTER — and its index can only be created once
 	// the column is there.
 	if err := s.addColumnIfMissing(ctx, "message_journal", "user_uuid", "TEXT"); err != nil {
+		return err
+	}
+	// Journal modes: metadata keeps sizes without text, so an older database
+	// needs the two counters too.
+	if err := s.addColumnIfMissing(ctx, "message_journal", "text_bytes", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing(ctx, "message_journal", "attachment_bytes", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	_, err = s.db.ExecContext(ctx,

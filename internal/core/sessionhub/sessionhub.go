@@ -383,6 +383,22 @@ func (h *Hub) Live(ctx context.Context, sessKey string) (bool, error) {
 	return h.leases.Held(ctx, sessionLease+":"+sessKey)
 }
 
+// ReleaseSession gives up one session this instance owns, so another instance
+// can take it at once rather than waiting for the TTL. It is what the idle
+// janitor calls after unloading a conversation: the conversation is not dead,
+// and the next message may land anywhere.
+func (h *Hub) ReleaseSession(ctx context.Context, sessKey string) error {
+	h.mu.Lock()
+	delete(h.held, sessKey)
+	delete(h.generations, sessKey)
+	delete(h.renewed, sessKey)
+	h.mu.Unlock()
+	if err := h.leases.Release(ctx, sessionLease+":"+sessKey); err != nil {
+		return fmt.Errorf("sessionhub: release %s: %w", sessKey, err)
+	}
+	return nil
+}
+
 // Release gives up every session this instance owns, so a shutdown hands them
 // over immediately instead of making the fleet wait out the leases.
 func (h *Hub) Release(ctx context.Context) {

@@ -74,6 +74,21 @@ func (r *Registry) Cancel(id string) {
 	r.mu.Unlock()
 }
 
+// PendingFor reports how many outstanding agent.request calls one session has
+// open. The idle janitor uses it: a session waiting for another agent's answer
+// is not idle even though the pool shows it parked.
+func (r *Registry) PendingFor(owner string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, p := range r.pending {
+		if p.owner == owner {
+			n++
+		}
+	}
+	return n
+}
+
 // CancelOwner removes every outstanding request opened by a session.
 func (r *Registry) CancelOwner(owner string) {
 	r.mu.Lock()

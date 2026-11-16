@@ -23,21 +23,26 @@ import (
 // JournalEntry is one journaled message. Direction is "in" (router ingress)
 // or "out" (session egress); Status records what happened to it.
 type JournalEntry struct {
-	ID          string         `json:"id"`        // message id (stamped at ingress if absent)
-	Ts          int64          `json:"ts"`        // unix seconds
-	Direction   string         `json:"direction"` // in | out
-	Status      string         `json:"status"`    // in: routed | dropped_queue; out: delivered | failed | blocked_safety
-	Channel     string         `json:"channel,omitempty"`
-	Chat        string         `json:"chat,omitempty"`        // channel chat id, when known
-	Sender      string         `json:"sender"`                // msg.from (in) or recipient (out)
-	UserUUID    string         `json:"user_uuid"`             // profile behind the message ("" when the sender is unregistered)
-	Agent       string         `json:"agent,omitempty"`       //
-	SessionID   string         `json:"session_id,omitempty"`  // out only
-	Type        string         `json:"type,omitempty"`        // message type (user|timer|agent|...)
-	Text        string         `json:"text,omitempty"`        //
-	Attachments []media.Part   `json:"attachments,omitempty"` // descriptors only (handles, never bytes)
-	Provenance  map[string]any `json:"provenance,omitempty"`  // in only
-	Err         string         `json:"err,omitempty"`         // delivery error detail (out, failed)
+	ID        string `json:"id"`        // message id (stamped at ingress if absent)
+	Ts        int64  `json:"ts"`        // unix seconds
+	Direction string `json:"direction"` // in | out
+	Status    string `json:"status"`    // in: routed | dropped_queue; out: delivered | failed | blocked_safety
+	Channel   string `json:"channel,omitempty"`
+	Chat      string `json:"chat,omitempty"`       // channel chat id, when known
+	Sender    string `json:"sender"`               // msg.from (in) or recipient (out)
+	UserUUID  string `json:"user_uuid"`            // profile behind the message ("" when the sender is unregistered)
+	Agent     string `json:"agent,omitempty"`      //
+	SessionID string `json:"session_id,omitempty"` // out only
+	Type      string `json:"type,omitempty"`       // message type (user|timer|agent|...)
+	Text      string `json:"text,omitempty"`       //
+	// TextBytes and AttachmentBytes keep the size of what a metadata-mode
+	// channel chose not to store. They are filled in for every mode; metadata
+	// is the one that leaves Text and Attachments empty.
+	TextBytes       int            `json:"text_bytes,omitempty"`
+	AttachmentBytes int            `json:"attachment_bytes,omitempty"`
+	Attachments     []media.Part   `json:"attachments,omitempty"` // descriptors only (handles, never bytes)
+	Provenance      map[string]any `json:"provenance,omitempty"`  // in only
+	Err             string         `json:"err,omitempty"`         // delivery error detail (out, failed)
 }
 
 // RecordMessage appends one entry to the journal.
@@ -57,10 +62,10 @@ func (s *sqliteStore) RecordMessage(ctx context.Context, e JournalEntry) error {
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO message_journal
 			(id, ts, direction, status, channel, chat, sender, user_uuid, agent, session_id,
-			 type, text, attachments_json, provenance_json, err)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 type, text, text_bytes, attachment_bytes, attachments_json, provenance_json, err)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		e.ID, ts, e.Direction, e.Status, e.Channel, e.Chat, e.Sender, e.UserUUID, e.Agent,
-		e.SessionID, e.Type, e.Text, string(atts), string(prov), e.Err)
+		e.SessionID, e.Type, e.Text, e.TextBytes, e.AttachmentBytes, string(atts), string(prov), e.Err)
 	return err
 }
 
@@ -112,7 +117,7 @@ func (s *sqliteStore) ListMessages(ctx context.Context, f JournalFilter) ([]Jour
 
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, ts, direction, status, channel, chat, sender, user_uuid, agent,
-		       session_id, type, text, attachments_json, provenance_json, err
+		       session_id, type, text, text_bytes, attachment_bytes, attachments_json, provenance_json, err
 		FROM message_journal
 		WHERE `+strings.Join(where, " AND ")+`
 		ORDER BY ts DESC, id DESC
@@ -129,7 +134,8 @@ func (s *sqliteStore) ListMessages(ctx context.Context, f JournalFilter) ([]Jour
 		// failing the whole query on one NULL.
 		var channel, chat, sender, userUUID, agent, sessionID, typ, text, atts, prov, errStr sql.NullString
 		if err := rows.Scan(&e.ID, &e.Ts, &e.Direction, &e.Status, &channel, &chat, &sender,
-			&userUUID, &agent, &sessionID, &typ, &text, &atts, &prov, &errStr); err != nil {
+			&userUUID, &agent, &sessionID, &typ, &text, &e.TextBytes, &e.AttachmentBytes,
+			&atts, &prov, &errStr); err != nil {
 			return nil, err
 		}
 		e.Channel, e.Chat, e.Sender, e.UserUUID = channel.String, chat.String, sender.String, userUUID.String

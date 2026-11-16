@@ -81,7 +81,17 @@ type Opts struct {
 	MaxTokens   int
 	Thinking    string // "" | off | low | medium | high | xhigh | max (see Thinking)
 	Tools       []ToolDef
-	ToolChoice  string // "" | "auto" | "none"
+	// ToolChoice is "auto", "none", "required", or "function:<name>" for a
+	// named function. Empty means the provider's default.
+	ToolChoice        string
+	ParallelToolCalls *bool
+	TopP              *float64
+	Stop              []string
+	Seed              *int64
+	// ResponseFormat is the OpenAI-shaped structured-output object:
+	// {"type":"text"|"json_object"|"json_schema", ...}. Providers with no
+	// equivalent refuse it rather than silently dropping the request's shape.
+	ResponseFormat map[string]any
 }
 
 // Usage counts tokens as reported by the provider (0 when unknown).

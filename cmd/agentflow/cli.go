@@ -402,6 +402,27 @@ runtime.topology is regional; -online=false turns it off.`,
 	} else {
 		add("PASS", "channels", fmt.Sprintf("%d configured", len(cfg.Gateway.Channels)))
 	}
+	for i, ch := range cfg.Gateway.Channels {
+		if ch.Type != "openai" {
+			continue
+		}
+		name := ch.Name
+		if name == "" {
+			name = fmt.Sprintf("openai-%d", i)
+		}
+		agents := ch.Agents
+		if len(agents) == 0 && ch.Agent != "" {
+			agents = []string{ch.Agent}
+		}
+		switch ch.Auth {
+		case "none":
+			add("WARN", "channel "+name, "openai with auth: none — anyone who can reach the listener can spend the models (loopback only is enforced at validation)")
+		case "user_token":
+			add("PASS", "channel "+name, fmt.Sprintf("openai, auth user_token, %d agents: %s", len(agents), strings.Join(agents, ", ")))
+		default:
+			add("PASS", "channel "+name, fmt.Sprintf("openai, auth key, %d agents: %s", len(agents), strings.Join(agents, ", ")))
+		}
+	}
 	if *online {
 		if runDoctorOnline(cfg, add) {
 			exit = 1
@@ -771,6 +792,15 @@ gateway:
     type: webhook
     agent: echo
     path: /webhook/local/
+
+  # OpenAI-compatible endpoint: point any Chat Completions client at
+  # http://<host>:8080/v1 with the key below. Uncomment and set the key.
+  # - name: api
+  #   type: openai
+  #   path: /v1/
+  #   agents: [echo]
+  #   auth: key
+  #   keys: ["${COMPAT_API_KEY}"]
 `
 		files[filepath.Join(*dir, "profiles", "echo.yaml")] = `name: echo
 loop: ./loops/echo.lua
@@ -788,6 +818,15 @@ gateway:
       type: webhook
       agent: echo
       path: /webhook/local/
+
+    # OpenAI-compatible endpoint: point any Chat Completions client at
+    # http://<host>:8080/v1 with the key below. Uncomment and set the key.
+    # - name: api
+    #   type: openai
+    #   path: /v1/
+    #   agents: [echo]
+    #   auth: key
+    #   keys: ["${COMPAT_API_KEY}"]
 
 agents:
   echo:

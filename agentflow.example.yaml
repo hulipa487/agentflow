@@ -97,7 +97,13 @@ runtime:
 
   limits:
     sessions_per_tenant: 50   # 0 disables
+    ephemeral_per_tenant: 16  # one-turn sessions (OpenAI channel); 0 disables
     egress_per_minute: 60     # http.request + mail.send, per tenant
+
+  # Conversations. An idle session is unloaded after this long; its Lua locals
+  # are gone, session.state.* survives, and the next message recreates it.
+  sessions:
+    idle_unload: 30m          # 0 disables unloading
 
   timezone_offset_hours: 0    # cron triggers; every: is unaffected
 
@@ -233,6 +239,22 @@ gateway:
     #   deliver_url: https://bridge.example.com/deliver
     #   secret: ${BRIDGE_SECRET}
     #   token: ${BRIDGE_TOKEN}
+    #
+    # OpenAI-compatible channel: any Chat Completions client works with only a
+    # base URL and a key. `model` names one of the exposed agents; the default
+    # loop forwards the client's messages, tools and sampling parameters
+    # unchanged (plugin:openai_passthrough). Use auth: user_token for per-user
+    # identity, or auth: none only on a loopback listener.
+    # - type: openai
+    #   name: api
+    #   path: /v1/                 # serves <path>chat/completions and <path>models
+    #   agents: [assistant]        # exposed as model ids
+    #   auth: key                  # user_token | key | none
+    #   keys: ["${COMPAT_API_KEY}"]
+    #   timeout: 600s              # whole-request limit
+    #   max_request_bytes: 33554432
+    #   journal: metadata          # full | metadata | off (metadata is this type's default)
+    #   expose_reasoning: false    # send model reasoning as reasoning_content
 
 # ---------------------------------------------------------------------------
 # Scheduled triggers (engine-fired; no agent scheduler needed)

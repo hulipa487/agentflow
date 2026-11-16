@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"agentflow/internal/core/gateway"
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/pool"
 	"agentflow/internal/vm"
@@ -27,8 +28,11 @@ type sendRec struct {
 }
 
 type fakeGW struct {
-	mu    sync.Mutex
-	sends []sendRec
+	mu      sync.Mutex
+	sends   []sendRec
+	replies []gateway.Reply
+	deltas  []string
+	turns   []endTurnRec
 }
 
 func (f *fakeGW) Send(channel, replyTo, text string, _ []media.Part) error {
@@ -38,11 +42,64 @@ func (f *fakeGW) Send(channel, replyTo, text string, _ []media.Part) error {
 	return nil
 }
 
+// SendReply records the answer as a send so a test asserting on gateway egress
+// sees it. The structure itself is asserted through the reply recorder where a
+// test cares.
+func (f *fakeGW) SendReply(channel, replyTo string, r gateway.Reply) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sends = append(f.sends, sendRec{channel, replyTo, r.Text})
+	f.replies = append(f.replies, r)
+	return nil
+}
+
+func (f *fakeGW) SendDelta(channel, replyTo, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deltas = append(f.deltas, text)
+	return nil
+}
+
+func (f *fakeGW) EndTurn(channel, replyTo string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.turns = append(f.turns, endTurnRec{channel: channel, replyTo: replyTo, err: err})
+}
+
+type endTurnRec struct {
+	channel, replyTo string
+	err              error
+}
+
 func (f *fakeGW) snapshot() []sendRec {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]sendRec, len(f.sends))
 	copy(out, f.sends)
+	return out
+}
+
+func (f *fakeGW) repliesSnapshot() []gateway.Reply {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]gateway.Reply, len(f.replies))
+	copy(out, f.replies)
+	return out
+}
+
+func (f *fakeGW) deltasSnapshot() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.deltas))
+	copy(out, f.deltas)
+	return out
+}
+
+func (f *fakeGW) turnsSnapshot() []endTurnRec {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]endTurnRec, len(f.turns))
+	copy(out, f.turns)
 	return out
 }
 

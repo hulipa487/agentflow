@@ -164,6 +164,15 @@ func (s *Service) Pending() int {
 	return len(s.timers)
 }
 
+// OwnerPending reports how many live timers one session owns. The idle
+// janitor asks it before unloading a session: a session with a timer is
+// waiting for something and must keep running.
+func (s *Service) OwnerPending(owner string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.byOwner[owner])
+}
+
 func (s *Service) registerWithID(id TimerID, owner string, kind string, run func(context.Context)) (TimerID, error) {
 	if owner == "" {
 		return "", fmt.Errorf("scheduler: owner is required")

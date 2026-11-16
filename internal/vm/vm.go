@@ -23,7 +23,9 @@ package vm
 import "C"
 
 import (
+	"crypto/sha256"
 	"errors"
+	"sync"
 	"unsafe"
 )
 
@@ -72,15 +74,93 @@ func (s *State) Close() {
 	}
 }
 
-// Eval compiles and executes a chunk (e.g. to define the loop global).
-func (s *State) Eval(name, code string) error {
-	cname := C.CString(name)
-	defer C.free(unsafe.Pointer(cname))
+// Chunk compilation is the dominant cost of a cold session spawn: the prelude
+// is tens of kilobytes, the support chunks add more, and the loop chunk is
+// compiled after them. None of it changes between spawns, so bytecode is cached
+// process-wide keyed by the source's SHA-256. Content addressing makes a stale
+// entry impossible — an edited file has a different hash and compiles anew —
+// and covers the hot-reload case without an mtime check.
+//
+// The cache is bounded: a deployment with hundreds of distinct loop files fits,
+// and a pathological stream of distinct sources resets it rather than growing
+// without limit.
+const (
+	compileCacheMaxBytes  = 64 << 20
+	compileCacheMaxChunks = 4096
+)
+
+type compiledChunk struct {
+	bytecode []byte
+	err      string // the compiler's message, without a chunk name
+}
+
+var compilation = struct {
+	sync.RWMutex
+	chunks map[[32]byte]compiledChunk
+	bytes  int
+}{chunks: map[[32]byte]compiledChunk{}}
+
+// compileChunk compiles source to Luau bytecode, or returns the compiler's
+// error with the chunk name prefixed exactly as luau_load would have reported
+// it.
+func compileChunk(name, code string) ([]byte, error) {
+	key := sha256.Sum256([]byte(code))
+	compilation.RLock()
+	entry, ok := compilation.chunks[key]
+	compilation.RUnlock()
+	if ok {
+		if entry.err != "" {
+			return nil, errors.New(name + entry.err)
+		}
+		return entry.bytecode, nil
+	}
+
 	ccode := C.CString(code)
 	defer C.free(unsafe.Pointer(ccode))
-
 	errbuf := make([]byte, 4096)
-	rc := C.afvm_eval(s.v, cname, ccode, C.size_t(len(code)),
+	var n C.size_t
+	ptr := C.afvm_compile(ccode, C.size_t(len(code)), &n,
+		(*C.char)(unsafe.Pointer(&errbuf[0])), C.size_t(len(errbuf)))
+	if ptr == nil {
+		msg := C.GoString((*C.char)(unsafe.Pointer(&errbuf[0])))
+		compilation.Lock()
+		if len(compilation.chunks) >= compileCacheMaxChunks {
+			compilation.chunks = map[[32]byte]compiledChunk{}
+			compilation.bytes = 0
+		}
+		compilation.chunks[key] = compiledChunk{err: msg}
+		compilation.Unlock()
+		return nil, errors.New(name + msg)
+	}
+	bc := C.GoBytes(unsafe.Pointer(ptr), C.int(n))
+
+	compilation.Lock()
+	if compilation.bytes+len(bc) > compileCacheMaxBytes || len(compilation.chunks) >= compileCacheMaxChunks {
+		compilation.chunks = map[[32]byte]compiledChunk{}
+		compilation.bytes = 0
+	}
+	compilation.chunks[key] = compiledChunk{bytecode: bc}
+	compilation.bytes += len(bc)
+	compilation.Unlock()
+	return bc, nil
+}
+
+// Eval compiles and executes a chunk (e.g. to define the loop global). The
+// bytecode cache means the second state built from the same source loads it
+// instead of compiling it.
+func (s *State) Eval(name, code string) error {
+	bc, err := compileChunk(name, code)
+	if err != nil {
+		return err
+	}
+	return s.evalBytecode(name, bc)
+}
+
+func (s *State) evalBytecode(name string, bc []byte) error {
+	cname := C.CString(name)
+	defer C.free(unsafe.Pointer(cname))
+	errbuf := make([]byte, 4096)
+	rc := C.afvm_eval_bytecode(s.v, cname, (*C.char)(unsafe.Pointer(&bc[0])), C.size_t(len(bc)),
 		(*C.char)(unsafe.Pointer(&errbuf[0])), C.size_t(len(errbuf)))
 	if rc != 0 {
 		return errors.New(C.GoString((*C.char)(unsafe.Pointer(&errbuf[0]))))
@@ -112,12 +192,18 @@ func (s *State) Start(fn, name, code string) (Status, string) {
 	if err := CheckChunkVersion(name, code); err != nil {
 		return Failed, err.Error()
 	}
+	bc, err := compileChunk(name, code)
+	if err != nil {
+		return Failed, err.Error()
+	}
+	return s.startBytecode(fn, bc)
+}
+
+func (s *State) startBytecode(fn string, bc []byte) (Status, string) {
 	cfn := C.CString(fn)
 	defer C.free(unsafe.Pointer(cfn))
-	ccode := C.CString(code)
-	defer C.free(unsafe.Pointer(ccode))
 	errbuf := make([]byte, 4096)
-	rc := C.afvm_start(s.v, cfn, ccode, C.size_t(len(code)),
+	rc := C.afvm_start_bytecode(s.v, cfn, (*C.char)(unsafe.Pointer(&bc[0])), C.size_t(len(bc)),
 		(*C.char)(unsafe.Pointer(&errbuf[0])), C.size_t(len(errbuf)))
 	status := Status(rc)
 	if status == Failed {

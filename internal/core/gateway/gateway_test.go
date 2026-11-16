@@ -138,3 +138,94 @@ func TestRegisterReplacesByName(t *testing.T) {
 		t.Fatalf("the replaced driver still received deliveries: %d", first.calls)
 	}
 }
+
+// structuredDriver implements every optional interface.
+type structuredDriver struct {
+	fakeDriver
+	replies []Reply
+	deltas  []string
+	turns   []error
+}
+
+func (s *structuredDriver) DeliverReply(replyTo string, r Reply) error {
+	s.replies = append(s.replies, r)
+	return nil
+}
+func (s *structuredDriver) DeliverDelta(replyTo, text string) error {
+	s.deltas = append(s.deltas, text)
+	return nil
+}
+func (s *structuredDriver) EndTurn(replyTo string, err error) { s.turns = append(s.turns, err) }
+
+// TestSendReplyFallbacks: a driver without ReplyDriver gets the text through
+// Deliver; a reply carrying tool calls is refused, because a text channel
+// cannot express them and dropping them silently would look like a model that
+// answered nothing.
+func TestSendReplyFallbacks(t *testing.T) {
+	d := &fakeDriver{name: "webhook"}
+	r := NewRegistry(discardLog())
+	r.Register(d)
+	if err := r.SendReply("webhook", "r1", Reply{Text: "hello"}); err != nil {
+		t.Fatalf("text reply: %v", err)
+	}
+	if d.calls != 1 || d.gotText != "hello" {
+		t.Fatalf("text reply did not fall back to Deliver: %+v", d)
+	}
+	err := r.SendReply("webhook", "r2", Reply{ToolCalls: []ToolCall{{ID: "c1", Name: "f"}}})
+	if err == nil || !strings.Contains(err.Error(), "structured replies") {
+		t.Fatalf("tool-call reply = %v; want a clear refusal", err)
+	}
+}
+
+// TestSendReplyAndDeltaRouteToStructuredDriver: with the optional interfaces
+// the structured reply, fragments and end-of-turn go where they belong.
+func TestSendReplyAndDeltaRouteToStructuredDriver(t *testing.T) {
+	d := &structuredDriver{fakeDriver: fakeDriver{name: "api"}}
+	r := NewRegistry(discardLog())
+	r.Register(d)
+	if err := r.SendReply("api", "r1", Reply{Text: "hi", FinishReason: "stop"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.replies) != 1 || d.replies[0].Text != "hi" {
+		t.Fatalf("structured reply not delivered: %+v", d.replies)
+	}
+	if err := r.SendDelta("api", "r1", "Hel"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SendDelta("api", "r1", "lo"); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.deltas) != 2 {
+		t.Fatalf("deltas = %v", d.deltas)
+	}
+	r.EndTurn("api", "r1", nil)
+	if len(d.turns) != 1 || d.turns[0] != nil {
+		t.Fatalf("EndTurn = %v", d.turns)
+	}
+}
+
+// TestDeltaFallbackBuffersUntilEndTurn: a channel with no DeltaDriver gets one
+// complete text at the end, in order.
+func TestDeltaFallbackBuffersUntilEndTurn(t *testing.T) {
+	d := &fakeDriver{name: "webhook"}
+	r := NewRegistry(discardLog())
+	r.Register(d)
+	if err := r.SendDelta("webhook", "r1", "Hel"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SendDelta("webhook", "r1", "lo"); err != nil {
+		t.Fatal(err)
+	}
+	if d.calls != 0 {
+		t.Fatalf("a fragment reached a non-streaming channel before end of turn: %d", d.calls)
+	}
+	r.EndTurn("webhook", "r1", nil)
+	if d.calls != 1 || d.gotText != "Hello" {
+		t.Fatalf("flushed = %d %q; want one delivery of Hello", d.calls, d.gotText)
+	}
+	// The buffer is gone: a second EndTurn delivers nothing.
+	r.EndTurn("webhook", "r1", nil)
+	if d.calls != 1 {
+		t.Fatalf("the delta buffer was not cleared: %d deliveries", d.calls)
+	}
+}

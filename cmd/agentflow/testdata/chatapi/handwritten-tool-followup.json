@@ -1,0 +1,28 @@
+{
+  "sequence": 4,
+  "recorded_at": "2026-11-17T00:00:00Z",
+  "handwritten": true,
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "Content-Type": [
+        "application/json"
+      ],
+      "Authorization": [
+        "Bearer REDACTED"
+      ]
+    },
+    "body": "{\"model\":\"coder\",\"messages\":[{\"role\":\"user\",\"content\":\"What's the weather in Paris?\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_hw_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"location\\\":\\\"Paris\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_hw_1\",\"content\":\"{\\\"temperature_c\\\":18,\\\"conditions\\\":\\\"clear\\\"}\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Get the current weather for a location.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\",\"description\":\"City name\"}},\"required\":[\"location\"]}}}],\"tool_choice\":\"auto\"}"
+  },
+  "response": {
+    "status": 200,
+    "content_type": "application/json",
+    "headers": {
+      "Content-Type": [
+        "application/json"
+      ]
+    },
+    "body": "{\"id\":\"chatcmpl-hw-tools-002\",\"object\":\"chat.completion\",\"created\":1763400003,\"model\":\"gpt-4o-mini-2024-07-18\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"It is 18\\u00b0C and clear in Paris.\"},\"finish_reason\":\"stop\",\"logprobs\":null}],\"usage\":{\"prompt_tokens\":102,\"completion_tokens\":12,\"total_tokens\":114}}"
+  }
+}

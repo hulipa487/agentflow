@@ -26,10 +26,22 @@ afvm* afvm_new(long instr_budget);
 void  afvm_set_memcap(afvm* v, long cap);
 void  afvm_close(afvm* v);
 
+// Compile source to Luau bytecode, for the cross-spawn cache in vm.go. On
+// success the return value is a thread-local buffer (valid until the next
+// afvm_compile on this thread) and *outlen is its size; the caller copies it.
+// On a parse/compile error NULL is returned and the message (without a chunk
+// name) is copied into err.
+const char* afvm_compile(const char* code, size_t len, size_t* outlen,
+                         char* err, size_t errlen);
+
 // Compile + execute a chunk (typically to define globals).
 // Returns 0 on success, 1 on error (message copied into err).
 int   afvm_eval(afvm* v, const char* name, const char* code, size_t len,
                 char* err, size_t errlen);
+
+// Eval from precompiled bytecode (see afvm_compile). Same contract.
+int   afvm_eval_bytecode(afvm* v, const char* name, const char* bc, size_t len,
+                         char* err, size_t errlen);
 
 // Seal globals, spawn the loop thread, load `code` ONTO the loop thread and
 // run it (top-level code may yield — it is driven exactly like loop code),
@@ -40,6 +52,10 @@ int   afvm_eval(afvm* v, const char* name, const char* code, size_t len,
 #define AF_ERROR    2
 int   afvm_start(afvm* v, const char* fn, const char* code, size_t len,
                  char* err, size_t errlen);
+
+// Start from precompiled bytecode (see afvm_compile). Same contract.
+int   afvm_start_bytecode(afvm* v, const char* fn, const char* bc, size_t len,
+                          char* err, size_t errlen);
 
 // Resume a yielded loop with the op response. ok=0 raises in Lua.
 int   afvm_resume(afvm* v, const char* resp, size_t len, int ok);

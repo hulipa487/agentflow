@@ -77,6 +77,8 @@ var postgresSchema = []string{
 		session_id       TEXT,
 		type             TEXT,
 		text             TEXT,
+		text_bytes       BIGINT NOT NULL DEFAULT 0,
+		attachment_bytes BIGINT NOT NULL DEFAULT 0,
 		attachments_json TEXT,
 		provenance_json  TEXT,
 		err              TEXT
@@ -132,6 +134,16 @@ func (s *postgresStore) migrate(ctx context.Context) error {
 			return fmt.Errorf("postgres schema: %w", err)
 		}
 	}
+	// Columns added after the table shipped: CREATE TABLE IF NOT EXISTS does
+	// nothing to an existing table, and PostgreSQL has ADD COLUMN IF NOT EXISTS.
+	for _, stmt := range []string{
+		`ALTER TABLE message_journal ADD COLUMN IF NOT EXISTS text_bytes BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE message_journal ADD COLUMN IF NOT EXISTS attachment_bytes BIGINT NOT NULL DEFAULT 0`,
+	} {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("postgres schema: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -153,12 +165,12 @@ func (s *postgresStore) RecordMessage(ctx context.Context, e JournalEntry) error
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO message_journal
 			(id, ts, direction, status, channel, chat, sender, user_uuid, agent, session_id,
-			 type, text, attachments_json, provenance_json, err)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+			 type, text, text_bytes, attachment_bytes, attachments_json, provenance_json, err)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
 		e.ID, ts, e.Direction, e.Status, nullIfEmpty(e.Channel), nullIfEmpty(e.Chat),
 		nullIfEmpty(e.Sender), nullIfEmpty(e.UserUUID), nullIfEmpty(e.Agent),
 		nullIfEmpty(e.SessionID), nullIfEmpty(e.Type), nullIfEmpty(e.Text),
-		string(atts), string(prov), nullIfEmpty(e.Err))
+		e.TextBytes, e.AttachmentBytes, string(atts), string(prov), nullIfEmpty(e.Err))
 	return err
 }
 
@@ -197,6 +209,7 @@ func (s *postgresStore) ListMessages(ctx context.Context, f JournalFilter) ([]Jo
 		SELECT id, ts, direction, status, COALESCE(channel,''), COALESCE(chat,''),
 		       COALESCE(sender,''), COALESCE(user_uuid,''), COALESCE(agent,''),
 		       COALESCE(session_id,''), COALESCE(type,''), COALESCE(text,''),
+		       COALESCE(text_bytes,0), COALESCE(attachment_bytes,0),
 		       COALESCE(attachments_json,''), COALESCE(provenance_json,''), COALESCE(err,'')
 		FROM message_journal
 		WHERE %s
@@ -212,7 +225,7 @@ func (s *postgresStore) ListMessages(ctx context.Context, f JournalFilter) ([]Jo
 		var atts, prov string
 		if err := rows.Scan(&e.ID, &e.Ts, &e.Direction, &e.Status, &e.Channel, &e.Chat,
 			&e.Sender, &e.UserUUID, &e.Agent, &e.SessionID, &e.Type, &e.Text,
-			&atts, &prov, &e.Err); err != nil {
+			&e.TextBytes, &e.AttachmentBytes, &atts, &prov, &e.Err); err != nil {
 			return nil, err
 		}
 		if atts != "" {

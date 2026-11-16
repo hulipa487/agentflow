@@ -57,6 +57,18 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 	if opts.Temperature != nil {
 		params.Temperature = param.NewOpt(*opts.Temperature)
 	}
+	if opts.TopP != nil {
+		params.TopP = param.NewOpt(*opts.TopP)
+	}
+	if len(opts.Stop) > 0 {
+		params.StopSequences = opts.Stop
+	}
+	if opts.ResponseFormat != nil {
+		// The Messages API models no response_format. Refused rather than
+		// dropped: a caller that asked for JSON and silently got prose would
+		// have no way to tell.
+		return nil, false, errors.New("anthropic: response_format has no equivalent in the Messages API; use a provider that maps it (openai, openai-responses) or instruct the model in the prompt")
+	}
 	if thinking != "" && thinking != ThinkingOff {
 		// The Messages API has no explicit "off"; omitting the block is the
 		// only way to leave thinking at the provider default.
@@ -69,7 +81,7 @@ func anthropicOpen(ctx context.Context, client *http.Client, cfg config.Model, m
 	if len(opts.Tools) > 0 {
 		params.Tools = anthropicTools(opts.Tools)
 		if opts.ToolChoice != "" {
-			params.ToolChoice = anthropicToolChoice(opts.ToolChoice)
+			params.ToolChoice = anthropicToolChoice(opts.ToolChoice, opts.ParallelToolCalls)
 		}
 	}
 
@@ -270,14 +282,23 @@ func anthropicInputSchema(schema map[string]any) anthropic.ToolInputSchemaParam 
 	return out
 }
 
-func anthropicToolChoice(choice string) anthropic.ToolChoiceUnionParam {
-	switch choice {
+func anthropicToolChoice(choice string, parallel *bool) anthropic.ToolChoiceUnionParam {
+	disable := func() param.Opt[bool] {
+		if parallel == nil {
+			return param.Opt[bool]{}
+		}
+		return param.NewOpt(!*parallel)
+	}
+	mode, name := toolChoiceName(choice)
+	switch mode {
 	case "auto":
-		return anthropic.ToolChoiceUnionParam{OfAuto: &anthropic.ToolChoiceAutoParam{}}
+		return anthropic.ToolChoiceUnionParam{OfAuto: &anthropic.ToolChoiceAutoParam{DisableParallelToolUse: disable()}}
 	case "none":
 		return anthropic.ToolChoiceUnionParam{OfNone: &anthropic.ToolChoiceNoneParam{}}
-	case "any":
-		return anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{}}
+	case "any", "required":
+		return anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{DisableParallelToolUse: disable()}}
+	case "function":
+		return anthropic.ToolChoiceUnionParam{OfTool: &anthropic.ToolChoiceToolParam{Name: name, DisableParallelToolUse: disable()}}
 	default:
 		return anthropic.ToolChoiceUnionParam{}
 	}
@@ -371,7 +392,7 @@ func anthropicTurns(msgs []Message) (system string, turns []anthropic.MessagePar
 				})
 			} else {
 				turns = append(turns, anthropic.MessageParam{
-					Role:    anthropic.MessageParamRole(m.Role),
+					Role: anthropic.MessageParamRole(m.Role),
 					Content: []anthropic.ContentBlockParamUnion{{
 						OfText: &anthropic.TextBlockParam{Text: m.Content},
 					}},

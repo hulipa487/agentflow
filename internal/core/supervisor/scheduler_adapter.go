@@ -145,6 +145,11 @@ func (a *schedulerAdapter) CancelOwner(owner string) {
 	a.svc.CancelOwner(owner)
 }
 
+// OwnerPending reports how many live timers one session owns (idle unload).
+func (a *schedulerAdapter) OwnerPending(owner string) int {
+	return a.svc.OwnerPending(owner)
+}
+
 // Ensure the adapter satisfies both interfaces.
 var _ session.SchedulerService = (*schedulerAdapter)(nil)
 var _ session.ScopedSchedulerService = (*schedulerAdapter)(nil)

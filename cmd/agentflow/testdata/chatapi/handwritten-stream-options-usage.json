@@ -1,0 +1,28 @@
+{
+  "sequence": 6,
+  "recorded_at": "2026-11-17T00:00:00Z",
+  "handwritten": true,
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "Content-Type": [
+        "application/json"
+      ],
+      "Authorization": [
+        "Bearer REDACTED"
+      ]
+    },
+    "body": "{\"model\":\"coder\",\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}],\"stream\":true,\"stream_options\":{\"include_usage\":true}}"
+  },
+  "response": {
+    "status": 200,
+    "content_type": "text/event-stream",
+    "headers": {
+      "Content-Type": [
+        "text/event-stream"
+      ]
+    },
+    "body": "data: {\"id\":\"chatcmpl-hw-usage-001\",\"object\":\"chat.completion.chunk\",\"created\":1763400005,\"model\":\"gpt-4o-mini-2024-07-18\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-hw-usage-001\",\"object\":\"chat.completion.chunk\",\"created\":1763400005,\"model\":\"gpt-4o-mini-2024-07-18\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"id\":\"chatcmpl-hw-usage-001\",\"object\":\"chat.completion.chunk\",\"created\":1763400005,\"model\":\"gpt-4o-mini-2024-07-18\",\"choices\":[],\"usage\":{\"prompt_tokens\":18,\"completion_tokens\":1,\"total_tokens\":19,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":0}}}\n\ndata: [DONE]\n\n"
+  }
+}

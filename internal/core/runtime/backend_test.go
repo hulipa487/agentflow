@@ -77,7 +77,7 @@ func TestStoreContract(t *testing.T) {
 		// A row with every optional field empty must round-trip, not fail.
 		if err := s.RecordMessage(ctx, JournalEntry{
 			ID: id + "m2", Ts: time.Now().Unix(), Direction: "in", Status: "routed",
-			UserUUID: user, Text: "new",
+			UserUUID: user, Text: "new", TextBytes: 123, AttachmentBytes: 45,
 			Provenance: map[string]any{"kind": "user"},
 		}); err != nil {
 			t.Fatalf("record sparse: %v", err)
@@ -97,6 +97,11 @@ func TestStoreContract(t *testing.T) {
 		}
 		if rows[0].Provenance["kind"] != "user" {
 			t.Fatalf("provenance did not round-trip: %+v", rows[0])
+		}
+		// The metadata-mode size columns round-trip on both backends: a row
+		// that keeps sizes and no text is the whole point of journal: metadata.
+		if rows[0].TextBytes != 123 || rows[0].AttachmentBytes != 45 {
+			t.Fatalf("size columns did not round-trip: %+v", rows[0])
 		}
 		if n, err := s.PruneMessages(ctx, time.Now().Add(-24*time.Hour)); err != nil || n < 1 {
 			t.Fatalf("prune should remove at least the old row: n=%d err=%v", n, err)

@@ -1,0 +1,28 @@
+{
+  "sequence": 3,
+  "recorded_at": "2026-11-17T00:00:00Z",
+  "handwritten": true,
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "Content-Type": [
+        "application/json"
+      ],
+      "Authorization": [
+        "Bearer REDACTED"
+      ]
+    },
+    "body": "{\"model\":\"coder\",\"messages\":[{\"role\":\"user\",\"content\":\"What's the weather in Paris?\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Get the current weather for a location.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\",\"description\":\"City name\"}},\"required\":[\"location\"]}}}],\"tool_choice\":\"auto\"}"
+  },
+  "response": {
+    "status": 200,
+    "content_type": "application/json",
+    "headers": {
+      "Content-Type": [
+        "application/json"
+      ]
+    },
+    "body": "{\"id\":\"chatcmpl-hw-tools-001\",\"object\":\"chat.completion\",\"created\":1763400002,\"model\":\"gpt-4o-mini-2024-07-18\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_hw_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"location\\\":\\\"Paris\\\"}\"}}]},\"finish_reason\":\"tool_calls\",\"logprobs\":null}],\"usage\":{\"prompt_tokens\":80,\"completion_tokens\":18,\"total_tokens\":98}}"
+  }
+}

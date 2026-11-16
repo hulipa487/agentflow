@@ -70,13 +70,40 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 			params.Tools = append(params.Tools, openaiServerTool(s))
 		}
 		if opts.ToolChoice != "" {
-			params.ToolChoice = openai.ChatCompletionToolChoiceOptionUnionParam{
-				OfAuto: param.NewOpt(opts.ToolChoice),
+			if mode, name := toolChoiceName(opts.ToolChoice); mode == "function" {
+				params.ToolChoice = openai.ChatCompletionToolChoiceOptionUnionParam{
+					OfChatCompletionNamedToolChoice: &openai.ChatCompletionNamedToolChoiceParam{
+						Function: openai.ChatCompletionNamedToolChoiceFunctionParam{Name: name},
+					},
+				}
+			} else {
+				params.ToolChoice = openai.ChatCompletionToolChoiceOptionUnionParam{
+					OfAuto: param.NewOpt(opts.ToolChoice),
+				}
 			}
 		}
 	}
 	if opts.Temperature != nil {
 		params.Temperature = param.NewOpt(*opts.Temperature)
+	}
+	if opts.TopP != nil {
+		params.TopP = param.NewOpt(*opts.TopP)
+	}
+	if opts.ParallelToolCalls != nil {
+		params.ParallelToolCalls = param.NewOpt(*opts.ParallelToolCalls)
+	}
+	if len(opts.Stop) > 0 {
+		params.Stop = openai.ChatCompletionNewParamsStopUnion{OfStringArray: opts.Stop}
+	}
+	if opts.Seed != nil {
+		params.Seed = param.NewOpt(*opts.Seed)
+	}
+	if opts.ResponseFormat != nil {
+		rf, err := openaiResponseFormat(opts.ResponseFormat)
+		if err != nil {
+			return nil, false, err
+		}
+		params.ResponseFormat = rf
 	}
 	if mt := maxTokensOf(cfg, opts); mt > 0 {
 		params.MaxTokens = param.NewOpt(int64(mt))

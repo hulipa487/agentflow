@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 
 	"agentflow/internal/core/accounting"
 	"agentflow/internal/core/budget"
+	"agentflow/internal/core/chatreq"
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/runtime"
@@ -79,18 +81,14 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 			ToolChoice:  op.ToolChoice,
 		}
 	}
-	fail := func(err error) (string, bool) {
-		b, _ := json.Marshal(err.Error())
-		return string(b), false
-	}
 	chatOf := func(ctx context.Context, op session.Op) (string, bool) {
 		msgs, err := toLLM(op.Messages)
 		if err != nil {
-			return fail(err)
+			return failJSON(err)
 		}
 		reply, err := m.Chat(ctx, op.Model, msgs, optsOf(op))
 		if err != nil {
-			return fail(err)
+			return failJSON(err)
 		}
 		b, _ := json.Marshal(map[string]any{
 			"text":            reply.Text,
@@ -104,11 +102,11 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 	streamOf := func(ctx context.Context, op session.Op) (string, bool) {
 		msgs, err := toLLM(op.Messages)
 		if err != nil {
-			return fail(err)
+			return failJSON(err)
 		}
 		id, err := m.StreamOpen(ctx, op.Model, msgs, optsOf(op))
 		if err != nil {
-			return fail(err)
+			return failJSON(err)
 		}
 		b, _ := json.Marshal(map[string]any{"id": id})
 		return string(b), true
@@ -124,7 +122,7 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 			copy(parts, op.Inputs)
 			for i := range parts {
 				if err := resolvePart(&parts[i], ms); err != nil {
-					return fail(err)
+					return failJSON(err)
 				}
 			}
 			vectors, usage, err := m.EmbedParts(ctx, op.Model, parts, llm.EmbedOpts{
@@ -133,7 +131,7 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 				Merged:     op.Merged,
 			})
 			if err != nil {
-				return fail(err)
+				return failJSON(err)
 			}
 			b, _ := json.Marshal(map[string]any{"vectors": vectors, "usage": usage})
 			return string(b), true
@@ -142,7 +140,7 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 		"llm.rerank": func(ctx context.Context, op session.Op) (string, bool) {
 			results, err := m.Rerank(ctx, op.Model, op.Text, op.Documents, op.TopN)
 			if err != nil {
-				return fail(err)
+				return failJSON(err)
 			}
 			b, _ := json.Marshal(map[string]any{"results": results})
 			return string(b), true
@@ -153,7 +151,7 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 		"llm.stream.next": func(ctx context.Context, op session.Op) (string, bool) {
 			frame, err := m.StreamNext(ctx, op.Stream)
 			if err != nil && !frame.Done {
-				return fail(err)
+				return failJSON(err)
 			}
 			b, _ := json.Marshal(map[string]any{
 				"delta":           frame.Delta,
@@ -237,6 +235,10 @@ type Metering struct {
 	Ledger UsageRecorder // nil = no accounting
 	Events bool          // also write the per-call detail row
 	Log    *slog.Logger
+	// Requests is the OpenAI-channel request registry. llm.forward and
+	// openai.request resolve the current turn's request through it; nil leaves
+	// both ops reporting that no forwarded request is available.
+	Requests *chatreq.Registry
 }
 
 // denyJSON is the structured refusal a loop receives when a limit bites, so it
@@ -587,5 +589,237 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]
 		mt.record(ctx, op, "rerank", usageCounts{}, ok)
 		return resp, ok
 	}
+
+	// llm.forward is the OpenAI channel's pass-through. It is built on the same
+	// metered stream path as llm.stream.open/next/close — quota hold, usage
+	// ledger, metrics, user keys — and adds only what the channel needs: the
+	// request the turn arrived with, and relay of its text deltas when the
+	// safety profile cannot veto the answer (D9).
+	base["llm.forward"] = func(ctx context.Context, op session.Op) (string, bool) {
+		var req *chatreq.Request
+		if mt.Requests != nil {
+			r, err := currentRequest(ctx, mt.Requests, "llm.forward")
+			if err == nil {
+				req = r
+			} else if len(op.Messages) == 0 {
+				return failJSON(err)
+			}
+		} else if len(op.Messages) == 0 {
+			return failJSON(errors.New("llm.forward: no OpenAI request registry is configured on this runtime; pass opts.messages"))
+		}
+		msgs := op.Messages
+		if len(msgs) == 0 {
+			msgs = req.Messages
+		}
+		if len(op.Prepend) > 0 {
+			msgs = append(append([]session.ChatMessage{}, op.Prepend...), msgs...)
+		}
+		if len(op.Append) > 0 {
+			msgs = append(msgs, op.Append...)
+		}
+		var tools []session.ToolSpec
+		if req != nil {
+			tools = append(tools, req.Tools...)
+		}
+		tools = append(tools, op.Tools...)
+
+		model := op.Model
+		temperature, topP := op.Temperature, op.TopP
+		parallel, stop, seed := op.ParallelToolCalls, op.Stop, op.Seed
+		responseFormat, toolChoice := op.ResponseFormat, op.ToolChoice
+		maxTokens := op.MaxTokens
+		if req != nil {
+			if temperature == nil {
+				temperature = req.Temperature
+			}
+			if topP == nil {
+				topP = req.TopP
+			}
+			if parallel == nil {
+				parallel = req.ParallelToolCalls
+			}
+			if len(stop) == 0 {
+				stop = req.Stop
+			}
+			if seed == nil {
+				seed = req.Seed
+			}
+			if responseFormat == nil {
+				responseFormat = req.ResponseFormat
+			}
+			if toolChoice == "" {
+				toolChoice = req.ToolChoice
+			}
+			if maxTokens == 0 {
+				maxTokens = req.MaxTokens
+			}
+		}
+		if model == "" {
+			model = session.AgentModelFromCtx(ctx)
+		}
+		if cap := op.MaxTokensCap; cap > 0 && (maxTokens == 0 || maxTokens > cap) {
+			maxTokens = cap
+		}
+
+		openOp := session.Op{
+			Type: "llm.stream.open", Model: model, Messages: msgs, Tools: tools,
+			ToolChoice: toolChoice, Temperature: temperature, TopP: topP,
+			ParallelToolCalls: parallel, Stop: stop, Seed: seed,
+			ResponseFormat: responseFormat, MaxTokens: maxTokens, Thinking: op.Thinking,
+		}
+		ledgerOp := session.Op{Type: "llm.forward", Model: model}
+		resp, ok := base["llm.stream.open"](ctx, openOp)
+		if !ok {
+			// A refusal (quota, budget) writes no ledger row — the call never
+			// happened. A provider failure did happen, and the forward contract
+			// says it is recorded like any other attempt.
+			if !strings.Contains(resp, "user_quota_exhausted") && !strings.Contains(resp, "budget_exhausted") {
+				mt.record(ctx, ledgerOp, "forward", usageCounts{}, false)
+			}
+			return resp, false
+		}
+		var handle struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal([]byte(resp), &handle); err != nil || handle.ID == "" {
+			return failJSON(fmt.Errorf("llm.forward: the stream handle is missing from %s", resp))
+		}
+		closeStream := func() {
+			base["llm.stream.close"](ctx, session.Op{Type: "llm.stream.close", Stream: handle.ID})
+		}
+
+		var text strings.Builder
+		var usage llm.Usage
+		var calls []llm.ToolCall
+		var thinking string
+		var blocks []map[string]any
+		for {
+			frameResp, ok := base["llm.stream.next"](ctx, session.Op{Type: "llm.stream.next", Stream: handle.ID})
+			if !ok {
+				// A mid-stream transport failure or a cancelled client: the
+				// terminal usage never arrived, so the metered next handler
+				// wrote nothing. The forward contract records one row for every
+				// attempt, and close releases the reservation.
+				mt.record(ctx, ledgerOp, "forward", usageCounts{}, false)
+				closeStream()
+				return frameResp, false
+			}
+			var frame struct {
+				Delta          string           `json:"delta"`
+				Done           bool             `json:"done"`
+				Usage          llm.Usage        `json:"usage"`
+				ToolCalls      []llm.ToolCall   `json:"tool_calls"`
+				Thinking       string           `json:"thinking"`
+				ThinkingBlocks []map[string]any `json:"thinking_blocks"`
+				Error          *string          `json:"error"`
+			}
+			if err := json.Unmarshal([]byte(frameResp), &frame); err != nil {
+				mt.record(ctx, ledgerOp, "forward", usageCounts{}, false)
+				closeStream()
+				return failJSON(fmt.Errorf("llm.forward: bad stream frame: %w", err))
+			}
+			if frame.Delta != "" {
+				text.WriteString(frame.Delta)
+				// Relay only when the client asked for a stream AND the safety
+				// profile cannot veto the answer afterwards (D7/D9). Otherwise
+				// the text is returned whole for session.reply.
+				if req != nil && req.Stream && session.StreamsLiveFromCtx(ctx) {
+					if sink, ok := session.DeltaSinkFromCtx(ctx); ok && sink != nil {
+						if err := sink(frame.Delta); err != nil {
+							mt.record(ctx, ledgerOp, "forward", usageCounts{}, false)
+							closeStream()
+							return failJSON(err)
+						}
+					}
+				}
+			}
+			if frame.Done {
+				usage = frame.Usage
+				calls = frame.ToolCalls
+				thinking = frame.Thinking
+				blocks = frame.ThinkingBlocks
+				if frame.Error != nil && *frame.Error != "" {
+					// The metered next handler already wrote the row for this
+					// terminal frame (it cannot tell a provider error from a
+					// normal end); do not write a second.
+					closeStream()
+					return failJSON(errors.New(*frame.Error))
+				}
+				break
+			}
+		}
+		closeStream() // idempotent; StreamNext already closed on done
+
+		outCalls := make([]session.ToolCallSpec, len(calls))
+		for i, c := range calls {
+			outCalls[i] = session.ToolCallSpec{ID: c.ID, Name: c.Name, Args: c.Args}
+		}
+		finish := "stop"
+		if len(outCalls) > 0 {
+			finish = "tool_calls"
+		}
+		b, err := json.Marshal(map[string]any{
+			"text":            text.String(),
+			"tool_calls":      outCalls,
+			"finish_reason":   finish,
+			"usage":           usage,
+			"thinking":        thinking,
+			"thinking_blocks": blocks,
+		})
+		if err != nil {
+			return failJSON(err)
+		}
+		return string(b), true
+	}
+
+	// openai.request exposes the full request as Lua data, size-capped. The
+	// cap is the design: above it the loop should forward the request rather
+	// than materialise it.
+	base["openai.request"] = func(ctx context.Context, op session.Op) (string, bool) {
+		if mt.Requests == nil {
+			return failJSON(errors.New("openai.request: this runtime has no OpenAI request registry"))
+		}
+		req, err := currentRequest(ctx, mt.Requests, "openai.request")
+		if err != nil {
+			return failJSON(err)
+		}
+		b, err := json.Marshal(req.LuaView())
+		if err != nil {
+			return failJSON(err)
+		}
+		if len(b) > maxForwardRequestJSON {
+			return failJSON(fmt.Errorf("openai.request: this request is %d bytes of JSON, over the %d-byte limit; forward it with llm.forward instead of materialising it", len(b), maxForwardRequestJSON))
+		}
+		return string(b), true
+	}
 	return base
+}
+
+// maxForwardRequestJSON is the largest request openai.request materialises.
+const maxForwardRequestJSON = 4 << 20
+
+// failJSON is the (response, ok) pair an op handler returns for an error: the
+// message crosses the bridge as a JSON string, which the Lua side raises with.
+func failJSON(err error) (string, bool) {
+	b, _ := json.Marshal(err.Error())
+	return string(b), false
+}
+
+// currentRequest resolves the request behind the turn being served. A ref this
+// process does not know is the regional gap (5.4): a keyed session moved
+// instances between turns, and the body stayed where it arrived.
+func currentRequest(ctx context.Context, reg *chatreq.Registry, opName string) (*chatreq.Request, error) {
+	m := session.TurnMessageFromCtx(ctx)
+	if m == nil || m.Payload == nil {
+		return nil, fmt.Errorf("%s: this turn has no forwarded request; use it inside an openai-channel turn", opName)
+	}
+	ref, _ := m.Payload["request_ref"].(string)
+	if ref == "" {
+		return nil, fmt.Errorf("%s: this turn carries no request_ref; the openai channel sets one on every turn it delivers", opName)
+	}
+	req, ok := reg.Get(ref)
+	if !ok {
+		return nil, fmt.Errorf("%s: the request behind this turn (ref %s) is not in this process — a keyed session that moved instances keeps only the message, not its body; forward with opts.messages, or give the route ephemeral sessions", opName, ref)
+	}
+	return req, nil
 }

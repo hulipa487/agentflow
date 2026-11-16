@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"agentflow/internal/config"
+	"agentflow/internal/core/gateway"
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/pool"
 	"agentflow/internal/core/session"
@@ -63,6 +64,22 @@ func (g *schemaGW) Send(channel, replyTo, text string, attachments []media.Part)
 	g.sends = append(g.sends, text)
 	return nil
 }
+
+func (g *schemaGW) SendReply(channel, replyTo string, r gateway.Reply) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.sends = append(g.sends, r.Text)
+	return nil
+}
+
+func (g *schemaGW) SendDelta(channel, replyTo, text string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.sends = append(g.sends, text)
+	return nil
+}
+
+func (g *schemaGW) EndTurn(channel, replyTo string, err error) {}
 
 // TestToolSchemaVMRoundTrip: register a tool whose schema carries
 // `"required": []string{}`, list it through tools.list inside a real Luau VM,

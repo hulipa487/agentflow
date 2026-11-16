@@ -313,6 +313,9 @@ func DefaultCounters() map[string]*Counter {
 		"agentflow_egress_total":             NewCounter("agentflow_egress_total", "Total outbound replies"),
 		"agentflow_egress_failed":            NewCounter("agentflow_egress_failed", "Outbound replies that failed delivery"),
 		"agentflow_sessions_active":          NewCounter("agentflow_sessions_active", "Currently active sessions (gauge)"),
+		"agentflow_sessions_unloaded":        NewCounter("agentflow_sessions_unloaded", "Idle sessions unloaded by the janitor"),
+		"agentflow_ephemeral_sessions":       NewCounter("agentflow_ephemeral_sessions", "Currently live one-turn sessions (gauge)"),
+		"agentflow_ephemeral_cap_drops":      NewCounter("agentflow_ephemeral_cap_drops", "Ephemeral sessions refused by the per-tenant cap"),
 		"agentflow_children_spawned":         NewCounter("agentflow_children_spawned", "Total spawned child agents"),
 		"agentflow_children_died":            NewCounter("agentflow_children_died", "Total child agent deaths"),
 		"agentflow_llm_calls":                NewCounter("agentflow_llm_calls", "Total LLM calls"),
@@ -366,7 +369,7 @@ type AdminServer struct {
 	reg       *Registry
 	token     string
 	operators map[string]string // name -> token
-	readyz    func() bool
+	ready     atomic.Bool
 	sessions  func() []SessionInfo
 	credStore *credentials.Store
 	cors      []string
@@ -502,10 +505,13 @@ func (s *AdminServer) Token() string { return s.token }
 // SetCORS was called), letting tests serve it via httptest.
 func (s *AdminServer) Handler() http.Handler { return s.srv.Handler }
 
-// SetReady sets the readiness check. The runtime calls this once boot is complete.
-func (s *AdminServer) SetReady(ready bool) {
-	s.readyz = func() bool { return ready }
-}
+// SetReady marks the instance ready to serve. The runtime sets it once boot is
+// complete and clears it when draining starts.
+func (s *AdminServer) SetReady(ready bool) { s.ready.Store(ready) }
+
+// Ready reports whether the instance is serving new traffic. Channels that can
+// answer 503 use it to refuse during the drain window.
+func (s *AdminServer) Ready() bool { return s.ready.Load() }
 
 // SetSessions sets the session lister. The supervisor provides this.
 func (s *AdminServer) SetSessions(lister func() []SessionInfo) {
@@ -595,7 +601,7 @@ func (s *AdminServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *AdminServer) handleReady(w http.ResponseWriter, r *http.Request) {
-	if s.readyz != nil && s.readyz() {
+	if s.ready.Load() {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, "ready")
 		return

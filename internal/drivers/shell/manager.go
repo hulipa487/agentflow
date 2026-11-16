@@ -299,6 +299,11 @@ func (m *Manager) Ensure(ctx context.Context, owner, providerName string, opts S
 	return m.Spawn(ctx, owner, providerName, opts)
 }
 
+// Owned reports how many live shell handles a session owns in this process.
+// The supervisor's idle janitor asks before unloading: a session holding a shell
+// has work in flight, not an idle conversation.
+func (m *Manager) Owned(owner string) int { return len(m.owned(owner)) }
+
 // ReapSession destroys every shell handle belonging to a session key: the ones
 // this instance holds, and the records it does not.
 //

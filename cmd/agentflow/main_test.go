@@ -8,6 +8,22 @@ import (
 	"agentflow/internal/config"
 )
 
+// TestSessionHubWiring: a single instance installs no hub, so it writes no
+// session leases; -force-single and a regional cell keep it.
+func TestSessionHubWiring(t *testing.T) {
+	single := &config.Config{}
+	if useSessionHub(single, false) {
+		t.Fatal("a single topology must not install the session hub")
+	}
+	if !useSessionHub(single, true) {
+		t.Fatal("-force-single must keep the hub: two processes may share the store")
+	}
+	regional := &config.Config{Runtime: config.Runtime{Topology: "regional"}}
+	if !useSessionHub(regional, false) {
+		t.Fatal("a regional cell must install the hub")
+	}
+}
+
 // TestTriggerTarget: a scheduled trigger's target.profile resolves to a
 // configured agent by name, or to the "spawn:<profile>" address the supervisor
 // registers for a spawn profile. Anything else is unresolvable (the trigger

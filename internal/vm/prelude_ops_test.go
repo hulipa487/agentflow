@@ -62,6 +62,54 @@ return h
 	}
 }
 
+// A sandbox job's options are the same for shell.run and shell.start, and the
+// Lua names differ from nothing on the wire: this is what would catch one that
+// did.
+func TestShellJobBuildersForwardTheirOptions(t *testing.T) {
+	for _, kind := range []string{"run", "start"} {
+		status, msg := opFromLua(t, `return shell.`+kind+`("make test", {
+  project = "site", environment = "python", workdir = "app",
+  env = { CI = "1" }, timeout = 90 })`)
+		if status != Yielded {
+			t.Fatalf("shell.%s: expected a yielded op request, got status %v: %s", kind, status, msg)
+		}
+		var op struct {
+			Type        string            `json:"type"`
+			Cmd         string            `json:"cmd"`
+			Project     string            `json:"project"`
+			Environment string            `json:"environment"`
+			WorkDir     string            `json:"workdir"`
+			Env         map[string]string `json:"env"`
+			Timeout     float64           `json:"timeout"`
+		}
+		if err := json.Unmarshal([]byte(msg), &op); err != nil {
+			t.Fatalf("op payload is not JSON (%q): %v", msg, err)
+		}
+		if op.Type != "shell."+kind || op.Cmd != "make test" {
+			t.Fatalf("shell.%s emitted %s", kind, msg)
+		}
+		if op.Project != "site" || op.Environment != "python" || op.WorkDir != "app" || op.Env["CI"] != "1" || op.Timeout != 90 {
+			t.Fatalf("shell.%s dropped an option: %s", kind, msg)
+		}
+	}
+
+	status, msg := opFromLua(t, `return shell.exec("h", "ls", { timeout = 30 })`)
+	var exec struct {
+		Handle  string  `json:"shell_handle"`
+		Timeout float64 `json:"timeout"`
+	}
+	if status != Yielded || json.Unmarshal([]byte(msg), &exec) != nil || exec.Handle != "h" || exec.Timeout != 30 {
+		t.Fatalf("shell.exec dropped its timeout: %v %s", status, msg)
+	}
+	status, msg = opFromLua(t, `return shell.status("j42")`)
+	var st struct {
+		JobID string `json:"job_id"`
+	}
+	if status != Yielded || json.Unmarshal([]byte(msg), &st) != nil || st.JobID != "j42" {
+		t.Fatalf("shell.status dropped the job id: %v %s", status, msg)
+	}
+}
+
 // opFromLua starts a chunk that calls one builder, and returns the op JSON it
 // yielded.
 func opFromLua(t *testing.T, body string) (Status, string) {
@@ -120,6 +168,10 @@ var builderTypes = []struct{ name, call, op string }{
 	{"shell.exec", `shell.exec("h", "ls")`, "shell.exec"},
 	{"shell.write", `shell.write("h", "f", "c")`, "shell.write"},
 	{"shell.destroy", `shell.destroy("h")`, "shell.destroy"},
+	{"shell.run", `shell.run("ls")`, "shell.run"},
+	{"shell.start", `shell.start("make")`, "shell.start"},
+	{"shell.status", `shell.status("j1")`, "shell.status"},
+	{"shell.cancel", `shell.cancel("j1")`, "shell.cancel"},
 	{"http.request", `http.request({ url = "https://x" })`, "http.request"},
 	{"http.get", `http.get("https://x")`, "http.request"},
 	{"http.post", `http.post("https://x", "b")`, "http.request"},

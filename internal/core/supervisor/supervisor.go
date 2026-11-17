@@ -69,8 +69,10 @@ type Supervisor struct {
 	gw       *gateway.Registry
 	pool     *pool.Pool
 	shellMgr *shell.Manager
-	sched    *schedulerAdapter
-	users    session.UserResolver
+	// jobs are the session's background shell jobs, when the sandbox is wired.
+	jobs  ShellJobs
+	sched *schedulerAdapter
+	users session.UserResolver
 	// profileSettings, when set, supplies each session with the per-user model
 	// and instruction overrides its person has. See session.ProfileSettings.
 	profileSettings session.ProfileSettings
@@ -317,6 +319,17 @@ func (s *Supervisor) SweepIdle() {
 	}
 }
 
+// ShellJobs is what the supervisor needs to know about background shell jobs:
+// whether a session is waiting on one, and how to stop them when it ends.
+type ShellJobs interface {
+	Running(owner string) int
+	CancelOwner(owner string)
+}
+
+// SetShellJobs installs the background shell job service. main calls it once,
+// before any session runs.
+func (s *Supervisor) SetShellJobs(j ShellJobs) { s.jobs = j }
+
 // ownsLiveResource reports whether a session holds anything that outlives its
 // parked actor. Call without s.mu held.
 func (s *Supervisor) ownsLiveResource(skey string) bool {
@@ -324,6 +337,11 @@ func (s *Supervisor) ownsLiveResource(skey string) bool {
 		return true
 	}
 	if s.shellMgr != nil && s.shellMgr.Owned(skey) > 0 {
+		return true
+	}
+	// A session waiting for a background job's result is not idle. Unloading
+	// it would end the session's resources, the job among them.
+	if s.jobs != nil && s.jobs.Running(skey) > 0 {
 		return true
 	}
 	if s.requests.PendingFor(skey) > 0 {
@@ -815,6 +833,10 @@ func (s *Supervisor) onActorExit(id session.Identity, reason session.EndReason) 
 		// The context is detached on purpose: the session is already gone, and
 		// the reap must not be cancelled by whatever cancelled it.
 		s.shellMgr.ReapSession(context.Background(), id.SessionID)
+	}
+	if s.jobs != nil {
+		// A job whose session is gone has no inbox to report to.
+		s.jobs.CancelOwner(id.SessionID)
 	}
 	if unloaded != nil {
 		metrics.Inc("agentflow_sessions_unloaded")

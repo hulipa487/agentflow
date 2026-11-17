@@ -145,12 +145,47 @@ func TestValidateShellProfile(t *testing.T) {
 			profile: ShellProfile{Provider: "ssh", Host: "1.2.3.4:22", User: "root"},
 		},
 		{
-			name:    "docker default (no provider) ok",
-			profile: ShellProfile{},
+			name:    "sandbox by default",
+			profile: ShellProfile{Environment: "python"},
 		},
 		{
-			name:    "docker explicit ok",
+			name:    "sandbox explicit, with its settings",
+			profile: ShellProfile{Provider: "sandbox", Environment: "python", Network: "none", Timeout: "90s", MemLimit: "512m", Project: "site"},
+		},
+		{
+			name:    "sandbox needs an environment",
+			profile: ShellProfile{},
+			wantErr: "names no environment (declared: python)",
+		},
+		{
+			name:    "sandbox environment must be declared",
+			profile: ShellProfile{Environment: "rust"},
+			wantErr: `names environment "rust", which is not declared (declared: python)`,
+		},
+		{
+			name:    "sandbox has no network yet",
+			profile: ShellProfile{Environment: "python", Network: "bridge"},
+			wantErr: "the only value is none",
+		},
+		{
+			name:    "sandbox timeout must parse",
+			profile: ShellProfile{Environment: "python", Timeout: "soon"},
+			wantErr: "not a positive duration",
+		},
+		{
+			name:    "sandbox memory must parse",
+			profile: ShellProfile{Environment: "python", MemLimit: "lots"},
+			wantErr: "not a positive size",
+		},
+		{
+			name:    "sandbox takes an environment, not an image",
+			profile: ShellProfile{Image: "alpine:3.20"},
+			wantErr: "declare the image under environments",
+		},
+		{
+			name:    "docker was removed",
 			profile: ShellProfile{Provider: "docker", Image: "alpine:3.20"},
+			wantErr: "provider docker, which was removed",
 		},
 		{
 			name:    "unknown provider",
@@ -160,15 +195,16 @@ func TestValidateShellProfile(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateShellProfile("cfg.yaml", "test-owner", "p", tt.profile)
+			cfg := &Config{Environments: map[string]Environment{"python": {Rootfs: "/srv/envs/python"}}}
+			err := validateShellProfile("cfg.yaml", "test-owner", "p", tt.profile, cfg)
 			if tt.wantErr == "" {
 				if err != nil {
 					t.Fatalf("expected no error, got: %v", err)
 				}
 				return
 			}
-			if err == nil {
-				t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tt.wantErr, err)
 			}
 		})
 	}

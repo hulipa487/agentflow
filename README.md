@@ -106,7 +106,7 @@ Edit the loop while it runs and every live session switches to the new code at i
 
 **🧠 Loops in Luau**
 - A sandboxed Lua state per conversation, with a memory cap and an instruction budget.
-- One small API: `llm.chat` / `llm.stream` / `llm.embed` / `llm.rerank`, `memory.recall` / `memory.write`, `store.*`, `tools.run`, `http.request`, `files.*`, `shell.exec`, `mail.*`, `scheduler.after` / `every` / `cron`, `agent.spawn` / `send` / `request`, `user.*`.
+- One small API: `llm.chat` / `llm.stream` / `llm.embed` / `llm.rerank`, `memory.recall` / `memory.write`, `store.*`, `tools.run`, `http.request`, `files.*`, `shell.run`, `mail.*`, `scheduler.after` / `every` / `cron`, `agent.spawn` / `send` / `request`, `user.*`.
 - Built-in plugins for the boring parts: recency and semantic recall, fact extraction, per-chat routing, token budgets.
 - `agentflow loop test` runs scripted scenarios against a loop, so loops get tests too.
 
@@ -123,6 +123,7 @@ Edit the loop while it runs and every live session switches to the new code at i
 **🧰 Tools and integrations**
 - Declarative HTTP tools in YAML, or generate them from an OpenAPI spec with `agentflow tools import-openapi`.
 - MCP servers as tool sources, a browser tool (Cloudflare Browser Rendering), web search and page fetch.
+- A shell that leaves nothing behind: each command is a one-off [gVisor](https://gvisor.dev) sandbox on a user's project files, with a declared toolchain image, a time limit and no network. Changes are stored when it ends; the next command can run on any instance. SSH is there for real remote machines.
 - Media and files on local disk or S3.
 
 **👥 Users and tenancy**

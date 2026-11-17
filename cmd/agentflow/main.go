@@ -57,6 +57,8 @@ import (
 	"agentflow/internal/core/scheduler"
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/sessionhub"
+	"agentflow/internal/core/shelljobs"
+	"agentflow/internal/core/shellops"
 	"agentflow/internal/core/storedb"
 	"agentflow/internal/core/studio"
 	"agentflow/internal/core/supervisor"
@@ -64,6 +66,7 @@ import (
 	"agentflow/internal/core/tools"
 	"agentflow/internal/core/triggers"
 	"agentflow/internal/core/users"
+	"agentflow/internal/core/workspace"
 	"agentflow/internal/drivers/bridge"
 	"agentflow/internal/drivers/browser"
 	"agentflow/internal/drivers/chatapi"
@@ -80,6 +83,7 @@ import (
 	"agentflow/internal/drivers/redis"
 	"agentflow/internal/drivers/redisvector"
 	"agentflow/internal/drivers/s3media"
+	"agentflow/internal/drivers/sandbox"
 	"agentflow/internal/drivers/search"
 	"agentflow/internal/drivers/shell"
 	"agentflow/internal/drivers/sqlite"
@@ -258,8 +262,8 @@ func main() {
 	}
 
 	// Shell profile passwords may be lazy references; an unresolvable one is
-	// cleared with a warning (the profile itself stays — docker needs no
-	// password, ssh may still authenticate by key).
+	// cleared with a warning (the profile itself stays — a sandbox profile has
+	// no password, and ssh may still authenticate by key).
 	for name, p := range cfg.Profiles.Shell {
 		if p.Password == "" {
 			continue
@@ -348,11 +352,10 @@ func main() {
 	metricReg := metrics.Global()
 	history := metricReg.StartSampler(ctx, 5*time.Second, 1440)
 
-	// Shell manager. Docker runs a single long-lived container per handle
-	// (persistent fs/env/process state); SSH dials a remote host. Both are
-	// generic providers; vendor-specific launchers live outside the runtime.
+	// Remote shells: a connection to a real machine, held for a session. Shell
+	// commands on this host are not handles at all — they run as one-off
+	// sandbox jobs, wired below once the files store exists.
 	shellMgr := shell.NewManager([]shell.ShellProvider{
-		shell.NewDockerProvider(log),
 		shell.NewSSHProvider(log),
 	}, log)
 
@@ -481,14 +484,6 @@ func main() {
 	if err := metricReg.SetLabels(labels); err != nil {
 		log.Warn("metric labels not set", "err", err)
 	}
-
-	// Shell handle registry. A handle is a resource out on a host — a container
-	// the session can reach from any instance — not a structure in this process,
-	// so it is recorded where the fleet can see it: that is what lets the
-	// instance that takes a session over adopt the shell the session was using,
-	// and what lets a handle whose instance was killed be reclaimed rather than
-	// living on the host forever.
-	shellMgr.SetRegistry(caps.ShellStore{Store: rtStore}, leaseMgr.Owner())
 
 	// singletonFor runs fn only while this instance holds the named lease for
 	// ttl. The TTL belongs to the job: a job that repeats should hold its lease
@@ -690,7 +685,55 @@ func main() {
 	tools.RegisterLegalBuiltins(toolReg, legalSet)
 	tools.RegisterBrowserBuiltins(toolReg, browserClient, filesMgr)
 	tools.RegisterFetchBuiltins(toolReg, fetch.New(netPolicy), log, filesMgr)
-	tools.RegisterShellBuiltins(toolReg, shellMgr)
+	// Sandbox jobs: one command, one gVisor sandbox, on a project from the
+	// files store. Nothing is probed or started here — a deployment with no
+	// sandbox shell profile never runs runsc — and an instance where the
+	// sandbox cannot work still boots: the first shell call says why.
+	envSpecs := make(map[string]sandbox.EnvSpec, len(cfg.Environments))
+	for name, e := range cfg.Environments {
+		envSpecs[name] = sandbox.EnvSpec{Image: e.Image, Rootfs: e.Rootfs, Env: e.Env}
+	}
+	sbx := cfg.Runtime.Sandbox
+	sandboxDir := cfg.SandboxDataDir()
+	sandboxRunner := sandbox.NewRunsc(sbx.Runsc, sandboxDir, log)
+	shellJobs := shelljobs.New(shelljobs.Config{
+		Concurrency:          sbx.Concurrency,
+		PerScope:             sbx.PerUser,
+		QueueTimeout:         sbx.QueueWait(),
+		Timeout:              sbx.JobTimeout(),
+		MaxTimeout:           sbx.JobMaxTimeout(),
+		BackgroundMaxTimeout: sbx.BackgroundTimeout(),
+		Limits: sandbox.Limits{
+			OutputBytes: sbx.OutputBytes(),
+			TmpBytes:    sbx.TmpBytes(),
+			MemoryBytes: sbx.MemoryBytes(),
+			CPUs:        sbx.CPUs,
+			PIDs:        sbx.PIDs,
+		},
+		WriteBack: workspace.Limits{MaxFiles: sbx.WriteBackFiles(), MaxBytes: sbx.WriteBackBytes()},
+	}, sandboxRunner, sandbox.NewEnvs(sandboxDir, envSpecs, log),
+		workspace.New(filepath.Join(sandboxDir, "workspaces"), filesMgr, log), filesMgr, log)
+	// Background jobs are recorded in the runtime store, so a session that
+	// moved to another instance can still ask about the one it started.
+	shellJobs.SetStore(ctx, rtStore, leaseMgr.Owner())
+	shellFront := &shellops.Front{SSH: shellMgr, Jobs: shellJobs, Files: filesMgr}
+	// A finished background job reports to its session's inbox. The supervisor
+	// that delivers it is built further down, so the handlers get a slot that
+	// is filled in then.
+	var jobDelivery atomic.Pointer[caps.JobDeliverer]
+	deliverJob := func(owner string, msg session.Message) {
+		if d := jobDelivery.Load(); d != nil {
+			(*d)(owner, msg)
+		}
+	}
+	if sandboxInUse(cfg) {
+		if err := shellJobs.Available(); err != nil {
+			log.Warn("an agent has a sandbox shell profile, but shell jobs cannot run on this instance", "err", err)
+		} else if enforced, note := sandboxRunner.Limiting(); !enforced {
+			log.Warn("shell jobs will run without memory and CPU limits", "why", strings.TrimPrefix(note, "memory and CPU limits are not enforced: "))
+		}
+	}
+	tools.RegisterShellBuiltins(toolReg, shellFront)
 	// Declarative HTTP tools: config-declared REST integrations, no Go code per
 	// API. They share the same dialer guard and per-tenant credential store as
 	// http.request and builtin:fetch.
@@ -973,7 +1016,7 @@ func main() {
 		for k, h := range gateOps(enforce, name, effectiveCaps, "tools", caps.ToolHandlers(agentSet, toolWiring), &withheld) {
 			handlers[k] = h
 		}
-		for k, h := range gateOps(enforce, name, effectiveCaps, "shell.exec", caps.ShellHandlers(shellMgr, filesMgr, name), &withheld) {
+		for k, h := range gateOps(enforce, name, effectiveCaps, "shell.exec", caps.ShellHandlers(shellFront, name, deliverJob), &withheld) {
 			handlers[k] = h
 		}
 		for k, h := range gateOps(enforce, name, effectiveCaps, "net.http", caps.HTTPHandlers(log, credStore, netPolicy, filesMgr), &withheld) {
@@ -1148,7 +1191,7 @@ func main() {
 		for k, h := range gateOps(enforce, pname, profileCaps, "tools", caps.ToolHandlers(agentSet, toolWiring), &withheld) {
 			handlers[k] = h
 		}
-		for k, h := range gateOps(enforce, pname, profileCaps, "shell.exec", caps.ShellHandlers(shellMgr, filesMgr, pname), &withheld) {
+		for k, h := range gateOps(enforce, pname, profileCaps, "shell.exec", caps.ShellHandlers(shellFront, pname, deliverJob), &withheld) {
 			handlers[k] = h
 		}
 		for k, h := range gateOps(enforce, pname, profileCaps, "net.http", caps.HTTPHandlers(log, credStore, netPolicy, filesMgr), &withheld) {
@@ -1287,6 +1330,20 @@ func main() {
 	}
 
 	sup = supervisor.New(defs, gw, opPool, shellMgr, log)
+	sup.SetShellJobs(shellJobs)
+	deliverJobResult := caps.JobDeliverer(func(owner string, msg session.Message) {
+		agent, key, ok := sessionhub.SplitSessionKey(owner)
+		if !ok {
+			log.Warn("shell job result has a malformed owner; dropping it", "owner", owner)
+			return
+		}
+		// Routed like any message: with a hub it goes to whichever instance
+		// owns the session now, which need not be the one that ran the job.
+		if err := sup.Deliver(agent, key, msg); err != nil {
+			log.Warn("shell job result could not be delivered", "session", owner, "job", msg.ID, "err", err)
+		}
+	})
+	jobDelivery.Store(&deliverJobResult)
 	sup.SetPushSameTenant(cfg.Runtime.Users.PushSameTenant)
 
 	// Studio (the standalone builder/playground app): one broker both observes
@@ -1424,38 +1481,6 @@ func main() {
 		}
 		every(ctx, failoverEvery, func() { sup.FailoverPersistent(ctx) })
 	}
-
-	// Shell handle reclaim. A session that ends reaps its own shells, but an
-	// instance that is killed never runs that, and its containers would stay on
-	// the host for good. One instance per deployment sweeps for them: a handle
-	// whose session is alive nowhere, and which no live session has used for the
-	// grace window, is released. A handle whose session is alive is left alone —
-	// and has its clock refreshed, which is what makes the window a grace period
-	// for a failover rather than a countdown from creation.
-	//
-	// The liveness question is asked of the lease in a fleet, and of this
-	// process's session map in single: there is no other process to ask about.
-	liveSession := func(ctx context.Context, sessKey string) (bool, error) {
-		if hub != nil {
-			return hub.Live(ctx, sessKey)
-		}
-		return sup.LiveLocal(sessKey), nil
-	}
-	reclaim := func() {
-		n, err := shellMgr.Sweep(ctx, shell.ReclaimGrace, liveSession)
-		if err != nil {
-			log.Warn("shell reclaim failed", "err", err)
-			return
-		}
-		if n > 0 {
-			log.Info("shell handles reclaimed", "handles", n)
-		}
-	}
-	reclaimTTL := housekeepingTTL(shell.ReclaimInterval)
-	singletonFor(ctx, "shell-reclaim", reclaimTTL, reclaim)
-	every(ctx, shell.ReclaimInterval, func() {
-		singletonFor(ctx, "shell-reclaim", reclaimTTL, reclaim)
-	})
 
 	// Expired key/value rows — a route handler's state, the file store's
 	// scratch — are reclaimed once a day. A row's deadline is a promise the
@@ -2545,9 +2570,33 @@ func toolPolicyFor(policy config.ToolsPolicy, caps map[string]bool) config.Tools
 		return policy
 	}
 	out := policy
+	// The file tools are forbidden with them: they read and write the same
+	// project the shell tools run commands in.
 	out.Forbidden = append(append([]string{}, policy.Forbidden...),
-		"builtin:shell.exec", "builtin:shell.write", "builtin:shell.destroy")
+		"builtin:shell.exec", "builtin:shell.write", "builtin:shell.destroy",
+		"builtin:fs.read", "builtin:fs.write")
 	return out
+}
+
+// sandboxInUse reports whether any agent or spawn profile is bound to a
+// sandbox shell profile, which is when it is worth finding out at boot
+// whether the sandbox works here.
+func sandboxInUse(cfg *config.Config) bool {
+	uses := func(name string) bool {
+		p, ok := cfg.Profiles.Shell[name]
+		return ok && p.Provider != "ssh"
+	}
+	for _, a := range cfg.Agents {
+		if uses(a.Shell) {
+			return true
+		}
+	}
+	for _, p := range cfg.Profiles.Agent {
+		if uses(p.Shell) {
+			return true
+		}
+	}
+	return false
 }
 
 func stringSet(values []string) map[string]bool {
@@ -2815,18 +2864,27 @@ func shellProfileMap(cfg *config.Config, name string) map[string]any {
 	if !ok {
 		return nil
 	}
+	// Both were validated at load, so neither parse can fail here.
+	timeout, _ := time.ParseDuration(p.Timeout)
+	var memory int64
+	if p.MemLimit != "" {
+		memory, _ = config.ParseByteSize(p.MemLimit)
+	}
 	return map[string]any{
-		"provider":  p.Provider,
-		"image":     p.Image,
-		"workdir":   p.WorkDir,
-		"network":   p.Network,
-		"mem_limit": p.MemLimit,
-		"cpu_limit": p.CPULimit,
-		"env":       p.Env,
-		"host":      p.Host,
-		"user":      p.User,
-		"password":  p.Password,
-		"key_file":  p.KeyFile,
+		"provider":     p.Provider,
+		"environment":  p.Environment,
+		"project":      p.Project,
+		"workdir":      p.WorkDir,
+		"network":      p.Network,
+		"timeout":      timeout,
+		"ignore":       p.Ignore,
+		"memory_bytes": memory,
+		"cpu_limit":    p.CPULimit,
+		"env":          p.Env,
+		"host":         p.Host,
+		"user":         p.User,
+		"password":     p.Password,
+		"key_file":     p.KeyFile,
 	}
 }
 

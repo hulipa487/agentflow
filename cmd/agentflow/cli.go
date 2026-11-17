@@ -431,6 +431,7 @@ runtime.topology is regional; -online=false turns it off.`,
 			add("PASS", "channel "+name, fmt.Sprintf("openai, auth key, %d agents: %s", len(agents), strings.Join(agents, ", ")))
 		}
 	}
+	doctorSandbox(cfg, add)
 	if *online {
 		if runDoctorOnline(cfg, add) {
 			exit = 1

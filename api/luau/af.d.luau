@@ -417,21 +417,93 @@ function tool.def(spec) end
 
 shell = {}
 
+--- What a sandbox job did, as shell.run and shell.exec return it. A non-zero
+--- exit_code and timed_out are results; a job that could not run at all
+--- raises instead.
+---@class ShellResult
+---@field ok boolean
+---@field exit_code integer            -- -1 when the job was killed at its time limit
+---@field stdout string
+---@field stderr string
+---@field duration_ms integer
+---@field timed_out boolean
+---@field truncated boolean            -- a stream passed the output limit and was cut
+---@field project string
+---@field environment string
+---@field changed string[]             -- project files the command wrote
+---@field deleted string[]             -- project files the command removed
+---@field conflicts string[]           -- changed by someone else meanwhile; the store's version was kept
+---@field skipped { path: string, reason: string }[]  -- not stored, and why
+
+--- A background job, as shell.start, shell.status and shell.cancel return it,
+--- and as the payload of the "shell.result" inbox message. stdout and stderr
+--- are the last 16 KiB.
+---@class ShellJob
+---@field id string
+---@field state "running" | "finished" | "failed" | "cancelled"
+---@field project string
+---@field command string
+---@field started_at integer
+---@field ended_at? integer
+---@field exit_code integer
+---@field timed_out boolean
+---@field stdout string
+---@field stderr string
+---@field error? string
+---@field changed? string[]
+---@field deleted? string[]
+---@field conflicts? string[]
+
+--- Run one command as one sandbox job on a project. There is no handle:
+--- nothing outlives the command except what it wrote into the project, which
+--- is stored when it ends. Capability: shell.exec.
+---@param command string
+---@param opts? { project?: string, environment?: string, workdir?: string, env?: table, timeout?: number }
+---@return ShellResult
+function shell.run(command, opts) end
+
+--- Queue the same job in the background and return at once. Its result
+--- arrives in the inbox as a message with type "shell.result" and the job in
+--- msg.payload. Capability: shell.exec.
+---@param command string
+---@param opts? { project?: string, environment?: string, workdir?: string, env?: table, timeout?: number }
+---@return ShellJob
+function shell.start(command, opts) end
+
+---@param job_id string
+---@return ShellJob
+function shell.status(job_id) end
+
+--- Stop a running background job of this session.
+---@param job_id string
+---@return ShellJob
+function shell.cancel(job_id) end
+
+--- Open a shell and return its handle. With provider "ssh" this is a
+--- connection to a remote machine (host, user, password or key_file). Without
+--- one it is a sandbox shell, which is only the options given here: each
+--- shell.exec on it runs as a job, and nothing but the project's files
+--- carries over between calls. `image` names a declared environment;
+--- the container path of volumes[1] is where the project is mounted.
 --- Capability: shell.exec.
----@param opts? { provider?: string, image?: string, workdir?: string, env?: table, network?: string, mem_limit?: string, cpu_limit?: string, host?: string, user?: string, password?: string, key_file?: string, volumes?: table, project?: string, ref?: string, scratch_mount?: string, shell_opts?: table }
----@return table handle
+---@param opts? { provider?: string, environment?: string, image?: string, workdir?: string, env?: table, network?: string, host?: string, user?: string, password?: string, key_file?: string, volumes?: table, project?: string, ref?: string, scratch_mount?: string, shell_opts?: table }
+---@return { id: string, provider: string, state: integer }
 function shell.spawn(opts) end
 
 ---@param handle_id string
 ---@param command string
----@return { stdout: string, stderr: string, exit_code: integer }
-function shell.exec(handle_id, command) end
+---@param opts? { timeout?: number }
+---@return ShellResult
+function shell.exec(handle_id, command, opts) end
 
+--- Write a text file: into the project for a sandbox shell, onto the remote
+--- machine for an SSH one.
 ---@param handle_id string
 ---@param filepath string
 ---@param content string
 function shell.write(handle_id, filepath, content) end
 
+--- Close an SSH shell. A sandbox shell has nothing to close.
 ---@param handle_id string
 function shell.destroy(handle_id) end
 

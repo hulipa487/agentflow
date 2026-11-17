@@ -2,14 +2,10 @@ package tools
 
 import (
 	"context"
-	"io"
-	"log/slog"
 	"testing"
 
 	"agentflow/internal/config"
-	"agentflow/internal/core/session"
 	"agentflow/internal/drivers/search"
-	"agentflow/internal/drivers/shell"
 )
 
 func TestRegistryExpose(t *testing.T) {
@@ -174,40 +170,5 @@ func TestForbidden(t *testing.T) {
 	as := r.Expose([]string{"builtin:web_search"}, config.ToolsPolicy{Forbidden: []string{"builtin:web_search"}}, false)
 	if len(as.Tools) != 0 {
 		t.Fatalf("expected no tools, got %d", len(as.Tools))
-	}
-}
-
-func TestRegisterShellBuiltins(t *testing.T) {
-	r := NewRegistry()
-	mgr := shell.NewManager([]shell.ShellProvider{&fakeShellProvider{name: "docker"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	RegisterShellBuiltins(r, mgr)
-	as := r.Expose([]string{"builtin:fs.read", "builtin:fs.write"}, config.ToolsPolicy{}, false)
-	for _, name := range []string{"builtin:fs.read", "builtin:fs.write"} {
-		if _, ok := as.ByName[name]; !ok {
-			t.Fatalf("expected %s to be exposed", name)
-		}
-	}
-	if !as.ByName["builtin:fs.write"].NeedsConfirm {
-		t.Fatal("fs.write should require confirm")
-	}
-}
-
-func TestFSReadTool(t *testing.T) {
-	r := NewRegistry()
-	mgr := shell.NewManager([]shell.ShellProvider{&fakeShellProvider{name: "docker"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	h, err := mgr.Spawn(context.Background(), "session-1", "docker", shell.SpawnOpts{Image: "alpine"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	RegisterShellBuiltins(r, mgr)
-	as := r.Expose([]string{"builtin:fs.read"}, config.ToolsPolicy{}, false)
-	ctx := session.WithOwner(context.Background(), "session-1")
-	res, err := as.Invoke(ctx, "builtin:fs.read", map[string]any{"handle_id": h.ID, "path": "/tmp/a.txt"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	m := res.(map[string]any)
-	if m["ok"] != true || m["content"] != "content:/tmp/a.txt" {
-		t.Fatalf("unexpected fs.read result: %v", m)
 	}
 }

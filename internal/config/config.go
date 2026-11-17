@@ -32,27 +32,31 @@ type Config struct {
 	// fragments as written, before ${VAR} expansion, so rotating a secret does
 	// not move it while any change of shape does. Two instances can compare it
 	// to tell whether they are running the same deployment.
-	Epoch    string            `yaml:"-"`
-	Runtime  Runtime           `yaml:"runtime"`
-	Models   map[string]Model  `yaml:"models"`
-	Memory   Memory            `yaml:"memory"`
-	Profiles Profiles          `yaml:"profiles"`
-	Safety   SafetyConfig      `yaml:"safety"`
-	Gateway  Gateway           `yaml:"gateway"`
-	MCP      MCP               `yaml:"mcp"`
-	Tools    Tools             `yaml:"tools"`
-	Search   Search            `yaml:"search"`
-	Legal    LegalSearch       `yaml:"legal_search"`
-	Browser  Browser           `yaml:"browser"`
-	Net      NetConfig         `yaml:"net"`
-	Media    MediaConfig       `yaml:"media"`
-	Files    FilesConfig       `yaml:"files"`
-	Audit    AuditConfig       `yaml:"audit"`
-	Usage    UsageConfig       `yaml:"usage"`
-	Agents   map[string]Agent  `yaml:"agents"`
-	Triggers []Trigger         `yaml:"triggers"` // configdir layout; declarative task data for loops
-	Prompts  map[string]Prompt `yaml:"prompts"`
-	Plugins  Plugins           `yaml:"plugins"`
+	Epoch    string           `yaml:"-"`
+	Runtime  Runtime          `yaml:"runtime"`
+	Models   map[string]Model `yaml:"models"`
+	Memory   Memory           `yaml:"memory"`
+	Profiles Profiles         `yaml:"profiles"`
+	Safety   SafetyConfig     `yaml:"safety"`
+	Gateway  Gateway          `yaml:"gateway"`
+	MCP      MCP              `yaml:"mcp"`
+	Tools    Tools            `yaml:"tools"`
+	Search   Search           `yaml:"search"`
+	Legal    LegalSearch      `yaml:"legal_search"`
+	Browser  Browser          `yaml:"browser"`
+	Net      NetConfig        `yaml:"net"`
+	Media    MediaConfig      `yaml:"media"`
+	Files    FilesConfig      `yaml:"files"`
+	Audit    AuditConfig      `yaml:"audit"`
+	Usage    UsageConfig      `yaml:"usage"`
+	Agents   map[string]Agent `yaml:"agents"`
+	// Environments are the declared toolchains shell jobs run in: a name, a
+	// pinned image or a local root filesystem, and variables. A shell profile
+	// picks one; a project may pick another.
+	Environments map[string]Environment `yaml:"environments"`
+	Triggers     []Trigger              `yaml:"triggers"` // configdir layout; declarative task data for loops
+	Prompts      map[string]Prompt      `yaml:"prompts"`
+	Plugins      Plugins                `yaml:"plugins"`
 	// Packages names deployable Lua source packages, each a directory with an
 	// optional manifest.yaml and *.lua files. A loop imports one with
 	// "-- af-import: <name>" (or is set to "package:<name>" directly). Package
@@ -232,6 +236,9 @@ type Runtime struct {
 	Reload struct {
 		Watch *bool `yaml:"watch"`
 	} `yaml:"reload"`
+	// Sandbox is how shell jobs run: the gVisor runtime, the queue and the
+	// limits. See SandboxConfig.
+	Sandbox SandboxConfig `yaml:"sandbox"`
 	// Limits are the per-tenant resource bounds (E18). Zero (the default)
 	// disables each bound — they are opt-in per deployment — but a hostile
 	// tenant (D14) makes the op-pool fairness unconditional: that one is not
@@ -831,10 +838,23 @@ type Store struct {
 	LocalityOK bool `yaml:"locality_ok"`
 }
 
-// ShellProfile defines defaults for shell.spawn.
+// ShellProfile is what an agent's shell is: either one-off sandbox jobs on a
+// project (provider sandbox, the default) or a connection to a real remote
+// machine (provider ssh).
 type ShellProfile struct {
-	Provider string            `yaml:"provider"` // docker (persistent local) | ssh (persistent remote)
-	Image    string            `yaml:"image"`    // docker: default alpine:3.20
+	Provider string `yaml:"provider"` // sandbox (default) | ssh
+	// Image is kept so that an old profile fails with a message naming its
+	// replacement instead of a YAML error; a sandbox profile sets Environment.
+	Image string `yaml:"image"`
+	// Environment names an entry of environments (sandbox).
+	Environment string `yaml:"environment"`
+	// Project is the files-store project jobs run in when a call names none
+	// (sandbox; default "workspace").
+	Project string `yaml:"project"`
+	// Timeout is a job's time limit, capped by runtime.sandbox.max_timeout.
+	Timeout string `yaml:"timeout"`
+	// Ignore lists paths a job may create that are not written back.
+	Ignore   []string          `yaml:"ignore"`
 	WorkDir  string            `yaml:"workdir"`
 	Network  string            `yaml:"network"`
 	MemLimit string            `yaml:"mem_limit"`
@@ -2063,6 +2083,9 @@ func validate(path string, c *Config) error {
 	default:
 		return fmt.Errorf("%s: tools.policy.default %q is not a policy (want \"all\", \"none\", or unset)", path, c.Tools.Policy.Default)
 	}
+	if err := validateSandbox(path, c); err != nil {
+		return err
+	}
 	if err := validateHTTPTools(path, c); err != nil {
 		return err
 	}
@@ -2158,7 +2181,7 @@ func validate(path string, c *Config) error {
 			if _, ok := c.Profiles.Shell[p.Shell]; !ok {
 				return fmt.Errorf("%s: spawn profile %q references unknown shell profile %q", path, pname, p.Shell)
 			}
-			if err := validateShellProfile(path, "spawn:"+pname, p.Shell, c.Profiles.Shell[p.Shell]); err != nil {
+			if err := validateShellProfile(path, "spawn:"+pname, p.Shell, c.Profiles.Shell[p.Shell], c); err != nil {
 				return err
 			}
 		}
@@ -2527,7 +2550,7 @@ func (c *Config) ValidateAgent(name string, a Agent, path string) error {
 			if _, ok := c.Profiles.Shell[a.Shell]; !ok {
 				return fmt.Errorf("%s: agent %q references unknown shell profile %q", path, name, a.Shell)
 			}
-			if err := validateShellProfile(path, name, a.Shell, c.Profiles.Shell[a.Shell]); err != nil {
+			if err := validateShellProfile(path, name, a.Shell, c.Profiles.Shell[a.Shell], c); err != nil {
 				return err
 			}
 		} else {
@@ -2609,23 +2632,6 @@ func validatePromptRefs(path string, c *Config) error {
 				return fmt.Errorf("%s: tool override %q param %q description references unknown prompt %q", path, tname, pname, po.Description.Value)
 			}
 		}
-	}
-	return nil
-}
-
-// validateShellProfile checks provider-specific requirements for a shell
-// profile referenced by an agent or spawn profile. SSH requires a host; docker
-// needs nothing (image defaults to alpine:3.20).
-func validateShellProfile(path, owner, name string, p ShellProfile) error {
-	switch p.Provider {
-	case "ssh":
-		if p.Host == "" {
-			return fmt.Errorf("%s: shell profile %q (used by %q) is provider ssh but missing required host", path, name, owner)
-		}
-	case "docker", "":
-		// docker is persistent; image defaults to alpine:3.20 if unset. No reqs.
-	default:
-		return fmt.Errorf("%s: shell profile %q (used by %q) has unknown provider %q", path, name, owner, p.Provider)
 	}
 	return nil
 }

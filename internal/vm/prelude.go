@@ -648,10 +648,42 @@ function shell.spawn(opts)
     ref        = opts.ref,
     scratch_mount = opts.scratch_mount,
     shell_opts = opts.shell_opts,
+    environment = opts.environment,
   })
 end
-function shell.exec(handle_id, command)
-  return op({ type = "shell.exec", shell_handle = handle_id, cmd = command })
+function shell.exec(handle_id, command, opts)
+  opts = opts or {}
+  return op({ type = "shell.exec", shell_handle = handle_id, cmd = command, timeout = opts.timeout })
+end
+-- shell.run(command, opts?) runs one command as one sandbox job on a project
+-- and returns { ok, exit_code, stdout, stderr, duration_ms, timed_out,
+-- truncated, changed, deleted, conflicts, skipped }. opts: project,
+-- environment, workdir, env, timeout (seconds). There is no handle: nothing
+-- outlives the command except what it wrote into the project.
+local function shell_job(kind, command, opts)
+  opts = opts or {}
+  return op({ type = kind, cmd = command,
+    project     = opts.project,
+    environment = opts.environment,
+    workdir     = opts.workdir,
+    env         = opts.env,
+    timeout     = opts.timeout,
+  })
+end
+function shell.run(command, opts)
+  return shell_job("shell.run", command, opts)
+end
+-- shell.start(command, opts?) queues the same job in the background and
+-- returns { id, state = "running", ... } at once. Its result arrives in the
+-- inbox as a message with type "shell.result" and the job in msg.payload.
+function shell.start(command, opts)
+  return shell_job("shell.start", command, opts)
+end
+function shell.status(job_id)
+  return op({ type = "shell.status", job_id = job_id })
+end
+function shell.cancel(job_id)
+  return op({ type = "shell.cancel", job_id = job_id })
 end
 function shell.write(handle_id, filepath, content)
   return op({ type = "shell.write", shell_handle = handle_id, path = filepath, content = content })

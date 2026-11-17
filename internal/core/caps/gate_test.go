@@ -143,6 +143,7 @@ func TestModelCannotDispatchToAnOp(t *testing.T) {
 		"http.request", "os.env", "llm.chat", "llm.embed",
 		"store.put", "store.get", "store.query", "store.delete",
 		"shell.spawn", "shell.exec", "shell.write", "shell.destroy",
+		"shell.run", "shell.start", "shell.status", "shell.cancel",
 		"mail.imap.fetch", "mail.smtp.send",
 		"credential.get", "runtime.triggers",
 		"tools.list", "tools.run",

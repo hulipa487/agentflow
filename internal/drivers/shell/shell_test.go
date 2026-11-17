@@ -2,35 +2,27 @@ package shell
 
 import (
 	"context"
-	"io"
-	"log/slog"
-	"os/exec"
+	"fmt"
 	"strings"
 	"testing"
-	"time"
 )
 
-// testProvider is a ShellProvider that replaces real docker with in-memory
-// command recording — no Docker host needed for tests.
+// testProvider is a ShellProvider that records what it is asked to do, in
+// place of a real remote machine.
 type testProvider struct {
 	name      string
-	handles   map[string]*Handle
 	spawned   []SpawnOpts
 	execCmds  []string
 	destroyed []string
 }
 
-func newTestProvider(name string) *testProvider {
-	return &testProvider{name: name, handles: map[string]*Handle{}}
-}
+func newTestProvider(name string) *testProvider { return &testProvider{name: name} }
 
 func (p *testProvider) Name() string { return p.name }
 
 func (p *testProvider) Spawn(ctx context.Context, opts SpawnOpts) (*Handle, error) {
 	p.spawned = append(p.spawned, opts)
-	h := &Handle{ID: "h-" + p.name + "-1", State: HandleRunning, Image: opts.Image, internal: "test-container-id"}
-	p.handles[h.ID] = h
-	return h, nil
+	return &Handle{ID: fmt.Sprintf("h-%s-%d", p.name, len(p.spawned)), State: HandleRunning, internal: "test-connection"}, nil
 }
 
 func (p *testProvider) Exec(ctx context.Context, handle *Handle, cmd string) (*ExecResult, error) {
@@ -52,192 +44,89 @@ func (p *testProvider) Destroy(ctx context.Context, handle *Handle) error {
 	return nil
 }
 
-func (p *testProvider) Alive(handle *Handle) bool {
-	return handle.State == HandleRunning
-}
+func (p *testProvider) Alive(handle *Handle) bool { return handle.State == HandleRunning }
 
 func TestManagerSpawnExecReap(t *testing.T) {
-	tp := newTestProvider("docker")
-	mgr := NewManager([]ShellProvider{tp}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	tp := newTestProvider("ssh")
+	mgr := NewManager([]ShellProvider{tp}, nil)
 	ctx := context.Background()
 
-	h, err := mgr.Spawn(ctx, "session-1", "docker", SpawnOpts{Image: "alpine:latest", Network: "none"})
+	h, err := mgr.Spawn(ctx, "session-1", "ssh", SpawnOpts{Host: "box:22", User: "dev"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h.State != HandleRunning {
-		t.Fatal("expected running state")
+	if h.State != HandleRunning || h.Provider != "ssh" {
+		t.Fatalf("handle = %+v, want a running ssh handle", h)
 	}
-
 	res, err := mgr.Exec(ctx, "session-1", h.ID, "echo hello")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.ExitCode != 0 {
-		t.Fatalf("expected exit 0, got %d", res.ExitCode)
+	if res.ExitCode != 0 || !strings.Contains(res.Stdout, "echo hello") {
+		t.Fatalf("exec result = %+v", res)
 	}
-	if !strings.Contains(res.Stdout, "echo hello") {
-		t.Fatalf("unexpected stdout: %s", res.Stdout)
+	content, err := mgr.Read(ctx, "session-1", h.ID, "/tmp/file.txt")
+	if err != nil || string(content) != "content:/tmp/file.txt" {
+		t.Fatalf("read = %q, %v", content, err)
 	}
-
-	readContent, err := mgr.Read(ctx, "session-1", h.ID, "/tmp/file.txt")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(readContent) != "content:/tmp/file.txt" {
-		t.Fatalf("unexpected read content: %q", readContent)
+	if mgr.Owned("session-1") != 1 || mgr.Owned("session-2") != 0 {
+		t.Fatal("Owned does not count the session's handle")
 	}
 
-	// Reap should destroy the handle.
 	mgr.ReapSession(ctx, "session-1")
 	if len(tp.destroyed) != 1 {
 		t.Fatalf("expected 1 destroy, got %d", len(tp.destroyed))
 	}
+	if mgr.Owned("session-1") != 0 || mgr.Current("session-1") != nil {
+		t.Fatal("a reaped session still owns a handle")
+	}
+	if _, err := mgr.Exec(ctx, "session-1", h.ID, "echo"); err == nil || !strings.Contains(err.Error(), "spawn a new one") {
+		t.Fatalf("exec on a reaped handle = %v, want an error that says what to do", err)
+	}
 }
 
 func TestManagerOwnershipEnforcement(t *testing.T) {
-	tp := newTestProvider("docker")
-	mgr := NewManager([]ShellProvider{tp}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	tp := newTestProvider("ssh")
+	mgr := NewManager([]ShellProvider{tp}, nil)
 	ctx := context.Background()
+	h, _ := mgr.Spawn(ctx, "alice", "ssh", SpawnOpts{})
 
-	h, _ := mgr.Spawn(ctx, "alice", "docker", SpawnOpts{Image: "alpine"})
-
-	// bob cannot exec alice's handle.
-	_, err := mgr.Exec(ctx, "bob", h.ID, "echo hi")
-	if err == nil {
-		t.Fatal("expected ownership error, got nil")
+	if _, err := mgr.Exec(ctx, "bob", h.ID, "echo hi"); err == nil {
+		t.Fatal("bob ran a command on alice's handle")
 	}
-
-	// alice can.
-	_, err = mgr.Exec(ctx, "alice", h.ID, "echo hi")
-	if err != nil {
+	if err := mgr.Destroy(ctx, "bob", h.ID); err == nil {
+		t.Fatal("bob destroyed alice's handle")
+	}
+	if _, err := mgr.Exec(ctx, "alice", h.ID, "echo hi"); err != nil {
 		t.Fatal(err)
 	}
 }
 
+func TestManagerEnsureReusesAndDestroyForgets(t *testing.T) {
+	tp := newTestProvider("ssh")
+	mgr := NewManager([]ShellProvider{tp}, nil)
+	ctx := context.Background()
+
+	first, err := mgr.Ensure(ctx, "s", "ssh", SpawnOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, _ := mgr.Ensure(ctx, "s", "ssh", SpawnOpts{})
+	if again.ID != first.ID || len(tp.spawned) != 1 {
+		t.Fatalf("Ensure spawned %d handles for one session", len(tp.spawned))
+	}
+	if err := mgr.Destroy(ctx, "s", first.ID); err != nil {
+		t.Fatal(err)
+	}
+	next, _ := mgr.Ensure(ctx, "s", "ssh", SpawnOpts{})
+	if next.ID == first.ID || len(tp.spawned) != 2 {
+		t.Fatal("Ensure handed back a destroyed handle")
+	}
+}
+
 func TestManagerUnknownProvider(t *testing.T) {
-	mgr := NewManager([]ShellProvider{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	_, err := mgr.Spawn(context.Background(), "s", "nonexistent", SpawnOpts{})
-	if err == nil {
+	mgr := NewManager([]ShellProvider{}, nil)
+	if _, err := mgr.Spawn(context.Background(), "s", "docker", SpawnOpts{}); err == nil {
 		t.Fatal("expected error for unknown provider")
 	}
-}
-
-// TestDockerPersistsStateAcrossCalls proves the defining property of the
-// persistent Docker driver: filesystem and environment state survive across
-// Exec calls within one handle. A file written (and an env var set at Spawn)
-// in one call is visible in the next. Skipped when no docker daemon is
-// reachable (e.g. CI without Docker Desktop).
-func TestDockerPersistsStateAcrossCalls(t *testing.T) {
-	if !dockerAvailable() {
-		t.Skip("no Linux-capable docker daemon; skipping persistent-shell integration test")
-	}
-	p := NewDockerProvider(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	ctx := context.Background()
-
-	h, err := p.Spawn(ctx, SpawnOpts{
-		Image: "alpine:3.20",
-		Env:   map[string]string{"MSG": "persisted"},
-	})
-	if err != nil {
-		t.Fatalf("spawn: %v", err)
-	}
-	defer func() { _ = p.Destroy(ctx, h) }()
-
-	// Write a file using a spawn-time env var, in one Exec.
-	if _, err := p.Exec(ctx, h, "echo $MSG > /tmp/once && echo wrote"); err != nil {
-		t.Fatalf("exec write: %v", err)
-	}
-
-	// A subsequent Exec must see /tmp/once and the env var — same container.
-	res, err := p.Exec(ctx, h, "test -f /tmp/once && cat /tmp/once")
-	if err != nil {
-		t.Fatalf("exec check: %v", err)
-	}
-	if !strings.Contains(res.Stdout, "persisted") {
-		t.Fatalf("persistence violated: /tmp/once not preserved across calls (stdout=%q)", res.Stdout)
-	}
-}
-
-// The property the fleet depends on: a container this process did not create is
-// addressable from its record alone, by a handle that carries nothing but the
-// container id. Gated on a daemon — the unit tests cover the manager's logic,
-// this covers Docker itself.
-func TestDockerContainerIsAttachableFromARecord(t *testing.T) {
-	if !dockerAvailable() {
-		t.Skip("no Linux-capable docker daemon; skipping the attach integration test")
-	}
-	p := NewDockerProvider(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	ctx := context.Background()
-
-	h, err := p.Spawn(ctx, SpawnOpts{Image: "alpine:3.20", Env: map[string]string{"MSG": "adopted"}})
-	if err != nil {
-		t.Fatalf("spawn: %v", err)
-	}
-	defer func() { _ = p.Destroy(ctx, h) }()
-	if _, err := p.Exec(ctx, h, "echo $MSG > /tmp/adopted"); err != nil {
-		t.Fatalf("exec write: %v", err)
-	}
-
-	// A handle rebuilt from the record alone reaches the same container, with
-	// the file the first one wrote — the file is the proof it is the same
-	// filesystem and not a fresh container.
-	rec := recordOf(h, "session-1", "instance-a")
-	if rec.Container == "" {
-		t.Fatal("the record does not name the container")
-	}
-	attached, err := p.Attach(rec)
-	if err != nil {
-		t.Fatalf("attach: %v", err)
-	}
-	res, err := p.Exec(ctx, attached, "cat /tmp/adopted")
-	if err != nil {
-		t.Fatalf("exec on the attached handle: %v", err)
-	}
-	if !strings.Contains(res.Stdout, "adopted") {
-		t.Fatalf("the attached handle is not the same container: %q", res.Stdout)
-	}
-
-	// Forget removes it from the record alone, which is what the reclaim pass
-	// does for an instance that is gone — and twice is harmless.
-	if err := p.Forget(ctx, rec); err != nil {
-		t.Fatalf("forget: %v", err)
-	}
-	if p.Alive(attached) {
-		t.Fatal("the container survived Forget")
-	}
-	if err := p.Forget(ctx, rec); err != nil {
-		t.Fatalf("second forget: %v", err)
-	}
-}
-
-// A record with no container is refused rather than turned into a handle that
-// fails every later call.
-func TestDockerAttachRefusesARecordWithNoContainer(t *testing.T) {
-	p := NewDockerProvider(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if _, err := p.Attach(Record{ID: "h-1"}); err == nil {
-		t.Fatal("a record naming no container must not attach")
-	}
-	// A container that does not exist is reported as unreachable rather than
-	// attached. Gated on a daemon: without one the docker call fails for a
-	// different reason, and the assertion would pass for the wrong one.
-	if !dockerAvailable() {
-		t.Skip("no Linux-capable docker daemon; skipping the unreachable-container case")
-	}
-	if _, err := p.Attach(Record{ID: "h-1", Container: "no-such-container"}); err == nil {
-		t.Fatal("a container that does not exist must not attach")
-	}
-}
-
-// These tests run Linux images. A daemon in Windows-containers mode answers
-// `docker version` happily but cannot pull alpine, so ask the engine which OS
-// it serves rather than merely whether the CLI can reach one.
-func dockerAvailable() bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "docker", "info", "--format", "{{.OSType}}").Output()
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(string(out)) == "linux"
 }

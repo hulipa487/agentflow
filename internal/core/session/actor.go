@@ -226,10 +226,12 @@ type Op struct {
 	Ref       string `json:"ref,omitempty"` // snapshot ref name or commit id
 	CommitMsg string `json:"commit_msg,omitempty"`
 
-	// Shell spawn extras: docker bind mounts, and materialization requests —
-	// Project+Ref check out a snapshot into the first mount's container dir,
-	// ScratchMount copies this session's scratch into the given container dir;
-	// both happen before the handle reports ready.
+	// Shell spawn extras. Volumes are "host:container" specs from the days of
+	// a container shell: only the container path still means something — it is
+	// where a sandbox mounts the project, and where an SSH spawn copies a
+	// Project+Ref snapshot to. ScratchMount copies this session's scratch into
+	// the given directory (SSH only). Both copies happen before the handle
+	// reports ready.
 	Volumes      []string `json:"volumes,omitempty"`
 	ScratchMount string   `json:"scratch_mount,omitempty"`
 
@@ -302,6 +304,10 @@ type Op struct {
 	User          string            `json:"user,omitempty"`
 	Password      string            `json:"password,omitempty"`
 	KeyFile       string            `json:"key_file,omitempty"`
+	// Environment names a declared environment for a sandbox job; JobID names
+	// a background job (shell.status / shell.cancel).
+	Environment string `json:"environment,omitempty"`
+	JobID       string `json:"job_id,omitempty"`
 
 	// Confirm bypass.
 	Confirmed bool   `json:"confirmed,omitempty"`
@@ -651,6 +657,10 @@ var blockingOps = map[string]bool{
 	"shell.exec":           true,
 	"shell.write":          true,
 	"shell.destroy":        true,
+	"shell.run":            true,
+	"shell.start":          true,
+	"shell.status":         true,
+	"shell.cancel":         true,
 	"http.request":         true,
 	"mail.imap.fetch":      true,
 	"mail.smtp.send":       true,
@@ -2184,6 +2194,10 @@ func ingressSource(typ string) string {
 		return "channel"
 	case "timer":
 		return "scheduler"
+	case "shell.result":
+		// A background job's result is engine-made, like a system message; its
+		// payload is the job's output, which the loop asked for.
+		return "system"
 	default:
 		return typ
 	}

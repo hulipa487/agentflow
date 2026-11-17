@@ -178,6 +178,52 @@ profiles:
       filters: [source-attribution, signal-gate, steady-directive, support-offer, affect-guard]
 
 # ---------------------------------------------------------------------------
+# Shell
+# ---------------------------------------------------------------------------
+# Shell commands run as one-off sandbox jobs (gVisor, Linux only): a command
+# gets a declared environment as its read-only root and one project from the
+# files store as its working directory, runs under a time limit, and whatever
+# it wrote into the project is stored when it ends. Nothing else survives.
+# `agentflow doctor` says whether the sandbox can run on this host.
+#
+# environments:
+#   python:
+#     image: docker.io/library/python:3.12-slim@sha256:<digest>   # pinned; pulled on first use
+#     env: { PYTHONUNBUFFERED: "1" }
+#   tools:
+#     rootfs: /srv/agentflow/envs/tools      # or a root filesystem already on this host
+#
+# profiles:
+#   shell:
+#     code:
+#       provider: sandbox        # sandbox (default) | ssh
+#       environment: python
+#       project: workspace       # the files-store project jobs run in
+#       timeout: 90s             # capped by runtime.sandbox.max_timeout
+#       ignore: ["node_modules/", "__pycache__/"]   # created by jobs, never stored
+#     box:
+#       provider: ssh            # a real remote machine, with a real connection
+#       host: build.example.com:22
+#       user: dev
+#       key_file: /etc/agentflow/id_ed25519
+#
+# runtime:
+#   sandbox:                     # every setting has a default
+#     concurrency: 4             # jobs at once on this instance
+#     per_user: 2
+#     queue_timeout: 30s
+#     timeout: 60s
+#     max_timeout: 10m
+#     background_max_timeout: 2h # shell.start jobs
+#     memory: 1GiB               # enforced where the host allows; doctor says
+#     output_limit: 256KiB
+#
+# A project may customise its agent's profile with .agentflow/shell.yaml
+# (environment, env, workdir, timeout, ignore) — nothing that raises a limit.
+#
+# An agent uses a profile with `shell: code` and the shell.exec capability.
+
+# ---------------------------------------------------------------------------
 # Agents
 # ---------------------------------------------------------------------------
 # `agents:` may be omitted entirely. The runtime then boots as an admin/Studio

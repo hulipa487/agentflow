@@ -50,6 +50,10 @@ type Entry struct {
 	MIME     string `json:"mime,omitempty"`
 	Ts       int64  `json:"ts"`
 	Revision int64  `json:"revision"` // working-tree writes bump this per path
+	// Exec marks the file executable. It is the only permission bit the store
+	// carries: enough for a script to survive a round trip through a sandbox
+	// job, without making the store a general permission system.
+	Exec bool `json:"exec,omitempty"`
 }
 
 // Commit is one snapshot: the full tree (path → handle) plus parent/message.
@@ -61,6 +65,9 @@ type Commit struct {
 	Ts      int64             `json:"ts"`
 	Message string            `json:"message"`
 	Tree    map[string]string `json:"tree"` // path → handle
+	// Exec lists the tree's executable paths. Absent on commits made before
+	// the bit existed, which read as "nothing is executable".
+	Exec map[string]bool `json:"exec,omitempty"`
 }
 
 // Manifest is what a checkout resolves to: the commit plus the file list a
@@ -128,8 +135,20 @@ func scratchKey(owner, name string) string         { return "s|" + owner + "|" +
 const allTreePrefix = "t|"
 
 // Put writes one file into the working tree, content-addressed; the returned
-// entry's Revision is the previous revision + 1 (1 for a new path).
+// entry's Revision is the previous revision + 1 (1 for a new path). A path
+// that was executable stays executable: a loop rewriting a script's text does
+// not mean to change what it is.
 func (m *Manager) Put(ctx context.Context, scope, project, p string, r io.Reader, mime string) (*Entry, error) {
+	return m.put(ctx, scope, project, p, r, mime, nil)
+}
+
+// PutFile is Put for a caller that knows the file's mode: a sandbox job's
+// write-back, which sees the bit on disk.
+func (m *Manager) PutFile(ctx context.Context, scope, project, p string, r io.Reader, mime string, exec bool) (*Entry, error) {
+	return m.put(ctx, scope, project, p, r, mime, &exec)
+}
+
+func (m *Manager) put(ctx context.Context, scope, project, p string, r io.Reader, mime string, exec *bool) (*Entry, error) {
 	if err := validPath(p); err != nil {
 		return nil, err
 	}
@@ -138,12 +157,17 @@ func (m *Manager) Put(ctx context.Context, scope, project, p string, r io.Reader
 		return nil, err
 	}
 	var rev int64 = 1
+	executable := false
 	if prev, ok, err := m.getTree(ctx, scope, project, p); err != nil {
 		return nil, err
 	} else if ok {
 		rev = prev.Revision + 1
+		executable = prev.Exec
 	}
-	e := &Entry{Path: p, Handle: ref.Handle, Size: ref.Size, MIME: mime, Ts: m.now().Unix(), Revision: rev}
+	if exec != nil {
+		executable = *exec
+	}
+	e := &Entry{Path: p, Handle: ref.Handle, Size: ref.Size, MIME: mime, Ts: m.now().Unix(), Revision: rev, Exec: executable}
 	if err := m.putJSON(ctx, treeKey(scope, project, p), e, time.Time{}); err != nil {
 		return nil, err
 	}
@@ -164,12 +188,14 @@ func (m *Manager) PutHandle(ctx context.Context, scope, project, p, handle, mime
 		return nil, err
 	}
 	var rev int64 = 1
+	executable := false
 	if prev, ok, err := m.getTree(ctx, scope, project, p); err != nil {
 		return nil, err
 	} else if ok {
 		rev = prev.Revision + 1
+		executable = prev.Exec
 	}
-	e := &Entry{Path: p, Handle: handle, MIME: mime, Ts: m.now().Unix(), Revision: rev}
+	e := &Entry{Path: p, Handle: handle, MIME: mime, Ts: m.now().Unix(), Revision: rev, Exec: executable}
 	if err := m.putJSON(ctx, treeKey(scope, project, p), e, time.Time{}); err != nil {
 		return nil, err
 	}
@@ -311,6 +337,12 @@ func (m *Manager) Commit(ctx context.Context, scope, project, ref, message strin
 	c := &Commit{ID: newID(), Ts: m.now().Unix(), Message: message, Tree: make(map[string]string, len(entries))}
 	for _, e := range entries {
 		c.Tree[e.Path] = e.Handle
+		if e.Exec {
+			if c.Exec == nil {
+				c.Exec = map[string]bool{}
+			}
+			c.Exec[e.Path] = true
+		}
 	}
 	if prev, ok, err := m.meta.GetRow(ctx, refKey(scope, project, ref)); err != nil {
 		return nil, err
@@ -357,7 +389,7 @@ func (m *Manager) Checkout(ctx context.Context, scope, project, target string) (
 	sort.Strings(paths)
 	files := make([]Entry, 0, len(paths))
 	for _, p := range paths {
-		e := Entry{Path: p, Handle: c.Tree[p]}
+		e := Entry{Path: p, Handle: c.Tree[p], Exec: c.Exec[p]}
 		if cur, ok, err := m.getTree(ctx, scope, project, p); err == nil && ok && cur.Handle == e.Handle {
 			e.Size = cur.Size
 			e.MIME = cur.MIME

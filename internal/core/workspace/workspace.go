@@ -28,6 +28,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -411,8 +412,8 @@ func (w *Workspace) Collect(ctx context.Context, lim Limits) (*Changes, error) {
 			skip(rel, "not a regular file (links and special files are not stored)")
 			return nil
 		}
-		exec := info.Mode()&0o111 != 0
 		st, tracked := w.state[rel]
+		exec := execBit(info, tracked && st.Exec)
 		if tracked && info.Size() == st.Size && info.ModTime().UnixNano() == st.MTime && exec == st.Exec {
 			return nil
 		}
@@ -504,6 +505,22 @@ func (w *Workspace) Collect(ctx context.Context, lim Limits) (*Changes, error) {
 		return nil, err
 	}
 	return ch, nil
+}
+
+// modeBits reports whether the filesystem carries Unix permission bits. On
+// Windows it does not: every file reads as not executable, whatever the store
+// says it is.
+var modeBits = runtime.GOOS != "windows"
+
+// execBit is a file's executable bit as write-back should store it. Where the
+// filesystem has no such bit, the disk says nothing about it, so the stored
+// value stands (and a new file is not executable): reading "no bit" as "not
+// executable" would clear the bit of every script a job touched.
+func execBit(info fs.FileInfo, stored bool) bool {
+	if !modeBits {
+		return stored
+	}
+	return info.Mode()&0o111 != 0
 }
 
 // unstorable says why a path cannot be a files-store path, or "". The store

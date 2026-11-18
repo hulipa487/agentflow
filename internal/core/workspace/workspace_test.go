@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	goruntime "runtime"
 	"strings"
 	"testing"
 	"time"
@@ -235,7 +236,9 @@ func TestCollectWritesChangesBack(t *testing.T) {
 	if got := f.stored("edit.txt"); got != "v2 longer" {
 		t.Errorf("edit.txt in the store = %q", got)
 	}
-	if e, _ := f.fm.Get(context.Background(), scope, project, "run.sh"); e == nil || !e.Exec {
+	// A file created executable by a job: only a filesystem with mode bits
+	// can say so. TestCollectKeepsAStoredExecutableBit covers every platform.
+	if e, _ := f.fm.Get(context.Background(), scope, project, "run.sh"); modeBits && (e == nil || !e.Exec) {
 		t.Errorf("run.sh lost its executable bit: %+v", e)
 	}
 	if e, _ := f.fm.Get(context.Background(), scope, project, "touched.txt"); e.Revision != touched.Revision {
@@ -244,12 +247,40 @@ func TestCollectWritesChangesBack(t *testing.T) {
 
 	// A second job with no changes writes nothing.
 	w = f.prepare()
-	if st, _ := os.Stat(filepath.Join(w.Dir, "run.sh")); st.Mode().Perm()&0o111 == 0 {
+	if st, _ := os.Stat(filepath.Join(w.Dir, "run.sh")); modeBits && st.Mode().Perm()&0o111 == 0 {
 		t.Error("run.sh came back without its executable bit")
 	}
 	ch = f.collect(w, Limits{})
 	if len(ch.Changed)+len(ch.Deleted)+len(ch.Conflicts)+len(ch.Skipped) != 0 {
 		t.Errorf("an idle job reported changes: %+v", ch)
+	}
+}
+
+// A script the store knows is executable stays executable when a job rewrites
+// it, on every platform: where the filesystem has mode bits the rewrite keeps
+// the file's mode, and where it has none the stored bit stands.
+func TestCollectKeepsAStoredExecutableBit(t *testing.T) {
+	f := newFixture(t)
+	if _, err := f.fm.PutFile(context.Background(), scope, project, "build.sh", strings.NewReader("#!/bin/sh\n"), "text/x-sh", true); err != nil {
+		t.Fatal(err)
+	}
+	f.put("notes.txt", "plain")
+	w := f.prepare()
+	write(t, w, "build.sh", "#!/bin/sh\necho v2\n")
+	write(t, w, "notes.txt", "plain, edited")
+
+	ch := f.collect(w, Limits{})
+	same(t, "changed", ch.Changed, []string{"build.sh", "notes.txt"})
+	if e, _ := f.fm.Get(context.Background(), scope, project, "build.sh"); e == nil || !e.Exec {
+		t.Fatalf("build.sh lost its executable bit: %+v", e)
+	}
+	if e, _ := f.fm.Get(context.Background(), scope, project, "notes.txt"); e == nil || e.Exec {
+		t.Fatalf("notes.txt became executable: %+v", e)
+	}
+	// And a job that does not touch it does not report it.
+	ch = f.collect(f.prepare(), Limits{})
+	if len(ch.Changed) != 0 {
+		t.Fatalf("an untouched executable was reported changed: %v", ch.Changed)
 	}
 }
 
@@ -301,7 +332,12 @@ func TestCollectSkipsWhatCannotBeStoredAndRemovesIt(t *testing.T) {
 	f.put("keep.txt", "k")
 	w := f.prepare()
 	write(t, w, "huge.bin", strings.Repeat("x", 2<<20)) // over the 1 MiB per-file limit
-	write(t, w, "a|b.txt", "pipe")
+	want := map[string]string{"huge.bin": "per-file limit", "link": "not a regular file"}
+	if goruntime.GOOS != "windows" {
+		// A name Windows will not create in the first place.
+		write(t, w, "a|b.txt", "pipe")
+		want["a|b.txt"] = "does not allow"
+	}
 	write(t, w, "ok.txt", "fine")
 	if err := os.Symlink("/etc/passwd", filepath.Join(w.Dir, "link")); err != nil {
 		t.Fatal(err)
@@ -313,7 +349,7 @@ func TestCollectSkipsWhatCannotBeStoredAndRemovesIt(t *testing.T) {
 	for _, s := range ch.Skipped {
 		reasons[s.Path] = s.Reason
 	}
-	for path, want := range map[string]string{"huge.bin": "per-file limit", "a|b.txt": "does not allow", "link": "not a regular file"} {
+	for path, want := range want {
 		if !strings.Contains(reasons[path], want) {
 			t.Errorf("skip reason for %s = %q, want it to mention %q", path, reasons[path], want)
 		}

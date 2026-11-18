@@ -155,9 +155,13 @@ func TestEphemeralSessionWritesNoLeaseOrInboxRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lm.Close()
-	if _, err := inboxOpenForTest(target); err != nil {
+	// Closed before the test ends: Windows cannot delete a file that is still
+	// open, so a leaked handle fails the temporary directory's cleanup.
+	closeInbox, err := inboxOpenForTest(target)
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer closeInbox()
 
 	sup, drv := testSupervisor(t, echoLoop)
 	hub := &countingHub{}

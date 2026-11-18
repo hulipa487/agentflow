@@ -64,7 +64,11 @@ func applyLayer(root string, layer io.Reader, budget *int64) error {
 		if err != nil {
 			return fmt.Errorf("layer: %w", err)
 		}
-		name := path.Clean("/" + hdr.Name)[1:]
+		// ToSlash first: on Windows a backslash in a name is a separator to the
+		// filesystem, so it must be one to Clean as well, or "a\..\..\x"
+		// would pass Clean untouched and climb out of root when joined. On
+		// other systems it is an ordinary character and ToSlash leaves it.
+		name := path.Clean("/" + filepath.ToSlash(hdr.Name))[1:]
 		if name == "" {
 			continue // the root directory itself
 		}
@@ -141,7 +145,7 @@ func applyLayer(root string, layer io.Reader, budget *int64) error {
 			}
 
 		case tar.TypeLink:
-			old, err := resolveIn(root, path.Clean("/" + hdr.Linkname)[1:])
+			old, err := resolveIn(root, path.Clean("/" + filepath.ToSlash(hdr.Linkname))[1:])
 			if err != nil {
 				return fmt.Errorf("layer entry %q: %w", hdr.Name, err)
 			}
@@ -192,12 +196,35 @@ func resolveIn(root, name string) (string, error) {
 		if err != nil {
 			return "", err
 		}
+		// Windows stores and reports link targets with backslashes, so the
+		// split below would see "..\..\.." as one name and the join would
+		// climb out of root. A target with a volume ("C:\x") or a leading
+		// separator is absolute: inside the image, that means root.
+		link = filepath.ToSlash(link)
+		if vol := filepath.VolumeName(link); vol != "" {
+			link = "/" + strings.TrimPrefix(link[len(vol):], "/")
+		}
 		if path.IsAbs(link) {
 			resolved = root
 		}
 		pending = append(strings.Split(link, "/"), pending...)
 	}
+	// The walk above cannot leave root by construction. This says so out loud,
+	// so that a platform quirk nobody thought of fails here instead of writing
+	// outside the image.
+	if !within(root, resolved) {
+		return "", fmt.Errorf("%q resolves outside the image", name)
+	}
 	return resolved, nil
+}
+
+// within reports whether p is root or inside it.
+func within(root, p string) bool {
+	rel, err := filepath.Rel(root, p)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel))
 }
 
 // emptyDir removes everything inside a directory, keeping the directory. A

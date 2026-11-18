@@ -1,6 +1,7 @@
 package config
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -37,7 +38,7 @@ func TestSandboxDefaults(t *testing.T) {
 	}
 	c := &Config{}
 	c.Runtime.Persistence = "sqlite://./var/agentflow.db"
-	if got := c.SandboxDataDir(); got != "var/sandbox" {
+	if got := c.SandboxDataDir(); got != filepath.Join("var", "sandbox") {
 		t.Errorf("SandboxDataDir = %q, want it beside the runtime store", got)
 	}
 	c.Runtime.Sandbox.DataDir = "/srv/af"

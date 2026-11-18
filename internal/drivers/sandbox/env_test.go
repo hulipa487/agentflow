@@ -108,11 +108,14 @@ func TestLayersStackWithWhiteouts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Mode()&os.ModeSetuid != 0 || st.Mode().Perm() != 0o755 {
-		t.Errorf("bin/tool mode = %v, want 0755 without setuid", st.Mode())
-	}
-	if st, _ := os.Stat(filepath.Join(root, "locked")); st.Mode().Perm()&0o700 != 0o700 {
-		t.Errorf("a read-only directory was left unwritable (%v): the tree could not be removed", st.Mode())
+	// Windows keeps no Unix modes, so there is nothing to check there.
+	if runtime.GOOS != "windows" {
+		if st.Mode()&os.ModeSetuid != 0 || st.Mode().Perm() != 0o755 {
+			t.Errorf("bin/tool mode = %v, want 0755 without setuid", st.Mode())
+		}
+		if st, _ := os.Stat(filepath.Join(root, "locked")); st.Mode().Perm()&0o700 != 0o700 {
+			t.Errorf("a read-only directory was left unwritable (%v): the tree could not be removed", st.Mode())
+		}
 	}
 }
 
@@ -140,6 +143,22 @@ func TestLayerEntriesNeverLeaveTheRoot(t *testing.T) {
 	left, _ := os.ReadDir(outside)
 	if len(left) != 1 {
 		t.Errorf("entries were written outside the root: %v", left)
+	}
+}
+
+func TestWithin(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "root")
+	for p, want := range map[string]bool{
+		root:                                     true,
+		filepath.Join(root, "a", "b"):            true,
+		filepath.Join(root, "..a"):               true, // a name that starts with dots is still inside
+		filepath.Dir(root):                       false,
+		filepath.Join(root, "..", "x"):           false,
+		filepath.Join(filepath.Dir(root), "roo"): false,
+	} {
+		if got := within(root, p); got != want {
+			t.Errorf("within(root, %q) = %v, want %v", p, got, want)
+		}
 	}
 }
 

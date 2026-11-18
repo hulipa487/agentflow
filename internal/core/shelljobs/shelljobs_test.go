@@ -440,7 +440,15 @@ func TestBackgroundJobRefusesAMistakeUpFrontAndBoundsASession(t *testing.T) {
 		t.Errorf("Start = %v, want the mistake reported at once", err)
 	}
 	block := make(chan struct{})
-	defer close(block)
+	var jobs sync.WaitGroup
+	// Release the jobs and wait for them to finish before the temporary
+	// directory is removed: a job still writing its workspace back while the
+	// directory goes makes the removal fail on Windows. Cleanups run last
+	// registered first, so this one runs before the fixture's TempDir.
+	t.Cleanup(func() {
+		close(block)
+		jobs.Wait()
+	})
 	f.runner.run = func(context.Context, sandbox.Spec) (*sandbox.Result, error) {
 		<-block
 		return &sandbox.Result{}, nil
@@ -448,7 +456,9 @@ func TestBackgroundJobRefusesAMistakeUpFrontAndBoundsASession(t *testing.T) {
 	for i := 0; i < maxPerOwner; i++ {
 		r := req("true")
 		r.Project = fmt.Sprintf("p%d", i)
-		if _, err := f.svc.Start(context.Background(), r, nil); err != nil {
+		jobs.Add(1)
+		if _, err := f.svc.Start(context.Background(), r, func(Job) { jobs.Done() }); err != nil {
+			jobs.Done()
 			t.Fatal(err)
 		}
 	}

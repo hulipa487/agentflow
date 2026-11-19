@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"agentflow/internal/config"
@@ -51,5 +52,26 @@ func TestOpenAIChatWithoutStreaming(t *testing.T) {
 	}
 	if reply.Usage.Input != 10 || reply.Usage.Output != 5 {
 		t.Errorf("usage = %+v", reply.Usage)
+	}
+}
+
+// A provider that reports errors outside OpenAI's {"error": {...}} shape still
+// has its explanation in the failure: the SDK alone prints only the status.
+func TestOpenAIErrorCarriesAForeignBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"code":20015,"message":"The parameter is invalid. Please check again.","data":null}`))
+	}))
+	defer srv.Close()
+	m := NewManager(map[string]config.Model{
+		"embed": {Provider: "openai", Model: "e", BaseURL: srv.URL},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	_, _, err := m.Embed(context.Background(), "embed", []string{"hello"})
+	if err == nil {
+		t.Fatal("a 400 was not an error")
+	}
+	if got := err.Error(); !strings.Contains(got, "The parameter is invalid") || !strings.Contains(got, "20015") {
+		t.Fatalf("the provider's explanation is missing: %s", got)
 	}
 }

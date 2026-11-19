@@ -140,7 +140,7 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 			serr = errors.New("stream closed before any event")
 		}
 		_ = stream.Close()
-		return nil, openaiRetryable(serr), fmt.Errorf("%s/chat/completions -> %w", base, serr)
+		return nil, openaiRetryable(serr), fmt.Errorf("%s/chat/completions -> %w", base, openaiErrDetail(serr))
 	}
 	first := stream.Current()
 
@@ -248,7 +248,7 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 func openaiChatWhole(ctx context.Context, api openai.Client, params openai.ChatCompletionNewParams, base string) (<-chan event, bool, error) {
 	resp, err := api.Chat.Completions.New(ctx, params)
 	if err != nil {
-		return nil, openaiRetryable(err), fmt.Errorf("%s/chat/completions -> %w", base, err)
+		return nil, openaiRetryable(err), fmt.Errorf("%s/chat/completions -> %w", base, openaiErrDetail(err))
 	}
 	events := make(chan event, 4)
 	var text, finish string
@@ -276,6 +276,28 @@ func openaiChatWhole(ctx context.Context, api openai.Client, params openai.ChatC
 	events <- event{usage: usage, finish: normalizeFinish(finish)}
 	close(events)
 	return events, false, nil
+}
+
+// openaiErrDetail adds the response body to an API error whose message the
+// SDK could not read. The SDK prints only the body's `error` object, the
+// OpenAI shape; a compatible provider that answers {"code":..,"message":..}
+// at the top level produced "400 Bad Request" and nothing else, which names
+// the failure without saying what was wrong with the request.
+func openaiErrDetail(err error) error {
+	var apiErr *openai.Error
+	if !errors.As(err, &apiErr) || apiErr.RawJSON() != "" || apiErr.Response == nil {
+		return err
+	}
+	dump := string(apiErr.DumpResponse(true))
+	_, body, found := strings.Cut(dump, "\r\n\r\n")
+	body = strings.TrimSpace(body)
+	if !found || body == "" {
+		return err
+	}
+	if len(body) > 400 {
+		body = body[:400] + "…"
+	}
+	return fmt.Errorf("%w(response body: %s)", err, body)
 }
 
 // openaiRetryable classifies an establishment failure. 429 and 5xx are worth

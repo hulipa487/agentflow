@@ -136,7 +136,7 @@ func openaiEmbed(ctx context.Context, client *http.Client, cfg config.Model, par
 
 	resp, err := api.Embeddings.New(ctx, params)
 	if err != nil {
-		return nil, Usage{}, openaiRetryable(err), fmt.Errorf("%s -> %w", url, err)
+		return nil, Usage{}, openaiRetryable(err), fmt.Errorf("%s -> %w", url, openaiErrDetail(err))
 	}
 	if len(resp.Data) == 0 {
 		return nil, Usage{}, false, fmt.Errorf("%s -> embeddings response carried no data", url)

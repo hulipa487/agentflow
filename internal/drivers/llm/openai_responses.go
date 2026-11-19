@@ -139,7 +139,7 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 			serr = errors.New("stream closed before any event")
 		}
 		_ = stream.Close()
-		return nil, openaiRetryable(serr), fmt.Errorf("%s/responses -> %w", base, serr)
+		return nil, openaiRetryable(serr), fmt.Errorf("%s/responses -> %w", base, openaiErrDetail(serr))
 	}
 	first := stream.Current()
 

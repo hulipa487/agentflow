@@ -48,6 +48,51 @@ type message struct {
 		Bot          bool   `json:"bot"`
 	} `json:"author"`
 	Attachments []attachment `json:"attachments"`
+	// Mentions lists who the message @s. A group message's content keeps each
+	// of them as an opaque <@id> marker.
+	Mentions []mentionee `json:"mentions"`
+}
+
+// mentionee is one @ in a message. IsYou marks the bot itself.
+type mentionee struct {
+	ID           string `json:"id"`
+	UserOpenID   string `json:"user_openid"`
+	MemberOpenID string `json:"member_openid"`
+	Nickname     string `json:"member_nickname"`
+	Username     string `json:"username"`
+	Bot          bool   `json:"bot"`
+	IsYou        bool   `json:"is_you"`
+}
+
+// resolveMentions rewrites the <@id> markers of a group message. The bot's
+// own marker is dropped, anyone else's becomes @name when the platform gave a
+// name. It reports whether the bot was @ed and whether anyone else was.
+func resolveMentions(text string, list []mentionee) (out string, self, others bool) {
+	for _, m := range list {
+		name := m.Nickname
+		if name == "" {
+			name = m.Username
+		}
+		if m.IsYou {
+			self = true
+		} else {
+			others = true
+		}
+		for _, id := range []string{m.ID, m.MemberOpenID, m.UserOpenID} {
+			if id == "" {
+				continue
+			}
+			for _, mark := range []string{"<@" + id + ">", "<@!" + id + ">"} {
+				switch {
+				case m.IsYou:
+					text = strings.ReplaceAll(text, mark, "")
+				case name != "":
+					text = strings.ReplaceAll(text, mark, "@"+name)
+				}
+			}
+		}
+	}
+	return strings.TrimSpace(text), self, others
 }
 
 type attachment struct {
@@ -127,6 +172,18 @@ func (d *Driver) handleEvent(t, eventID string, raw json.RawMessage) {
 		payload["union_openid"] = m.Author.UnionOpenID
 	}
 	text := strings.TrimSpace(m.Content)
+	if scene == SceneGroup {
+		// With full group access the platform pushes an @ of the bot as a
+		// plain group message too; the mentions list is what tells it apart.
+		var self, others bool
+		text, self, others = resolveMentions(text, m.Mentions)
+		if self {
+			payload["mentioned"] = true
+		}
+		if others || strings.Contains(text, "<@") {
+			payload["mentions_others"] = true
+		}
+	}
 	switch scene {
 	case SceneC2C:
 		target = SceneC2C + ":" + m.Author.UserOpenID

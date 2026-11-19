@@ -47,3 +47,26 @@ func TestGroupAllScene(t *testing.T) {
 		t.Fatalf("a message delivered under both events made %d messages", n)
 	}
 }
+
+// With full group access an @ of the bot arrives as a plain group message;
+// the mentions list says whether it was the bot or someone else.
+func TestGroupAllMentions(t *testing.T) {
+	d, sink, _ := newDriver(t, nil, Options{Scenes: []string{"group_all"}})
+	d.handleEvent(evGroupAll, "e1", json.RawMessage(`{"id":"m1","content":"<@BOT1> still alive?","group_openid":"G9","author":{"member_openid":"M1"},"mentions":[{"member_openid":"BOT1","bot":true,"is_you":true}]}`))
+	d.handleEvent(evGroupAll, "e2", json.RawMessage(`{"id":"m2","content":"<@BOT2> where is your owner","group_openid":"G9","author":{"member_openid":"M1"},"mentions":[{"member_openid":"BOT2","member_nickname":"Other","username":"other","bot":true,"is_you":false}]}`))
+	d.handleEvent(evGroupAll, "e3", json.RawMessage(`{"id":"m3","content":"<@X9> hi","group_openid":"G9","author":{"member_openid":"M1"}}`))
+	got := sink.all()
+	if len(got) != 3 {
+		t.Fatalf("%d messages", len(got))
+	}
+	me, other, bare := got[0].Message, got[1].Message, got[2].Message
+	if me.Payload["mentioned"] != true || me.Payload["mentions_others"] != nil || me.Text != "still alive?" {
+		t.Fatalf("@ of the bot = %q %+v", me.Text, me.Payload)
+	}
+	if other.Payload["mentioned"] != false || other.Payload["mentions_others"] != true || other.Text != "@Other where is your owner" {
+		t.Fatalf("@ of another = %q %+v", other.Text, other.Payload)
+	}
+	if bare.Payload["mentioned"] != false || bare.Payload["mentions_others"] != true {
+		t.Fatalf("unlisted @ = %q %+v", bare.Text, bare.Payload)
+	}
+}

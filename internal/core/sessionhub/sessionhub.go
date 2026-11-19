@@ -74,6 +74,10 @@ type Hub struct {
 	// The drain renews an idle session at a fraction of the TTL rather than on
 	// every poll — see renewIfDue — so it has to know when it last did.
 	renewed map[string]time.Time
+
+	// now is the clock the renewal throttle and the fence read. Tests move it
+	// by hand, so what they check does not depend on how fast the store is.
+	now func() time.Time
 }
 
 // New builds a hub. leases and queue must live on the same store — they do when
@@ -93,6 +97,7 @@ func New(leases *lease.Manager, queue *inbox.Queue, deliver Deliver, log *slog.L
 		held:        map[string]bool{},
 		generations: map[string]int64{},
 		renewed:     map[string]time.Time{},
+		now:         time.Now,
 	}
 }
 
@@ -191,7 +196,7 @@ func (h *Hub) claim(ctx context.Context, sessKey string) (bool, error) {
 	if ok {
 		h.held[sessKey] = true
 		h.generations[sessKey] = generation
-		h.renewed[sessKey] = time.Now()
+		h.renewed[sessKey] = h.now()
 	} else {
 		// Another instance owns it. Only a session this instance actually held
 		// is a loss; a message for someone else's session is the normal case.
@@ -230,7 +235,7 @@ func (h *Hub) Generation(sessKey string) int64 {
 // claim.
 func (h *Hub) renewIfDue(ctx context.Context, sessKey string) (bool, error) {
 	h.mu.Lock()
-	due := time.Since(h.renewed[sessKey]) >= h.ttl/3
+	due := h.now().Sub(h.renewed[sessKey]) >= h.ttl/3
 	h.mu.Unlock()
 	if !due {
 		return true, nil
@@ -358,7 +363,7 @@ func (h *Hub) fenceStale() {
 	h.mu.Lock()
 	var stale []string
 	for k := range h.held {
-		if time.Since(h.renewed[k]) >= limit {
+		if h.now().Sub(h.renewed[k]) >= limit {
 			stale = append(stale, k)
 			delete(h.held, k)
 			delete(h.generations, k)

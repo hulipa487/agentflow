@@ -340,11 +340,13 @@ func TestIdleClaimsAreRenewedAtAFractionOfTheTTL(t *testing.T) {
 	a, da := oneInstance(t, path, "instance-a")
 	b, _ := oneInstance(t, path, "instance-b")
 	ctx := context.Background()
-	// A third of this is 100ms: short enough to observe, long enough that the
-	// steps below are not racing the clock.
-	const ttl = 300 * time.Millisecond
+	// The hub's own clock is moved by hand, so a slow store cannot age the
+	// claim past the fence between two steps. The TTL is long enough that the
+	// lease row, which the store dates with the real clock, never lapses here.
+	const ttl = time.Minute
 	a.SetSessionTTL(ttl)
 	b.SetSessionTTL(ttl)
+	clock := freezeClock(a)
 
 	if ok, err := a.Claim(ctx, "bot|idle"); err != nil || !ok {
 		t.Fatalf("claim: ok=%v err=%v", ok, err)
@@ -353,6 +355,7 @@ func TestIdleClaimsAreRenewedAtAFractionOfTheTTL(t *testing.T) {
 
 	// The next pass is not a renewal: nothing is waiting for the session and
 	// nothing is due.
+	waitForWallClock()
 	a.drainOnce(ctx)
 	if got := leaseDeadline(t, path, "bot|idle"); got != first {
 		t.Fatal("an idle session's claim was renewed on every poll")
@@ -373,7 +376,8 @@ func TestIdleClaimsAreRenewedAtAFractionOfTheTTL(t *testing.T) {
 	}
 
 	// And once a third of the TTL has passed, the idle path renews too.
-	time.Sleep(ttl / 2)
+	clock.advance(ttl / 2)
+	waitForWallClock()
 	a.drainOnce(ctx)
 	if got := leaseDeadline(t, path, "bot|idle"); got <= withWork {
 		t.Fatalf("an idle claim was not renewed after a third of its %v TTL", ttl)
@@ -382,6 +386,35 @@ func TestIdleClaimsAreRenewedAtAFractionOfTheTTL(t *testing.T) {
 		t.Fatalf("held = %d, want the one session", a.Held())
 	}
 }
+
+// fakeClock stands in for a hub's clock so tests decide when time passes.
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *fakeClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
+
+func freezeClock(h *Hub) *fakeClock {
+	c := &fakeClock{t: time.Now()}
+	h.now = c.now
+	return c
+}
+
+// waitForWallClock lets the real clock move on before a lease write whose
+// deadline a test compares with an earlier one. The store dates leases with
+// the wall clock, which on Windows can advance in steps of about 15ms.
+func waitForWallClock() { time.Sleep(20 * time.Millisecond) }
 
 // A claim that lapsed while this instance was idle means the session is another
 // instance's now. The messages waiting for it are that instance's to deliver,
@@ -515,7 +548,9 @@ func TestOnLostOnlyFiresForSessionsThisInstanceHeld(t *testing.T) {
 func TestUnrenewableClaimIsFenced(t *testing.T) {
 	a, _ := oneInstance(t, filepath.Join(t.TempDir(), "hub.db"), "instance-a")
 	ctx := context.Background()
-	a.SetSessionTTL(300 * time.Millisecond)
+	const ttl = 300 * time.Millisecond
+	a.SetSessionTTL(ttl)
+	clock := freezeClock(a)
 	if ok, err := a.Claim(ctx, "bot|chat-1"); err != nil || !ok {
 		t.Fatalf("claim: %v %v", ok, err)
 	}
@@ -528,7 +563,7 @@ func TestUnrenewableClaimIsFenced(t *testing.T) {
 	if len(lost) != 0 || a.Held() != 1 {
 		t.Fatal("a fresh claim was fenced")
 	}
-	time.Sleep(260 * time.Millisecond) // past 5/6 of the TTL with no renewal
+	clock.advance(ttl * 9 / 10) // past 5/6 of the TTL with no renewal
 	a.drainOnce(dead)
 	select {
 	case key := <-lost:

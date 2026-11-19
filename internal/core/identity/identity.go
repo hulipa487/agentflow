@@ -68,7 +68,10 @@ type ChannelTraits struct {
 // channelDefaults is the per-driver table of traits. An unknown channel gets
 // the most conservative treatment: asserted, undeliverable, unlinkable.
 var channelDefaults = map[string]ChannelTraits{
-	"telegram":  {Trust: TrustVerified, Deliverable: true, Linkable: true},
+	"telegram": {Trust: TrustVerified, Deliverable: true, Linkable: true},
+	// QQ authenticates the sender's openid; a bot can message a user later,
+	// within the platform's proactive-message limits.
+	"qq":        {Trust: TrustVerified, Deliverable: true, Linkable: true},
 	oidcChannel: {Trust: TrustVerified}, // a login, not an address: nothing to deliver to
 	"webhook":   {Trust: TrustAsserted, Deliverable: false, Linkable: false},
 	"ghhook":    {Trust: TrustSystem, Deliverable: false, Linkable: false},

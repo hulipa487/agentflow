@@ -1257,13 +1257,26 @@ type Gateway struct {
 
 type Channel struct {
 	Name   string   `yaml:"name"`
-	Type   string   `yaml:"type"` // webhook | telegram | ghhook | bridge | openai
-	Mode   string   `yaml:"mode"` // telegram: polling (default) | webhook | auto
+	Type   string   `yaml:"type"` // webhook | telegram | ghhook | bridge | openai | qq
+	Mode   string   `yaml:"mode"` // telegram: polling (default) | webhook | auto; qq: websocket (default) | webhook
 	Agent  string   `yaml:"agent"`
 	Agents []string `yaml:"agents"` // openai: the agents exposed as model ids
 	Path   string   `yaml:"path"`   // route mounted on the shared server, e.g. /webhook/<chan>/<uuid>/
 	Token  string   `yaml:"token"`
-	Secret string   `yaml:"secret"` // ghhook: webhook secret for HMAC verification (env-interpolated)
+	Secret string   `yaml:"secret"` // ghhook: webhook secret for HMAC verification; qq: the app secret (env-interpolated)
+	// AppID is the qq channel's bot AppID from the QQ Open Platform console.
+	AppID string `yaml:"app_id"`
+	// Scenes are where a qq channel takes messages from: c2c (private chats),
+	// group (@-mentions in groups), guild (@-mentions in guild channels) and dm
+	// (guild direct messages). Empty means c2c, group and guild.
+	Scenes []string `yaml:"scenes"`
+	// APIBase overrides the qq channel's API domain (default
+	// https://api.bot.qq.com), for a proxy or a sandbox endpoint.
+	APIBase string `yaml:"api_base"`
+	// Markdown sends a qq channel's text replies in private chats and groups
+	// as markdown messages, a capability the platform grants per bot. A
+	// refused markdown message is resent as plain text.
+	Markdown bool `yaml:"markdown"`
 	// Auth is the openai channel's credential mode: user_token (a per-user
 	// bearer token, requires runtime.identity.enabled), key (a shared key from
 	// keys:), or none (loopback listeners only).

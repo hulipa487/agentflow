@@ -43,6 +43,10 @@ type ChannelDraft struct {
 	Timeout         string   `json:"timeout,omitempty"`
 	Async           bool     `json:"async,omitempty"`
 	DeliverURL      string   `json:"deliver_url,omitempty"`
+	AppID           string   `json:"app_id,omitempty"`
+	Scenes          []string `json:"scenes,omitempty"`
+	APIBase         string   `json:"api_base,omitempty"`
+	Markdown        bool     `json:"markdown,omitempty"`
 	MediaAllow      []string `json:"media_allow,omitempty"`
 	MediaMaxBytes   int      `json:"media_max_bytes,omitempty"`
 }
@@ -61,6 +65,10 @@ type ChannelView struct {
 	Timeout         string   `json:"timeout,omitempty"`
 	Async           bool     `json:"async,omitempty"`
 	DeliverURL      string   `json:"deliver_url,omitempty"`
+	AppID           string   `json:"app_id,omitempty"`
+	Scenes          []string `json:"scenes,omitempty"`
+	APIBase         string   `json:"api_base,omitempty"`
+	Markdown        bool     `json:"markdown,omitempty"`
 	Auth            string   `json:"auth,omitempty"`
 	MaxRequestBytes int      `json:"max_request_bytes,omitempty"`
 	ExposeReasoning bool     `json:"expose_reasoning,omitempty"`
@@ -166,8 +174,8 @@ func (c *Channels) view(i int, ch config.Channel) ChannelView {
 	v := ChannelView{
 		Index: i, Name: ch.Name, Type: ch.Type, Agent: ch.Agent, Agents: ch.Agents,
 		Mode: ch.Mode, Path: ch.Path, Timeout: ch.Timeout, Async: ch.Async,
-		DeliverURL: ch.DeliverURL,
-		Auth:       ch.Auth, MaxRequestBytes: ch.MaxRequestBytes, ExposeReasoning: ch.ExposeReasoning,
+		DeliverURL: ch.DeliverURL, AppID: ch.AppID, Scenes: ch.Scenes, APIBase: ch.APIBase, Markdown: ch.Markdown,
+		Auth: ch.Auth, MaxRequestBytes: ch.MaxRequestBytes, ExposeReasoning: ch.ExposeReasoning,
 		Journal:    ch.Journal,
 		AllowUsers: ch.AllowUsers, MediaAllow: ch.Media.Allow, MediaMaxBytes: ch.Media.MaxBytes,
 		HasToken: ch.Token != "", HasSecret: ch.Secret != "", HasSecretTok: ch.SecretToken != "",
@@ -197,6 +205,7 @@ func (c *Channels) live(i int, raw config.Channel) bool {
 		l.ExposeReasoning == raw.ExposeReasoning &&
 		l.Mode == raw.Mode && l.Path == raw.Path && l.Timeout == raw.Timeout &&
 		l.Async == raw.Async && l.DeliverURL == raw.DeliverURL &&
+		l.AppID == raw.AppID && equalStrings(l.Scenes, raw.Scenes) && l.APIBase == raw.APIBase && l.Markdown == raw.Markdown &&
 		equalInts(l.AllowUsers, raw.AllowUsers) &&
 		equalStrings(l.Media.Allow, raw.Media.Allow)
 }
@@ -346,6 +355,7 @@ func channelFromDraft(d ChannelDraft, existing *config.Channel) config.Channel {
 		Agent: strings.TrimSpace(d.Agent), Agents: d.Agents, Mode: strings.TrimSpace(d.Mode),
 		Path: strings.TrimSpace(d.Path), Timeout: strings.TrimSpace(d.Timeout),
 		Async: d.Async, DeliverURL: strings.TrimSpace(d.DeliverURL), AllowUsers: d.AllowUsers,
+		AppID: strings.TrimSpace(d.AppID), Scenes: d.Scenes, APIBase: strings.TrimSpace(d.APIBase), Markdown: d.Markdown,
 		Auth: strings.TrimSpace(d.Auth), MaxRequestBytes: d.MaxRequestBytes,
 		ExposeReasoning: d.ExposeReasoning, Journal: strings.TrimSpace(d.Journal),
 		Media: config.ChannelMedia{Allow: d.MediaAllow, MaxBytes: d.MediaMaxBytes},

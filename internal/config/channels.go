@@ -220,8 +220,15 @@ func validateChannelList(path string, c *Config, channels []Channel) error {
 			if err := validateOpenAIChannel(path, c, ch); err != nil {
 				return err
 			}
+		case "qq":
+			if err := validateQQChannel(path, ch); err != nil {
+				return err
+			}
 		default:
 			return fmt.Errorf("%s: unsupported channel type %q (channel %q)", path, ch.Type, ch.Name)
+		}
+		if ch.Markdown && ch.Type != "qq" {
+			return fmt.Errorf("%s: channel %q sets markdown, which only the qq channel type uses", path, ch.Name)
 		}
 		switch ch.JournalMode() {
 		case "full", "metadata", "off":
@@ -235,6 +242,9 @@ func validateChannelList(path string, c *Config, channels []Channel) error {
 			return fmt.Errorf("%s: channel %q media.max_bytes must be >= 0", path, ch.Name)
 		}
 		key := ch.Path
+		if ch.Type == "qq" {
+			key = ch.QQPath()
+		}
 		if ch.Type == "openai" {
 			p := key
 			if p == "" {
@@ -288,6 +298,61 @@ func validateChannelList(path string, c *Config, channels []Channel) error {
 					path, a.channel, b.channel, a.pattern, b.pattern)
 			}
 		}
+	}
+	return nil
+}
+
+// QQPath is the route a qq channel in webhook mode mounts: its path, or
+// /webhook/qq/<name>/ so two QQ bots never share one. Empty in websocket mode.
+func (ch Channel) QQPath() string {
+	if ch.Mode != "webhook" {
+		return ""
+	}
+	if ch.Path != "" {
+		return ch.Path
+	}
+	if ch.Name != "" {
+		return "/webhook/qq/" + ch.Name + "/"
+	}
+	return "/webhook/qq/"
+}
+
+// validateQQChannel checks a QQ Bot channel. The secret may be a lazy
+// reference (${VAR} / cred:<service>), so only its presence is checked here.
+func validateQQChannel(path string, ch Channel) error {
+	if strings.TrimSpace(ch.AppID) == "" {
+		return fmt.Errorf("%s: qq channel %q has no app_id; copy the bot's AppID from the QQ Open Platform console (q.qq.com)", path, ch.Name)
+	}
+	if ch.Secret == "" {
+		return fmt.Errorf("%s: qq channel %q has no secret; set secret to the bot's AppSecret, e.g. ${QQ_BOT_SECRET}", path, ch.Name)
+	}
+	switch ch.Mode {
+	case "", "websocket":
+		if ch.Path != "" {
+			return fmt.Errorf("%s: qq channel %q sets path, which only webhook mode uses; remove it or set mode: webhook", path, ch.Name)
+		}
+	case "webhook":
+		if !strings.HasSuffix(ch.QQPath(), "/") {
+			return fmt.Errorf("%s: qq channel %q path must end with / (got %q)", path, ch.Name, ch.Path)
+		}
+	default:
+		return fmt.Errorf("%s: qq channel %q has unsupported mode %q (use websocket or webhook)", path, ch.Name, ch.Mode)
+	}
+	for _, s := range ch.Scenes {
+		switch strings.ToLower(strings.TrimSpace(s)) {
+		case "c2c", "group", "guild", "dm":
+		default:
+			return fmt.Errorf("%s: qq channel %q has unknown scene %q (use c2c, group, guild or dm)", path, ch.Name, s)
+		}
+	}
+	if ch.APIBase != "" {
+		u, err := url.Parse(ch.APIBase)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("%s: qq channel %q api_base must be an absolute http(s) URL", path, ch.Name)
+		}
+	}
+	if len(ch.AllowUsers) > 0 {
+		return fmt.Errorf("%s: qq channel %q sets allow_users, which only telegram uses (QQ ids are openids, not numbers)", path, ch.Name)
 	}
 	return nil
 }
@@ -438,6 +503,10 @@ func (ch Channel) MarshalYAML() (any, error) {
 		Path            string        `yaml:"path,omitempty"`
 		Token           string        `yaml:"token,omitempty"`
 		Secret          string        `yaml:"secret,omitempty"`
+		AppID           string        `yaml:"app_id,omitempty"`
+		Scenes          []string      `yaml:"scenes,omitempty"`
+		APIBase         string        `yaml:"api_base,omitempty"`
+		Markdown        bool          `yaml:"markdown,omitempty"`
 		SecretToken     string        `yaml:"secret_token,omitempty"`
 		Auth            string        `yaml:"auth,omitempty"`
 		Keys            []string      `yaml:"keys,omitempty"`
@@ -453,6 +522,7 @@ func (ch Channel) MarshalYAML() (any, error) {
 	o := out{
 		Name: ch.Name, Type: ch.Type, Mode: ch.Mode, Agent: ch.Agent, Agents: ch.Agents,
 		Path: ch.Path, Token: ch.Token, Secret: ch.Secret, SecretToken: ch.SecretToken,
+		AppID: ch.AppID, Scenes: ch.Scenes, APIBase: ch.APIBase, Markdown: ch.Markdown,
 		Auth: ch.Auth, Keys: ch.Keys, MaxRequestBytes: ch.MaxRequestBytes,
 		ExposeReasoning: ch.ExposeReasoning, Journal: ch.Journal,
 		AllowUsers: ch.AllowUsers, Timeout: ch.Timeout, Async: ch.Async,

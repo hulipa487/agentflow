@@ -270,6 +270,18 @@ gateway:
     #   mode: polling              # polling | webhook | auto
     #   allow_users: []
     #
+    # QQ Bot (Tencent's official QQ Open Platform API). websocket mode connects
+    # out to the QQ gateway, so nothing needs to be public; webhook mode takes
+    # callbacks at path (set <public https url><path> in the q.qq.com console).
+    # - type: qq
+    #   name: qq
+    #   agent: assistant
+    #   app_id: "102xxxxxx"
+    #   secret: ${QQ_BOT_SECRET}
+    #   mode: websocket            # websocket | webhook
+    #   scenes: [c2c, group, guild] # c2c | group | guild | dm
+    #   markdown: true             # markdown replies (private chats and groups)
+    #
     # - type: ghhook
     #   name: github
     #   agent: assistant

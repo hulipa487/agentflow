@@ -80,6 +80,7 @@ import (
 	"agentflow/internal/drivers/pgvector"
 	"agentflow/internal/drivers/postgres"
 	"agentflow/internal/drivers/qdrant"
+	"agentflow/internal/drivers/qqbot"
 	"agentflow/internal/drivers/redis"
 	"agentflow/internal/drivers/redisvector"
 	"agentflow/internal/drivers/s3media"
@@ -1810,6 +1811,7 @@ func main() {
 			"cors_origins", len(cfg.Runtime.Users.CORSOrigins))
 	}
 	var telegramDrivers []*telegram.Driver
+	var qqDrivers []*qqbot.Driver
 	for i, ch := range cfg.Gateway.Channels {
 		name := ch.Name
 		if name == "" {
@@ -1845,6 +1847,25 @@ func main() {
 			d := telegram.New(name, token, ch.Agent, ch.Mode, ch.AllowUsers, ch.Path, cfg.Gateway.PublicURL, secretToken, sink, httpSrv, mstore, mpol, log)
 			gw.Register(d)
 			telegramDrivers = append(telegramDrivers, d)
+		case "qq":
+			secret, ok := credResolver.Resolve(ctx, ch.Secret)
+			if !ok {
+				log.Warn("channel skipped: unresolved credential",
+					"channel", name, "field", "secret", "credential", config.CredentialName(ch.Secret))
+				continue
+			}
+			d := qqbot.New(name, ch.Agent, qqbot.Options{
+				AppID:     ch.AppID,
+				Secret:    secret,
+				Mode:      ch.Mode,
+				Path:      ch.QQPath(),
+				PublicURL: cfg.Gateway.PublicURL,
+				Scenes:    ch.Scenes,
+				APIBase:   ch.APIBase,
+				Markdown:  ch.Markdown,
+			}, sink, httpSrv, mstore, mpol, log)
+			gw.Register(d)
+			qqDrivers = append(qqDrivers, d)
 		case "ghhook":
 			secret := ch.Secret
 			if secret != "" {
@@ -1950,6 +1971,12 @@ func main() {
 		exit(1)
 	}
 	for _, d := range telegramDrivers {
+		if err := d.Start(ctx); err != nil {
+			log.Error("channel start failed", "channel", d.Name(), "err", err)
+			exit(1)
+		}
+	}
+	for _, d := range qqDrivers {
 		if err := d.Start(ctx); err != nil {
 			log.Error("channel start failed", "channel", d.Name(), "err", err)
 			exit(1)

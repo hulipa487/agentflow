@@ -177,6 +177,20 @@ make
 ./agentflow run -config agentflow.example.yaml
 ```
 
+From the Gitee mirror, clone without submodules and let `make` fetch Luau from
+[its Gitee mirror](https://gitee.com/trusted-list/luau) as well:
+
+```bash
+git clone https://gitee.com/chutszwai/agentflow.git
+cd agentflow
+make submodules-gitee
+make
+```
+
+Gitee asks you to sign in for git over HTTPS, even on public repositories. To
+use your SSH key for both instead, clone `git@gitee.com:chutszwai/agentflow.git`
+and run `make submodules-gitee LUAU_MIRROR=git@gitee.com:trusted-list/luau.git`.
+
 Starting your own deployment:
 
 ```bash

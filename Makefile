@@ -7,6 +7,7 @@
 #   make vet        # go vet with the cgo toolchain
 #   make run        # build, then run with CONFIG (default: config.yaml)
 #   make clean      # remove objects, static lib, and binary
+#   make submodules-gitee  # fetch vendored Luau from the Gitee mirror
 #
 # Toolchain is auto-selected by host OS:
 #   Windows -> zig (hermetic; no system gcc required)
@@ -235,6 +236,21 @@ docker:
 
 # Both names: a Linux-named binary can be left behind by a cross build or an
 # older checkout even when the host default is agentflow.exe.
+# ---- Gitee mirror ------------------------------------------------------------
+# .gitmodules points at GitHub, and one committed file cannot hold a URL per
+# remote. A checkout cloned from Gitee overrides the URL in its own config
+# (which git reads before .gitmodules) and repoints an existing submodule, so
+# the Luau sources come from the mirror as well. Never run `git submodule sync`
+# afterwards: it copies the .gitmodules URL back over the override. Gitee wants
+# a sign-in for git over HTTPS even on public repositories; to use an SSH key,
+# pass LUAU_MIRROR=git@gitee.com:trusted-list/luau.git.
+LUAU_MIRROR ?= https://gitee.com/trusted-list/luau
+
+submodules-gitee:
+	git config submodule.third_party/luau.url $(LUAU_MIRROR)
+	git submodule foreach --quiet "git remote set-url origin $(LUAU_MIRROR)"
+	git submodule update --init third_party/luau
+
 CLEANBINS := $(sort $(BIN) agentflow agentflow.exe)
 
 ifeq ($(SHELL_KIND),sh)
@@ -248,4 +264,4 @@ clean:
 endif
 
 
-.PHONY: all luau build run test vet fmt fmt-check check schema loop-check docker clean
+.PHONY: all luau build run test vet fmt fmt-check check schema loop-check docker clean submodules-gitee

@@ -241,10 +241,10 @@ docker:
 # remote. A checkout cloned from Gitee overrides the URL in its own config
 # (which git reads before .gitmodules) and repoints an existing submodule, so
 # the Luau sources come from the mirror as well. Never run `git submodule sync`
-# afterwards: it copies the .gitmodules URL back over the override. Gitee wants
-# a sign-in for git over HTTPS even on public repositories; to use an SSH key,
-# pass LUAU_MIRROR=git@gitee.com:trusted-list/luau.git.
-LUAU_MIRROR ?= https://gitee.com/trusted-list/luau
+# afterwards: it copies the .gitmodules URL back over the override. Gitee
+# serves git over SSH only, public repositories included, so the mirror is an
+# SSH URL and needs the same key the clone used.
+LUAU_MIRROR ?= git@gitee.com:trusted-list/luau.git
 
 submodules-gitee:
 	git config submodule.third_party/luau.url $(LUAU_MIRROR)

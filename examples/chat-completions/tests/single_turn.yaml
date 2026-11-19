@@ -1,0 +1,12 @@
+# agentflow loop test examples/chat-completions/tests/single_turn.yaml
+agent: assistant
+loop: ../loops/single_turn.lua
+messages:
+  - from: client
+    text: Say hi in French.
+llm:
+  - match: French
+    text: "Bonjour !"
+expect:
+  - "Bonjour !"
+expect_ops: [llm.chat]

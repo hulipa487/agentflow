@@ -1,0 +1,12 @@
+# agentflow loop test examples/telegram-rag/tests/learn.yaml
+# /learn is refused for anyone who is not an editor. (Editors come from the
+# agent's extras, which the harness does not load; the ingest webhook and
+# extras.editors are what grant it in a deployment.)
+agent: rag
+loop: ../loops/rag.lua
+messages:
+  - from: user:telegram:7
+    text: "/learn Something sneaky."
+expect:
+  - "Only editors can teach me. Ask the bot's owner to add you."
+expect_ops: []

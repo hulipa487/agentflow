@@ -216,7 +216,7 @@ The desktop companion: connect to any deployment and get an overview of sessions
 | `internal/drivers` | Models, channels, memory backends, MCP, browser, S3... |
 | `internal/builtins` | The built-in Lua plugins |
 | `api/` | The contracts: the users OpenAPI spec and the Luau type stubs (`af.d.luau`) |
-| `examples/` | Loops, configs, scenarios and a package to start from |
+| `examples/` | Runnable scenarios (QQ group chatbot with memory, Telegram RAG bot, GitHub PR code agents, chat/completions endpoint) and single-pattern loops to start from |
 
 `make test` and `make vet` run with the right cgo toolchain for your OS. The core and the Lua API move together: every Lua file declares the prelude version it targets (`-- af-prelude-version: 1`), and a mismatch is refused at load instead of half-working.
 

@@ -1,0 +1,12 @@
+# agentflow loop test examples/telegram-rag/tests/unknown.yaml
+# With nothing relevant in the knowledge base the bot says so and never asks
+# the model, so it cannot invent an answer.
+agent: rag
+loop: ../loops/rag.lua
+messages:
+  - from: user:telegram:7
+    text: who won the world cup?
+ops:
+  store.query: '{"records": []}'
+expect:
+  - "I don't have anything on that in my knowledge base yet."

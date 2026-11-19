@@ -1,0 +1,19 @@
+# agentflow loop test examples/telegram-rag/tests/answer.yaml
+# A question with a matching passage is answered from it; one without is
+# declined without a model call.
+agent: rag
+loop: ../loops/rag.lua
+messages:
+  - from: user:telegram:7
+    text: what is a sandbox job?
+llm:
+  - match: sandbox
+    text: "A one-off gVisor job with no network [1]."
+# The harness runs the loop without the agent's memory profile, so recall uses
+# the default handler (no embedding step); in a deployment plugin:semantic
+# embeds the question first.
+ops:
+  store.query: '{"records": [{"key": "doc:1:1", "value": {"text": "Shell commands run as one-off gVisor sandbox jobs.", "source": "agentflow.md"}}]}'
+expect:
+  - "A one-off gVisor job with no network [1]."
+expect_ops: [store.query, llm.chat]

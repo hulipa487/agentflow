@@ -1,0 +1,39 @@
+# A simple single-turn chat/completions endpoint.
+#
+#   export OPENAI_API_KEY=...  COMPLETIONS_API_KEY=$(openssl rand -hex 24)
+#   agentflow validate -config examples/chat-completions/agentflow.yaml
+#   agentflow -config examples/chat-completions/agentflow.yaml
+#
+#   curl -s localhost:8080/v1/chat/completions \
+#     -H "Authorization: Bearer $COMPLETIONS_API_KEY" -H 'Content-Type: application/json' \
+#     -d '{"model": "assistant", "messages": [{"role": "user", "content": "Say hi in French."}]}'
+
+version: "1"
+
+runtime:
+  persistence: sqlite://./data/agentflow.db
+
+models:
+  default:
+    provider: openai           # the model behind the endpoint: any provider works
+    model: ${CHAT_MODEL:-gpt-4.1-mini}
+    base_url: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+    api_key: ${OPENAI_API_KEY}
+
+agents:
+  assistant:                   # the "model" id clients ask for
+    loop: ./loops/single_turn.lua
+    model: default
+    instructions: ./prompts/assistant.md
+    capabilities: [llm.chat]
+
+gateway:
+  listen: 127.0.0.1:8080
+  channels:
+    - type: openai
+      name: api
+      path: /v1/               # serves /v1/chat/completions and /v1/models
+      agents: [assistant]
+      auth: key                # clients send Authorization: Bearer <key>
+      keys: ["${COMPLETIONS_API_KEY}"]
+      timeout: 120s

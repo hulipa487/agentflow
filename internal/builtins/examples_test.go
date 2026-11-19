@@ -9,18 +9,27 @@ import (
 )
 
 // TestExampleLoopsCompile keeps the documented examples honest: every loop
-// under examples/loops must declare this core's prelude version and compile.
-// A docs snippet can rot silently; a checked-in loop cannot.
+// under examples/loops and every scenario's loops (examples/<scenario>/loops)
+// must declare this core's prelude version and compile. A docs snippet can rot
+// silently; a checked-in loop cannot.
 func TestExampleLoopsCompile(t *testing.T) {
-	paths, err := filepath.Glob(filepath.Join("..", "..", "examples", "loops", "*.lua"))
-	if err != nil {
-		t.Fatal(err)
+	var paths []string
+	for _, pattern := range []string{
+		filepath.Join("..", "..", "examples", "loops", "*.lua"),
+		filepath.Join("..", "..", "examples", "*", "loops", "*.lua"),
+	} {
+		found, err := filepath.Glob(pattern)
+		if err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, found...)
 	}
 	if len(paths) == 0 {
 		t.Fatal("no example loops found")
 	}
 	for _, path := range paths {
-		t.Run(filepath.Base(path), func(t *testing.T) {
+		name, _ := filepath.Rel(filepath.Join("..", "..", "examples"), path)
+		t.Run(filepath.ToSlash(name), func(t *testing.T) {
 			src, err := os.ReadFile(path)
 			if err != nil {
 				t.Fatal(err)

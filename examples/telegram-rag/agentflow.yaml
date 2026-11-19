@@ -1,0 +1,76 @@
+# Telegram bot that answers from a knowledge base (RAG).
+#
+#   export OPENAI_API_KEY=...  TELEGRAM_BOT_TOKEN=...
+#   agentflow validate -config examples/telegram-rag/agentflow.yaml
+#   agentflow -config examples/telegram-rag/agentflow.yaml
+#
+# Load knowledge/agentflow.md through the ingest webhook, then ask the bot
+# about it on Telegram. See README.md.
+
+version: "1"
+
+runtime:
+  persistence: sqlite://./data/agentflow.db
+
+models:
+  default:
+    provider: openai
+    model: ${CHAT_MODEL:-gpt-4.1-mini}
+    base_url: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+    api_key: ${OPENAI_API_KEY}
+  embed:                    # turns passages and questions into vectors
+    provider: openai
+    model: ${EMBED_MODEL:-text-embedding-3-small}
+    base_url: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+    api_key: ${OPENAI_API_KEY}
+  # Optional: a cross-encoder reranker sharpens which passages come first.
+  # rerank:
+  #   provider: rerank
+  #   model: jina-reranker-v2-base-multilingual
+  #   base_url: https://api.jina.ai/v1
+  #   api_key: ${JINA_API_KEY}
+
+memory:
+  backends:
+    main_db:                # SQLite stores vectors too: no extra service needed
+      provider: sqlite
+      config:
+        path: ./data/agentflow.db
+
+profiles:
+  memory:
+    knowledge:
+      stores:
+        knowledge: { backend: main_db, table: knowledge, requires: [vector] }
+      write: [plugin:routing_table]
+      recall: plugin:semantic   # embed the question, nearest passages first
+      embed_model: embed
+      # rerank_model: rerank    # with the rerank model above
+      # oversample: 4
+
+agents:
+  rag:
+    loop: ./loops/rag.lua
+    model: default
+    instructions: ./prompts/answer.md
+    memory: knowledge
+    capabilities: [llm.chat, memory]
+    extras:
+      # Who may /learn from Telegram: "user:telegram:<numeric id>".
+      editors: []
+
+gateway:
+  listen: 127.0.0.1:8080
+  channels:
+    - type: telegram
+      name: telegram
+      agent: rag
+      token: ${TELEGRAM_BOT_TOKEN}
+      mode: polling         # connects out; nothing needs to be public
+    # Bulk loading: POST {"from": "...", "text": "/learn <document>"} here.
+    # The unguessable path is the authorisation; change it before you deploy.
+    - type: webhook
+      name: ingest
+      agent: rag
+      path: /webhook/ingest/change-me-5f0c9e2a/
+      timeout: 120s

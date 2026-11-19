@@ -35,8 +35,8 @@ jobs:
       - name: Loop checks
         run: |
           ./agentflow loop check examples/loops/echo.lua
-          ./agentflow loop test examples/scenarios/echo.yaml
-          ./agentflow loop test examples/scenarios/package.yaml
+          ./agentflow loop test examples/loop-tests/echo.yaml
+          ./agentflow loop test examples/loop-tests/package.yaml
 
   windows:
     name: build + test (windows-latest)
@@ -71,5 +71,5 @@ jobs:
         shell: bash
         run: |
           ./agentflow.exe loop check examples/loops/echo.lua
-          ./agentflow.exe loop test examples/scenarios/echo.yaml
-          ./agentflow.exe loop test examples/scenarios/package.yaml
+          ./agentflow.exe loop test examples/loop-tests/echo.yaml
+          ./agentflow.exe loop test examples/loop-tests/package.yaml

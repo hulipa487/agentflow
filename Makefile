@@ -228,7 +228,7 @@ schema: $(BIN)
 
 loop-check: $(BIN)
 	$(RUN) loop check examples/loops/echo.lua
-	$(RUN) loop test examples/scenarios/echo.yaml
+	$(RUN) loop test examples/loop-tests/echo.yaml
 
 docker:
 	docker build -t agentflow:$(VERSION) .

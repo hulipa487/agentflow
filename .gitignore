@@ -66,3 +66,6 @@ agentflow-test.exe
 # of the build or the runtime, and not something every checkout needs
 .agents/
 skills-lock.json
+
+# root filesystems made for example sandbox environments
+examples/*/envs/

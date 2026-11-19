@@ -1,0 +1,72 @@
+# GitHub pull request webhook that launches code agents.
+#
+#   export OPENAI_API_KEY=...  GITHUB_WEBHOOK_SECRET=...  CREDENTIALS_MASTER_KEY=...
+#   printf %s "$GITHUB_TOKEN" | agentflow cred set github -config examples/github-pr-agents/agentflow.yaml
+#   agentflow validate -config examples/github-pr-agents/agentflow.yaml
+#   agentflow -config examples/github-pr-agents/agentflow.yaml
+#
+# Point a repository webhook (pull_request events) at
+# <public url>/webhook/github/change-me-3b9d71c4/. See README.md.
+# The shell sandbox is gVisor and runs on Linux; `agentflow doctor` checks it.
+
+version: "1"
+
+runtime:
+  persistence: sqlite://./data/agentflow.db
+  credentials:
+    enabled: true            # master key from CREDENTIALS_MASTER_KEY
+  sandbox:
+    timeout: 60s             # one shell command
+    max_timeout: 5m
+    concurrency: 4           # sandbox jobs at once on this instance
+
+models:
+  default:
+    provider: openai
+    model: ${CHAT_MODEL:-gpt-4.1}
+    base_url: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+    api_key: ${OPENAI_API_KEY}
+
+files:
+  backend: fs                # where review projects live; default dir under ./data
+
+# The toolchain a review's commands run on, as a read-only root filesystem.
+# Either a directory on this host (see README.md for making one), or an OCI
+# image pinned by digest:  image: docker.io/library/python:3.12-slim@sha256:<64 hex>
+environments:
+  python:
+    rootfs: ./envs/python
+    env: { PYTHONDONTWRITEBYTECODE: "1" }
+
+profiles:
+  shell:
+    review:
+      provider: sandbox
+      environment: python
+      timeout: 60s
+      ignore: ["__pycache__/", "node_modules/"]
+  agent:
+    # The template every reviewer is spawned from.
+    code_reviewer:
+      model: default
+      loop: ./loops/code_reviewer.lua
+      instructions: ./prompts/reviewer.md
+      shell: review
+      capabilities: [llm.chat, tools, net.http, files, shell.exec]
+      credentials: [github]    # credential.get("github") is allowed
+      budget:
+        tokens_per_day: 2000000
+
+agents:
+  pr_dispatcher:
+    loop: ./loops/pr_dispatcher.lua
+    capabilities: [agent.spawn, agent.send]
+
+gateway:
+  listen: 127.0.0.1:8080     # put a TLS reverse proxy in front for GitHub
+  channels:
+    - type: ghhook
+      name: github
+      agent: pr_dispatcher
+      path: /webhook/github/change-me-3b9d71c4/   # unguessable; change it
+      secret: ${GITHUB_WEBHOOK_SECRET}            # the webhook's secret (HMAC)

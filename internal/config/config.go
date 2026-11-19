@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -907,6 +908,20 @@ type MemoryAgentConfig struct {
 	Inline   MemoryProfile
 }
 
+// MarshalYAML writes the setting the way it is read: a profile name, an inline
+// profile, or nothing. Without it the struct's own fields would be written,
+// which the strict loader then refuses.
+func (m MemoryAgentConfig) MarshalYAML() (any, error) {
+	switch {
+	case m.IsInline:
+		return m.Inline, nil
+	case m.Profile != "":
+		return m.Profile, nil
+	default:
+		return nil, nil
+	}
+}
+
 func (m *MemoryAgentConfig) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind == yaml.ScalarNode {
 		return node.Decode(&m.Profile)
@@ -1330,11 +1345,113 @@ var DefaultCapabilities = []string{"llm.chat", "memory", "tools", "agent.send", 
 // memoryProviderKnown reports whether name is a supported memory backend
 // provider, for the hint that catches the retired "builtin:" spelling.
 func memoryProviderKnown(name string) bool {
-	switch name {
-	case "sqlite", "redis", "postgres", "pgvector", "qdrant", "redisvector", "volatile":
-		return true
+	for _, p := range memoryProviders {
+		if p == name {
+			return true
+		}
 	}
 	return false
+}
+
+// memoryProviders is every memory backend provider the engine can open.
+var memoryProviders = []string{"sqlite", "postgres", "pgvector", "qdrant", "redis", "redisvector", "volatile"}
+
+// MemoryProviders returns the memory backend providers, in the order an editor
+// offers them.
+func MemoryProviders() []string { return append([]string(nil), memoryProviders...) }
+
+// ImplicitMainDB is the main_db backend a deployment that declares no memory
+// backends gets: the runtime store, so a minimal config needs no extra setting.
+func (c *Config) ImplicitMainDB() Backend {
+	if storedb.BackendFor(c.PersistencePath()) == storedb.BackendPostgres {
+		return Backend{Provider: "postgres", Config: map[string]any{"url": c.PersistencePath()}}
+	}
+	return Backend{Provider: "sqlite", Config: map[string]any{"path": c.PersistencePath()}}
+}
+
+// validateMemoryProviders refuses a backend whose provider the engine cannot open.
+func validateMemoryProviders(path string, c *Config) error {
+	for bname, b := range c.Memory.Backends {
+		if memoryProviderKnown(b.Provider) {
+			continue
+		}
+		// The prefix used to be required. Saying so beats "unsupported
+		// provider", which reads as if the backend were unknown when it is
+		// only misspelled.
+		if name, ok := strings.CutPrefix(b.Provider, "builtin:"); ok && memoryProviderKnown(name) {
+			return fmt.Errorf("%s: memory backend %q has provider %q — providers are unprefixed now, write %q",
+				path, bname, b.Provider, name)
+		}
+		return fmt.Errorf("%s: memory backend %q has unsupported provider %q", path, bname, b.Provider)
+	}
+	return nil
+}
+
+// validateMemoryScoping runs the store isolation rules over every declared
+// profile and the built-in preset.
+func validateMemoryScoping(path string, c *Config) error {
+	check := func(label string, stores map[string]Store) error {
+		for sname, s := range stores {
+			if err := validateStoreScoping(path, label, sname, s); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := check("built-in memory profile", DefaultMemoryProfile().Stores); err != nil {
+		return err
+	}
+	for pname, p := range c.Profiles.Memory {
+		if err := check(fmt.Sprintf("memory profile %q", pname), p.Stores); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ValidateMemorySections checks a replacement memory.backends and
+// profiles.memory against an otherwise loaded config, with the checks a
+// restart would run on them: providers, retention, store isolation, locality,
+// the reserved profile name, and every agent's memory reference. It is how
+// Studio dry-runs a memory edit without writing the file.
+func ValidateMemorySections(path string, base *Config, backends map[string]Backend, profiles map[string]MemoryProfile) error {
+	if base == nil {
+		return fmt.Errorf("%s: no configuration to validate against", path)
+	}
+	clone := *base
+	clone.Memory.Backends = make(map[string]Backend, len(backends))
+	for k, v := range backends {
+		clone.Memory.Backends[k] = v
+	}
+	if len(clone.Memory.Backends) == 0 {
+		clone.Memory.Backends["main_db"] = base.ImplicitMainDB()
+	}
+	clone.Profiles.Memory = profiles
+	for _, check := range []func(string, *Config) error{
+		validateMemoryRetention, validateMemoryScoping, validateMemoryProviders, validateMemoryLocality,
+	} {
+		if err := check(path, &clone); err != nil {
+			return err
+		}
+	}
+	if _, clash := profiles["conversational"]; clash {
+		return fmt.Errorf("%s: profiles.memory defines %q, which is reserved for the built-in profile", path, "conversational")
+	}
+	for _, name := range sortedAgentNames(clone.Agents) {
+		if err := clone.ValidateAgent(name, clone.Agents[name], path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sortedAgentNames(m map[string]Agent) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // DefaultMemoryProfile is the expansion of `memory: conversational`.
@@ -1903,18 +2020,7 @@ func validate(path string, c *Config) error {
 	// file or one server, no extra setting, which is what a minimal config
 	// promises. An explicit backend named main_db wins.
 	if len(c.Memory.Backends) == 0 {
-		c.Memory.Backends = map[string]Backend{}
-		if storedb.BackendFor(c.PersistencePath()) == storedb.BackendPostgres {
-			c.Memory.Backends["main_db"] = Backend{
-				Provider: "postgres",
-				Config:   map[string]any{"url": c.PersistencePath()},
-			}
-		} else {
-			c.Memory.Backends["main_db"] = Backend{
-				Provider: "sqlite",
-				Config:   map[string]any{"path": c.PersistencePath()},
-			}
-		}
+		c.Memory.Backends = map[string]Backend{"main_db": c.ImplicitMainDB()}
 	}
 	if off := c.Runtime.TimezoneOffsetHours; off < -12 || off > 14 {
 		return fmt.Errorf("%s: runtime.timezone_offset_hours %g is outside the real-world range -12..14", path, off)
@@ -2126,21 +2232,8 @@ func validate(path string, c *Config) error {
 	// every declared profile and the built-in preset — a store a profile
 	// declares but no agent references is still refused, because a boot that
 	// tolerates it would silently reinterpret it if an agent picked it up.
-	scopingCheck := func(label string, stores map[string]Store) error {
-		for sname, s := range stores {
-			if err := validateStoreScoping(path, label, sname, s); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	if err := scopingCheck("built-in memory profile", DefaultMemoryProfile().Stores); err != nil {
+	if err := validateMemoryScoping(path, c); err != nil {
 		return err
-	}
-	for pname, p := range c.Profiles.Memory {
-		if err := scopingCheck(fmt.Sprintf("memory profile %q", pname), p.Stores); err != nil {
-			return err
-		}
 	}
 
 	// Model-backed classifiers must resolve before profiles reference them.
@@ -2316,19 +2409,8 @@ func validate(path string, c *Config) error {
 		return fmt.Errorf("%s: browser.api_token is set but browser.account_id is empty", path)
 	}
 
-	for bname, b := range c.Memory.Backends {
-		switch b.Provider {
-		case "sqlite", "redis", "postgres", "pgvector", "qdrant", "redisvector", "volatile":
-		default:
-			// The prefix used to be required. Saying so beats "unsupported
-			// provider", which reads as if the backend were unknown when it is
-			// only misspelled.
-			if name, ok := strings.CutPrefix(b.Provider, "builtin:"); ok && memoryProviderKnown(name) {
-				return fmt.Errorf("%s: memory backend %q has provider %q — providers are unprefixed now, write %q",
-					path, bname, b.Provider, name)
-			}
-			return fmt.Errorf("%s: memory backend %q has unsupported provider %q", path, bname, b.Provider)
-		}
+	if err := validateMemoryProviders(path, c); err != nil {
+		return err
 	}
 	if err := validateMemoryLocality(path, c); err != nil {
 		return err

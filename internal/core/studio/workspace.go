@@ -541,7 +541,7 @@ func pruneValue(key string, v *yaml.Node) bool {
 		if v.Value == "false" && key != "inherit_user" {
 			return false
 		}
-		if (key == "history_budget" || key == "oversample") && v.Value == "0" {
+		if (key == "history_budget" || key == "oversample" || key == "window") && v.Value == "0" {
 			return false
 		}
 		return true

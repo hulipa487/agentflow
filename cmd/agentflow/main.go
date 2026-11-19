@@ -1355,6 +1355,7 @@ func main() {
 	var studioWS *studio.Workspace
 	var channelsStore *studio.Channels
 	var safetyStore *studio.Safety
+	var memoryStore *studio.Memory
 	if cfg.Runtime.Studio.IsEnabled() {
 		studioBroker = studio.NewBroker(sup, journalSink, studio.Config{
 			TraceEvents:   cfg.Runtime.Studio.TraceEvents,
@@ -1382,6 +1383,7 @@ func main() {
 			return names
 		}, log)
 		safetyStore = studio.NewSafety(cfg, cfgSource.ConfigDir(), cfgSource.ConfigPath(), log)
+		memoryStore = studio.NewMemory(cfg, cfgSource.ConfigDir(), cfgSource.ConfigPath(), log)
 	}
 	// Per-tenant resource bounds (E18). Both are opt-in: 0 disables. The op
 	// pool's fairness, the sharpest bound, is not here — it is how the pool
@@ -2085,6 +2087,7 @@ func main() {
 			Workspace:  studioWS,
 			Channels:   channelsStore,
 			Safety:     safetyStore,
+			Memory:     memoryStore,
 			StudioCatalog: func() studio.Catalog {
 				models := make([]string, 0)
 				for name := range llmMgr.List() {

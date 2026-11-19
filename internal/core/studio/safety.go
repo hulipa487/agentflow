@@ -661,6 +661,12 @@ func applySafety(root *yaml.Node, sec safetySections) error {
 // writeDir writes system.yaml and reloads the whole directory, restoring the
 // previous file if the new one would not boot.
 func (s *Safety) writeDir(path string, out []byte) error {
+	return writeSystemYAML(s.configDir, path, out, s.log)
+}
+
+// writeSystemYAML writes a config directory's system.yaml and reloads the
+// whole directory, restoring the previous file if the new one would not boot.
+func writeSystemYAML(configDir, path string, out []byte, log *slog.Logger) error {
 	old, oldErr := os.ReadFile(path)
 	if oldErr != nil && !os.IsNotExist(oldErr) {
 		return oldErr
@@ -677,7 +683,7 @@ func (s *Safety) writeDir(path string, out []byte) error {
 			return fmt.Errorf("backup: %w", err)
 		}
 	}
-	tmp, err := os.CreateTemp(s.configDir, ".system-*.yaml")
+	tmp, err := os.CreateTemp(configDir, ".system-*.yaml")
 	if err != nil {
 		return err
 	}
@@ -696,7 +702,7 @@ func (s *Safety) writeDir(path string, out []byte) error {
 		}
 	}
 	_ = os.Chmod(path, 0o600)
-	if _, err := config.LoadDir(s.configDir, s.log); err != nil {
+	if _, err := config.LoadDir(configDir, log); err != nil {
 		restore()
 		return fmt.Errorf("system.yaml does not validate: %w", err)
 	}

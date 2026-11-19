@@ -105,6 +105,7 @@ type Deps struct {
 	Workspace     *studio.Workspace
 	Channels      *studio.Channels
 	Safety        *studio.Safety
+	Memory        *studio.Memory
 	StudioCatalog func() studio.Catalog
 }
 
@@ -233,6 +234,14 @@ func (u *UI) API() http.Handler {
 	mux.HandleFunc("POST /admin/api/studio/safety/classifiers", u.handleStudioSafetyClassifierCreate)
 	mux.HandleFunc("PUT /admin/api/studio/safety/classifiers/{name}", u.handleStudioSafetyClassifierPut)
 	mux.HandleFunc("DELETE /admin/api/studio/safety/classifiers/{name}", u.handleStudioSafetyClassifierDelete)
+	mux.HandleFunc("GET /admin/api/studio/memory", u.handleStudioMemory)
+	mux.HandleFunc("POST /admin/api/studio/memory/validate", u.handleStudioMemoryValidate)
+	mux.HandleFunc("POST /admin/api/studio/memory/profiles", u.handleStudioMemoryProfileCreate)
+	mux.HandleFunc("PUT /admin/api/studio/memory/profiles/{name}", u.handleStudioMemoryProfilePut)
+	mux.HandleFunc("DELETE /admin/api/studio/memory/profiles/{name}", u.handleStudioMemoryProfileDelete)
+	mux.HandleFunc("POST /admin/api/studio/memory/backends", u.handleStudioMemoryBackendCreate)
+	mux.HandleFunc("PUT /admin/api/studio/memory/backends/{name}", u.handleStudioMemoryBackendPut)
+	mux.HandleFunc("DELETE /admin/api/studio/memory/backends/{name}", u.handleStudioMemoryBackendDelete)
 	return mux
 }
 

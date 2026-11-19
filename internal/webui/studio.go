@@ -204,18 +204,23 @@ func (u *UI) handleStudioAgentGet(w http.ResponseWriter, r *http.Request) {
 // form edits are flattened; anything else (inline memory stores, arbitrary
 // extras) stays available through the raw YAML pane.
 type studioAgentJSON struct {
-	Loop          string         `json:"loop"`
-	Model         string         `json:"model"`
-	HistoryBudget int            `json:"history_budget"`
-	Safety        string         `json:"safety"`
-	Shell         string         `json:"shell,omitempty"`
-	Skills        []string       `json:"skills"`
-	Capabilities  []string       `json:"capabilities"`
-	CanContact    []string       `json:"can_contact"`
-	Persistent    bool           `json:"persistent"`
-	Credentials   []string       `json:"credentials"`
-	InheritUser   *bool          `json:"inherit_user,omitempty"`
-	Extras        map[string]any `json:"extras,omitempty"`
+	Loop          string `json:"loop"`
+	Model         string `json:"model"`
+	HistoryBudget int    `json:"history_budget"`
+	Safety        string `json:"safety"`
+	Shell         string `json:"shell,omitempty"`
+	// Memory is the memory profile the agent names ("conversational" is the
+	// built-in one). MemoryInline is an inline profile, as the file spells it,
+	// which the builder keeps as it is and the raw YAML pane edits.
+	Memory       string         `json:"memory,omitempty"`
+	MemoryInline map[string]any `json:"memory_inline,omitempty"`
+	Skills       []string       `json:"skills"`
+	Capabilities []string       `json:"capabilities"`
+	CanContact   []string       `json:"can_contact"`
+	Persistent   bool           `json:"persistent"`
+	Credentials  []string       `json:"credentials"`
+	InheritUser  *bool          `json:"inherit_user,omitempty"`
+	Extras       map[string]any `json:"extras,omitempty"`
 }
 
 func agentJSON(a config.Agent) studioAgentJSON {
@@ -225,6 +230,8 @@ func agentJSON(a config.Agent) studioAgentJSON {
 		HistoryBudget: a.HistoryBudget,
 		Safety:        a.Safety,
 		Shell:         a.Shell,
+		Memory:        a.Memory.Profile,
+		MemoryInline:  inlineMemory(a.Memory),
 		Skills:        append([]string(nil), a.Skills...),
 		Capabilities:  append([]string(nil), a.Capabilities...),
 		CanContact:    append([]string(nil), a.CanContact...),
@@ -233,6 +240,15 @@ func agentJSON(a config.Agent) studioAgentJSON {
 		InheritUser:   a.InheritUser,
 		Extras:        a.Extras,
 	}
+}
+
+// inlineMemory renders an inline memory profile as the file spells it, so
+// the builder can write it back unchanged.
+func inlineMemory(m config.MemoryAgentConfig) map[string]any {
+	if !m.IsInline {
+		return nil
+	}
+	return studio.MemoryProfileMap(m.Inline)
 }
 
 // agentFromDef reconstructs an edit-able definition for an agent that exists

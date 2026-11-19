@@ -340,9 +340,9 @@ func validateQQChannel(path string, ch Channel) error {
 	}
 	for _, s := range ch.Scenes {
 		switch strings.ToLower(strings.TrimSpace(s)) {
-		case "c2c", "group", "guild", "dm":
+		case "c2c", "group", "group_all", "guild", "dm":
 		default:
-			return fmt.Errorf("%s: qq channel %q has unknown scene %q (use c2c, group, guild or dm)", path, ch.Name, s)
+			return fmt.Errorf("%s: qq channel %q has unknown scene %q (use c2c, group, group_all, guild or dm)", path, ch.Name, s)
 		}
 	}
 	if ch.APIBase != "" {

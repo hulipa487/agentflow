@@ -67,6 +67,11 @@ const (
 	SceneGroup = "group"
 	SceneGuild = "guild"
 	SceneDM    = "dm"
+	// SceneGroupAll is every message in a group, not only the ones that
+	// @-mention the bot. The platform sends these only to bots it has granted
+	// full group-message access, so it is opt-in and a bot without the grant
+	// simply keeps receiving @-mentions.
+	SceneGroupAll = "group_all"
 )
 
 // DefaultScenes are the scenes a channel listens to when none are configured:
@@ -77,7 +82,7 @@ var DefaultScenes = []string{SceneC2C, SceneGroup, SceneGuild}
 // Intent bits (https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/interface-framework/event-emit.html).
 const (
 	intentDirectMessage       = 1 << 12 // DIRECT_MESSAGE_CREATE
-	intentGroupAndC2C         = 1 << 25 // C2C_MESSAGE_CREATE, GROUP_AT_MESSAGE_CREATE
+	intentGroupAndC2C         = 1 << 25 // C2C_MESSAGE_CREATE, GROUP_AT_MESSAGE_CREATE, GROUP_MESSAGE_CREATE
 	intentPublicGuildMessages = 1 << 30 // AT_MESSAGE_CREATE
 )
 
@@ -101,6 +106,7 @@ type Options struct {
 // replies and either holds a gateway connection or serves a webhook.
 type Driver struct {
 	name    string
+	unknown sync.Map // event types already reported as unhandled
 	agent   string
 	appID   string
 	mode    string
@@ -222,7 +228,7 @@ func (d *Driver) Stop(_ context.Context) {}
 // intents is the gateway intent mask for the configured scenes.
 func (d *Driver) intents() int {
 	n := 0
-	if d.scenes[SceneC2C] || d.scenes[SceneGroup] {
+	if d.scenes[SceneC2C] || d.scenes[SceneGroup] || d.scenes[SceneGroupAll] {
 		n |= intentGroupAndC2C
 	}
 	if d.scenes[SceneGuild] {

@@ -18,10 +18,13 @@ import (
 
 // Event types this driver turns into messages.
 const (
-	evC2C    = "C2C_MESSAGE_CREATE"
-	evGroup  = "GROUP_AT_MESSAGE_CREATE"
-	evGuild  = "AT_MESSAGE_CREATE"
-	evDirect = "DIRECT_MESSAGE_CREATE"
+	evC2C   = "C2C_MESSAGE_CREATE"
+	evGroup = "GROUP_AT_MESSAGE_CREATE"
+	// evGroupAll is a group message that does not @-mention the bot. Only
+	// bots granted full group-message access receive it.
+	evGroupAll = "GROUP_MESSAGE_CREATE"
+	evGuild    = "AT_MESSAGE_CREATE"
+	evDirect   = "DIRECT_MESSAGE_CREATE"
 )
 
 // message is the union of the message events' d, reduced to what the driver
@@ -63,19 +66,37 @@ var mention = regexp.MustCompile(`^\s*(<@!?\w+>\s*)+`)
 // driver does not use, and scenes the channel does not listen to, are dropped.
 func (d *Driver) handleEvent(t, eventID string, raw json.RawMessage) {
 	scene := ""
+	mentioned := true
 	switch t {
 	case evC2C:
 		scene = SceneC2C
 	case evGroup:
 		scene = SceneGroup
+	case evGroupAll:
+		scene = SceneGroup
+		mentioned = false
 	case evGuild:
 		scene = SceneGuild
 	case evDirect:
 		scene = SceneDM
 	default:
+		// Said once per type: what the platform actually pushes to this bot
+		// is otherwise invisible, and "why does it not hear X" starts here.
+		if _, seen := d.unknown.LoadOrStore(t, true); !seen {
+			d.log.Info("qq event type not handled", "type", t)
+		}
 		return
 	}
-	if !d.scenes[scene] {
+	switch {
+	case t == evGroupAll:
+		if !d.scenes[SceneGroupAll] {
+			return
+		}
+	case t == evGroup:
+		if !d.scenes[SceneGroup] && !d.scenes[SceneGroupAll] {
+			return
+		}
+	case !d.scenes[scene]:
 		return
 	}
 	var m message
@@ -94,6 +115,11 @@ func (d *Driver) handleEvent(t, eventID string, raw json.RawMessage) {
 
 	var target, from string
 	payload := map[string]any{"scene": scene, "message_id": m.ID}
+	if scene == SceneGroup {
+		// Whether the bot was addressed with an @. A loop that listens to a
+		// whole group uses it to tell a message for it from one it overheard.
+		payload["mentioned"] = mentioned
+	}
 	if eventID != "" {
 		payload["event_id"] = eventID
 	}

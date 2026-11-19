@@ -702,6 +702,58 @@ func TestMarkdownRefusalFallsBackToTextAndPauses(t *testing.T) {
 	}
 }
 
+// A long reply goes out whole when the platform takes it, and is cut smaller
+// only as far as the platform makes necessary.
+func TestLongMarkdownIsSentWholeWhenThePlatformTakesIt(t *testing.T) {
+	long := "here:\n\n```svg\n" + strings.Repeat("<stop offset='0' stop-color='#ffe9a8'/>\n", 150) + "```"
+	size := func(body map[string]any) int {
+		md, _ := body["markdown"].(map[string]any)
+		c, _ := md["content"].(string)
+		return len([]rune(c))
+	}
+
+	api := newFakeAPI(t)
+	d, _, _ := newDriver(t, api, Options{Markdown: true})
+	if err := d.Deliver("group:G1", long, nil); err != nil {
+		t.Fatal(err)
+	}
+	if posts := api.sent(); len(posts) != 1 || posts[0].body["msg_type"] != float64(2) {
+		t.Fatalf("posts = %d, want the whole reply in one markdown message", len(posts))
+	}
+
+	// A platform that takes at most 4000 runes: the whole reply is refused
+	// once, then it goes in pieces that fit, each a closed code block.
+	api = newFakeAPI(t)
+	api.reject = func(path string, body map[string]any) (int, string) {
+		if size(body) > 4000 {
+			return http.StatusBadRequest, `{"code":40034099,"message":"content too long"}`
+		}
+		return 0, ""
+	}
+	d, _, _ = newDriver(t, api, Options{Markdown: true})
+	if err := d.Deliver("group:G1", long, nil); err != nil {
+		t.Fatal(err)
+	}
+	posts := api.sent()
+	if len(posts) != 4 || size(posts[0].body) <= 4000 {
+		t.Fatalf("posts = %d, want one refused attempt and three pieces", len(posts))
+	}
+	for _, p := range posts[1:] {
+		md, _ := p.body["markdown"].(map[string]any)
+		c, _ := md["content"].(string)
+		if p.body["msg_type"] != float64(2) || size(p.body) > 4000 || strings.Count(c, "```")%2 != 0 {
+			t.Fatalf("piece = %d runes, msg_type %v, fences %d", size(p.body), p.body["msg_type"], strings.Count(c, "```"))
+		}
+	}
+	// The limit is remembered: the next long reply is not tried whole again.
+	if err := d.Deliver("group:G1", long, nil); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(api.sent()); n != 7 {
+		t.Fatalf("posts after the second reply = %d, want 7", n)
+	}
+}
+
 func TestSplitMarkdownKeepsCodeFencesClosed(t *testing.T) {
 	body := strings.Repeat("line of code\n", 40)
 	text := "intro\n```lua\n" + body + "```\nafter"

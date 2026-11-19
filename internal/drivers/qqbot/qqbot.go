@@ -120,6 +120,9 @@ type Driver struct {
 	markdown   bool
 	mdMu       sync.Mutex
 	mdOffUntil time.Time
+	// mdLimit is the longest markdown message the platform is known to
+	// take, once it refused a longer one; zero until then.
+	mdLimit int
 	store      media.Store // nil = media disabled
 	pol        media.Policy
 	sink       router.Sink

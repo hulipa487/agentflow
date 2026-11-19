@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"agentflow/internal/core/media"
 )
@@ -121,10 +122,8 @@ func (d *Driver) Deliver(replyTo, text string, attachments []media.Part) error {
 		return err
 	}
 	if d.useMarkdown(scene) {
-		for _, chunk := range splitMarkdown(text, maxTextRunes) {
-			if err := d.sendMarkdown(scene, id, replyTo, chunk); err != nil {
-				return err
-			}
+		if err := d.deliverMarkdown(scene, id, replyTo, text); err != nil {
+			return err
 		}
 	} else {
 		for _, chunk := range splitText(text, maxTextRunes) {
@@ -135,6 +134,53 @@ func (d *Driver) Deliver(replyTo, text string, attachments []media.Part) error {
 	}
 	for _, att := range attachments {
 		if err := d.sendMedia(scene, id, replyTo, att); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// maxMarkdownRunes is the longest markdown message the driver tries to send
+// in one piece. The platform's real limit is not documented, so the driver
+// starts here and learns it: see deliverMarkdown.
+const maxMarkdownRunes = 12000
+
+// deliverMarkdown sends text as markdown in as few messages as the platform
+// takes. A long reply (a block of code, say) reads badly cut into pieces, so
+// a piece longer than maxTextRunes is tried whole first. When the platform
+// refuses it, the size the driver tries from then on is halved and the piece
+// is cut again; at maxTextRunes it is the ordinary path, with its plain-text
+// fallback.
+func (d *Driver) deliverMarkdown(scene, id, target, text string) error {
+	d.mdMu.Lock()
+	limit := d.mdLimit
+	d.mdMu.Unlock()
+	if limit < maxTextRunes {
+		limit = maxMarkdownRunes
+	}
+	for _, chunk := range splitMarkdown(text, limit) {
+		n := utf8.RuneCountInString(chunk)
+		if n <= maxTextRunes {
+			if err := d.sendMarkdown(scene, id, target, chunk); err != nil {
+				return err
+			}
+			continue
+		}
+		err := d.send(scene, id, target, map[string]any{"msg_type": 2, "markdown": map[string]string{"content": chunk}})
+		var refused *apiError
+		if err == nil {
+			continue
+		}
+		if !errors.As(err, &refused) {
+			return err
+		}
+		smaller := max(n/2, maxTextRunes)
+		d.mdMu.Lock()
+		d.mdLimit = smaller
+		d.mdMu.Unlock()
+		d.log.Info("qq refused a long markdown message; cutting it smaller",
+			"runes", n, "next_limit", smaller, "code", refused.code(), "message", refused.Message)
+		if err := d.deliverMarkdown(scene, id, target, chunk); err != nil {
 			return err
 		}
 	}

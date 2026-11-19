@@ -141,6 +141,32 @@ type ToolSpec struct {
 	Parameters  map[string]any `json:"parameters,omitempty"`
 }
 
+// UnmarshalJSON accepts a tool definition in either shape a loop may hand to
+// llm.chat: the flat { name, description, parameters }, or the wrapped
+// { type = "function", function = { ... } } that tools.list returns. Reading
+// only the flat one meant a loop that passed tools.list() straight through,
+// as the examples do, sent every tool to the model with an empty name.
+func (t *ToolSpec) UnmarshalJSON(b []byte) error {
+	var raw struct {
+		Name        string         `json:"name"`
+		Description string         `json:"description"`
+		Parameters  map[string]any `json:"parameters"`
+		Function    *struct {
+			Name        string         `json:"name"`
+			Description string         `json:"description"`
+			Parameters  map[string]any `json:"parameters"`
+		} `json:"function"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	t.Name, t.Description, t.Parameters = raw.Name, raw.Description, raw.Parameters
+	if raw.Function != nil && t.Name == "" {
+		t.Name, t.Description, t.Parameters = raw.Function.Name, raw.Function.Description, raw.Function.Parameters
+	}
+	return nil
+}
+
 // Op is a request yielded by Lua through the async bridge.
 type Op struct {
 	Type        string        `json:"type"`

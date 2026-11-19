@@ -123,6 +123,10 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 	}, openaiAuthOptions(cfg.APIKey)...)
 	api := openai.NewClient(sdkOpts...)
 
+	if cfg.Stream != nil && !*cfg.Stream {
+		return openaiChatWhole(ctx, api, params, base)
+	}
+
 	stream := api.Chat.Completions.NewStreaming(ctx, params)
 
 	// The request is issued inside NewStreaming, but its failure only surfaces
@@ -235,6 +239,42 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 		}
 		events <- event{usage: usage, thinking: reason.String(), finish: normalizeFinish(finish)}
 	}()
+	return events, false, nil
+}
+
+// openaiChatWhole makes one non-streamed Chat Completions request and reports
+// it as the events a stream would have produced: the text as a single delta,
+// then tool calls, then usage. A model opts in with `stream: false`.
+func openaiChatWhole(ctx context.Context, api openai.Client, params openai.ChatCompletionNewParams, base string) (<-chan event, bool, error) {
+	resp, err := api.Chat.Completions.New(ctx, params)
+	if err != nil {
+		return nil, openaiRetryable(err), fmt.Errorf("%s/chat/completions -> %w", base, err)
+	}
+	events := make(chan event, 4)
+	var text, finish string
+	var calls []ToolCall
+	if len(resp.Choices) > 0 {
+		c := resp.Choices[0]
+		text = c.Message.Content
+		finish = string(c.FinishReason)
+		for _, tc := range c.Message.ToolCalls {
+			calls = append(calls, ToolCall{ID: tc.ID, Name: tc.Function.Name, Args: parseArgs(tc.Function.Arguments), Raw: rawArgs(tc.Function.Arguments)})
+		}
+	}
+	usage := Usage{
+		Input:     int(resp.Usage.PromptTokens),
+		Output:    int(resp.Usage.CompletionTokens),
+		Cached:    int(resp.Usage.PromptTokensDetails.CachedTokens),
+		Reasoning: int(resp.Usage.CompletionTokensDetails.ReasoningTokens),
+	}
+	if text != "" {
+		events <- event{delta: text}
+	}
+	if len(calls) > 0 {
+		events <- event{toolCalls: calls}
+	}
+	events <- event{usage: usage, finish: normalizeFinish(finish)}
+	close(events)
 	return events, false, nil
 }
 

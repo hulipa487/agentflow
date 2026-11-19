@@ -642,6 +642,12 @@ type Model struct {
 	// nothing and the provider uses its own default. Overridable per call
 	// via llm.chat opts.thinking.
 	Thinking string `yaml:"thinking,omitempty"`
+	// Stream, when set to false, makes chat calls to this model one ordinary
+	// request instead of a streamed one. It is for endpoints whose streaming
+	// is broken for some responses (a proxy that cannot relay streamed tool
+	// calls, say). Replies then arrive whole, so llm.stream yields one delta.
+	// Chat Completions (provider: openai) only; unset means streamed.
+	Stream *bool `yaml:"stream,omitempty"`
 	// ServerTools names provider-native server-side tools to enable on every
 	// request for this model (e.g. "web_search", "x_search", "google_search").
 	// Unlike client-side function tools (opts.Tools), these are executed by the

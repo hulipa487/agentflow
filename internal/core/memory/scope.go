@@ -427,22 +427,29 @@ func (s *scopedHandle) queryPrefix(table string, q Query) (Iterator, error) {
 	}
 	prefixes = append(prefixes, q.Prefix) // legacy stratum
 	its := make([]Iterator, 0, len(prefixes))
-	for _, p := range prefixes {
+	for i, p := range prefixes {
 		qq := q
 		qq.Prefix = p
 		it, err := s.inner.Query(table, qq)
 		if err != nil {
 			return nil, err
 		}
-		// Each per-stratum query returns only that stratum's rows, so filtering
-		// looks redundant here — but the list above also carries the RAW prefix
-		// as the legacy stratum, and a loop chooses that prefix. Passing
-		// "user:<someone-else>|" makes the legacy scan match another user's
-		// rows, so every result is re-checked against the allowed strata exactly
-		// as the text/vector/time_range paths do. Relying on the backend's
-		// prefix semantics to be the isolation boundary is what made this the
-		// one path that could return a row the caller may not read.
-		its = append(its, &filterIterator{inner: it, allow: s.allowedStrata(), strip: true})
+		// Every result is re-checked against what the caller may read, exactly
+		// as the text/vector/time_range paths do: a loop chooses the prefix,
+		// and relying on the backend's prefix semantics to be the isolation
+		// boundary is what once made this the one path that could return a row
+		// the caller may not read.
+		allow := s.allowedStrata()
+		if i == len(prefixes)-1 {
+			// The raw prefix is the legacy scan, and it may return legacy rows
+			// only. Scoped rows share the table, so a raw prefix that the
+			// caller's own scope head starts with ("u", "user:", or a key
+			// scheme that begins with the sender) matches the caller's scoped
+			// rows as well — rows the per-stratum scans above already
+			// returned. Passing them here handed back every such row twice.
+			allow = map[string]bool{"": true}
+		}
+		its = append(its, &filterIterator{inner: it, allow: allow, strip: true})
 	}
 	return &mergeIterator{its: its}, nil
 }

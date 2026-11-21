@@ -414,6 +414,16 @@ type stack struct {
 	mu       sync.Mutex
 }
 
+const passthroughLoopSrc = `-- af-prelude-version: 1
+function loop()
+  while true do
+    local msg = session.inbox()
+    local reply = llm.forward()
+    session.reply(reply)
+  end
+end
+`
+
 func newStack(t *testing.T, opt stackOpts) *stack {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -425,10 +435,7 @@ func newStack(t *testing.T, opt stackOpts) *stack {
 		"default": {Provider: "openai", Model: "stub", BaseURL: upSrv.URL},
 	}, log)
 	reqs := chatreq.NewRegistry()
-	loopSrc, _, err := luacode.Resolve(filepath.Join("..", "..", "..", "examples", "loops", "openai_passthrough.lua"))
-	if err != nil {
-		t.Fatalf("resolve passthrough: %v", err)
-	}
+	loopSrc := passthroughLoopSrc
 	if opt.loopSrc != "" {
 		loopSrc = opt.loopSrc
 	}

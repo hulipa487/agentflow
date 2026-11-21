@@ -7,7 +7,7 @@
 //   - routing_table  (default memory.write routing table called by prelude.go)
 //   - recency        (default memory.recall handler called by prelude.go)
 //   - semantic       (embedding recall handler dispatched by prelude.go)
-//   - token_budget   (official prelude stdlib helper declared in af.d.luau)
+//   - token_budget   (official prelude stdlib helper declared in af.d.lua)
 //
 // Reference/example loops and optional helpers (such as openai_passthrough and
 // fact_extractor) live in agentflow-studio (`examples/`) instead of being

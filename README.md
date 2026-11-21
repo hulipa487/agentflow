@@ -214,7 +214,7 @@ AgentFlow itself is strictly a headless runtime; all UI, full documentation, and
 | `internal/drivers` | Models, channels, memory backends, sandbox (`gVisor` & `microsandbox`), MCP, browser, S3... |
 | `internal/luacode` | Lua source, package (`-- af-import:`), and shadow loader |
 | `internal/builtins` | Core-contract embedded Lua defaults (router, memory handlers, `token_budget`) |
-| `api/` | The contracts: the users OpenAPI spec and the Lua type stubs (`af.d.luau`) |
+| `api/` | The contracts: the users OpenAPI spec and the Lua type stubs (`af.d.lua`) |
 
 `go test ./...` and `go vet ./...` (or `make test` / `make vet`) work out of the box with `CGO_ENABLED=0`. The core and the Lua API move together: every Lua file declares the prelude version it targets (`-- af-prelude-version: 1`), and a mismatch is refused at load instead of half-working.
 

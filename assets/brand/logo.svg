@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <!-- High-Contrast Universal Brand Gradient -->
+    <linearGradient id="af-univ-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38BDF8" />
+      <stop offset="50%" stop-color="#6366F1" />
+      <stop offset="100%" stop-color="#A855F7" />
+    </linearGradient>
+
+    <!-- Feedback Loop Gradient -->
+    <linearGradient id="af-univ-subgrad" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#0EA5E9" stop-opacity="0.7" />
+      <stop offset="100%" stop-color="#9333EA" stop-opacity="0.95" />
+    </linearGradient>
+
+    <!-- Subtle Elevation Shadow for Light Mode Separation -->
+    <filter id="af-univ-shadow" x="-15%" y="-15%" width="130%" height="130%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#020617" flood-opacity="0.28" />
+    </filter>
+  </defs>
+
+  <!-- Centered Self-Contained Hexagon Mark (Transparent Canvas, Safe for Circle & Favicon Crops) -->
+  <g transform="translate(52, 32) scale(3.4)">
+    <!-- Outer Hexagonal Container (Deep Slate Fill + Gradient Stroke ensures contrast on both white & black surfaces) -->
+    <polygon points="60,6 110,34 110,90 60,118 10,90 10,34" fill="#0F172A" stroke="url(#af-univ-grad)" stroke-width="4.5" stroke-linejoin="round" filter="url(#af-univ-shadow)" />
+
+    <!-- Inner Geometric Grid Lines -->
+    <path d="M 60,6 L 60,118 M 10,34 L 110,90 M 110,34 L 10,90" stroke="#1E293B" stroke-width="1.8" />
+
+    <!-- Primary DAG Execution Flow ('A' Silhouette, thickened for 16x16/32x32 favicon legibility) -->
+    <path d="M 32,84 C 32,56 46,42 60,34 C 74,42 88,56 88,84" fill="none" stroke="url(#af-univ-grad)" stroke-width="6.5" stroke-linecap="round" />
+
+    <!-- Crossbar / Feedback Loop -->
+    <path d="M 36,68 Q 60,76 84,68" fill="none" stroke="url(#af-univ-subgrad)" stroke-width="5" stroke-linecap="round" />
+
+    <!-- Agent Nodes (Enlarged cores for crisp downscaling) -->
+    <!-- Top Orchestrator Node -->
+    <circle cx="60" cy="34" r="8" fill="#38BDF8" />
+    <circle cx="60" cy="34" r="3.5" fill="#FFFFFF" />
+
+    <!-- Bottom-Left Worker Node -->
+    <circle cx="32" cy="84" r="7" fill="#6366F1" />
+    <circle cx="32" cy="84" r="3" fill="#FFFFFF" />
+
+    <!-- Bottom-Right Worker Node -->
+    <circle cx="88" cy="84" r="7" fill="#A855F7" />
+    <circle cx="88" cy="84" r="3" fill="#FFFFFF" />
+
+    <!-- Center Routing Pulse -->
+    <circle cx="60" cy="71" r="5" fill="#38BDF8" />
+  </g>
+</svg>

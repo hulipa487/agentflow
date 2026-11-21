@@ -1,13 +1,15 @@
 <div align="center">
-<h1>
-🤖 AgentFlow
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/brand/logo-banner-darkmode.svg">
+  <img src="assets/brand/logo-banner-lightmode.svg" alt="AgentFlow" height="96">
+</picture>
+<h1>AgentFlow</h1>
+<p><i>Configure the ordinary, code the exceptionals.</i></p>
 <p>
-</h1>
-<i> Configure the ordinary, code the exceptionals. <p></p></i>
-<img src="https://img.shields.io/github/v/release/hulipa487/agentflow">
-<img src="https://img.shields.io/github/stars/hulipa487/agentflow">
-<img src="https://img.shields.io/github/forks/hulipa487/agentflow"><p></p>
-<img width="1444" height="691" alt="image" src="https://github.com/user-attachments/assets/0817ad4c-da1e-4502-9aaf-3bf15dca0394" />
+  <img src="https://img.shields.io/github/v/release/hulipa487/agentflow" alt="Release">
+  <img src="https://img.shields.io/github/stars/hulipa487/agentflow" alt="Stars">
+  <img src="https://img.shields.io/github/forks/hulipa487/agentflow" alt="Forks">
+</p>
 </div>
 
 
@@ -230,6 +232,6 @@ AgentFlow itself is strictly a headless runtime; all UI, full documentation, and
   <img src="https://contrib.rocks/image?repo=hulipa487/agentflow" />
 </a><p></p>
 
-**LICENSE**: MIT
+**LICENSE**: AGPLv3
 
 Made with Vibe and ❤️ by hulipa and her team.

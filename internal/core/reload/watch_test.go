@@ -12,11 +12,12 @@ import (
 	"testing"
 	"time"
 
-	"agentflow/internal/builtins"
+	_ "agentflow/internal/builtins"
 	"agentflow/internal/core/gateway"
 	"agentflow/internal/core/pool"
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/supervisor"
+	"agentflow/internal/luacode"
 	"agentflow/internal/vm"
 )
 
@@ -517,7 +518,7 @@ func TestDeletedMemberEntryIsPruned(t *testing.T) {
 
 // TestEmptyDirectoryLoopIsRefused: deleting the last member of a directory loop
 // must not install an empty loop. A directory with no members is a condition
-// builtins.Resolve rejects — and the actor re-resolves the directory on every
+// luacode.Resolve rejects — and the actor re-resolves the directory on every
 // restart — so "accepting" it here does not yield an idle agent: the restarted
 // session cannot load its loop and crash-restarts once a second. The watcher
 // must refuse the reload and keep the old version running.
@@ -703,10 +704,10 @@ func newRouteFixture(t *testing.T) *routeFixture {
 	if err := os.WriteFile(file, []byte(routeFirst), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	builtins.SetPluginDir(dir)
-	t.Cleanup(func() { builtins.SetPluginDir("") })
+	luacode.SetPluginDir(dir)
+	t.Cleanup(func() { luacode.SetPluginDir("") })
 
-	src, watch, err := builtins.Resolve("plugin:per_chat")
+	src, watch, err := luacode.Resolve("plugin:per_chat")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -806,8 +807,8 @@ func TestRouteCompileFailureKeepsRunningHandler(t *testing.T) {
 // one case a route edit still cannot reach, and it is the same rule a builtin
 // loop follows.
 func TestUnshadowedRouteIsNotWatched(t *testing.T) {
-	builtins.SetPluginDir("")
-	_, watch, err := builtins.Resolve("plugin:per_chat")
+	luacode.SetPluginDir("")
+	_, watch, err := luacode.Resolve("plugin:per_chat")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -870,8 +871,8 @@ func newSupportFixture(t *testing.T, names ...string) *supportFixture {
 	// The shadow is what makes the chunk a file on disk at all: an embedded
 	// chunk has nothing to watch, which is why the deployment's plugins.dir is
 	// the whole watch surface here.
-	builtins.SetPluginDir(dir)
-	t.Cleanup(func() { builtins.SetPluginDir("") })
+	luacode.SetPluginDir(dir)
+	t.Cleanup(func() { luacode.SetPluginDir("") })
 
 	logs := &syncBuf{}
 	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -912,7 +913,7 @@ func newSupportFixture(t *testing.T, names ...string) *supportFixture {
 func (fx *supportFixture) startWatcher(t *testing.T) *Watcher {
 	t.Helper()
 	w := New(fx.sup, nil, fx.log)
-	w.SetSupport(&SupportSource{Paths: builtins.SupportChunkPaths(), Reload: fx.sup.ReloadAll})
+	w.SetSupport(&SupportSource{Paths: luacode.SupportChunkPaths(), Reload: fx.sup.ReloadAll})
 	w.Start()
 	t.Cleanup(w.Stop)
 	return w

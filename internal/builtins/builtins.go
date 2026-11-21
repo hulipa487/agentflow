@@ -1,29 +1,28 @@
-// Package builtins ships the default plugins, embedded in the binary.
-// Builtins are plugins with the same contract as user plugins; a file
-// <plugins.dir>/<name>.lua shadows a builtin by name (see SetPluginDir).
+// Package builtins embeds the runtime's core-contract Lua chunks and registers
+// them with internal/luacode.
 //
-// Every chunk this package hands out — embedded, shadowed, or read from a
-// path — has passed the prelude version gate (vm.CheckChunkVersion): it
-// declares the prelude API version it targets and that version is the one this
-// core provides. Resolve returns a refusal instead of source for a chunk that
-// does not, and SupportChunks — the other way a chunk leaves this package, for
-// the chunks every session loads before its loop — returns one too, which is
-// what stops a core upgrade from silently loading Lua written against a
-// different API. There is no compatibility window, by design — see
-// vm.PreludeVersion.
+// Only chunks the runtime core itself requires or defines as standard prelude
+// helpers live here:
+//   - per_chat       (default gateway.route handler when none is configured)
+//   - routing_table  (default memory.write routing table called by prelude.go)
+//   - recency        (default memory.recall handler called by prelude.go)
+//   - semantic       (embedding recall handler dispatched by prelude.go)
+//   - token_budget   (official prelude stdlib helper declared in af.d.luau)
+//
+// Reference/example loops and optional helpers (such as openai_passthrough and
+// fact_extractor) live in agentflow-studio (`examples/`) instead of being
+// embedded in the binary.
+//
+// Generic Lua resolution, package imports, shadowing via plugins.dir, and
+// prelude version gating live in internal/luacode so core Go packages do not
+// depend on embedded Lua scripts.
 package builtins
 
 import (
 	_ "embed"
-	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
-	"strings"
 
-	"gopkg.in/yaml.v3"
-
-	"agentflow/internal/vm"
+	"agentflow/internal/luacode"
 )
 
 //go:embed lua/per_chat.lua
@@ -41,44 +40,33 @@ var recency string
 //go:embed lua/semantic.lua
 var semantic string
 
-//go:embed lua/fact_extractor.lua
-var factExtractor string
-
-//go:embed lua/openai_passthrough.lua
-var openaiPassthrough string
-
 var sources = map[string]string{
-	"per_chat":           perChat,
-	"token_budget":       tokenBudget,
-	"routing_table":      routingTable,
-	"recency":            recency,
-	"semantic":           semantic,
-	"fact_extractor":     factExtractor,
-	"openai_passthrough": openaiPassthrough,
+	"per_chat":      perChat,
+	"token_budget":  tokenBudget,
+	"routing_table": routingTable,
+	"recency":       recency,
+	"semantic":      semantic,
 }
 
 // supportOrder fixes the evaluation order of support chunks in every session.
 //
-// exec_policy and ttl used to be here. Both were shadowable, listed and loaded
-// into every session's Lua state, and neither was ever called: shell.exec goes
-// straight to the manager, and shell_before_exec_policy/shell_ttl had no caller
-// in Go or in Lua. A shipped plugin whose entry point nothing invokes is a
-// promise the engine does not keep, so they are gone — and the docs now say
-// what is true, that shell commands are gated by the capability alone.
-var supportOrder = []string{"token_budget", "routing_table", "recency", "semantic", "fact_extractor"}
+// Only chunks that the prelude calls directly or exposes as part of the
+// documented Lua stdlib belong here. Unreferenced example heuristics (like
+// fact_extractor, exec_policy, and ttl) are kept out of the binary.
+var supportOrder = []string{"token_budget", "routing_table", "recency", "semantic"}
 
-// Names returns the builtin plugin names as config spells them —
+func init() {
+	Register()
+}
+
+// Register installs the embedded core-contract Lua chunks into internal/luacode.
+// Safe to call explicitly at boot (or after a test replaces luacode builtins).
+func Register() {
+	luacode.SetBuiltins(sources, supportOrder)
+}
+
+// Names returns the embedded builtin plugin names as config spells them —
 // "plugin:per_chat", not "per_chat".
-//
-// The "plugin:" prefix marks this vocabulary alone. It used to be "builtin:",
-// which loop names, tool names (builtin:web_search) and memory provider names
-// (builtin:sqlite) all spelled: a name from one was never valid in another's
-// field, and nothing in the string said which it was. The prefix now also
-// settles the loop-vs-path question outright — a path never begins with
-// "plugin:", where before a file named "per_chat" was unreachable.
-//
-// Returning the config spelling is what lets a caller compare a configured
-// value against this list directly and say which vocabulary it belongs to.
 func Names() []string {
 	out := make([]string, 0, len(sources))
 	for n := range sources {
@@ -86,309 +74,4 @@ func Names() []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-// pluginDir is the deployment's plugins.dir, set once at boot via
-// SetPluginDir. A file <pluginDir>/<name>.lua shadows the embedded builtin
-// of the same name — for loop/route refs (Resolve) and support chunks
-// (SupportChunks) alike. Boot-time only; not synchronized.
-var pluginDir string
-
-// SetPluginDir points the builtin loader at the deployment's plugins dir.
-// Call once at boot, before any Resolve or SupportChunks.
-func SetPluginDir(dir string) { pluginDir = dir }
-
-// packages maps a deployment package name to its directory (config packages:).
-// A loop imports one with "-- af-import: <name>" or refers to it directly as
-// "package:<name>". The package's files are version-gated and concatenated
-// before the importing chunk, so a package is shared source, not a runtime
-// module: it defines tables/functions the importing loop uses.
-var packages map[string]string
-
-// SetPackages installs the deployment's package map. Call once at boot.
-func SetPackages(m map[string]string) { packages = m }
-
-// PackagePaths returns the directories the reload watcher should poll. A
-// package edit changes every loop that imports it.
-func PackagePaths() []string {
-	out := make([]string, 0, len(packages))
-	for _, dir := range packages {
-		out = append(out, dir)
-	}
-	sort.Strings(out)
-	return out
-}
-
-// packageManifest is optional; a package without one loads its *.lua files in
-// lexical order. prelude_api pins the package to this core's Lua API.
-type packageManifest struct {
-	Name        string   `yaml:"name"`
-	Description string   `yaml:"description"`
-	Version     string   `yaml:"version"`
-	PreludeAPI  int      `yaml:"prelude_api"`
-	Files       []string `yaml:"files"`
-}
-
-// packageSource loads one package, recursively expanding its own imports.
-func packageSource(name string, stack []string) (string, string, error) {
-	dir, ok := packages[name]
-	if !ok {
-		return "", "", fmt.Errorf("unknown package %q (declare it under packages:)", name)
-	}
-	for _, s := range stack {
-		if s == name {
-			return "", "", fmt.Errorf("package import cycle: %s -> %s", strings.Join(stack, " -> "), name)
-		}
-	}
-	if dir == "" {
-		return "", "", fmt.Errorf("package %q has no directory", name)
-	}
-	files := []string{}
-	manifestPath := filepath.Join(dir, "manifest.yaml")
-	if b, err := os.ReadFile(manifestPath); err == nil {
-		var m packageManifest
-		if err := yaml.Unmarshal(b, &m); err != nil {
-			return "", "", fmt.Errorf("package %q: manifest: %w", name, err)
-		}
-		if m.PreludeAPI != 0 && m.PreludeAPI != vm.PreludeVersion {
-			return "", "", fmt.Errorf("package %q: manifest prelude_api %d, this core provides %d", name, m.PreludeAPI, vm.PreludeVersion)
-		}
-		files = append(files, m.Files...)
-	} else if !os.IsNotExist(err) {
-		return "", "", fmt.Errorf("package %q: manifest: %w", name, err)
-	}
-	if len(files) == 0 {
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			return "", "", fmt.Errorf("package %q: %w", name, err)
-		}
-		for _, e := range entries {
-			if !e.IsDir() && strings.HasSuffix(e.Name(), ".lua") {
-				files = append(files, e.Name())
-			}
-		}
-		sort.Strings(files)
-	}
-	if len(files) == 0 {
-		return "", "", fmt.Errorf("package %q: no .lua files", name)
-	}
-	var parts []string
-	for _, f := range files {
-		p := f
-		if !filepath.IsAbs(p) {
-			p = filepath.Join(dir, p)
-		}
-		b, err := os.ReadFile(p)
-		if err != nil {
-			return "", "", fmt.Errorf("package %q: read %s: %w", name, p, err)
-		}
-		if err := vm.CheckChunkVersion(p, string(b)); err != nil {
-			return "", "", err
-		}
-		expanded, err := expandImports(string(b), append(stack, name))
-		if err != nil {
-			return "", "", fmt.Errorf("package %q: %w", name, err)
-		}
-		parts = append(parts, expanded)
-	}
-	return strings.Join(parts, "\n"), dir, nil
-}
-
-// expandImports replaces "-- af-import: <name>" lines with the package's
-// source. Imports are positional: a package's definitions are available to
-// everything after the directive.
-func expandImports(src string, stack []string) (string, error) {
-	lines := strings.Split(src, "\n")
-	out := make([]string, 0, len(lines)+8)
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if rest, ok := strings.CutPrefix(trimmed, "-- af-import:"); ok {
-			name := strings.TrimSpace(rest)
-			if name == "" {
-				return "", fmt.Errorf("af-import: missing package name")
-			}
-			body, _, err := packageSource(name, stack)
-			if err != nil {
-				return "", err
-			}
-			// The package was version-gated on its own file. Its directive
-			// must not join the importing chunk's leading comment block: the
-			// gate would see two declarations and refuse the whole loop.
-			out = append(out, stripPreludeDirective(body))
-			continue
-		}
-		out = append(out, line)
-	}
-	return strings.Join(out, "\n"), nil
-}
-
-// stripPreludeDirective removes af-prelude-version lines from embedded package
-// source. The package file was already checked; leaving its directive in place
-// would make the concatenated loop declare the version twice.
-func stripPreludeDirective(src string) string {
-	lines := strings.Split(src, "\n")
-	out := lines[:0]
-	for _, line := range lines {
-		t := strings.TrimSpace(line)
-		if strings.HasPrefix(t, "--") && strings.Contains(t, "af-prelude-version") {
-			continue
-		}
-		out = append(out, line)
-	}
-	return strings.Join(out, "\n")
-}
-
-// shadow returns the deployment's override for a builtin name, if one exists.
-func shadow(name string) (src, path string, ok bool) {
-	if pluginDir == "" {
-		return "", "", false
-	}
-	p := filepath.Join(pluginDir, name+".lua")
-	b, err := os.ReadFile(p)
-	if err != nil {
-		return "", "", false
-	}
-	return string(b), p, true
-}
-
-// SupportChunkPaths returns the file backing each support chunk that
-// plugins.dir overrides, keyed by chunk name. Only a shadow has a path: an
-// embedded chunk has no file, so there is nothing on disk to watch. The
-// deployment's reload watcher polls these, which is what makes a shadowed
-// support chunk hot-reloadable rather than new-session-only.
-func SupportChunkPaths() map[string]string {
-	out := map[string]string{}
-	for _, name := range supportOrder {
-		if _, path, ok := shadow(name); ok {
-			out[name] = path
-		}
-	}
-	return out
-}
-
-// SupportChunks returns the support chunks loaded into every session state
-// before the loop plugin, or a prelude version refusal for one this core cannot
-// serve. A chunk shadowed in plugins.dir loads from disk (and is re-read on
-// every session start — the first one and each reload restart — so a shadow
-// edit takes effect on the next restart of every session).
-//
-// The gate is applied here as well as in Resolve because a support chunk is not
-// a loop/route ref: nothing resolves it, so this call is the only way one
-// reaches a session, and a version refusal has to come out of here or it does
-// not exist for them. The embedded chunks are checked too — the package doc's
-// promise covers everything this package hands out, and a shadow is not the
-// only way a chunk can be wrong: a core upgrade moves the embedded chunks with
-// it, and a build whose own Lua is out of step should refuse to load rather
-// than run.
-//
-// The name in a refusal is what the operator sees: the shadow's path, or the
-// same "builtin:<name>" spelling Resolve uses for an embedded chunk.
-func SupportChunks() ([]string, error) {
-	out := make([]string, 0, len(supportOrder))
-	for _, name := range supportOrder {
-		src, path, ok := shadow(name)
-		if !ok {
-			src, path = sources[name], "builtin:"+name
-		}
-		if err := vm.CheckChunkVersion(path, src); err != nil {
-			return nil, err
-		}
-		out = append(out, src)
-	}
-	return out, nil
-}
-
-// Resolve turns a loop/route reference into Lua source. "plugin:<name>"
-// resolves to an embedded builtin unless plugins.dir shadows it (the shadow
-// file then also becomes the hot-reload watch path); anything else is a file
-// or directory path. The second return value is the watch path for
-// hot-reload ("" for unshadowed builtins): a file watches itself; a
-// directory is concatenated as its *.lua files in sorted name order and the
-// directory is watched as a whole.
-//
-// Every chunk returned has passed the prelude version gate, named in the error
-// by the path the chunk was read from. A directory is checked member by member,
-// not as the concatenation: only the first member's directive would lead the
-// joined source, so a support member written against an older prelude would be
-// invisible to a check on the result.
-func Resolve(ref string) (src string, watchPath string, err error) {
-	if name, ok := strings.CutPrefix(ref, "package:"); ok {
-		return packageSource(name, nil)
-	}
-	if name, ok := strings.CutPrefix(ref, "plugin:"); ok {
-		if _, found := sources[name]; !found {
-			return "", "", fmt.Errorf("unknown plugin %q (builtins are named plugin:<name>, e.g. plugin:per_chat)", ref)
-		}
-		if src, path, ok := shadow(name); ok {
-			if err := vm.CheckChunkVersion(path, src); err != nil {
-				return "", "", err
-			}
-			expanded, err := expandImports(src, nil)
-			if err != nil {
-				return "", "", err
-			}
-			return expanded, path, nil
-		}
-		// The embedded chunk is checked like any other. A failure here is a
-		// broken build rather than a broken deployment — the conformance suite
-		// (TestPreludeContract) refuses to ship one — and it is better to
-		// refuse to start than to run a core whose own Lua is out of step.
-		if err := vm.CheckChunkVersion("builtin:"+name, sources[name]); err != nil {
-			return "", "", err
-		}
-		expanded, err := expandImports(sources[name], nil)
-		if err != nil {
-			return "", "", err
-		}
-		return expanded, "", nil
-	}
-	fi, err := os.Stat(ref)
-	if err != nil {
-		return "", "", fmt.Errorf("read plugin %s: %w", ref, err)
-	}
-	if !fi.IsDir() {
-		b, err := os.ReadFile(ref)
-		if err != nil {
-			return "", "", fmt.Errorf("read plugin %s: %w", ref, err)
-		}
-		if err := vm.CheckChunkVersion(ref, string(b)); err != nil {
-			return "", "", err
-		}
-		expanded, err := expandImports(string(b), nil)
-		if err != nil {
-			return "", "", err
-		}
-		return expanded, ref, nil
-	}
-	// Directory loop: concatenate all *.lua files (sorted) with a newline
-	// between, so a multi-module loop can be authored as separate files. The
-	// order is lexical — name modules with a leading digit (10_identity.lua)
-	// or rely on a single `loop.lua` entry that runs last.
-	entries, err := os.ReadDir(ref)
-	if err != nil {
-		return "", "", fmt.Errorf("read loop dir %s: %w", ref, err)
-	}
-	var parts []string
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".lua") {
-			continue
-		}
-		member := filepath.Join(ref, e.Name())
-		b, err := os.ReadFile(member)
-		if err != nil {
-			return "", "", fmt.Errorf("read %s: %w", member, err)
-		}
-		if err := vm.CheckChunkVersion(member, string(b)); err != nil {
-			return "", "", err
-		}
-		parts = append(parts, string(b))
-	}
-	if len(parts) == 0 {
-		return "", "", fmt.Errorf("loop dir %s has no .lua files", ref)
-	}
-	expanded, err := expandImports(strings.Join(parts, "\n"), nil)
-	if err != nil {
-		return "", "", err
-	}
-	return expanded, ref, nil
 }

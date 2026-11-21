@@ -208,15 +208,6 @@ func (r *Registry) ApplyOverrides(overrides map[string]config.ToolSpecOverride, 
 		if o.Permission != nil {
 			t.Permission = *o.Permission
 		}
-		if o.CostLevel != nil {
-			t.CostLevel = *o.CostLevel
-		}
-		if o.UserVisible != nil {
-			t.UserVisible = *o.UserVisible
-		}
-		if o.Autonomous != nil {
-			t.Autonomous = *o.Autonomous
-		}
 		r.tools[name] = t
 	}
 	if len(unresolved) > 0 {
@@ -409,15 +400,6 @@ func (r *Registry) Expose(skills []string, policy config.ToolsPolicy, autonomous
 			}
 			if override.Permission != nil && *override.Permission == "forbidden" {
 				continue
-			}
-			if override.CostLevel != nil {
-				t.CostLevel = *override.CostLevel
-			}
-			if override.UserVisible != nil {
-				t.UserVisible = *override.UserVisible
-			}
-			if override.Autonomous != nil {
-				t.Autonomous = *override.Autonomous
 			}
 		}
 		if autonomous && !t.Autonomous {

@@ -31,8 +31,22 @@ const maxInlineMedia = 20 << 20 // 20 MiB
 // store used to resolve part handles to inline base64 just before the
 // provider request; nil disables handle resolution (handle parts error).
 func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
-	toLLM := func(ms0 []session.ChatMessage) ([]llm.Message, error) {
+	return llmHandlers(m, ms, nil, "")
+}
+
+func llmHandlers(m *llm.Manager, ms media.Store, mediaSvc *media.Service, agent string) map[string]session.OpHandler {
+	scopeOf := func(ctx context.Context) string {
+		if p := session.ScopePrefixFromCtx(ctx); p != "" {
+			return p
+		}
+		if agent != "" {
+			return "agent:" + agent
+		}
+		return ""
+	}
+	toLLM := func(ctx context.Context, ms0 []session.ChatMessage) ([]llm.Message, error) {
 		out := make([]llm.Message, len(ms0))
+		scope := scopeOf(ctx)
 		for i, mm := range ms0 {
 			out[i] = llm.Message{
 				Role:           mm.Role,
@@ -45,7 +59,7 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 				parts := make([]media.Part, len(mm.Parts))
 				copy(parts, mm.Parts)
 				for j := range parts {
-					if err := resolvePart(&parts[j], ms); err != nil {
+					if err := resolvePartForScope(ctx, scope, &parts[j], ms, mediaSvc); err != nil {
 						return nil, err
 					}
 				}
@@ -91,7 +105,7 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 		}
 	}
 	chatOf := func(ctx context.Context, op session.Op) (string, bool) {
-		msgs, err := toLLM(op.Messages)
+		msgs, err := toLLM(ctx, op.Messages)
 		if err != nil {
 			return failJSON(err)
 		}
@@ -99,18 +113,26 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 		if err != nil {
 			return failJSON(err)
 		}
-		b, _ := json.Marshal(map[string]any{
+		replyMedia, err := ingestLLMOutputs(ctx, scopeOf(ctx), reply.Media, ms, mediaSvc)
+		if err != nil {
+			return failJSON(err)
+		}
+		payload := map[string]any{
 			"text":            reply.Text,
 			"thinking":        reply.Thinking,
 			"thinking_blocks": reply.ThinkingBlocks,
 			"usage":           reply.Usage,
 			"tool_calls":      reply.ToolCalls,
 			"finish_reason":   finishOf(reply.FinishReason, len(reply.ToolCalls)),
-		})
+		}
+		if len(replyMedia) > 0 {
+			payload["media"] = replyMedia
+		}
+		b, _ := json.Marshal(payload)
 		return string(b), true
 	}
 	streamOf := func(ctx context.Context, op session.Op) (string, bool) {
-		msgs, err := toLLM(op.Messages)
+		msgs, err := toLLM(ctx, op.Messages)
 		if err != nil {
 			return failJSON(err)
 		}
@@ -130,8 +152,9 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 			// same rule as llm.chat parts — bytes only enter at the wire.
 			parts := make([]media.Part, len(op.Inputs))
 			copy(parts, op.Inputs)
+			scope := scopeOf(ctx)
 			for i := range parts {
-				if err := resolvePart(&parts[i], ms); err != nil {
+				if err := resolvePartForScope(ctx, scope, &parts[i], ms, mediaSvc); err != nil {
 					return failJSON(err)
 				}
 			}
@@ -163,7 +186,15 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 			if err != nil && !frame.Done {
 				return failJSON(err)
 			}
-			b, _ := json.Marshal(map[string]any{
+			var frameMedia []media.Part
+			if len(frame.Media) > 0 {
+				var ierr error
+				frameMedia, ierr = ingestLLMOutputs(ctx, scopeOf(ctx), frame.Media, ms, mediaSvc)
+				if ierr != nil {
+					return failJSON(ierr)
+				}
+			}
+			payload := map[string]any{
 				"delta":           frame.Delta,
 				"done":            frame.Done,
 				"usage":           frame.Usage,
@@ -172,7 +203,11 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 				"thinking_blocks": frame.ThinkingBlocks,
 				"finish_reason":   frame.FinishReason,
 				"error":           errString(err),
-			})
+			}
+			if len(frameMedia) > 0 {
+				payload["media"] = frameMedia
+			}
+			b, _ := json.Marshal(payload)
 			return string(b), true
 		},
 
@@ -181,6 +216,79 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 			return "true", true
 		},
 	}
+}
+
+// resolvePartForScope resolves a handle part via the centralized media.Service
+// (enforcing per-scope grants and unified files/media lookup) when configured,
+// falling back to resolvePart over a bare media.Store.
+func resolvePartForScope(ctx context.Context, scope string, p *media.Part, ms media.Store, svc *media.Service) error {
+	if p.Handle == "" || p.Data != "" {
+		return nil
+	}
+	if svc != nil {
+		blob, err := svc.MaterializeBytes(ctx, scope, *p, media.TargetSpec{MaxBytes: maxInlineMedia})
+		if err != nil {
+			return err
+		}
+		if blob.MIME != "" {
+			p.MIME = blob.MIME
+		} else if p.MIME == "" {
+			p.MIME = "application/octet-stream"
+		}
+		p.Data = base64.StdEncoding.EncodeToString(blob.Bytes)
+		return nil
+	}
+	return resolvePart(p, ms)
+}
+
+// ingestLLMOutputs stores model-generated media (base64/data) into the
+// centralized media store so only lightweight handles cross the Lua border.
+func ingestLLMOutputs(ctx context.Context, scope string, in []media.Part, ms media.Store, svc *media.Service) ([]media.Part, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	out := make([]media.Part, 0, len(in))
+	for _, p := range in {
+		if p.Data == "" {
+			out = append(out, p)
+			continue
+		}
+		if svc != nil {
+			stored, err := svc.IngestBase64(ctx, p.Data, media.IngestOptions{
+				MIME:   p.MIME,
+				Name:   p.Name,
+				Scope:  scope,
+				Origin: "llm",
+				Policy: media.Policy{MaxBytes: maxInlineMedia},
+			})
+			if err != nil {
+				return nil, fmt.Errorf("store model media: %w", err)
+			}
+			if p.Type != "" {
+				stored.Type = p.Type
+			}
+			out = append(out, stored)
+			continue
+		}
+		if ms != nil {
+			raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(p.Data))
+			if err != nil {
+				return nil, fmt.Errorf("decode model media: %w", err)
+			}
+			mime := p.MIME
+			if mime == "" {
+				mime = media.SniffMIME(raw, p.Name)
+			}
+			ref, err := ms.Put(strings.NewReader(string(raw)), mime, media.Policy{MaxBytes: maxInlineMedia})
+			if err != nil {
+				return nil, fmt.Errorf("store model media: %w", err)
+			}
+			out = append(out, media.Part{Type: media.Classify(mime), MIME: mime, Handle: ref.Handle, Name: p.Name, Size: ref.Size})
+			continue
+		}
+		out = append(out, p)
+	}
+	return out, nil
 }
 
 // resolvePart dereferences a blob-store handle into inline base64 data.
@@ -250,6 +358,9 @@ type Metering struct {
 	// openai.request resolve the current turn's request through it; nil leaves
 	// both ops reporting that no forwarded request is available.
 	Requests *chatreq.Registry
+	// Media is the centralized media service for scope-checked handle
+	// materialization and LLM output media ingestion.
+	Media *media.Service
 }
 
 // denyJSON is the structured refusal a loop receives when a limit bites, so it
@@ -385,7 +496,7 @@ func (mt Metering) record(ctx context.Context, op session.Op, kind string, u usa
 // Every metered call — success or failure — reaches the ledger, so "how many
 // invocations" is answerable per user as well as "how many tokens".
 func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]session.OpHandler {
-	base := LLMHandlers(m, ms)
+	base := llmHandlers(m, ms, mt.Media, mt.Agent)
 	chat := base["llm.chat"]
 	metered := func(ctx context.Context, op session.Op) (string, bool) {
 		// Reserve a conservative estimate before the call.
@@ -729,6 +840,7 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]
 		var calls []llm.ToolCall
 		var thinking, finishReason string
 		var blocks []map[string]any
+		var outMedia []media.Part
 		for {
 			frameResp, ok := base["llm.stream.next"](ctx, session.Op{Type: "llm.stream.next", Stream: handle.ID})
 			if !ok {
@@ -747,6 +859,7 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]
 				ToolCalls      []llm.ToolCall   `json:"tool_calls"`
 				Thinking       string           `json:"thinking"`
 				ThinkingBlocks []map[string]any `json:"thinking_blocks"`
+				Media          []media.Part     `json:"media"`
 				FinishReason   string           `json:"finish_reason"`
 				Error          *string          `json:"error"`
 			}
@@ -775,6 +888,7 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]
 				calls = frame.ToolCalls
 				thinking = frame.Thinking
 				blocks = frame.ThinkingBlocks
+				outMedia = frame.Media
 				finishReason = frame.FinishReason
 				if frame.Error != nil && *frame.Error != "" {
 					// The metered next handler already wrote the row for this
@@ -791,14 +905,18 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]
 		for i, c := range calls {
 			outCalls[i] = session.ToolCallSpec{ID: c.ID, Name: c.Name, Args: c.Args, Arguments: c.Raw}
 		}
-		b, err := json.Marshal(map[string]any{
+		replyMap := map[string]any{
 			"text":            text.String(),
 			"tool_calls":      outCalls,
 			"finish_reason":   finishOf(finishReason, len(outCalls)),
 			"usage":           usage,
 			"thinking":        thinking,
 			"thinking_blocks": blocks,
-		})
+		}
+		if len(outMedia) > 0 {
+			replyMap["media"] = outMedia
+		}
+		b, err := json.Marshal(replyMap)
 		if err != nil {
 			return failJSON(err)
 		}

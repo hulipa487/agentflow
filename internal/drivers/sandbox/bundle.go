@@ -65,9 +65,8 @@ type ociNamespace struct {
 	Type string `json:"type"`
 }
 
-// validate checks a spec before anything is created for it. Every failure
-// here is the caller's mistake, said in the caller's terms.
-func (s Spec) validate() error {
+// validateCommon checks fields shared across every sandbox runner.
+func (s Spec) validateCommon() error {
 	if s.ID == "" || strings.ContainsAny(s.ID, "/\\ \t\n") {
 		return fmt.Errorf("sandbox: job id %q is not usable as a name", s.ID)
 	}
@@ -76,9 +75,6 @@ func (s Spec) validate() error {
 	}
 	if s.Network != "" && s.Network != "none" {
 		return fmt.Errorf("sandbox: network %q is not supported yet: jobs run with no network", s.Network)
-	}
-	if st, err := os.Stat(s.Rootfs); err != nil || !st.IsDir() {
-		return fmt.Errorf("%w: root filesystem %q is not a directory", ErrUnavailable, s.Rootfs)
 	}
 	if !filepath.IsAbs(s.Workspace) {
 		return fmt.Errorf("sandbox: workspace %q must be an absolute path", s.Workspace)
@@ -101,6 +97,33 @@ func (s Spec) validate() error {
 		if !filepath.IsAbs(b.Source) || !path.IsAbs(b.Dest) || path.Clean(b.Dest) != b.Dest || b.Dest == "/" {
 			return fmt.Errorf("sandbox: bind %q -> %q needs two clean absolute paths", b.Source, b.Dest)
 		}
+	}
+	return nil
+}
+
+// validate checks a spec before a gVisor bundle is created for it. Every
+// failure here is the caller's mistake, said in the caller's terms.
+func (s Spec) validate() error {
+	if err := s.validateCommon(); err != nil {
+		return err
+	}
+	if st, err := os.Stat(s.Rootfs); err != nil || !st.IsDir() {
+		return fmt.Errorf("%w: root filesystem %q is not a directory", ErrUnavailable, s.Rootfs)
+	}
+	return nil
+}
+
+// validateMicrosandbox checks a spec for a microsandbox job, which accepts
+// either a native OCI image reference or a host rootfs directory.
+func (s Spec) validateMicrosandbox() error {
+	if err := s.validateCommon(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(s.Image) != "" {
+		return nil
+	}
+	if st, err := os.Stat(s.Rootfs); err != nil || !st.IsDir() {
+		return fmt.Errorf("%w: neither image nor root filesystem %q is usable", ErrUnavailable, s.Rootfs)
 	}
 	return nil
 }

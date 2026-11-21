@@ -139,6 +139,7 @@ type Reply struct {
 	Thinking       string
 	ThinkingBlocks []map[string]any
 	ToolCalls      []ToolCall
+	Media          []media.Part
 	Usage          Usage
 	// FinishReason is why the model stopped, in the OpenAI vocabulary every
 	// provider's own value is mapped to: "stop", "length" (the output limit
@@ -149,12 +150,13 @@ type Reply struct {
 
 // Frame is one llm.stream.next step. Delta is a text fragment; on Done the
 // terminal fields carry the full reply payload (Usage, ToolCalls, Thinking,
-// ThinkingBlocks — the same values Chat would have returned).
+// ThinkingBlocks, Media — the same values Chat would have returned).
 type Frame struct {
 	Delta          string
 	Done           bool
 	Usage          Usage
 	ToolCalls      []ToolCall
+	Media          []media.Part
 	Thinking       string
 	ThinkingBlocks []map[string]any
 	FinishReason   string // terminal only; see Reply.FinishReason
@@ -163,7 +165,7 @@ type Frame struct {
 // event is one normalized provider event: a text delta, terminal usage, an
 // error, or the assembled tool_calls at stream end. Exactly one of the fields
 // is meaningful per event; a closed channel means the stream is over.
-// thinking/thinkingBlocks are terminal-only: providers assemble reasoning
+// thinking/thinkingBlocks/media are terminal-only: providers assemble them
 // internally and attach the full payload to their end-of-stream events, so
 // consumers see it exactly once, with toolCalls and/or usage.
 type event struct {
@@ -171,6 +173,7 @@ type event struct {
 	usage          Usage
 	err            error
 	toolCalls      []ToolCall
+	media          []media.Part
 	thinking       string
 	thinkingBlocks []map[string]any
 	finish         string // terminal: the normalised finish reason, when known
@@ -385,6 +388,9 @@ func (m *Manager) Chat(ctx context.Context, model string, msgs []Message, opts O
 		if len(ev.toolCalls) > 0 {
 			r.ToolCalls = ev.toolCalls
 		}
+		if len(ev.media) > 0 {
+			r.Media = append(r.Media, ev.media...)
+		}
 		if ev.finish != "" {
 			r.FinishReason = ev.finish
 		}
@@ -402,6 +408,7 @@ type Stream struct {
 	// StreamNext touches these, and one loop calls it sequentially.
 	usage    Usage
 	calls    []ToolCall
+	media    []media.Part
 	thinking string
 	blocks   []map[string]any
 	finish   string
@@ -457,7 +464,7 @@ func (m *Manager) StreamNext(ctx context.Context, id string) (Frame, error) {
 		select {
 		case ev, open := <-st.ch:
 			if !open {
-				done := Frame{Done: true, Usage: st.usage, ToolCalls: st.calls, Thinking: st.thinking, ThinkingBlocks: st.blocks, FinishReason: st.finish}
+				done := Frame{Done: true, Usage: st.usage, ToolCalls: st.calls, Media: st.media, Thinking: st.thinking, ThinkingBlocks: st.blocks, FinishReason: st.finish}
 				m.StreamClose(id)
 				return done, nil
 			}
@@ -470,6 +477,9 @@ func (m *Manager) StreamNext(ctx context.Context, id string) (Frame, error) {
 			if len(ev.toolCalls) > 0 {
 				st.calls = ev.toolCalls
 			}
+			if len(ev.media) > 0 {
+				st.media = append(st.media, ev.media...)
+			}
 			if ev.thinking != "" {
 				st.thinking = ev.thinking
 			}
@@ -477,7 +487,7 @@ func (m *Manager) StreamNext(ctx context.Context, id string) (Frame, error) {
 				st.blocks = ev.thinkingBlocks
 			}
 			if ev.err != nil {
-				done := Frame{Done: true, Usage: st.usage, ToolCalls: st.calls, Thinking: st.thinking, ThinkingBlocks: st.blocks, FinishReason: st.finish}
+				done := Frame{Done: true, Usage: st.usage, ToolCalls: st.calls, Media: st.media, Thinking: st.thinking, ThinkingBlocks: st.blocks, FinishReason: st.finish}
 				m.StreamClose(id)
 				return done, ev.err
 			}

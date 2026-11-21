@@ -51,11 +51,11 @@ func TestAdminTransportValidation(t *testing.T) {
 	}
 }
 
-// The admin plane has no port of its own: a config that still names one is
-// told where the admin API went instead of being silently ignored.
+// The admin plane has no port of its own: runtime.admin.listen is rejected by
+// strict decoding.
 func TestAdminListenIsRetired(t *testing.T) {
 	_, err := loadAdminConfig(t, "    listen: 127.0.0.1:9090\n")
-	if err == nil || !strings.Contains(err.Error(), "runtime.admin.listen was removed") || !strings.Contains(err.Error(), "gateway.listen") {
+	if err == nil || !strings.Contains(err.Error(), "field listen not found") {
 		t.Fatalf("admin.listen: %v", err)
 	}
 }

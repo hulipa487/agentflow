@@ -86,15 +86,8 @@ func TestValidateRegionalRefusals(t *testing.T) {
 		},
 		{
 			name:   "sqlite credentials store",
-			mutate: func(c *Config) { c.Runtime.Credentials.Path = "credentials.db" },
-			want:   "runtime.credentials.path is a SQLite target",
-		},
-		{
-			name: "cluster store differs",
-			mutate: func(c *Config) {
-				c.Runtime.Cluster.Persistence = "postgres://agentflow:secret@other.internal:5432/agentflow"
-			},
-			want: "runtime.cluster.persistence",
+			mutate: func(c *Config) { c.Runtime.Credentials.Persistence = "credentials.db" },
+			want:   "runtime.credentials.persistence is a SQLite target",
 		},
 		{
 			name: "sqlite memory backend",
@@ -131,16 +124,6 @@ func TestValidateRegionalRefusals(t *testing.T) {
 				t.Fatalf("err = %v, want the refusal to name the topology rule", err)
 			}
 		})
-	}
-}
-
-// TestRegionalClusterStoreSameTarget: the deprecated setting is tolerated when
-// it names the runtime store, even under the other PostgreSQL scheme.
-func TestRegionalClusterStoreSameTarget(t *testing.T) {
-	c := regionalConfig()
-	c.Runtime.Cluster.Persistence = "postgresql://agentflow:secret@db.internal:5432/agentflow"
-	if err := validate("test.yaml", c); err != nil {
-		t.Fatalf("cluster.persistence naming the runtime store was refused: %v", err)
 	}
 }
 

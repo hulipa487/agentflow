@@ -189,7 +189,7 @@ func TestStoreTargets(t *testing.T) {
 			c := &Config{}
 			c.Runtime.Persistence = tt.persistence
 			c.Runtime.Identity.Persistence = tt.identity
-			c.Runtime.Credentials.Path = tt.creds
+			c.Runtime.Credentials.Persistence = tt.creds
 			if got := filepath.ToSlash(c.IdentityStore()); !strings.HasSuffix(got, tt.wantID) {
 				t.Errorf("IdentityStore() = %q, want a target ending in %q", got, tt.wantID)
 			}
@@ -270,9 +270,9 @@ agents:
 	if c1.Epoch != ComputeEpoch(cfgPath) {
 		t.Fatal("Load must set the epoch from the file it read")
 	}
-	// The instances really did load different secrets — the epoch is stable
-	// because it hashes what was written, not what was resolved.
-	if c1.Models["m"].APIKey == c2.Models["m"].APIKey {
-		t.Fatal("test premise: the two loads should have resolved different keys")
+	// The secret stays as the raw ${EPOCH_TEST_KEY} reference at load time,
+	// so the epoch hashes what was written and never changes on secret rotation.
+	if c1.Models["m"].APIKey != "${EPOCH_TEST_KEY}" || c2.Models["m"].APIKey != "${EPOCH_TEST_KEY}" {
+		t.Fatalf("secret reference should stay deferred: %q / %q", c1.Models["m"].APIKey, c2.Models["m"].APIKey)
 	}
 }

@@ -41,7 +41,7 @@ func directive() string { return fmt.Sprintf("-- af-prelude-version: %d\n", vm.P
 // this module is under internal/, which a separate module cannot import — so
 // there is nothing to import, and the suite has to travel as source the way the
 // backends' contract does. With the variable unset the suite still checks this
-// repo's own six embedded chunks, which is what makes it a build check here and
+// repo's own embedded chunks, which is what makes it a build check here and
 // a compatibility check there.
 //
 // The version covers more than the list of ops a chunk may call: it covers

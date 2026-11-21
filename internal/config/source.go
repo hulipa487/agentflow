@@ -55,13 +55,16 @@ func (s Source) Load(log *slog.Logger) (*Config, error) {
 
 // ResolveSource turns -config into one absolute source. The path may name a
 // file, a config directory (system.yaml + profiles/), or a directory holding an
-// agentflow.yaml. With no path it discovers agentflow.yaml and then config.yaml
-// in the working directory, and reports when it used the legacy name. The
-// engine and every CLI command use this function, so they cannot disagree
-// about what "the config" is.
+// agentflow.yaml. With no path it discovers system.yaml (config directory),
+// agentflow.yaml, and then config.yaml in the working directory, and reports
+// when it used the legacy name. The engine and every CLI command use this
+// function, so they cannot disagree about what "the config" is.
 func ResolveSource(path string) (Source, error) {
 	if path != "" {
 		return resolvePath(path, false)
+	}
+	if fileExists("system.yaml") {
+		return resolvePath(".", false)
 	}
 	for _, candidate := range []string{"agentflow.yaml", "config.yaml"} {
 		if _, err := os.Stat(candidate); err == nil {
@@ -70,7 +73,7 @@ func ResolveSource(path string) (Source, error) {
 			return Source{}, err
 		}
 	}
-	return Source{}, fmt.Errorf("no config found: looked for agentflow.yaml and config.yaml in %s; run `agentflow init` or pass -config", mustGetwd())
+	return Source{}, fmt.Errorf("no config found: looked for system.yaml, agentflow.yaml, and config.yaml in %s; run `agentflow init` or pass -config", mustGetwd())
 }
 
 func resolvePath(path string, legacy bool) (Source, error) {

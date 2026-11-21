@@ -261,7 +261,7 @@ func (r *Router) runOnce(ctx context.Context) runOutcome {
 	default:
 	}
 	// The handler is version-gated at load (vm.State.Start). In a deployment
-	// every route source reaches here through builtins.Resolve — at boot — or
+	// every route source reaches here through luacode.Resolve — at boot — or
 	// through the reload watcher, which gates it too, so the check is a second
 	// look at a source this core has already accepted. It is not redundant: a
 	// route source handed straight to New by an embedder has passed through

@@ -11,8 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"agentflow/internal/builtins"
+	_ "agentflow/internal/builtins"
 	"agentflow/internal/core/pool"
+	"agentflow/internal/luacode"
 )
 
 // logBuf is a race-safe sink for a test that reads what an actor logged while
@@ -47,8 +48,8 @@ func TestSupportChunkEditThatGoesBadKeepsTheRunningVersion(t *testing.T) {
 	if err := os.WriteFile(file, []byte(directive()+"SUPPORT_MARK = \"v1\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	builtins.SetPluginDir(dir)
-	t.Cleanup(func() { builtins.SetPluginDir("") })
+	luacode.SetPluginDir(dir)
+	t.Cleanup(func() { luacode.SetPluginDir("") })
 
 	logs := &logBuf{}
 	gw := &fakeGW{}

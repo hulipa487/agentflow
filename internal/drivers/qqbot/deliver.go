@@ -1,7 +1,9 @@
 package qqbot
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/url"
@@ -114,8 +116,9 @@ func filesPath(scene, id string) string {
 
 // Deliver implements gateway.Driver. Text is sent as plain text, split into
 // chunks the platform accepts; each attachment is its own message. QQ fetches
-// media by URL, so an attachment needs a public http(s) URL — a blob-store
-// handle alone cannot be sent, and is reported rather than dropped.
+// media by URL: an attachment with an http(s) URL is sent directly, while a
+// blob-store handle or inline base64 payload is resolved via a presigned GET
+// URL when the media store implements media.Presigner (e.g. media.backend: s3).
 func (d *Driver) Deliver(replyTo, text string, attachments []media.Part) error {
 	scene, id, err := parseTarget(replyTo)
 	if err != nil {
@@ -272,24 +275,28 @@ func (d *Driver) send(scene, id, target string, body map[string]any) error {
 }
 
 // sendMedia sends one attachment by URL: uploaded as rich media for private
-// chats and groups, as an image link for guild channels and DMs.
+// chats and groups, as an image link for guild channels and DMs. Blob-store
+// handles and inline base64 attachments are resolved to time-limited presigned
+// GET URLs when the configured media store implements media.Presigner (S3).
 func (d *Driver) sendMedia(scene, id, target string, att media.Part) error {
-	link := att.URL
-	if !strings.HasPrefix(link, "https://") && !strings.HasPrefix(link, "http://") {
-		name := att.Name
-		if name == "" {
-			name = att.Type
-		}
-		return fmt.Errorf("qq: attachment %q has no public URL; QQ fetches media by URL, so host it and set url", name)
+	partType := att.Type
+	if partType == "" && att.MIME != "" {
+		partType = media.Classify(att.MIME)
 	}
 	if scene == SceneGuild || scene == SceneDM {
-		if att.Type != "image" {
-			return fmt.Errorf("qq: guild channels take images only, not %s", att.Type)
+		if partType != "image" {
+			return fmt.Errorf("qq: guild channels take images only, not %s", partType)
 		}
+	}
+	link, err := d.resolveMediaURL(att, partType)
+	if err != nil {
+		return err
+	}
+	if scene == SceneGuild || scene == SceneDM {
 		return d.send(scene, id, target, map[string]any{"image": link})
 	}
 	fileType := 4 // file
-	switch att.Type {
+	switch partType {
 	case "image":
 		fileType = 1
 	case "video":
@@ -302,7 +309,7 @@ func (d *Driver) sendMedia(scene, id, target string, att media.Part) error {
 	var up struct {
 		FileInfo string `json:"file_info"`
 	}
-	err := d.call(ctx, "POST", filesPath(scene, id), map[string]any{
+	err = d.call(ctx, "POST", filesPath(scene, id), map[string]any{
 		"file_type":    fileType,
 		"url":          link,
 		"srv_send_msg": false,
@@ -318,6 +325,73 @@ func (d *Driver) sendMedia(scene, id, target string, att media.Part) error {
 		"content":  " ",
 		"media":    map[string]string{"file_info": up.FileInfo},
 	})
+}
+
+// resolveMediaURL turns an attachment into an http(s) URL QQ's servers can
+// fetch. When d.media is wired, it uses the centralized media.Service to
+// transcode images to QQ-compatible JPEG/PNG, fit within size limits, cache
+// derived variants, and mint an S3 presigned or FS HMAC-signed URL.
+func (d *Driver) resolveMediaURL(att media.Part, partType string) (string, error) {
+	if d.media != nil {
+		spec := qqTargetSpec(partType, d.presignTTL)
+		ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+		defer cancel()
+		return d.media.MaterializeURL(ctx, media.ScopeMaintenance, att, spec)
+	}
+	if strings.HasPrefix(att.URL, "https://") || strings.HasPrefix(att.URL, "http://") {
+		return att.URL, nil
+	}
+	name := att.Name
+	if name == "" {
+		name = partType
+	}
+	if att.Handle == "" && att.Data == "" {
+		return "", fmt.Errorf("qq: attachment %q has no public URL, handle, or data", name)
+	}
+	presigner, ok := d.store.(media.Presigner)
+	if !ok {
+		return "", fmt.Errorf("qq: attachment %q has no public URL and the configured media store cannot presign URLs; set url or configure media.backend: s3", name)
+	}
+	handle := att.Handle
+	if handle == "" {
+		raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(att.Data))
+		if err != nil {
+			return "", fmt.Errorf("qq: attachment %q bad base64: %w", name, err)
+		}
+		ref, err := d.store.Put(bytes.NewReader(raw), att.MIME, media.Policy{MaxBytes: maxOutboundMediaBytes})
+		if err != nil {
+			return "", fmt.Errorf("qq: stage attachment %q for presign: %w", name, err)
+		}
+		handle = ref.Handle
+	}
+	opts := media.PresignOptions{ContentType: att.MIME}
+	if partType == "file" && att.Name != "" {
+		opts.Filename = att.Name
+	}
+	link, err := presigner.PresignGet(handle, d.presignTTL, opts)
+	if err != nil {
+		return "", fmt.Errorf("qq: presign attachment %q: %w", name, err)
+	}
+	return link, nil
+}
+
+// qqTargetSpec declares QQ's media format requirements: images prefer JPEG
+// (accepting JPEG/PNG up to 10 MiB, auto-transcoding WebP/GIF/oversized PNG);
+// files carry an RFC 6266 attachment filename.
+func qqTargetSpec(partType string, ttl time.Duration) media.TargetSpec {
+	spec := media.TargetSpec{
+		MaxBytes:   maxOutboundMediaBytes,
+		PresignTTL: ttl,
+	}
+	switch partType {
+	case "image":
+		spec.AcceptMIME = []string{"image/jpeg", "image/png"}
+		spec.PreferMIME = "image/jpeg"
+		spec.MaxBytes = 10 << 20
+	case "file":
+		spec.AttachFilename = true
+	}
+	return spec
 }
 
 // splitText cuts text into chunks of at most n runes, preferring line breaks

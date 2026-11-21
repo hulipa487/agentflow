@@ -25,7 +25,6 @@ tools:
         params:
           query: { description: "What to look up" }
         needs_confirm: true
-        autonomous: false
 `))
 	dec.KnownFields(true)
 	if err := dec.Decode(&c); err != nil {
@@ -43,9 +42,6 @@ tools:
 	}
 	if o.NeedsConfirm == nil || !*o.NeedsConfirm {
 		t.Fatalf("needs_confirm not decoded: %+v", o.NeedsConfirm)
-	}
-	if o.Autonomous == nil || *o.Autonomous {
-		t.Fatalf("explicit autonomous: false must decode as a non-nil false: %+v", o.Autonomous)
 	}
 }
 
@@ -176,16 +172,6 @@ func TestValidateShellProfile(t *testing.T) {
 			name:    "sandbox memory must parse",
 			profile: ShellProfile{Environment: "python", MemLimit: "lots"},
 			wantErr: "not a positive size",
-		},
-		{
-			name:    "sandbox takes an environment, not an image",
-			profile: ShellProfile{Image: "alpine:3.20"},
-			wantErr: "declare the image under environments",
-		},
-		{
-			name:    "docker was removed",
-			profile: ShellProfile{Provider: "docker", Image: "alpine:3.20"},
-			wantErr: "provider docker, which was removed",
 		},
 		{
 			name:    "unknown provider",
@@ -475,7 +461,6 @@ func TestValidateUsers(t *testing.T) {
 			wantErr: "runtime.users.link_ttl",
 		},
 		{name: "link ttl ok", users: UsersConfig{LinkTTL: "15m"}},
-		{name: "auto-claim opt-out ok", users: UsersConfig{RequireRegistration: &no}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -494,11 +479,16 @@ func TestValidateUsers(t *testing.T) {
 			}
 		})
 	}
-	// Defaults: registration required, open mode, 10m challenge lifetime.
+	// Defaults: registration required on identity, open mode, 10m challenge lifetime.
+	id := IdentityConfig{}
 	u := UsersConfig{}
-	if !u.RegistrationRequired() || u.RegistrationMode() != "open" || u.LinkChallengeTTL() != 10*time.Minute {
-		t.Fatalf("users defaults: required=%v mode=%q ttl=%v",
-			u.RegistrationRequired(), u.RegistrationMode(), u.LinkChallengeTTL())
+	if !id.RegistrationRequired() || u.RegistrationMode() != "open" || u.LinkChallengeTTL() != 10*time.Minute {
+		t.Fatalf("defaults: required=%v mode=%q ttl=%v",
+			id.RegistrationRequired(), u.RegistrationMode(), u.LinkChallengeTTL())
+	}
+	id.RequireRegistration = &no
+	if id.RegistrationRequired() {
+		t.Fatal("explicit require_registration=false must disable requirement")
 	}
 }
 
@@ -969,35 +959,16 @@ func TestValidateRegionAndClusterPeriods(t *testing.T) {
 	}
 }
 
-// The cluster store is where the state that has to be one store across every
-// region lives: the lease table and the session inbox. It follows the runtime
-// store unless it names its own target.
+// The cluster store always follows runtime.persistence.
 func TestClusterStoreTarget(t *testing.T) {
 	local := &Config{Runtime: Runtime{Persistence: "sqlite://./data/agentflow.db"}}
 	if got := local.ClusterStore(); got != "./data/agentflow.db" {
 		t.Fatalf("cluster store follows persistence: %q", got)
 	}
-	own := &Config{Runtime: Runtime{
-		Persistence: "sqlite://./data/agentflow.db",
-		Cluster:     ClusterConfig{Persistence: "postgres://db.internal/agentflow"},
-	}}
-	if got := own.ClusterStore(); got != "postgres://db.internal/agentflow" {
-		t.Fatalf("an explicit cluster store wins: %q", got)
-	}
-	// The scheme is stripped for the local-file form, or the store would create
-	// a file called "sqlite:".
-	prefixed := &Config{Runtime: Runtime{
-		Persistence: "./data/agentflow.db",
-		Cluster:     ClusterConfig{Persistence: "sqlite://./data/cluster.db"},
-	}}
-	if got := prefixed.ClusterStore(); got != "./data/cluster.db" {
-		t.Fatalf("sqlite:// not stripped: %q", got)
-	}
-	// The same rule for the two per-store targets that came before it.
 	sibling := &Config{Runtime: Runtime{
 		Persistence: "sqlite://./data/agentflow.db",
 		Identity:    IdentityConfig{Persistence: "sqlite://./data/ids.db"},
-		Credentials: CredentialsConfig{Path: "sqlite://./data/creds.db"},
+		Credentials: CredentialsConfig{Persistence: "sqlite://./data/creds.db"},
 	}}
 	if got := sibling.IdentityStore(); got != "./data/ids.db" {
 		t.Fatalf("identity store: %q", got)
@@ -1053,12 +1024,10 @@ func TestStoreTargetsRejectUnknownSchemes(t *testing.T) {
 	}{
 		{name: "the runtime store", set: func(c *Config) { c.Runtime.Persistence = "mongodb://host/agentflow" },
 			wantIn: "runtime.persistence"},
-		{name: "the cluster store", set: func(c *Config) { c.Runtime.Cluster.Persistence = "scylla://host:9042" },
-			wantIn: "runtime.cluster.persistence"},
 		{name: "the identity store", set: func(c *Config) { c.Runtime.Identity.Persistence = "mysql://host/db" },
 			wantIn: "runtime.identity.persistence"},
-		{name: "the credential store", set: func(c *Config) { c.Runtime.Credentials.Path = "redis://host/0" },
-			wantIn: "runtime.credentials.path"},
+		{name: "the credential store", set: func(c *Config) { c.Runtime.Credentials.Persistence = "redis://host/0" },
+			wantIn: "runtime.credentials.persistence"},
 		// A store target cannot be the log plane's directory backend, and the
 		// log plane cannot be a store's.
 		{name: "a file target for a store", set: func(c *Config) { c.Runtime.Persistence = "file://./data/log" },
@@ -1098,13 +1067,12 @@ func TestStoreTargetsRejectUnknownSchemes(t *testing.T) {
 	}
 	c = &Config{Runtime: Runtime{
 		Persistence: "postgres://u:p@h:5432/agentflow",
-		Cluster:     ClusterConfig{Persistence: "postgres://u:p@h2:5432/agentflow"},
 	}}
 	if got := c.PersistencePath(); got != "postgres://u:p@h:5432/agentflow" {
 		t.Fatalf("PersistencePath dropped the scheme: %q", got)
 	}
-	if got := c.ClusterStore(); got != "postgres://u:p@h2:5432/agentflow" {
-		t.Fatalf("ClusterStore dropped the scheme: %q", got)
+	if got := c.ClusterStore(); got != "postgres://u:p@h:5432/agentflow" {
+		t.Fatalf("ClusterStore must follow runtime.persistence: %q", got)
 	}
 	if got := c.DataDir(); got != "./data" {
 		t.Fatalf("DataDir for a server store = %q", got)

@@ -155,7 +155,7 @@ func TestApplyOverridesUnknownPromptOnUnregisteredFails(t *testing.T) {
 func TestApplyOverridesPolicyFieldsFlip(t *testing.T) {
 	r := overrideRegistry()
 	err := r.ApplyOverrides(map[string]config.ToolSpecOverride{
-		"builtin:web_search": {NeedsConfirm: boolPtr(true), Autonomous: boolPtr(false)},
+		"builtin:web_search": {NeedsConfirm: boolPtr(true)},
 	}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -163,7 +163,7 @@ func TestApplyOverridesPolicyFieldsFlip(t *testing.T) {
 	// Expose with an empty policy: the baked-in fields must hold on their own.
 	as := r.Expose(nil, config.ToolsPolicy{}, false)
 	spec := as.ByName["builtin:web_search"]
-	if !spec.NeedsConfirm || spec.Autonomous {
+	if !spec.NeedsConfirm {
 		t.Fatalf("policy fields not applied: %+v", spec)
 	}
 	res, err := as.Invoke(context.Background(), "builtin:web_search", map[string]any{"query": "x"})

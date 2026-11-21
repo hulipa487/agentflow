@@ -22,6 +22,7 @@ import (
 	"agentflow/internal/builtins"
 	"agentflow/internal/config"
 	"agentflow/internal/looptest"
+	"agentflow/internal/luacode"
 	"agentflow/internal/vm"
 )
 
@@ -201,7 +202,8 @@ func loadConfigForCLI(cfgPath string, stderr io.Writer) (*config.Config, config.
 // enforces the prelude version, which is the failure a first-time author hits
 // most often.
 func checkLoop(label, ref string) error {
-	src, _, err := builtins.Resolve(ref)
+	builtins.Register()
+	src, _, err := luacode.Resolve(ref)
 	if err != nil {
 		return fmt.Errorf("%s: %w", label, err)
 	}
@@ -259,14 +261,18 @@ func cmdValidate(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "config:", err)
 		return 1
 	}
-	builtins.SetPluginDir(cfg.Plugins.Dir)
-	builtins.SetPackages(cfg.Packages)
+	builtins.Register()
+	luacode.SetPluginDir(cfg.Plugins.Dir)
+	luacode.SetPackages(cfg.Packages)
 	if err := validateLoops(cfg); err != nil {
 		fmt.Fprintln(stderr, "loop:", err)
 		return 1
 	}
 	// Warnings do not fail validation: the config loads and runs. They name a
 	// combination that works differently from how it reads.
+	warnLog := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	warnUnenforceableGC(cfg, warnLog)
+	warnTopologyConfig(cfg, warnLog)
 	for _, w := range cfg.RegionalReplyWarnings() {
 		fmt.Fprintln(stderr, "warning:", w)
 	}
@@ -318,8 +324,9 @@ runtime.topology is regional; -online=false turns it off.`,
 		report()
 		return 1
 	}
-	builtins.SetPluginDir(cfg.Plugins.Dir)
-	builtins.SetPackages(cfg.Packages)
+	builtins.Register()
+	luacode.SetPluginDir(cfg.Plugins.Dir)
+	luacode.SetPackages(cfg.Packages)
 	add("PASS", "configuration", used.String()+" (epoch "+cfg.Epoch+")")
 
 	// A regional cell's failure modes are all "some instance cannot reach what
@@ -369,7 +376,7 @@ runtime.topology is regional; -online=false turns it off.`,
 	hasToken := os.Getenv("ADMIN_TOKEN") != "" || len(cfg.Runtime.Admin.Operators) > 0
 	switch {
 	case hasToken:
-		add("PASS", "admin", "a configured token guards the admin API on "+listen+" (/admin/)")
+		add("PASS", "admin", "a configured token guards the admin API on "+listen+" (/admin/api/)")
 	case cfg.IsRegional():
 		add("FAIL", "admin", "regional topology needs ADMIN_TOKEN or runtime.admin.operators: a per-boot token is unknown to the other instances")
 		exit = 1
@@ -480,7 +487,7 @@ func cmdConfigSchema(args []string, stdout, stderr io.Writer) int {
 	}
 	reflector := &jsonschema.Reflector{
 		FieldNameTag:              "yaml",
-		AllowAdditionalProperties: true,
+		AllowAdditionalProperties: false,
 	}
 	schema := reflector.Reflect(&config.Config{})
 	schema.Version = jsonschema.Version
@@ -684,15 +691,26 @@ func cmdLoop(args []string, stdout, stderr io.Writer) int {
 func cmdLoopCheck(args []string, stdout, stderr io.Writer) int {
 	info := cmdInfo{
 		Name:    "loop check",
-		Args:    "FILE|DIR|plugin:NAME",
+		Args:    "FILE|DIR|plugin:NAME|package:NAME",
 		Summary: "Compile a loop and check the prelude version it declares.",
+		Detail:  "Pass -config to load packages: and plugins.dir when checking loops that use -- af-import: or package: refs.",
 	}
 	fs := newCommand(info, stderr)
+	cfgPath := addConfigFlag(fs)
 	if code, ok := parseArgs(fs, args, nil); !ok {
 		return code
 	}
 	if !positionals(fs, info, 1) {
 		return 2
+	}
+	if *cfgPath != "" {
+		cfg, _, err := loadConfigForCLI(*cfgPath, stderr)
+		if err != nil {
+			fmt.Fprintln(stderr, "config:", err)
+			return 1
+		}
+		luacode.SetPluginDir(cfg.Plugins.Dir)
+		luacode.SetPackages(cfg.Packages)
 	}
 	ref := fs.Arg(0)
 	if err := checkLoop(ref, ref); err != nil {
@@ -804,8 +822,8 @@ gateway:
 
   # OpenAI-compatible endpoint: point any Chat Completions client at
   # http://<host>:8080/v1 with the key below. Uncomment and set the key. An
-  # exposed agent runs its own loop; loop: plugin:openai_passthrough makes it
-  # answer as its model.
+  # exposed agent runs its own loop; see agentflow-studio/examples/loops/openai_passthrough.lua
+  # to make an agent answer as its model.
   # - name: api
   #   type: openai
   #   path: /v1/
@@ -832,8 +850,8 @@ gateway:
 
     # OpenAI-compatible endpoint: point any Chat Completions client at
     # http://<host>:8080/v1 with the key below. Uncomment and set the key. An
-    # exposed agent runs its own loop; loop: plugin:openai_passthrough makes it
-    # answer as its model.
+    # exposed agent runs its own loop; see agentflow-studio/examples/loops/openai_passthrough.lua
+    # to make an agent answer as its model.
     # - name: api
     #   type: openai
     #   path: /v1/
@@ -885,8 +903,6 @@ type runFlags struct {
 	logLevel    string
 	logFormat   string
 	logFile     string
-	noTUI       bool
-	noConsole   bool
 	forceSingle bool
 }
 
@@ -896,7 +912,7 @@ func parseRunFlags(args []string, w io.Writer) (runFlags, int, bool) {
 		Summary: "Run the engine. `agentflow [flags]` with no command does the same.",
 		Detail: `The worker pool size is runtime.scheduler.workers in the config (default 8).
 Set ADMIN_TOKEN to fix the admin API token; without it a loopback-only
-console mints one per boot.`,
+admin API mints one per boot.`,
 	}
 	fs := newCommand(info, w)
 	var f runFlags
@@ -904,8 +920,6 @@ console mints one per boot.`,
 	fs.StringVar(&f.logLevel, "log-level", "info", "minimum log level: dev, debug, info, warn or error")
 	fs.StringVar(&f.logFormat, "log-format", "text", "log format: text or json")
 	fs.StringVar(&f.logFile, "log-file", "", "also append logs to this file")
-	fs.BoolVar(&f.noTUI, "no-tui", false, "no terminal dashboard; plain logs on stderr")
-	fs.BoolVar(&f.noConsole, "no-console", false, "serve the admin API without the static web console")
 	fs.BoolVar(&f.forceSingle, "force-single", false, "start even if another instance looks live on the store (single topology; only after a crash)")
 	code, ok := parseArgs(fs, args, map[string]string{"version": "run `agentflow version`"})
 	if !ok {

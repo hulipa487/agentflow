@@ -26,6 +26,14 @@ func TestParseByteSize(t *testing.T) {
 
 func TestSandboxDefaults(t *testing.T) {
 	var s SandboxConfig
+	if got := s.ProviderName(); got != "gvisor" {
+		t.Errorf("ProviderName() = %q, want gvisor", got)
+	}
+	s.Provider = "  MicroSandbox "
+	if got := s.ProviderName(); got != "microsandbox" {
+		t.Errorf("ProviderName() = %q, want microsandbox", got)
+	}
+	s.Provider = ""
 	if s.QueueWait() != 30*time.Second || s.JobTimeout() != time.Minute || s.JobMaxTimeout() != 10*time.Minute || s.BackgroundTimeout() != 2*time.Hour {
 		t.Errorf("default durations: %s %s %s %s", s.QueueWait(), s.JobTimeout(), s.JobMaxTimeout(), s.BackgroundTimeout())
 	}
@@ -55,6 +63,9 @@ func TestValidateSandboxAndEnvironments(t *testing.T) {
 		want string // "" = valid
 	}{
 		{"empty is valid", func(*Config) {}, ""},
+		{"gvisor provider", func(c *Config) { c.Runtime.Sandbox.Provider = "gvisor" }, ""},
+		{"microsandbox provider", func(c *Config) { c.Runtime.Sandbox.Provider = "microsandbox" }, ""},
+		{"unknown provider", func(c *Config) { c.Runtime.Sandbox.Provider = "docker" }, "runtime.sandbox.provider"},
 		{"a pinned image", func(c *Config) { c.Environments = map[string]Environment{"py": {Image: pin}} }, ""},
 		{"a local rootfs", func(c *Config) { c.Environments = map[string]Environment{"py": {Rootfs: "/srv/py"}} }, ""},
 		{"a tag is not a pin", func(c *Config) { c.Environments = map[string]Environment{"py": {Image: "python:3.12"}} }, "must be pinned by digest"},

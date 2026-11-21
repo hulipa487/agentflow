@@ -85,7 +85,7 @@ func NewWorkspace(configDir, configPath, root string, cfg *config.Config, log *s
 // Stage writes an agent's loop and instructions to the workspace without
 // touching the config. Apply uses it so the runtime definition points at a
 // real file (hot reload watches it) even when the agent is not persisted yet.
-// The paths returned are absolute and safe to hand to builtins.Resolve.
+// The paths returned are absolute and safe to hand to luacode.Resolve.
 func (w *Workspace) Stage(name, loopSrc, instructionsSrc string) (loopPath, promptPath string, err error) {
 	if !studioNameRe.MatchString(name) {
 		return "", "", fmt.Errorf("agent name must be 1-64 chars of letters, digits, _ or -")
@@ -98,6 +98,38 @@ func (w *Workspace) Stage(name, loopSrc, instructionsSrc string) (loopPath, prom
 	}
 	loopPath = w.loopPath(name)
 	promptPath = w.promptPath(name)
+	if err := os.MkdirAll(filepath.Dir(loopPath), 0o755); err != nil {
+		return "", "", err
+	}
+	if err := writeAtomic(loopPath, []byte(loopSrc)); err != nil {
+		return "", "", err
+	}
+	if instructionsSrc != "" {
+		if err := os.MkdirAll(filepath.Dir(promptPath), 0o755); err != nil {
+			return "", "", err
+		}
+		if err := writeAtomic(promptPath, []byte(instructionsSrc)); err != nil {
+			return "", "", err
+		}
+	} else if err := os.Remove(promptPath); err != nil && !os.IsNotExist(err) {
+		return "", "", err
+	}
+	return loopPath, promptPath, nil
+}
+
+// StageTransient writes an agent's loop and instructions to a process-private
+// staging directory outside the config tree so a live-only Apply (persist=false)
+// never overwrites hand-edited loops/prompts on disk.
+func (w *Workspace) StageTransient(name, loopSrc, instructionsSrc string) (loopPath, promptPath string, err error) {
+	if !studioNameRe.MatchString(name) {
+		return "", "", fmt.Errorf("agent name must be 1-64 chars of letters, digits, _ or -")
+	}
+	if strings.TrimSpace(loopSrc) == "" {
+		return "", "", fmt.Errorf("loop source is empty")
+	}
+	stageRoot := filepath.Join(os.TempDir(), "agentflow-studio-stage")
+	loopPath = filepath.Join(stageRoot, "loops", name+".lua")
+	promptPath = filepath.Join(stageRoot, "prompts", name+".md")
 	if err := os.MkdirAll(filepath.Dir(loopPath), 0o755); err != nil {
 		return "", "", err
 	}
@@ -277,14 +309,17 @@ func (w *Workspace) Save(name string, a config.Agent, loopSrc, instructionsSrc s
 
 	loopPath := w.loopPath(name)
 	promptPath := w.promptPath(name)
+	keepPromptRef := a.Instructions.Prompt != ""
 	if w.Mode() == "configdir" {
 		// Paths in a configdir are rebased onto the directory, so the fragment
 		// stores them relative to it.
 		a.Loop = filepath.ToSlash(filepath.Join("loops", name+".lua"))
-		if instructionsSrc != "" {
-			a.Instructions = config.InstructionsRef{File: filepath.ToSlash(filepath.Join("prompts", name+".md"))}
-		} else {
-			a.Instructions = config.InstructionsRef{}
+		if !keepPromptRef {
+			if instructionsSrc != "" {
+				a.Instructions = config.InstructionsRef{File: filepath.ToSlash(filepath.Join("prompts", name+".md"))}
+			} else {
+				a.Instructions = config.InstructionsRef{}
+			}
 		}
 	} else {
 		// Single-file loops and instructions resolve against the config file
@@ -295,14 +330,16 @@ func (w *Workspace) Save(name string, a config.Agent, loopSrc, instructionsSrc s
 			return f, err
 		}
 		a.Loop = abs
-		if instructionsSrc != "" {
-			absP, err := filepath.Abs(promptPath)
-			if err != nil {
-				return f, err
+		if !keepPromptRef {
+			if instructionsSrc != "" {
+				absP, err := filepath.Abs(promptPath)
+				if err != nil {
+					return f, err
+				}
+				a.Instructions = config.InstructionsRef{File: absP}
+			} else {
+				a.Instructions = config.InstructionsRef{}
 			}
-			a.Instructions = config.InstructionsRef{File: absP}
-		} else {
-			a.Instructions = config.InstructionsRef{}
 		}
 	}
 
@@ -318,13 +355,15 @@ func (w *Workspace) Save(name string, a config.Agent, loopSrc, instructionsSrc s
 	if err := w.writeTracked(loopPath, []byte(loopSrc), &undo); err != nil {
 		return f, err
 	}
-	if instructionsSrc != "" {
-		if err := w.writeTracked(promptPath, []byte(instructionsSrc), &undo); err != nil {
-			rollback()
+	if !keepPromptRef {
+		if instructionsSrc != "" {
+			if err := w.writeTracked(promptPath, []byte(instructionsSrc), &undo); err != nil {
+				rollback()
+				return f, err
+			}
+		} else if err := w.removeTracked(promptPath, &undo); err != nil {
 			return f, err
 		}
-	} else if err := w.removeTracked(promptPath, &undo); err != nil {
-		return f, err
 	}
 
 	switch w.Mode() {

@@ -22,7 +22,7 @@ func directive() string { return fmt.Sprintf("-- af-prelude-version: %d\n", Prel
 
 // TestStartRefusesAnUngatedSource is the in-memory path's gate. A loop a library
 // consumer hands to a session as raw source never passes through
-// builtins.Resolve, so this is the only place it can be stopped — and a source
+// luacode.Resolve, so this is the only place it can be stopped — and a source
 // that does go through Resolve is checked again here, which is harmless because
 // Resolve returns only what this same check accepted.
 func TestStartRefusesAnUngatedSource(t *testing.T) {

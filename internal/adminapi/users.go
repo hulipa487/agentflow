@@ -1,0 +1,402 @@
+package adminapi
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strconv"
+	"time"
+
+	"agentflow/internal/core/accounting"
+	"agentflow/internal/core/files"
+	"agentflow/internal/core/identity"
+	"agentflow/internal/core/media"
+	"agentflow/internal/core/runtime"
+)
+
+// UserDeps is the per-user console surface: the profile store, the ledger
+// rollups, the per-call detail and the audit journal behind a profile's page,
+// the quota, and the file store. Any of them may be nil when the corresponding
+// subsystem is disabled, and each handler degrades with a named reason rather
+// than an empty answer.
+//
+// The three read planes are separate fields because a deployment can keep them
+// in different places: the rollups have to stay where a quota check can read
+// them, while the detail and the journal are append-only and can live on a log
+// plane.
+type UserDeps struct {
+	Identities *identity.Registry
+	Store      runtime.Ledger
+	Events     runtime.EventLog
+	Journal    runtime.Journal
+	Quota      *accounting.Quota
+	Files      *files.Manager
+	Media      *media.Service
+	// Purge removes the runtime-store rows attributed to one profile (usage,
+	// journal, file metadata). It is separate from Store so a test or an
+	// embedder can wire the read planes without granting deletion.
+	Purge interface {
+		DeleteUserData(ctx context.Context, userID string) error
+	}
+}
+
+func (u *UI) usersAvailable(w http.ResponseWriter) bool {
+	if u.deps.Users.Identities == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "the identity layer is not enabled (runtime.identity.enabled)",
+		})
+		return false
+	}
+	return true
+}
+
+// handleUsers lists every profile with today's usage and quota standing.
+func (u *UI) handleUsers(w http.ResponseWriter, r *http.Request) {
+	if !u.usersAvailable(w) {
+		return
+	}
+	profiles, err := u.deps.Users.Identities.List()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	day := runtime.DayKey(time.Now())
+	out := make([]map[string]any, 0, len(profiles))
+	for _, p := range profiles {
+		row := map[string]any{
+			"user_id":        p.UserID,
+			"display_name":   p.DisplayName,
+			"email":          p.Email,
+			"tokens_per_day": p.TokensPerDay,
+			"created_at":     p.CreatedAt,
+			"updated_at":     p.UpdatedAt,
+			"identities":     len(p.Identities),
+		}
+		if u.deps.Users.Store != nil {
+			if totals, err := u.deps.Users.Store.UsageForDay(p.UserID, day); err == nil {
+				row["usage_today"] = totals
+			}
+		}
+		if u.deps.Users.Quota != nil {
+			if used, limit, inFlight, err := u.deps.Users.Quota.Status(p.UserID); err == nil {
+				row["quota"] = map[string]any{"used": used, "limit": limit, "in_flight": inFlight}
+			}
+		}
+		out = append(out, row)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"day": day, "users": out})
+}
+
+// handleUser is the profile detail: who they are, what they spent, what they
+// own, and what the audit trail says they did.
+func (u *UI) handleUser(w http.ResponseWriter, r *http.Request) {
+	if !u.usersAvailable(w) {
+		return
+	}
+	id := r.PathValue("id")
+	p, ok, err := u.deps.Users.Identities.Get(id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such profile"})
+		return
+	}
+
+	day := runtime.DayKey(time.Now())
+	out := map[string]any{"profile": p, "day": day}
+
+	if u.deps.Users.Store != nil {
+		if totals, err := u.deps.Users.Store.UsageForDay(id, day); err == nil {
+			out["usage_today"] = totals
+		}
+	}
+	// The per-call detail exists only when usage.events is enabled, and it may
+	// live on a log plane of its own; an empty answer is the honest one
+	// otherwise.
+	if u.deps.Users.Events != nil {
+		if events, err := u.deps.Users.Events.UsageEvents(id, time.Now().AddDate(0, 0, -7), 50); err == nil {
+			out["recent_calls"] = events
+		}
+	}
+	if u.deps.Users.Journal != nil {
+		if audit, err := u.deps.Users.Journal.ListMessages(r.Context(), runtime.JournalFilter{
+			UserUUID: id, Limit: 50,
+		}); err == nil {
+			out["audit"] = audit
+		}
+	}
+	if u.deps.Users.Quota != nil {
+		if used, limit, inFlight, err := u.deps.Users.Quota.Status(id); err == nil {
+			out["quota"] = map[string]any{"used": used, "limit": limit, "in_flight": inFlight}
+		}
+	}
+	if u.deps.Users.Files != nil {
+		if projects, err := u.deps.Users.Files.Projects(r.Context(), "user:"+id); err == nil {
+			out["projects"] = projects
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleUserLimit sets a profile's own daily token limit (0 = inherit the
+// deployment default).
+func (u *UI) handleUserLimit(w http.ResponseWriter, r *http.Request) {
+	if !u.usersAvailable(w) {
+		return
+	}
+	var req struct {
+		TokensPerDay *int64 `json:"tokens_per_day"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if req.TokensPerDay == nil || *req.TokensPerDay < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "tokens_per_day must be >= 0 (0 = inherit the default)"})
+		return
+	}
+	id := r.PathValue("id")
+	if err := u.deps.Users.Identities.Update(id, nil, nil, req.TokensPerDay); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	p, _, _ := u.deps.Users.Identities.Get(id)
+	writeJSON(w, http.StatusOK, map[string]any{"profile": p})
+}
+
+// handleUserSettings sets a profile's per-user overrides: the model that
+// person's turns run on, and a layer of instructions appended to the agent's
+// own. An empty string clears an override and returns them to inheriting.
+//
+// The model is validated against the live registry rather than stored blindly.
+// A name that resolves to nothing would otherwise fail *every* turn that person
+// takes, at the provider call, long after this request returned — the operator
+// setting it is the one who can act on the error, so they get it here.
+//
+// This is deliberately an operator surface and not part of /v1/users: which
+// model a person runs on is a cost decision, not a preference they set on
+// themselves.
+func (u *UI) handleUserSettings(w http.ResponseWriter, r *http.Request) {
+	if !u.usersAvailable(w) {
+		return
+	}
+	var req struct {
+		Model              *string `json:"model"`
+		InstructionsAppend *string `json:"instructions_append"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if req.Model == nil && req.InstructionsAppend == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "nothing to set: pass model or instructions_append (an empty string clears it)",
+		})
+		return
+	}
+	if req.Model != nil && *req.Model != "" {
+		if u.deps.Models == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "no models are configured"})
+			return
+		}
+		if _, ok := u.deps.Models.List()[*req.Model]; !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "unknown model " + strconv.Quote(*req.Model) + ": it is not in the models registry",
+			})
+			return
+		}
+	}
+	id := r.PathValue("id")
+	if err := u.deps.Users.Identities.SetOverrides(id, req.Model, req.InstructionsAppend); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	p, _, _ := u.deps.Users.Identities.Get(id)
+	writeJSON(w, http.StatusOK, map[string]any{"profile": p})
+}
+
+// handleUserUnlink detaches a handle from a profile. The store refuses to
+// remove the last one: that would leave the account unreachable.
+func (u *UI) handleUserUnlink(w http.ResponseWriter, r *http.Request) {
+	if !u.usersAvailable(w) {
+		return
+	}
+	var req struct {
+		IdentityID string `json:"identity_id"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if req.IdentityID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "identity_id is required"})
+		return
+	}
+	id := r.PathValue("id")
+	if err := u.deps.Users.Identities.Unlink(id, req.IdentityID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	p, _, _ := u.deps.Users.Identities.Get(id)
+	writeJSON(w, http.StatusOK, map[string]any{"profile": p})
+}
+
+// handleInviteIssue mints a registration invite, for the invite-only mode where
+// the operator hands out codes instead of opening registration.
+func (u *UI) handleInviteIssue(w http.ResponseWriter, r *http.Request) {
+	if !u.usersAvailable(w) {
+		return
+	}
+	code, err := u.deps.Users.Identities.IssueInvite(7 * 24 * time.Hour)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"invite":     code,
+		"expires_in": "168h",
+		"hint":       "the user redeems this at POST /v1/users/register with {\"invite\": \"...\"}",
+	})
+}
+
+// handleUsage is the deployment-wide accounting view for one UTC day. The
+// per-user page already answers "what did this person spend"; this is the
+// tenant aggregation an operator or a billing export needs.
+func (u *UI) handleUsage(w http.ResponseWriter, r *http.Request) {
+	if u.deps.Users.Store == nil {
+		writeErr(w, http.StatusServiceUnavailable, "the usage ledger is not wired on this instance")
+		return
+	}
+	day := r.URL.Query().Get("day")
+	if day == "" {
+		day = runtime.DayKey(time.Now())
+	}
+	rows, err := u.deps.Users.Store.UsageDaily(day)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var input, output, calls int64
+	for _, row := range rows {
+		input += row.Input
+		output += row.Output
+		calls += row.Calls
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"day":     day,
+		"rows":    rows,
+		"totals":  map[string]int64{"input": input, "output": output, "billable": input + output, "calls": calls},
+		"tenants": len(rows),
+	})
+}
+
+// handleUserExport returns everything the engine can attribute to one profile
+// as a single JSON document. It is the export half of tenant lifecycle; the
+// delete endpoint is the other half.
+func (u *UI) handleUserExport(w http.ResponseWriter, r *http.Request) {
+	if !u.usersAvailable(w) {
+		return
+	}
+	id := r.PathValue("id")
+	p, ok, err := u.deps.Users.Identities.Get(id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !ok {
+		writeErr(w, http.StatusNotFound, "no such profile")
+		return
+	}
+	out := map[string]any{"exported_at": time.Now().UTC().Format(time.RFC3339), "profile": p}
+	if u.deps.Users.Store != nil {
+		if history, err := u.deps.Users.Store.UsageHistory(id, 90); err == nil {
+			out["usage_history"] = history
+		}
+	}
+	if u.deps.Users.Events != nil {
+		if events, err := u.deps.Users.Events.UsageEvents(id, time.Now().AddDate(0, 0, -90), 5000); err == nil {
+			out["usage_events"] = events
+		}
+	}
+	if u.deps.Users.Journal != nil {
+		if audit, err := u.deps.Users.Journal.ListMessages(r.Context(), runtime.JournalFilter{UserUUID: id, Limit: 5000}); err == nil {
+			out["audit"] = audit
+		}
+	}
+	if u.deps.Users.Files != nil {
+		if projects, err := u.deps.Users.Files.Projects(r.Context(), "user:"+id); err == nil {
+			out["projects"] = projects
+		}
+	}
+	if u.deps.Creds != nil {
+		if refs, err := u.deps.Creds.List(r.Context(), id); err == nil {
+			out["credentials"] = refs
+		}
+	}
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="agentflow-user-%s.json"`, id))
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleUserDelete is the destructive half of tenant lifecycle. It requires an
+// explicit confirm value so a mistyped URL cannot erase an account, and it
+// removes the profile, handles, tokens, credentials, usage, journal and file
+// metadata. Memory rows follow their store's retention; content-addressed
+// blobs are reclaimed by the file GC once no tree references them.
+func (u *UI) handleUserDelete(w http.ResponseWriter, r *http.Request) {
+	if !u.usersAvailable(w) {
+		return
+	}
+	id := r.PathValue("id")
+	confirm := r.URL.Query().Get("confirm")
+	if confirm != id && confirm != "true" {
+		writeErr(w, http.StatusBadRequest, "refusing to delete: pass ?confirm="+id)
+		return
+	}
+	if _, ok, err := u.deps.Users.Identities.Get(id); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	} else if !ok {
+		writeErr(w, http.StatusNotFound, "no such profile")
+		return
+	}
+	// Remove the data first and the identity last: if a store refuses, the
+	// profile is still there and the operator can retry, rather than a deleted
+	// account whose data survived.
+	if u.deps.Users.Purge != nil {
+		if err := u.deps.Users.Purge.DeleteUserData(r.Context(), id); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	if u.deps.Users.Media != nil {
+		if _, err := u.deps.Users.Media.PurgeScope(r.Context(), "user:"+id); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	if u.deps.Creds != nil {
+		if err := u.deps.Creds.DeleteUser(r.Context(), id); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	if err := u.deps.Users.Identities.Delete(id); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	operator := r.Header.Get("X-Operator")
+	if operator == "" {
+		operator = "admin-token"
+	}
+	slog.Info("tenant deleted", "user_id", id, "operator", operator)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"deleted": id,
+		"note":    "memory rows follow their store retention; content-addressed blobs are reclaimed by the file GC",
+	})
+}

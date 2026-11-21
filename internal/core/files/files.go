@@ -500,6 +500,12 @@ func (m *Manager) GC(ctx context.Context, grace time.Duration) (int, int, error)
 	return len(live), swept, nil
 }
 
+// LiveHandles returns every blob handle currently referenced by files_meta
+// (working trees, commits, and active scratch entries), for unified blob GC.
+func (m *Manager) LiveHandles(ctx context.Context) (map[string]bool, error) {
+	return m.liveHandles(ctx)
+}
+
 // liveHandles collects every blob handle referenced by files_meta: tree
 // records (t|), commit trees (c|), and scratch records (s|).
 func (m *Manager) liveHandles(ctx context.Context) (map[string]bool, error) {

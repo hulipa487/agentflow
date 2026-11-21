@@ -17,7 +17,7 @@
 // load there, which is the loud failure the version gate exists to produce. And
 // it does not make the bad file safe to leave lying around: a session that
 // restarts for any reason re-reads its loop from disk through
-// builtins.Resolve, so it refuses and retries too. The file is what has to be
+// luacode.Resolve, so it refuses and retries too. The file is what has to be
 // fixed — the refusal is a message, not a repair.
 //
 // Prompts are the deployment-wide registry (config `prompts:`). Only the
@@ -47,9 +47,9 @@ import (
 	"strings"
 	"time"
 
-	"agentflow/internal/builtins"
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/supervisor"
+	"agentflow/internal/luacode"
 	"agentflow/internal/vm"
 )
 
@@ -247,7 +247,7 @@ func (w *Watcher) seedDir(agent, dir string) {
 }
 
 // dirMembers lists a directory's *.lua member names, sorted (the concatenation
-// order builtins.Resolve uses).
+// order luacode.Resolve uses).
 func dirMembers(dir string) ([]string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -348,7 +348,7 @@ func (w *Watcher) pollRoute() {
 	if !w.changed(routeOwner, w.route.WatchPath) {
 		return
 	}
-	src, _, err := builtins.Resolve(w.route.WatchPath)
+	src, _, err := luacode.Resolve(w.route.WatchPath)
 	if err != nil {
 		w.log.Warn("reload: cannot read route", "route", w.route.Ref, "file", w.route.WatchPath, "err", err)
 		return
@@ -543,7 +543,7 @@ func (w *Watcher) reloadLoop(agent, path string) {
 	// compile check must see the same source the actor will load. A broken
 	// package therefore keeps the running loop instead of letting a reload
 	// through that fails on the next restart.
-	src, _, err := builtins.Resolve(path)
+	src, _, err := luacode.Resolve(path)
 	if err != nil {
 		// A version refusal is not a typo to be retried: the file on disk
 		// targets a prelude this core does not provide, and loading it would
@@ -569,13 +569,13 @@ func (w *Watcher) reloadLoop(agent, path string) {
 
 // readLoop reads a plugin source path — a loop's or the route's, which resolve
 // the same way — concatenating a directory's *.lua members in sorted order
-// (matching builtins.Resolve). An empty directory is an error, not an empty
-// plugin: builtins.Resolve — which the actor calls on every restart — rejects
+// (matching luacode.Resolve). An empty directory is an error, not an empty
+// plugin: luacode.Resolve — which the actor calls on every restart — rejects
 // that same condition, so accepting it here would install a plugin the runtime
 // cannot load, and the session would crash-restart once a second.
 //
 // Every member read here must also pass the prelude version gate, for the same
-// reason: builtins.Resolve enforces it on the actor's path, so a plugin the
+// reason: luacode.Resolve enforces it on the actor's path, so a plugin the
 // watcher accepted and Resolve refused would be a plugin that passes hot reload
 // and then fails on the next session restart. Members are checked one by one
 // rather than on the concatenation, because only the first member's directive

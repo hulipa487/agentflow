@@ -1,36 +1,30 @@
 # AgentFlow example configuration.
 #
-# Copy it to the name the runtime discovers:
+# Full runnable scenarios and single-pattern Lua loops live in the companion
+# AgentFlow Studio repository (`examples/`). For a minimal starter on disk, run:
 #
-#   cp agentflow.example.yaml agentflow.yaml
-#   ./agentflow validate
-#   ./agentflow
+#   ./agentflow init mybot
+#   ./agentflow validate -config mybot
+#   ./agentflow run -config mybot
 #
-# Or point at this file directly, from any directory:
+# Or validate this file directly from any directory:
 #
 #   ./agentflow validate -config path/to/agentflow.example.yaml
-#   ./agentflow run -config path/to/agentflow.example.yaml -log-level debug -no-tui
+#   ./agentflow run -config path/to/agentflow.example.yaml -log-level debug
 #
 # Relative paths resolve against this file's directory, not the shell's
 # working directory, so the two commands above behave the same.
 #
-# The example boots with no external services. The `assistant` agent points at
-# an OpenAI-compatible local endpoint (Ollama by default); that model is only
-# contacted when a turn needs it. The `echo` agent and the webhook channel work
-# immediately:
-#
-#   curl -X POST localhost:8080/webhook/local/ \
-#        -d '{"from":"alice","text":"hello"}'
-#
+# This example boots with no external services as a headless admin/Studio
+# control plane (`agents:` below is commented out so no local files are required).
 # Everything is on the one HTTP port, gateway.listen: the channels, and the
-# admin plane under /admin/ (plus /healthz, /readyz and /metrics). Connect the
-# AgentFlow Studio desktop app to http://127.0.0.1:8080 with the admin token;
-# the browser operator console is at /admin/, and `-no-console` serves the API
-# without it. Without ADMIN_TOKEN (or operators) the token is minted per boot
-# and the admin API answers only clients on this machine.
+# headless admin/Studio API under /admin/api/ (plus /healthz, /readyz and
+# /metrics). Connect AgentFlow Studio to http://127.0.0.1:8080 with the admin
+# token. Without ADMIN_TOKEN (or operators) the token is minted per boot and
+# the admin API answers only clients on this machine.
 #
-# Run `agentflow help` for commands and flags. The optional sections at the
-# bottom are comments: uncomment only what your deployment has.
+# Run `agentflow help` for commands and flags. The optional sections below are
+# comments: uncomment only what your deployment has.
 
 version: "1"
 
@@ -180,11 +174,12 @@ profiles:
 # ---------------------------------------------------------------------------
 # Shell
 # ---------------------------------------------------------------------------
-# Shell commands run as one-off sandbox jobs (gVisor, Linux only): a command
-# gets a declared environment as its read-only root and one project from the
-# files store as its working directory, runs under a time limit, and whatever
-# it wrote into the project is stored when it ends. Nothing else survives.
-# `agentflow doctor` says whether the sandbox can run on this host.
+# Shell commands run as one-off sandbox jobs (`gvisor` on Linux, or
+# `microsandbox` via `msb` on Linux KVM / macOS Apple Silicon HVF / Windows WHP):
+# a command gets a declared environment and one project from the files store as
+# its working directory, runs under a time limit, and whatever it wrote into the
+# project is stored when it ends. Nothing else survives.
+# `agentflow doctor` says whether the configured sandbox can run on this host.
 #
 # environments:
 #   python:
@@ -209,6 +204,9 @@ profiles:
 #
 # runtime:
 #   sandbox:                     # every setting has a default
+#     provider: gvisor           # gvisor (default, Linux runsc) | microsandbox (msb microVM)
+#     # runsc: runsc             # path to gVisor runsc binary
+#     # microsandbox: msb        # path to superradcompany/microsandbox msb CLI binary
 #     concurrency: 4             # jobs at once on this instance
 #     per_user: 2
 #     queue_timeout: 30s
@@ -226,26 +224,28 @@ profiles:
 # ---------------------------------------------------------------------------
 # Agents
 # ---------------------------------------------------------------------------
-# `agents:` may be omitted entirely. The runtime then boots as an admin/Studio
-# control plane (with a warning) so the first agent can be created from Studio.
-agents:
-  # A conversational agent with memory. Needs the model above to be reachable.
-  assistant:
-    loop: ./examples/loops/chat.lua
-    model: default
-    instructions: ./examples/prompts/assistant.md
-    memory: assistant
-    safety: strict
-    history_budget: 6000
-    capabilities: [llm.chat, memory, tools]
-    skills: [builtin:fetch]
-    budget:
-      tokens_per_day: 100000
-
-  # No model needed: replies with what it received.
-  echo:
-    loop: ./examples/loops/echo.lua
-    capabilities: [tools]
+# `agents:` may be omitted (as here, so no external loop/prompt files are
+# required to boot). The runtime then starts as a headless admin/Studio control
+# plane where agents can be created live, or run `agentflow init mybot` for a
+# minimal file-based echo loop. Full scenarios live in agentflow-studio/examples/.
+# agents:
+#   # A conversational agent with memory. Needs the model above to be reachable.
+#   assistant:
+#     loop: ./loops/chat.lua
+#     model: default
+#     instructions: ./prompts/assistant.md
+#     memory: assistant
+#     safety: strict
+#     history_budget: 6000
+#     capabilities: [llm.chat, memory, tools]
+#     skills: [builtin:fetch]
+#     budget:
+#       tokens_per_day: 100000
+#
+#   # No model needed: replies with what it received.
+#   echo:
+#     loop: ./loops/echo.lua
+#     capabilities: [tools]
 
 # ---------------------------------------------------------------------------
 # Gateway
@@ -257,12 +257,12 @@ gateway:
   listen: 127.0.0.1:8080
   # Required for telegram mode: webhook (the provider must reach this URL).
   # public_url: https://agentflow.example.com
-  channels:
-    - type: webhook
-      name: local
-      path: /webhook/local/       # must end in "/"
-      agent: echo
-      timeout: 55s
+  channels: []
+    # - type: webhook
+    #   name: local
+    #   path: /webhook/local/       # must end in "/"
+    #   agent: echo
+    #   timeout: 55s
     # - type: telegram
     #   name: tg
     #   agent: assistant
@@ -273,6 +273,9 @@ gateway:
     # QQ Bot (Tencent's official QQ Open Platform API). websocket mode connects
     # out to the QQ gateway, so nothing needs to be public; webhook mode takes
     # callbacks at path (set <public https url><path> in the q.qq.com console).
+    # Requires a public media URL publisher: configure media.backend: s3 or
+    # media.temp_url.enabled: true (with gateway.public_url), otherwise the
+    # QQ channel is skipped at boot.
     # - type: qq
     #   name: qq
     #   agent: assistant
@@ -300,8 +303,9 @@ gateway:
     #
     # OpenAI-compatible channel: any Chat Completions client works with only a
     # base URL and a key. `model` names one of the exposed agents, and each
-    # runs its own loop: give an agent `loop: plugin:openai_passthrough` to
-    # forward the client's messages, tools and sampling parameters to its model
+    # runs its own loop: point an agent at `openai_passthrough.lua` (see
+    # `examples/loops/openai_passthrough.lua` in agentflow-studio) to forward
+    # the client's messages, tools and sampling parameters to its model
     # unchanged. Use auth: user_token for per-user identity, or auth: none only
     # on a loopback listener.
     # - type: openai
@@ -332,19 +336,30 @@ gateway:
 # Optional surfaces (commented: each needs its own backend or key)
 # ---------------------------------------------------------------------------
 # runtime:
-#   identity: { enabled: true }              # profiles + per-user scopes
+#   identity: { enabled: true }              # profiles + per-user scopes (require_registration, unregistered)
 #   users: { enabled: true, cors_origins: ["http://127.0.0.1:3000"] }
-#   credentials: { enabled: true }           # needs CREDENTIALS_MASTER_KEY
+#   credentials: { enabled: true }           # needs CREDENTIALS_MASTER_KEY; follows runtime.persistence
 #   log_plane: { persistence: ./data/log }   # JSONL journal + usage, per UTC day
-#   cluster:
-#     persistence: postgres://user:pass@host/db   # fleet lease + session inbox
+#   cluster: { session_ttl: 30s, poll_interval: 250ms }
 
+# media:
+#   backend: fs                              # fs (default) | s3; files shares this store unless files.* sets its own
+#   dir: ./data/media
+#   retention: 168h                          # per-scope media grant lifetime (default 7d; 0 = forever)
+#   derived_ttl: 24h                         # cached transcoded variant lifetime (default 24h)
+#   gc_grace: 24h                            # blob GC grace window (default 24h; 0 = GC disabled)
+#   temp_url:                                # optional HMAC-SHA256 temporary URLs on gateway.public_url (for QQ on fs)
+#     enabled: false
+#     path: /media/t/
+#     ttl: 10m
+#     secret: ${MEDIA_TEMP_URL_SECRET}       # optional in single-node; set in multi-instance fleets
+#
 # usage:
 #   events: true                             # per-call detail (default off)
 #   retention_days: 30
 
 # prompts:
-#   assistant: { file: ./examples/prompts/assistant.md }   # shared prompt registry
+#   assistant: { file: ./prompts/assistant.md }   # shared prompt registry
 
 # Declarative HTTP tools need no Go code. Each becomes http:<name>; add that
 # name to an agent's `skills` list to expose it to the model.

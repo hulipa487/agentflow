@@ -95,6 +95,7 @@ type Driver struct {
 	secretToken string         // webhook/auto: Telegram webhook secret (verified per delivery); empty = unauthenticated
 	apiBase     string         // override for the Telegram API host (tests); empty = api.telegram.org
 	store       media.Store    // nil = media policy disabled
+	media       *media.Service // optional centralized media service for outbound materialization
 	pol         media.Policy
 	sink        router.Sink
 	log         *slog.Logger
@@ -748,31 +749,58 @@ func (d *Driver) sendText(replyTo, text string) error {
 // There is no file-field name to carry around any more: an SDK params struct
 // *is* one method and names its own file field, so sendMethodFor picks the
 // method and the switch below picks the struct that matches it.
+// SetMedia attaches the centralized media service for outbound materialization
+// (enabling unified files/media handles, photo size fitting, and URL fetching).
+func (d *Driver) SetMedia(svc *media.Service) { d.media = svc }
+
 func (d *Driver) uploadMedia(replyTo string, att media.Part, caption string) error {
 	method := sendMethodFor(att.Type)
 	var payload []byte
-	switch {
-	case att.Handle != "" && d.store != nil:
-		b, err := d.store.ReadAll(att.Handle, 50<<20)
+	mime := att.MIME
+	name := att.Name
+	if d.media != nil {
+		spec := media.TargetSpec{MaxBytes: 50 << 20, AllowURLFetch: true}
+		if att.Type == partImage {
+			spec.AcceptMIME = []string{"image/jpeg", "image/png", "image/webp"}
+			spec.PreferMIME = "image/jpeg"
+			spec.MaxBytes = 10 << 20
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+		blob, err := d.media.MaterializeBytes(ctx, media.ScopeMaintenance, att, spec)
+		cancel()
 		if err != nil {
 			return fmt.Errorf("%s: %w", method, err)
 		}
-		payload = b
-	case att.Data != "":
-		b, err := base64.StdEncoding.DecodeString(att.Data)
-		if err != nil {
-			return fmt.Errorf("%s: bad base64: %w", method, err)
+		payload = blob.Bytes
+		if blob.MIME != "" {
+			mime = blob.MIME
 		}
-		payload = b
-	default:
-		return fmt.Errorf("%s: attachment has no resolvable source (need handle or data)", method)
+		if blob.Name != "" {
+			name = blob.Name
+		}
+	} else {
+		switch {
+		case att.Handle != "" && d.store != nil:
+			b, err := d.store.ReadAll(att.Handle, 50<<20)
+			if err != nil {
+				return fmt.Errorf("%s: %w", method, err)
+			}
+			payload = b
+		case att.Data != "":
+			b, err := base64.StdEncoding.DecodeString(att.Data)
+			if err != nil {
+				return fmt.Errorf("%s: bad base64: %w", method, err)
+			}
+			payload = b
+		default:
+			return fmt.Errorf("%s: attachment has no resolvable source (need handle or data)", method)
+		}
 	}
 
-	name := att.Name
 	if name == "" {
 		name = "file"
-		if att.MIME != "" {
-			name += mimeExtension(att.MIME)
+		if mime != "" {
+			name += mimeExtension(mime)
 		}
 	}
 	return d.call(method, uploadTimeout, func(ctx context.Context) error {

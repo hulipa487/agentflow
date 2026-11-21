@@ -353,6 +353,7 @@ func (s *Service) run(ctx context.Context, req Request, onOutput func(stream str
 		ID:        newID(),
 		Command:   req.Command,
 		Env:       vars,
+		Image:     env.Image,
 		Rootfs:    env.Rootfs,
 		Workspace: ws.Dir,
 		Mount:     req.Mount,

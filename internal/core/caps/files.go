@@ -8,19 +8,19 @@ import (
 	"errors"
 
 	"agentflow/internal/core/files"
+	"agentflow/internal/core/media"
 	"agentflow/internal/core/session"
 )
 
-// FileHandlers exposes the user-scoped file store as session op handlers,
-// gated by the "files" capability at assembly time (see Gate). Scope is
-// engine-resolved per call: the turn's resolved scope prefix ("user:<uuid>")
-// when it has a user scope — the personal uuid, or the group membership uuid in
-// group context — otherwise "agent:<agent>". A loop can never name another
-// scope. Bytes never cross the bridge: put takes content (or base64 data), read
-// returns the handle + metadata. A nil manager (file store disabled at boot,
-// e.g. unresolvable S3 credentials) makes every op fail honestly instead of
-// panicking.
+// FileHandlers exposes the user-scoped file store as session op handlers.
 func FileHandlers(m *files.Manager, agent string) map[string]session.OpHandler {
+	return FileHandlersWithMedia(m, agent, nil)
+}
+
+// FileHandlersWithMedia exposes the user-scoped file store and automatically
+// grants read/written handles in mediaSvc under the acting scope so loops can
+// pass a files.read handle straight to llm.chat or session.send.
+func FileHandlersWithMedia(m *files.Manager, agent string, mediaSvc *media.Service) map[string]session.OpHandler {
 	disabled := m == nil
 	scope := func(ctx context.Context) string {
 		if p := session.ScopePrefixFromCtx(ctx); p != "" {
@@ -86,6 +86,9 @@ func FileHandlers(m *files.Manager, agent string) map[string]session.OpHandler {
 				return fail(err)
 			}
 			if op.Handle != "" {
+				if err := mediaSvc.Authorize(ctx, scope(ctx), op.Handle); err != nil {
+					return fail(err)
+				}
 				e, err := m.PutHandle(ctx, scope(ctx), op.Project, op.Path, op.Handle, op.Mime)
 				if err != nil {
 					return fail(err)
@@ -100,6 +103,7 @@ func FileHandlers(m *files.Manager, agent string) map[string]session.OpHandler {
 			if err != nil {
 				return fail(err)
 			}
+			_ = mediaSvc.Grant(ctx, scope(ctx), e.Handle, "files")
 			return okJSON(map[string]any{"ok": true, "entry": e})
 		},
 
@@ -109,10 +113,12 @@ func FileHandlers(m *files.Manager, agent string) map[string]session.OpHandler {
 			if err := guard(); err != nil {
 				return fail(err)
 			}
-			e, err := m.Get(ctx, scope(ctx), op.Project, op.Path)
+			sc := scope(ctx)
+			e, err := m.Get(ctx, sc, op.Project, op.Path)
 			if err != nil {
 				return fail(err)
 			}
+			_ = mediaSvc.Grant(ctx, sc, e.Handle, "files")
 			return okJSON(map[string]any{"ok": true, "entry": e})
 		},
 

@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -17,9 +19,11 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"agentflow/internal/config"
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/router"
 	"agentflow/internal/drivers/httpd"
+	"agentflow/internal/drivers/s3media"
 )
 
 const testSecret = "naOC0ocQE3shWLAfffVLB1rhYPG7"
@@ -398,6 +402,147 @@ func TestDeliverMediaByURL(t *testing.T) {
 	}
 	if err := d.Deliver("guild:C1", "", []media.Part{{Type: "video", URL: "https://x/v.mp4"}}); err == nil {
 		t.Fatal("a video to a guild channel was accepted")
+	}
+}
+
+func TestDeliverMediaByPresignedS3(t *testing.T) {
+	// Minimal in-memory S3 endpoint to verify end-to-end Put + PresignGet + QQ upload.
+	var mu sync.Mutex
+	objects := map[string][]byte{}
+	s3Srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		key := strings.TrimPrefix(r.URL.Path, "/")
+		switch r.Method {
+		case http.MethodPut:
+			b, _ := io.ReadAll(r.Body)
+			objects[key] = b
+			w.WriteHeader(http.StatusOK)
+		case http.MethodHead:
+			if _, ok := objects[key]; ok {
+				w.WriteHeader(http.StatusOK)
+			} else {
+				w.WriteHeader(http.StatusNotFound)
+			}
+		case http.MethodGet:
+			if b, ok := objects[key]; ok {
+				_, _ = w.Write(b)
+			} else {
+				w.WriteHeader(http.StatusNotFound)
+			}
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer s3Srv.Close()
+
+	s3Store, err := s3media.New(config.MediaS3{
+		Bucket:    "qq-bucket",
+		Region:    "us-east-1",
+		Endpoint:  s3Srv.URL,
+		Prefix:    "media",
+		AccessKey: "AKID",
+		SecretKey: "sekret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-populate one blob for handle-based delivery.
+	ref, err := s3Store.Put(strings.NewReader("stored-png"), "image/png", media.Policy{Allow: []string{"image/*"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	api := newFakeAPI(t)
+	sink := &captureSink{}
+	srv := httpd.New("127.0.0.1:0", testLog())
+	d := New("qq", "main", Options{
+		AppID:      "1024",
+		Secret:     testSecret,
+		APIBase:    api.srv.URL,
+		PresignTTL: 5 * time.Minute,
+	}, sink, srv, s3Store, media.Policy{}, testLog())
+
+	// 1. Handle in C2C: presigned URL sent to /v2/users/U1/files, then msg_type 7.
+	if err := d.Deliver("c2c:U1", "", []media.Part{{Type: "image", MIME: "image/png", Handle: ref.Handle}}); err != nil {
+		t.Fatalf("c2c handle deliver: %v", err)
+	}
+	posts := api.sent()
+	if len(posts) != 2 || posts[0].path != "/v2/users/U1/files" || posts[0].body["file_type"] != float64(1) {
+		t.Fatalf("c2c handle upload = %+v", posts)
+	}
+	link, _ := posts[0].body["url"].(string)
+	u, err := url.Parse(link)
+	if err != nil || u.Query().Get("X-Amz-Signature") == "" || u.Query().Get("X-Amz-Expires") != "300" {
+		t.Fatalf("expected SigV4 presigned URL, got %q", link)
+	}
+	resp, err := http.Get(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotBytes, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(gotBytes) != "stored-png" {
+		t.Fatalf("presigned GET body = %q, want stored-png", gotBytes)
+	}
+
+	// 2. Inline base64 Data in Group (with Type inferred from MIME): staged to S3 and presigned.
+	raw := []byte("inline-img-bytes")
+	if err := d.Deliver("group:G1", "", []media.Part{{MIME: "image/jpeg", Data: base64.StdEncoding.EncodeToString(raw)}}); err != nil {
+		t.Fatalf("group inline data deliver: %v", err)
+	}
+	posts = api.sent()
+	if len(posts) != 4 || posts[2].path != "/v2/groups/G1/files" || posts[2].body["file_type"] != float64(1) {
+		t.Fatalf("group inline upload = %+v", posts[2:])
+	}
+	inlineURL, _ := posts[2].body["url"].(string)
+	resp, err = http.Get(inlineURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotBytes, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(gotBytes) != string(raw) {
+		t.Fatalf("staged inline GET body = %q, want %q", gotBytes, raw)
+	}
+
+	// 3. Generic file attachment includes response-content-disposition and file_type 4.
+	pdfRef, err := s3Store.Put(strings.NewReader("%PDF-1.4"), "application/pdf", media.Policy{Allow: []string{"*"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Deliver("c2c:U1", "", []media.Part{{Type: "file", MIME: "application/pdf", Handle: pdfRef.Handle, Name: "report.pdf"}}); err != nil {
+		t.Fatalf("c2c file deliver: %v", err)
+	}
+	posts = api.sent()
+	fileUpload := posts[4]
+	if fileUpload.body["file_type"] != float64(4) {
+		t.Fatalf("file_type = %v, want 4", fileUpload.body["file_type"])
+	}
+	fu, _ := url.Parse(fileUpload.body["url"].(string))
+	if !strings.Contains(fu.Query().Get("response-content-disposition"), "report.pdf") {
+		t.Fatalf("missing filename in disposition: %s", fu.RawQuery)
+	}
+
+	// 4. Guild image uses presigned URL in the "image" field.
+	if err := d.Deliver("guild:C1", "", []media.Part{{Type: "image", MIME: "image/png", Handle: ref.Handle}}); err != nil {
+		t.Fatalf("guild handle deliver: %v", err)
+	}
+	posts = api.sent()
+	guildMsg := posts[6]
+	if guildMsg.path != "/channels/C1/messages" || !strings.Contains(guildMsg.body["image"].(string), "X-Amz-Signature=") {
+		t.Fatalf("guild image message = %+v", guildMsg)
+	}
+
+	// 5. Local FS store cannot presign and reports a clear actionable error.
+	fsStore, err := media.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fsDriver := New("qq-fs", "main", Options{AppID: "1024", Secret: testSecret, APIBase: api.srv.URL}, sink, srv, fsStore, media.Policy{}, testLog())
+	if err := fsDriver.Deliver("c2c:U1", "", []media.Part{{Type: "image", Handle: ref.Handle, Name: "a.png"}}); err == nil || !strings.Contains(err.Error(), "media.backend: s3") {
+		t.Fatalf("FS store should fail with media.backend: s3 hint, got: %v", err)
 	}
 }
 

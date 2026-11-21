@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"agentflow/internal/config"
+	"agentflow/internal/core/media"
 
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
@@ -155,6 +156,7 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 		// serve as the fallback for proxies that skip the item events.
 		var reasoningItems []map[string]any
 		var itemTexts []string
+		var outMedia []media.Part
 		var summary strings.Builder
 		// Function-call accumulation keyed by output_index: arguments arrive as
 		// fragments to concatenate; id/name come from the first delta that has
@@ -236,6 +238,10 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 							itemTexts = append(itemTexts, reasoningItemText(item)...)
 						}
 					}
+				case "image_generation_call":
+					if p, ok := responsesImagePart(ev.Item.RawJSON()); ok {
+						outMedia = append(outMedia, p)
+					}
 				}
 			case "response.completed":
 				applyResponsesUsage(&usage, ev)
@@ -281,9 +287,36 @@ func openaiResponsesOpen(ctx context.Context, client *http.Client, cfg config.Mo
 			}
 			events <- event{toolCalls: calls, thinking: thinking, thinkingBlocks: reasoningItems}
 		}
-		events <- event{usage: usage, thinking: thinking, thinkingBlocks: reasoningItems, finish: finish}
+		events <- event{usage: usage, media: outMedia, thinking: thinking, thinkingBlocks: reasoningItems, finish: finish}
 	}()
 	return events, false, nil
+}
+
+// responsesImagePart extracts base64 output from a Responses API
+// image_generation_call output item.
+func responsesImagePart(raw string) (media.Part, bool) {
+	if raw == "" {
+		return media.Part{}, false
+	}
+	var item struct {
+		Type         string `json:"type"`
+		Result       string `json:"result"`
+		OutputFormat string `json:"output_format"`
+	}
+	if err := json.Unmarshal([]byte(raw), &item); err != nil || item.Result == "" {
+		return media.Part{}, false
+	}
+	if item.Type != "" && item.Type != "image_generation_call" {
+		return media.Part{}, false
+	}
+	mime := "image/png"
+	switch strings.ToLower(strings.TrimSpace(item.OutputFormat)) {
+	case "jpeg", "jpg":
+		mime = "image/jpeg"
+	case "webp":
+		mime = "image/webp"
+	}
+	return media.Part{Type: "image", MIME: mime, Data: item.Result}, true
 }
 
 // applyResponsesUsage copies token counts off a response.completed event. The

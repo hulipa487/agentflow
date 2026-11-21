@@ -12,6 +12,9 @@ type Catalog struct {
 	DefaultCaps    []string   `json:"default_capabilities"`
 	SafetyProfiles []string   `json:"safety_profiles"`
 	MemoryProfiles []string   `json:"memory_profiles"`
+	ShellProfiles  []string   `json:"shell_profiles,omitempty"`
+	Environments   []string   `json:"environments,omitempty"`
+	Packages       []string   `json:"packages,omitempty"`
 	PromptKeys     []string   `json:"prompt_keys"`
 	PreludeVersion int        `json:"prelude_version"`
 	Templates      []Template `json:"templates"`
@@ -31,8 +34,9 @@ var NewLuaOps = []string{
 // builder offers these as checkboxes; a deployment's plugins.allow_capabilities
 // ceiling still decides which are accepted.
 var CapabilityNames = []string{
-	"llm.chat", "memory", "tools", "agent.send", "net.http", "net.mail",
-	"shell.exec", "files", "session.state", "users", "channel.push",
+	"llm.chat", "memory", "tools", "agent.send", "agent.request", "agent.spawn",
+	"net.http", "net.mail", "shell.exec", "files", "session.state", "users",
+	"channel.push",
 }
 
 // NewCatalog assembles the menu. Empty slices are normalized to [] so the app

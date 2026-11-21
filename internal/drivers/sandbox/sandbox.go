@@ -1,12 +1,12 @@
-// Package sandbox runs one command in one gVisor sandbox and throws the
-// sandbox away.
+// Package sandbox runs one command in an isolated sandbox (gVisor runsc or
+// superradcompany/microsandbox msb) and throws the sandbox away.
 //
 // A job is stateless by construction: the sandbox is created for a single
-// command, gets a read-only toolchain root and one read-write workspace
-// directory, runs under a wall-clock limit, and is destroyed. Whatever must
-// outlive the command is in the workspace directory, which the caller owns.
-// Nothing here knows about users, projects or the files store: internal/core
-// decides what a job may see, this package only runs it.
+// command, gets a read-only toolchain root (or OCI image) and one read-write
+// workspace directory, runs under a wall-clock limit, and is destroyed.
+// Whatever must outlive the command is in the workspace directory, which the
+// caller owns. Nothing here knows about users, projects or the files store:
+// internal/core decides what a job may see, this package only runs it.
 package sandbox
 
 import (
@@ -53,6 +53,9 @@ type Spec struct {
 	// Env is the complete environment of the command. PATH and HOME are
 	// filled in when absent.
 	Env map[string]string
+	// Image is a pinned OCI image reference when the provider pulls/runs OCI
+	// images directly (microsandbox).
+	Image string
 	// Rootfs is the read-only root filesystem (a host directory).
 	Rootfs string
 	// Workspace is the host directory mounted read-write at Mount.
@@ -99,6 +102,12 @@ type Runner interface {
 	Run(ctx context.Context, spec Spec) (*Result, error)
 	// Available reports why jobs cannot run here, or nil.
 	Available() error
+}
+
+// Inspector reports provider metadata for startup warnings and `agentflow doctor`.
+type Inspector interface {
+	Version() string
+	Limiting() (enforced bool, note string)
 }
 
 const (

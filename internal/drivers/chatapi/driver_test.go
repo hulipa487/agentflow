@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"agentflow/internal/builtins"
+	_ "agentflow/internal/builtins"
 	"agentflow/internal/config"
 	"agentflow/internal/core/caps"
 	"agentflow/internal/core/chatreq"
@@ -32,6 +32,7 @@ import (
 	"agentflow/internal/core/supervisor"
 	"agentflow/internal/drivers/httpd"
 	"agentflow/internal/drivers/llm"
+	"agentflow/internal/luacode"
 )
 
 // --- fixtures ---------------------------------------------------------------
@@ -424,7 +425,7 @@ func newStack(t *testing.T, opt stackOpts) *stack {
 		"default": {Provider: "openai", Model: "stub", BaseURL: upSrv.URL},
 	}, log)
 	reqs := chatreq.NewRegistry()
-	loopSrc, _, err := builtins.Resolve("plugin:openai_passthrough")
+	loopSrc, _, err := luacode.Resolve(filepath.Join("..", "..", "..", "examples", "loops", "openai_passthrough.lua"))
 	if err != nil {
 		t.Fatalf("resolve passthrough: %v", err)
 	}
@@ -447,7 +448,7 @@ func newStack(t *testing.T, opt stackOpts) *stack {
 	sup.Start(ctx)
 	t.Cleanup(cancel)
 
-	routeSrc, _, err := builtins.Resolve("plugin:per_chat")
+	routeSrc, _, err := luacode.Resolve("plugin:per_chat")
 	if err != nil {
 		t.Fatalf("resolve route: %v", err)
 	}

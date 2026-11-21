@@ -11,61 +11,6 @@ import (
 	"agentflow/internal/config"
 )
 
-// TestWarnInertConfig: the fields in the "want" list are parsed — so an
-// existing config keeps booting — and read by nothing. The warning is the only
-// thing that tells a deployment its setting did nothing. Live settings set in
-// the same config must stay silent.
-func TestWarnInertConfig(t *testing.T) {
-	str := func(s string) *string { return &s }
-	workers, visible, cost := 4, true, 3
-
-	var buf bytes.Buffer
-	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
-
-	cfg := &config.Config{}
-	cfg.Runtime.VM.InstructionBudget = str("10m")
-	cfg.Runtime.Scheduler.Workers = &workers
-	cfg.Runtime.Reload.Watch = &visible
-	cfg.Profiles.Memory = map[string]config.MemoryProfile{
-		"p": {Stores: map[string]config.Store{
-			"s": {Backend: "b", Table: "t", Collection: str("c"), Policy: str("q")},
-		}},
-	}
-	cfg.Tools.Policy.Write = str("w")
-	cfg.Tools.Policy.Overrides = map[string]config.ToolSpecOverride{
-		"builtin:x": {CostLevel: &cost, UserVisible: &visible},
-	}
-
-	warnInertConfig(cfg, log)
-
-	out := buf.String()
-	for _, want := range []string{
-		"vm.instruction_budget", "reload.watch",
-		"memory store collection", "memory store policy",
-		"tools.policy.write", "cost_level", "user_visible",
-	} {
-		if !strings.Contains(out, want) {
-			t.Errorf("nothing warned about %q; got:\n%s", want, out)
-		}
-	}
-	// These were on the inert list and are live now — the memory cap reaches
-	// every new session, the worker count drives the op pool — so they must
-	// warn NOTHING.
-	for _, live := range []string{"memory_limit", "scheduler.workers"} {
-		if strings.Contains(out, live) {
-			t.Errorf("%s is live now but still warned as inert:\n%s", live, out)
-		}
-	}
-
-	// A config that sets none of them says nothing: the warnings must not fire
-	// on the defaults, or every boot would carry a wall of noise.
-	buf.Reset()
-	warnInertConfig(&config.Config{}, log)
-	if got := buf.String(); got != "" {
-		t.Fatalf("an empty config produced warnings:\n%s", got)
-	}
-}
-
 // TestResolveAdminTokenRegional: a regional cell shares one admin credential.
 // With no ADMIN_TOKEN it may use named operators, and must not mint a per-boot
 // token that no peer knows; with neither it refuses rather than minting.
@@ -82,23 +27,6 @@ func TestResolveAdminTokenRegional(t *testing.T) {
 	}
 	if _, _, err := resolveAdminToken("", false, true, log); err == nil {
 		t.Fatal("regional with no token and no operators must be refused")
-	}
-}
-
-func TestWarnDeprecatedConfig(t *testing.T) {
-	var buf bytes.Buffer
-	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
-
-	cfg := &config.Config{}
-	warnDeprecatedConfig(cfg, log)
-	if got := buf.String(); got != "" {
-		t.Fatalf("an empty config warned about deprecations:\n%s", got)
-	}
-
-	cfg.Runtime.Cluster.Persistence = "sqlite://./other.db"
-	warnDeprecatedConfig(cfg, log)
-	if !strings.Contains(buf.String(), "runtime.cluster.persistence is deprecated") {
-		t.Fatalf("deprecated setting not reported:\n%s", buf.String())
 	}
 }
 

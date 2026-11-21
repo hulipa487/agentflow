@@ -17,7 +17,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"agentflow/internal/builtins"
 	"agentflow/internal/config"
 	"agentflow/internal/core/address"
 	"agentflow/internal/core/gateway"
@@ -26,6 +25,7 @@ import (
 	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/pool"
 	"agentflow/internal/core/safety"
+	"agentflow/internal/luacode"
 	"agentflow/internal/vm"
 )
 
@@ -809,6 +809,11 @@ type Actor struct {
 	// Metadata (op type, model, duration, tokens, errors) is always emitted.
 	TracePayloads bool
 
+	// Media is the centralized media service. When set, inbound attachments
+	// receive per-scope grants before Lua sees them, and outbound attachments
+	// are normalized and scope-authorized at the Lua→Go border.
+	Media *media.Service
+
 	gw     Gateway
 	agents AgentService
 	sched  SchedulerService
@@ -1065,10 +1070,10 @@ func (a *Actor) Run(ctx context.Context) {
 // on the same terms as one read from a path.
 func (a *Actor) loadSource() (name, src string, err error) {
 	if a.LoopFile != "" {
-		// LoopFile may be a directory (a multi-module loop); builtins.Resolve
+		// LoopFile may be a directory (a multi-module loop); luacode.Resolve
 		// handles both file and directory, concatenating a directory's *.lua
 		// members in sorted order. For a plain file it reads the file.
-		src, _, err := builtins.Resolve(a.LoopFile)
+		src, _, err := luacode.Resolve(a.LoopFile)
 		return a.LoopFile, src, err
 	}
 	return "in-memory loop of " + a.Name, a.LoopSrc, nil
@@ -1100,7 +1105,7 @@ func (a *Actor) runOnce(ctx context.Context) (crashed bool) {
 	// one. A refusal with nothing to fall back on is the one case that cannot
 	// keep anything — the loop would then run without the support chunks it
 	// expects — so that session does not start.
-	if srcs, err := builtins.SupportChunks(); err != nil {
+	if srcs, err := luacode.SupportChunks(); err != nil {
 		if len(a.SupportSrcs) == 0 && a.SupportSrc == "" {
 			a.log.Error("support chunk refused and no earlier version is loaded to keep; not starting without it", "err", err)
 			return true
@@ -1296,6 +1301,18 @@ func (a *Actor) dispatchInline(ctx context.Context, op Op, current *Message) (re
 				a.trace(TraceEvent{Kind: "safety", Op: "ingress", Turn: m.ID, OK: true, Err: res.Reason, Safety: res.Meta})
 			}
 			break
+		}
+		if a.Media != nil && len(m.Attachments) > 0 {
+			turnCtx := a.opContext(ctx, &m)
+			scope := a.mediaScope(turnCtx)
+			for _, att := range m.Attachments {
+				if att.Handle != "" {
+					_ = a.Media.Grant(turnCtx, scope, att.Handle, "channel")
+				}
+			}
+			if norm, err := a.Media.NormalizeBorder(turnCtx, scope, m.Attachments); err == nil {
+				m.Attachments = norm
+			}
 		}
 		*current = m
 		ev := TraceEvent{Kind: "turn.start", Turn: m.ID, Messages: 1}
@@ -1643,6 +1660,13 @@ func (a *Actor) writeEgressJournal(rec EgressRecord) {
 // Attachments are not safety-screened (the filters are text-only by design);
 // the text (caption) always is. Media allow-lists gate them at ingestion.
 // Every outcome is journaled when a Journal is set.
+func (a *Actor) mediaScope(ctx context.Context) string {
+	if p := ScopePrefixFromCtx(ctx); p != "" {
+		return p
+	}
+	return "agent:" + a.Identity.Agent
+}
+
 func (a *Actor) egress(ctx context.Context, channel, replyTo, text string, attachments []media.Part, inReplyTo string) (string, bool) {
 	journal := func(status, errStr string) {
 		a.writeEgressJournal(EgressRecord{
@@ -1657,6 +1681,17 @@ func (a *Actor) egress(ctx context.Context, channel, replyTo, text string, attac
 			Status:      status,
 			Err:         errStr,
 		})
+	}
+	if a.Media != nil && len(attachments) > 0 {
+		norm, err := a.Media.NormalizeBorder(ctx, a.mediaScope(ctx), attachments)
+		if err != nil {
+			a.log.Warn("egress media refused", "err", err)
+			journal("failed", err.Error())
+			a.trace(TraceEvent{Kind: "reply", Turn: inReplyTo, Err: err.Error()})
+			r, _ := jsonString(err.Error())
+			return r, false
+		}
+		attachments = norm
 	}
 	text, allowed := a.checkEgress(ctx, channel, replyTo, text, inReplyTo, journal)
 	if !allowed {

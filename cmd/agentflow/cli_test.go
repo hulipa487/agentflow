@@ -18,8 +18,8 @@ func TestHoistConfigFlags(t *testing.T) {
 	}
 
 	// The engine path is untouched.
-	got = hoistConfigFlags([]string{"-config", "deploy/agentflow.yaml", "-no-tui"})
-	if strings.Join(got, " ") != "-config deploy/agentflow.yaml -no-tui" {
+	got = hoistConfigFlags([]string{"-config", "deploy/agentflow.yaml", "-log-level", "debug"})
+	if strings.Join(got, " ") != "-config deploy/agentflow.yaml -log-level debug" {
 		t.Fatalf("engine args changed: %v", got)
 	}
 
@@ -51,7 +51,7 @@ func TestHelp(t *testing.T) {
 	if code := cmdHelp([]string{"run"}, &out, &errOut); code != 0 {
 		t.Fatalf("run help exit = %d", code)
 	}
-	for _, want := range []string{"usage: agentflow run [flags]", "-config", "-no-console", "-force-single"} {
+	for _, want := range []string{"usage: agentflow run [flags]", "-config", "-log-level", "-force-single"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("run help missing %q:\n%s", want, out.String())
 		}
@@ -150,7 +150,7 @@ func TestInitOutputValidates(t *testing.T) {
 	}
 }
 
-// The checked-in example is the schema's front door: keep it compiling and
+// The checked-in example is the schema's front door: keep it loading and
 // validating as the config changes.
 func TestExampleConfigValidates(t *testing.T) {
 	path := filepath.Join("..", "..", "agentflow.example.yaml")
@@ -161,7 +161,28 @@ func TestExampleConfigValidates(t *testing.T) {
 	if err := validateLoops(cfg); err != nil {
 		t.Fatalf("example config loops do not compile: %v", err)
 	}
-	if len(cfg.Agents) == 0 {
-		t.Fatal("example config has no agents")
+}
+
+func TestLoopCheckAndLoopTestCLI(t *testing.T) {
+	dir := t.TempDir()
+	loopPath := filepath.Join(dir, "echo.lua")
+	loopSrc := "-- af-prelude-version: 1\nfunction loop()\n  local msg = session.inbox()\n  session.send(\"echo: \" .. (msg.text or \"\"))\nend\n"
+	if err := os.WriteFile(loopPath, []byte(loopSrc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	if code := cmdLoopCheck([]string{loopPath}, &out, &errOut); code != 0 {
+		t.Fatalf("loop check exit = %d: %s%s", code, out.String(), errOut.String())
+	}
+
+	scenPath := filepath.Join(dir, "echo.yaml")
+	scen := "loop: " + filepath.ToSlash(loopPath) + "\nturns:\n  - in: \"hi\"\n    expect_sends:\n      - \"echo: hi\"\n"
+	if err := os.WriteFile(scenPath, []byte(scen), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	errOut.Reset()
+	if code := cmdLoopTest([]string{scenPath}, &out, &errOut); code != 0 {
+		t.Fatalf("loop test exit = %d: %s%s", code, out.String(), errOut.String())
 	}
 }

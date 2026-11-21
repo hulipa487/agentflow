@@ -214,13 +214,17 @@ func (s *Safety) listLocked() (SafetyList, error) {
 	}
 
 	agentUse := map[string][]string{}
-	for name, a := range s.boot().Agents {
+	curCfg := s.boot()
+	if loaded, lerr := s.diskConfig(); lerr == nil && loaded != nil {
+		curCfg = loaded
+	}
+	for name, a := range curCfg.Agents {
 		if a.Safety != "" && a.Safety != "default" && a.Safety != "none" {
 			agentUse[a.Safety] = append(agentUse[a.Safety], name)
 		}
 	}
 	spawnUse := map[string][]string{}
-	for name, p := range s.boot().Profiles.Agent {
+	for name, p := range curCfg.Profiles.Agent {
 		if p.Safety != "" && p.Safety != "default" && p.Safety != "none" {
 			spawnUse[p.Safety] = append(spawnUse[p.Safety], name)
 		}

@@ -122,7 +122,7 @@ type MemoryList struct {
 
 // The fixed vocabularies the editor offers.
 var (
-	memoryWritePlugins  = []string{"plugin:routing_table", "plugin:fact_extractor"}
+	memoryWritePlugins  = []string{"plugin:routing_table"}
 	memoryRecallPlugins = []string{"plugin:recency", "plugin:semantic"}
 	memoryRequires      = []string{"kv", "text_search", "vector"}
 	memoryScopes        = []string{"", "user", "agent"}
@@ -514,7 +514,7 @@ func (m *Memory) mergeProfile(sec memorySections, d MemoryProfileDraft, creating
 	case name == "conversational":
 		errs = append(errs, `"conversational" is the built-in profile; choose another name`)
 	}
-	old, exists := sec.profiles[name]
+	_, exists := sec.profiles[name]
 	if exists && creating {
 		errs = append(errs, fmt.Sprintf("memory profile %q already exists", name))
 	}
@@ -582,10 +582,6 @@ func (m *Memory) mergeProfile(sec memorySections, d MemoryProfileDraft, creating
 			Scope:      scope,
 			Pool:       strings.TrimSpace(st.Pool),
 			LocalityOK: st.LocalityOK,
-		}
-		// Keys the editor does not show are kept as they were.
-		if prev, ok := old.Stores[sname]; ok {
-			next.Collection, next.Policy = prev.Collection, prev.Policy
 		}
 		stores[sname] = next
 	}

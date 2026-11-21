@@ -107,24 +107,86 @@ func (i *InstructionsRef) UnmarshalYAML(node *yaml.Node) error {
 	}
 }
 
-// MediaConfig selects the blob-store backend for inbound channel media.
-// Handles ("media:<sha256>") are backend-agnostic, so loops and the journal
-// never see where bytes live. Default: fs rooted beside the runtime db.
+// MediaConfig selects the centralized blob-store backend for media (and, by
+// default, for files when files.* sets no separate store). Handles
+// ("media:<sha256>") are backend-agnostic, so loops and the journal never see
+// where bytes live. Default: fs rooted beside the runtime db.
 type MediaConfig struct {
-	Backend string  `yaml:"backend"` // fs (default) | s3
-	Dir     string  `yaml:"dir"`     // fs root; default <runtime-persistence-dir>/media
-	S3      MediaS3 `yaml:"s3"`
+	Backend    string       `yaml:"backend"` // fs (default) | s3
+	Dir        string       `yaml:"dir"`     // fs root; default <runtime-persistence-dir>/media
+	S3         MediaS3      `yaml:"s3"`
+	TempURL    MediaTempURL `yaml:"temp_url"`    // optional HMAC-signed HTTP endpoint for serving fs blobs to URL-only channels (e.g. QQ)
+	Retention  string       `yaml:"retention"`   // media grant lifetime; default 168h (7d); "0" = forever
+	DerivedTTL string       `yaml:"derived_ttl"` // cached transcoded variant lifetime; default 24h
+	GCGrace    string       `yaml:"gc_grace"`    // blob GC grace window; default 24h; "0" disables GC
+}
+
+// MediaTempURL configures the optional HMAC-signed temporary HTTP endpoint
+// that lets URL-only channels (such as QQ) fetch media stored on local disk
+// without S3. Requires gateway.public_url to be set.
+type MediaTempURL struct {
+	Enabled bool   `yaml:"enabled"` // opt-in; disabled by default
+	Path    string `yaml:"path"`    // HTTP route prefix; default /media/t/
+	Secret  string `yaml:"secret"`  // HMAC signing key (secret registry); empty in single-node mints an ephemeral per-boot key
+	TTL     string `yaml:"ttl"`     // signed URL lifetime; default 10m
+}
+
+// MediaTempURLPath returns the mounted route prefix for temporary media URLs.
+func (m MediaTempURL) MediaTempURLPath() string {
+	if m.Path != "" {
+		return m.Path
+	}
+	return "/media/t/"
+}
+
+// MediaTempURLTTL returns the signed URL lifetime (default 10m).
+func (m MediaTempURL) MediaTempURLTTL() time.Duration {
+	if m.TTL == "" {
+		return 10 * time.Minute
+	}
+	d, _ := time.ParseDuration(m.TTL)
+	return d
+}
+
+// MediaRetention returns the default media grant retention (default 168h / 7d;
+// "0" disables expiry).
+func (m MediaConfig) MediaRetention() time.Duration {
+	if m.Retention == "" {
+		return 7 * 24 * time.Hour
+	}
+	d, _ := time.ParseDuration(m.Retention)
+	return d
+}
+
+// MediaDerivedTTL returns the TTL for cached transcoded variants (default 24h).
+func (m MediaConfig) MediaDerivedTTL() time.Duration {
+	if m.DerivedTTL == "" {
+		return 24 * time.Hour
+	}
+	d, _ := time.ParseDuration(m.DerivedTTL)
+	return d
+}
+
+// MediaGCGrace returns the blob GC grace window for media (default 24h; "0"
+// disables GC).
+func (m MediaConfig) MediaGCGrace() time.Duration {
+	if m.GCGrace == "" {
+		return 24 * time.Hour
+	}
+	d, _ := time.ParseDuration(m.GCGrace)
+	return d
 }
 
 // MediaS3 configures the S3 blob-store backend. Keys are env-interpolated
 // (${VAR}) like model keys so secrets never sit in the file as literals.
 type MediaS3 struct {
-	Bucket    string `yaml:"bucket"`
-	Region    string `yaml:"region"`
-	Endpoint  string `yaml:"endpoint"`   // optional custom S3-compatible host (MinIO, R2, ...); empty = AWS
-	Prefix    string `yaml:"prefix"`     // optional object key prefix
-	AccessKey string `yaml:"access_key"` // env-interpolated
-	SecretKey string `yaml:"secret_key"` // env-interpolated
+	Bucket         string `yaml:"bucket"`
+	Region         string `yaml:"region"`
+	Endpoint       string `yaml:"endpoint"`        // optional custom S3-compatible host (MinIO, R2, ...); empty = AWS
+	PublicEndpoint string `yaml:"public_endpoint"` // optional public base URL for presigned GETs when endpoint is internal
+	Prefix         string `yaml:"prefix"`          // optional object key prefix
+	AccessKey      string `yaml:"access_key"`      // env-interpolated
+	SecretKey      string `yaml:"secret_key"`      // env-interpolated
 }
 
 // FilesConfig selects the backend for the user-scoped file store. File bytes
@@ -138,6 +200,12 @@ type FilesConfig struct {
 	MaxFileBytes int64   `yaml:"max_file_bytes"` // per-file ceiling; 0 = 32 MiB
 	ScratchTTL   string  `yaml:"scratch_ttl"`    // e.g. 24h; 0 = no expiry; default 24h
 	GCGrace      string  `yaml:"gc_grace"`       // blob GC grace window; 0/empty = disabled; default 24h
+}
+
+// HasExplicitStore reports whether files configures its own separate blob store
+// rather than sharing the unified media blob store.
+func (f FilesConfig) HasExplicitStore() bool {
+	return f.Backend != "" || f.Dir != "" || f.S3.Bucket != "" || f.S3.Endpoint != ""
 }
 
 // FilesMaxBytes returns the per-file ceiling, applying the default.
@@ -217,26 +285,14 @@ func (u UsageConfig) UsageRetention() int {
 
 // Runtime contains instance-wide tuning and persistence.
 type Runtime struct {
-	// Pointers distinguish "unset" from an explicit zero. vm.memory_limit and
-	// scheduler.workers are live: the first caps each Luau state, the second is
-	// the op-pool size (default 8); there is no flag for it.
-	//
-	// vm.instruction_budget and reload.watch do nothing. They are parsed so a
-	// configuration that sets them keeps booting, and main warns when one is
-	// present. They are kept rather than deleted because decodeStrict uses
-	// KnownFields(true), so removing a field turns an existing config into a
-	// parse error — a boot failure for a setting that does nothing. Removing
-	// them for real is a release note, not a silent change.
+	// Pointers distinguish "unset" from an explicit zero. vm.memory_limit caps
+	// each Luau state and scheduler.workers is the op-pool size (default 8).
 	VM struct {
-		MemoryLimit       *string `yaml:"memory_limit"`
-		InstructionBudget *string `yaml:"instruction_budget"`
+		MemoryLimit *string `yaml:"memory_limit"`
 	} `yaml:"vm"`
 	Scheduler struct {
 		Workers *int `yaml:"workers"`
 	} `yaml:"scheduler"`
-	Reload struct {
-		Watch *bool `yaml:"watch"`
-	} `yaml:"reload"`
 	// Sandbox is how shell jobs run: the gVisor runtime, the queue and the
 	// limits. See SandboxConfig.
 	Sandbox SandboxConfig `yaml:"sandbox"`
@@ -345,7 +401,7 @@ func (r Runtime) IdleUnload() time.Duration {
 // environment variable at boot (never from the config file).
 type CredentialsConfig struct {
 	Enabled      bool   `yaml:"enabled"`
-	Path         string `yaml:"path"`           // sqlite path or postgres DSN; "" = follow runtime.persistence
+	Persistence  string `yaml:"persistence"`    // sqlite path or postgres DSN; "" = follow runtime.persistence
 	MasterKeyEnv string `yaml:"master_key_env"` // env var holding the master key; default "CREDENTIALS_MASTER_KEY"
 	// EngineWide controls credential.get(), the raw-secret op. Empty/"allow"
 	// preserves the historical behavior (an agent's credentials allow-list is
@@ -395,27 +451,9 @@ func (c *Config) LogPlaneDir() string {
 	return t.Address
 }
 
-// ClusterConfig is the store every instance of a deployment shares for the
-// state that has to be deployment-singular rather than region-local: the lease
-// table and the session inbox.
-//
-// The two share one target because they have to be one store. A lease in one
-// place and the inbox in another routes a session to an owner that never sees
-// its messages, and a lease table per region means an instance in one region
-// cannot see that a session is already running in another — it takes the
-// session and starts a second copy of the conversation. That is what a
-// multi-region deployment sets this to the one store every region can reach
-// for; a single-instance deployment and a single-region fleet leave it empty
-// and get exactly the behaviour they had before.
+// ClusterConfig tunes session-hub timing in multi-instance deployments.
+// Leases and the session inbox always live in runtime.persistence.
 type ClusterConfig struct {
-	Persistence string `yaml:"persistence"` // sqlite path or postgres DSN; "" = follow runtime.persistence
-	// SessionTTL is how long a session claim survives without renewal, and
-	// PollInterval is how often an instance looks for messages waiting for the
-	// sessions it owns. Defaults: 30s and 250ms. They are a pair: the poll is
-	// the added latency a message pays when it arrives on the wrong instance,
-	// and the TTL is how long a killed instance's sessions stay unavailable.
-	// A deployment whose lease store is in another region raises both — the TTL
-	// to several times the poll, and never below a round trip to the store.
 	SessionTTL   string `yaml:"session_ttl"`   // Go duration; default 30s
 	PollInterval string `yaml:"poll_interval"` // Go duration; default 250ms
 }
@@ -437,10 +475,6 @@ func (c ClusterConfig) ClusterPollInterval() time.Duration {
 // API and the console. Its HTTP routes are served on gateway.listen, the
 // engine's one HTTP port, under /admin/ plus /healthz, /readyz and /metrics.
 type AdminConfig struct {
-	// Listen is retired: the admin plane has no port of its own any more. It
-	// stays in the struct only so a config that still sets it is refused with
-	// a message that says where the admin API went, instead of a decode error.
-	Listen string `yaml:"listen"`
 	// Socket adds a local-only admin listener: a unix domain socket path on
 	// Unix, or a named pipe such as \.\pipegentflow-admin on Windows.
 	// It is intended for Studio/admin clients on the same machine; the bearer
@@ -506,18 +540,35 @@ func (s StudioConfig) Timeout() time.Duration {
 	return d
 }
 
-// IdentityConfig configures the optional user-identity layer. When disabled
-// (the default), channel drivers submit to the router directly and message
-// From stays channel-native — zero behavior change. When enabled, every
-// inbound is minted a stable user UUID (persisted here) and From is rewritten
-// to "user:<uuid>", making loops channel-agnostic and proactive push uniform.
+// IdentityConfig configures the optional user-identity layer and the policy
+// applied to senders whose channel handle has not been linked to a profile.
 type IdentityConfig struct {
 	Enabled     bool   `yaml:"enabled"`
 	Persistence string `yaml:"persistence"` // sqlite path or postgres DSN; "" = follow runtime.persistence
+	// RequireRegistration (default true) keeps an unknown channel handle in the
+	// shared service stratum — no personal scope, no quota identity — until it
+	// is linked to a profile. Set false to restore auto-claiming a profile on
+	// first contact.
+	RequireRegistration *bool `yaml:"require_registration"`
+	// Unregistered selects what happens to a channel handle that is not linked
+	// to a profile: "allow" (default) keeps it in the shared service stratum,
+	// "reject" drops the inbound and asks the person to link/register.
+	Unregistered string `yaml:"unregistered"`
 }
 
-// UsersConfig configures the user-facing profile API (profile registration and
-// channel linking) and the policy applied to senders who have not registered.
+// RegistrationRequired reports whether an unknown handle must be linked to a
+// profile before it gets any per-user state. Defaults to true.
+func (i IdentityConfig) RegistrationRequired() bool {
+	return i.RequireRegistration == nil || *i.RequireRegistration
+}
+
+// RejectUnregistered reports whether unlinked handles are refused.
+func (i IdentityConfig) RejectUnregistered() bool {
+	return strings.EqualFold(strings.TrimSpace(i.Unregistered), "reject")
+}
+
+// UsersConfig configures the public /v1/users profile API (profile registration
+// and channel linking). Requires runtime.identity.enabled.
 type UsersConfig struct {
 	// Enabled exposes the /v1/users API on the shared httpd listener. Off by
 	// default: the surface is public, so opening it is a deliberate act.
@@ -525,11 +576,6 @@ type UsersConfig struct {
 	// Registration selects who may create a profile: "open" (default) or
 	// "invite", where an operator issues single-use codes first.
 	Registration string `yaml:"registration"`
-	// RequireRegistration (default true) keeps an unknown channel handle in the
-	// shared service stratum — no personal scope, no quota identity — until it
-	// is linked to a profile. Set false to restore auto-claiming a profile on
-	// first contact, which is the pre-registration behavior.
-	RequireRegistration *bool `yaml:"require_registration"`
 	// LinkTTL is how long a channel-link challenge stays valid (default 10m).
 	LinkTTL string `yaml:"link_ttl"`
 	// CORSOrigins is the allow-list of browser origins permitted to call the
@@ -546,22 +592,11 @@ type UsersConfig struct {
 	// identity provider. Login — passwords, OAuth, MFA, session lifetimes and
 	// revocation — lives there; the engine only verifies what it is handed.
 	OIDC *OIDCConfig `yaml:"oidc"`
-	// Unregistered selects what happens to a channel handle that is not linked
-	// to a profile: "allow" (default) keeps it in the shared service stratum,
-	// "reject" drops the inbound and asks the person to link/register. Reject
-	// closes the anonymous quota/egress/session-cap bypass, at the cost of
-	// refusing first contact until the account exists.
-	Unregistered string `yaml:"unregistered"`
 	// PushSameTenant makes session.push_user refuse a target other than the
 	// current turn's tenant. The default (false) preserves deployments whose
 	// agents notify users across tenants as an operator service; a multi-tenant
 	// chat product should set it true.
 	PushSameTenant bool `yaml:"push_same_tenant"`
-}
-
-// RejectUnregistered reports whether unlinked handles are refused.
-func (u UsersConfig) RejectUnregistered() bool {
-	return strings.EqualFold(strings.TrimSpace(u.Unregistered), "reject")
 }
 
 // OIDCConfig describes the identity provider whose tokens this deployment
@@ -579,12 +614,6 @@ type OIDCConfig struct {
 	SubjectClaim string `yaml:"subject_claim"`
 	EmailClaim   string `yaml:"email_claim"`
 	NameClaim    string `yaml:"name_claim"`
-}
-
-// RegistrationRequired reports whether an unknown handle must be linked to a
-// profile before it gets any per-user state. Defaults to true.
-func (u UsersConfig) RegistrationRequired() bool {
-	return u.RequireRegistration == nil || *u.RequireRegistration
 }
 
 // RegistrationMode returns the normalized registration mode ("open" default).
@@ -807,30 +836,14 @@ type MemoryProfile struct {
 }
 
 type Store struct {
-	Backend string `yaml:"backend"`
-	Table   string `yaml:"table"`
-	// Collection and Policy are parsed and read by nothing: a store is bound by
-	// backend and table, and the policy knobs they suggest were never
-	// implemented. They are pointers so main can warn when one is actually set
-	// — the same treatment the runtime: keys get, and for the same reason:
-	// deleting a field turns an existing config into a strict-decode boot error.
-	Collection *string  `yaml:"collection"`
-	Retention  string   `yaml:"retention"`
-	Window     int      `yaml:"window"`
-	Requires   []string `yaml:"requires"`
-	Policy     *string  `yaml:"policy"`
-	// Shared is parsed so a config that still carries it fails validation with
-	// the migration instead of being silently reinterpreted: `shared: true`
-	// published a tenant's rows to every tenant with nothing enforcing
-	// anything — reasonable for a single-tenant engine, a footgun in
-	// multi-tenant SaaS. Its replacement is a named pool: `pool: <name>`
-	// (below), where the pool is the isolation boundary. Both may not be set.
-	Shared *bool `yaml:"shared"`
+	Backend   string   `yaml:"backend"`
+	Table     string   `yaml:"table"`
+	Retention string   `yaml:"retention"`
+	Window    int      `yaml:"window"`
+	Requires  []string `yaml:"requires"`
 	// Scope selects the isolation granularity of a private store: "user"
-	// (default) scopes rows per user at the key level — channel-originated
-	// turns read and write only their own scope, service contexts, and
-	// pre-upgrade rows; "agent" keeps one pool for the whole agent across
-	// users (pre-isolation behavior). A bound Pool supersedes it.
+	// (default) scopes rows per user at the key level; "agent" keeps one pool
+	// for the whole agent across users. A bound Pool supersedes it.
 	Scope string `yaml:"scope"`
 	// Pool binds the store to a named shared pool (created through the
 	// tenancy admin API before the engine boots agents against it): rows live
@@ -850,9 +863,6 @@ type Store struct {
 // machine (provider ssh).
 type ShellProfile struct {
 	Provider string `yaml:"provider"` // sandbox (default) | ssh
-	// Image is kept so that an old profile fails with a message naming its
-	// replacement instead of a YAML error; a sandbox profile sets Environment.
-	Image string `yaml:"image"`
 	// Environment names an entry of environments (sandbox).
 	Environment string `yaml:"environment"`
 	// Project is the files-store project jobs run in when a call names none
@@ -877,16 +887,17 @@ type ShellProfile struct {
 // references rather than raw memory/shell credentials, and its grants are
 // always intersected with the spawning actor's effective grants.
 type SpawnProfile struct {
-	Model        string          `yaml:"model"`
-	Loop         string          `yaml:"loop"`
-	Instructions InstructionsRef `yaml:"instructions"`
-	Memory       string          `yaml:"memory"`
-	Shell        string          `yaml:"shell"`
-	Safety       string          `yaml:"safety"`
-	Skills       []string        `yaml:"skills"`
-	Capabilities []string        `yaml:"capabilities"`
-	CanContact   []string        `yaml:"can_contact"`
-	Credentials  []string        `yaml:"credentials"` // credential.get allow-list for spawned children
+	Model         string          `yaml:"model"`
+	Loop          string          `yaml:"loop"`
+	Instructions  InstructionsRef `yaml:"instructions"`
+	HistoryBudget int             `yaml:"history_budget"`
+	Memory        string          `yaml:"memory"`
+	Shell         string          `yaml:"shell"`
+	Safety        string          `yaml:"safety"`
+	Skills        []string        `yaml:"skills"`
+	Capabilities  []string        `yaml:"capabilities"`
+	CanContact    []string        `yaml:"can_contact"`
+	Credentials   []string        `yaml:"credentials"` // credential.get allow-list for spawned children
 	// InheritUser mirrors agents.<name>.inherit_user for a spawned child: false
 	// runs the child in the service stratum whatever tenant delegated to it.
 	// Absent means inherit.
@@ -1002,10 +1013,7 @@ type HTTPAuth struct {
 }
 
 type ToolsPolicy struct {
-	Default string `yaml:"default"`
-	// Write is parsed and read by nothing. A pointer so main can warn when it
-	// is set, without turning an existing config into a boot error.
-	Write     *string                     `yaml:"write"`
+	Default   string                      `yaml:"default"`
 	Forbidden []string                    `yaml:"forbidden"`
 	Overrides map[string]ToolSpecOverride `yaml:"overrides"`
 }
@@ -1022,9 +1030,6 @@ type ToolSpecOverride struct {
 
 	NeedsConfirm *bool   `yaml:"needs_confirm"`
 	Permission   *string `yaml:"permission"`
-	CostLevel    *int    `yaml:"cost_level"`
-	UserVisible  *bool   `yaml:"user_visible"`
-	Autonomous   *bool   `yaml:"autonomous"`
 }
 
 // ToolParamOverride overrides the presentation of one parameter. Only the
@@ -1244,12 +1249,8 @@ type Agent struct {
 	Skills        []string          `yaml:"skills"`
 	Capabilities  []string          `yaml:"capabilities"`
 	CanContact    []string          `yaml:"can_contact"`
-	Taps          []string          `yaml:"taps"`
 	Persistent    bool              `yaml:"persistent"`
-	Singleton     bool              `yaml:"singleton"`
-	Lifecycle     map[string]any    `yaml:"lifecycle"`
-	Budget        map[string]any    `yaml:"budget"`
-	Channels      []string          `yaml:"channels"`
+	Budget        BudgetConfig      `yaml:"budget"`
 	// Credentials is the allow-list of engine-wide credential names this
 	// agent may fetch with credential.get(). Empty or missing = no access.
 	Credentials []string `yaml:"credentials"`
@@ -1412,6 +1413,13 @@ func validateMemoryScoping(path string, c *Config) error {
 			return err
 		}
 	}
+	for aname, a := range c.Agents {
+		if a.Memory.IsInline {
+			if err := check(fmt.Sprintf("agent %q inline memory", aname), a.Memory.Inline.Stores); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -1515,9 +1523,10 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	var c Config
-	if err := decodeStrict(b, &c, path); err != nil {
+	if err := decodeStrictRaw(b, &c, path); err != nil {
 		return nil, err
 	}
+	expandDeferredSecrets(&c)
 	if err := validate(path, &c); err != nil {
 		return nil, err
 	}
@@ -1633,6 +1642,13 @@ func validateMemoryRetention(path string, c *Config) error {
 			return err
 		}
 	}
+	for aname, a := range c.Agents {
+		if a.Memory.IsInline {
+			if err := check(fmt.Sprintf("agent %q inline memory", aname), a.Memory.Inline.Stores); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -1728,14 +1744,9 @@ func backendMaxEntries(cfg map[string]any) int {
 // and in grant rows, whose separator is "|".
 var poolNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
-// validateStoreScoping checks one store's isolation config: the `shared:`
-// flag is refused with its migration (it was the multi-tenant footgun — one
-// flag published a tenant's rows to every tenant), a pool binding takes no
-// scope of its own, and pool names must be key-safe.
+// validateStoreScoping checks one store's isolation config: a pool binding
+// takes no scope of its own, and pool names must be key-safe.
 func validateStoreScoping(path, owner, sname string, s Store) error {
-	if s.Shared != nil && *s.Shared {
-		return fmt.Errorf("%s: %s store %q sets shared: true, which is no longer supported — it published rows to every tenant with nothing enforcing anything. Bind the store to a named pool instead (pool: <name>, created via the tenancy admin API); the pool is the isolation boundary", path, owner, sname)
-	}
 	if s.Pool != "" {
 		if s.Scope != "" {
 			return fmt.Errorf("%s: %s store %q sets both pool and scope — a pool-bound store does not take a scope; the pool is the isolation boundary", path, owner, sname)
@@ -2106,8 +2117,13 @@ func validate(path string, c *Config) error {
 			return fmt.Errorf("%s: runtime.sessions.idle_unload must be >= 0 (0 disables unloading)", path)
 		}
 	}
-	if strings.TrimSpace(c.Runtime.Admin.Listen) != "" {
-		return fmt.Errorf("%s: runtime.admin.listen was removed: the admin API is served on gateway.listen (under /admin/), so delete the key; to keep it off the network, set runtime.admin.tcp: false and use runtime.admin.socket", path)
+	if c.Runtime.VM.MemoryLimit != nil {
+		raw := strings.TrimSpace(*c.Runtime.VM.MemoryLimit)
+		if raw != "" {
+			if _, err := ParseByteSize(raw); err != nil {
+				return fmt.Errorf("%s: runtime.vm.memory_limit: %w", path, err)
+			}
+		}
 	}
 	if !c.Runtime.Admin.TCPEnabled() && strings.TrimSpace(c.Runtime.Admin.Socket) == "" {
 		return fmt.Errorf("%s: runtime.admin.tcp is false but no runtime.admin.socket is configured", path)
@@ -2151,9 +2167,8 @@ func validate(path string, c *Config) error {
 		allowed []string
 	}{
 		{"runtime.persistence", c.Runtime.Persistence, []string{storedb.BackendSQLite, storedb.BackendPostgres}},
-		{"runtime.cluster.persistence", c.Runtime.Cluster.Persistence, []string{storedb.BackendSQLite, storedb.BackendPostgres}},
 		{"runtime.identity.persistence", c.Runtime.Identity.Persistence, []string{storedb.BackendSQLite, storedb.BackendPostgres}},
-		{"runtime.credentials.path", c.Runtime.Credentials.Path, []string{storedb.BackendSQLite, storedb.BackendPostgres}},
+		{"runtime.credentials.persistence", c.Runtime.Credentials.Persistence, []string{storedb.BackendSQLite, storedb.BackendPostgres}},
 		{"runtime.log_plane.persistence", c.Runtime.LogPlane.Persistence, []string{storedb.BackendFile}},
 	} {
 		if strings.TrimSpace(t.target) == "" {
@@ -2441,6 +2456,40 @@ func validate(path string, c *Config) error {
 	default:
 		return fmt.Errorf("%s: unsupported media backend %q (want fs or s3)", path, c.Media.Backend)
 	}
+	if c.Media.Retention != "" {
+		d, err := time.ParseDuration(c.Media.Retention)
+		if err != nil || d < 0 {
+			return fmt.Errorf("%s: media.retention must be a non-negative duration (got %q)", path, c.Media.Retention)
+		}
+	}
+	if c.Media.DerivedTTL != "" {
+		d, err := time.ParseDuration(c.Media.DerivedTTL)
+		if err != nil || d < 0 {
+			return fmt.Errorf("%s: media.derived_ttl must be a non-negative duration (got %q)", path, c.Media.DerivedTTL)
+		}
+	}
+	if c.Media.GCGrace != "" {
+		d, err := time.ParseDuration(c.Media.GCGrace)
+		if err != nil || d < 0 {
+			return fmt.Errorf("%s: media.gc_grace must be a non-negative duration (got %q)", path, c.Media.GCGrace)
+		}
+	}
+	if c.Media.TempURL.Enabled {
+		pub := strings.TrimSpace(c.Gateway.PublicURL)
+		if !strings.HasPrefix(pub, "http://") && !strings.HasPrefix(pub, "https://") {
+			return fmt.Errorf("%s: media.temp_url.enabled requires gateway.public_url to be an http(s) URL", path)
+		}
+		p := c.Media.TempURL.MediaTempURLPath()
+		if !strings.HasPrefix(p, "/") || !strings.HasSuffix(p, "/") {
+			return fmt.Errorf("%s: media.temp_url.path must start and end with / (got %q)", path, p)
+		}
+		if c.Media.TempURL.TTL != "" {
+			d, err := time.ParseDuration(c.Media.TempURL.TTL)
+			if err != nil || d <= 0 {
+				return fmt.Errorf("%s: media.temp_url.ttl must be a positive duration (got %q)", path, c.Media.TempURL.TTL)
+			}
+		}
+	}
 
 	// File store: same backend shape as media. S3 requires bucket and region;
 	// credentials may be lazy references and an unresolvable one skips the
@@ -2491,10 +2540,10 @@ func validate(path string, c *Config) error {
 	default:
 		return fmt.Errorf("%s: runtime.users.registration must be open or invite (got %q)", path, c.Runtime.Users.Registration)
 	}
-	switch strings.ToLower(strings.TrimSpace(c.Runtime.Users.Unregistered)) {
+	switch strings.ToLower(strings.TrimSpace(c.Runtime.Identity.Unregistered)) {
 	case "", "allow", "reject":
 	default:
-		return fmt.Errorf("%s: runtime.users.unregistered must be allow or reject (got %q)", path, c.Runtime.Users.Unregistered)
+		return fmt.Errorf("%s: runtime.identity.unregistered must be allow or reject (got %q)", path, c.Runtime.Identity.Unregistered)
 	}
 	if c.Runtime.Users.LinkTTL != "" {
 		if _, err := time.ParseDuration(c.Runtime.Users.LinkTTL); err != nil {
@@ -2541,7 +2590,7 @@ func validate(path string, c *Config) error {
 			target string
 		}{
 			{"runtime.identity.persistence", c.Runtime.Identity.Persistence},
-			{"runtime.credentials.path", c.Runtime.Credentials.Path},
+			{"runtime.credentials.persistence", c.Runtime.Credentials.Persistence},
 		} {
 			if strings.TrimSpace(t.target) == "" {
 				continue
@@ -2551,12 +2600,6 @@ func validate(path string, c *Config) error {
 				return fmt.Errorf("%s: regional topology: %s is a SQLite target; each instance would keep its own copy. Unset it to follow runtime.persistence, or point it at the shared PostgreSQL server", path, t.key)
 			}
 		}
-		// The cluster store used to exist so regions could share one
-		// lease/inbox store. Leases and the inbox now always live in the runtime
-		// store, so a regional cell may only spell the same target twice.
-		if p := strings.TrimSpace(c.Runtime.Cluster.Persistence); p != "" && !SameStoreTarget(p, c.Runtime.Persistence) {
-			return fmt.Errorf("%s: regional topology: runtime.cluster.persistence %q must resolve to runtime.persistence (leases and the session inbox always live in the runtime store); remove the setting, or make it name the same target", path, p)
-		}
 		for name, b := range c.Memory.Backends {
 			if b.Provider == "sqlite" {
 				return fmt.Errorf("%s: regional topology: memory backend %q uses provider sqlite; every instance would keep its own memory. Use postgres, pgvector, qdrant or redisvector", path, name)
@@ -2565,8 +2608,8 @@ func validate(path string, c *Config) error {
 		if c.Media.Backend != "s3" {
 			return fmt.Errorf("%s: regional topology: media.backend is %q; every instance would keep its own blobs. Set media.backend: s3", path, backendOrDefault(c.Media.Backend, "fs"))
 		}
-		if c.Files.Backend != "s3" {
-			return fmt.Errorf("%s: regional topology: files.backend is %q; every instance would keep its own files. Set files.backend: s3", path, backendOrDefault(c.Files.Backend, "fs"))
+		if c.Files.HasExplicitStore() && c.Files.Backend != "s3" {
+			return fmt.Errorf("%s: regional topology: files.backend is %q; every instance would keep its own files. Set files.backend: s3 or omit files.backend/dir to share media's S3 store", path, backendOrDefault(c.Files.Backend, "fs"))
 		}
 		if strings.TrimSpace(c.Runtime.LogPlane.Persistence) != "" {
 			return fmt.Errorf("%s: regional topology: runtime.log_plane.persistence is set; a local log-plane directory would be per-instance. Unset it to keep the log in the runtime store", path)
@@ -2598,22 +2641,13 @@ func (c *Config) allowedCapabilitySet() map[string]bool {
 		for _, cap := range DefaultCapabilities {
 			allowedCaps[cap] = true
 		}
-		allowedCaps["scheduler"] = true
 		allowedCaps["shell.exec"] = true
-		allowedCaps["gateway"] = true
-		allowedCaps["vector"] = true
-		allowedCaps["store.raw"] = true
 		allowedCaps["agent.spawn"] = true
 		allowedCaps["agent.request"] = true
 		allowedCaps["channel.push"] = true
 		allowedCaps["net.mail"] = true
 		allowedCaps["files"] = true
 		allowedCaps["users"] = true
-		// session.state is a persistence surface (a durable per-session
-		// scratchpad in the shared store), so it is not handed out by default —
-		// but it has to be declarable. It was missing from this set, so an
-		// agent that followed caps/sessionstate.go's own instruction and listed
-		// it in capabilities failed the boot instead.
 		allowedCaps["session.state"] = true
 	}
 	return allowedCaps
@@ -2662,25 +2696,24 @@ func (c *Config) ValidateAgent(name string, a Agent, path string) error {
 		if !allowedCaps["memory"] {
 			return fmt.Errorf("%s: agent %q uses memory but lacks memory capability", path, name)
 		}
-		if a.Memory.Profile == "conversational" {
-			return nil
-		}
-		// Resolve the store set: a named profiles.memory reference or an
-		// inline profile. Either way, every store's backend must exist.
-		stores := a.Memory.Inline.Stores
-		if !a.Memory.IsInline {
-			mp, ok := c.Profiles.Memory[a.Memory.Profile]
-			if !ok {
-				return fmt.Errorf("%s: agent %q references unknown memory profile %q", path, name, a.Memory.Profile)
+		if a.Memory.Profile != "conversational" {
+			// Resolve the store set: a named profiles.memory reference or an
+			// inline profile. Either way, every store's backend must exist.
+			stores := a.Memory.Inline.Stores
+			if !a.Memory.IsInline {
+				mp, ok := c.Profiles.Memory[a.Memory.Profile]
+				if !ok {
+					return fmt.Errorf("%s: agent %q references unknown memory profile %q", path, name, a.Memory.Profile)
+				}
+				stores = mp.Stores
 			}
-			stores = mp.Stores
-		}
-		for sname, store := range stores {
-			if _, ok := c.Memory.Backends[store.Backend]; !ok {
-				return fmt.Errorf("%s: agent %q store %q references unknown backend %q", path, name, sname, store.Backend)
-			}
-			if err := validateStoreScoping(path, name, sname, store); err != nil {
-				return err
+			for sname, store := range stores {
+				if _, ok := c.Memory.Backends[store.Backend]; !ok {
+					return fmt.Errorf("%s: agent %q store %q references unknown backend %q", path, name, sname, store.Backend)
+				}
+				if err := validateStoreScoping(path, name, sname, store); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -2828,15 +2861,9 @@ func storeAddress(target string) string {
 	return t.Address
 }
 
-// ClusterStore returns where the state that has to be one store across every
-// instance — and every region — lives: the lease table and the session inbox.
-// It follows runtime.persistence unless runtime.cluster.persistence names its
-// own target, which is what a multi-region deployment sets to the one store all
-// regions can reach.
+// ClusterStore returns where deployment-shared lease and session-inbox state
+// lives (always runtime.persistence).
 func (c *Config) ClusterStore() string {
-	if p := c.Runtime.Cluster.Persistence; p != "" {
-		return storeAddress(p)
-	}
 	return c.PersistencePath()
 }
 
@@ -2874,8 +2901,8 @@ func (c *Config) IdentityStore() string {
 // follows the runtime store — one file per store on one machine, one server for
 // a fleet.
 func (c *Config) CredentialsStore() string {
-	if c.Runtime.Credentials.Path != "" {
-		return storeAddress(c.Runtime.Credentials.Path)
+	if c.Runtime.Credentials.Persistence != "" {
+		return storeAddress(c.Runtime.Credentials.Persistence)
 	}
 	return c.storeBesideRuntime("credentials.db")
 }

@@ -10,13 +10,14 @@ import (
 	"testing"
 	"time"
 
-	"agentflow/internal/builtins"
+	_ "agentflow/internal/builtins"
 	"agentflow/internal/core/gateway"
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/pool"
 	"agentflow/internal/core/runtime"
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/supervisor"
+	"agentflow/internal/luacode"
 	"agentflow/internal/vm"
 )
 
@@ -109,7 +110,7 @@ end`,
 			defer cancel()
 			sup.Start(ctx)
 
-			routeSrc, _, err := builtins.Resolve("plugin:per_chat")
+			routeSrc, _, err := luacode.Resolve("plugin:per_chat")
 			if err != nil {
 				b.Fatalf("resolve route: %v", err)
 			}

@@ -1,5 +1,0 @@
-channels:
-  - name: local
-    type: webhook
-    agent: echo
-    path: /webhook/local/

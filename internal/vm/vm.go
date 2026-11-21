@@ -1,32 +1,20 @@
-// Package vm wraps the Luau VM behind a minimal Go API.
+// Package vm wraps the pure-Go gopher-lua VM behind a minimal Go API.
 //
-// It is the ONLY cgo package in agentflow (see DESIGN.md). One State owns one
-// Luau state and one loop thread; a State must be used from a single
-// goroutine at a time (session actors guarantee this).
+// One State owns one Lua main state and one sandboxed loop thread; a State
+// must be used from a single goroutine at a time (session actors guarantee
+// this).
 package vm
-
-/*
-#cgo CFLAGS: -I${SRCDIR}
-#cgo CFLAGS: -I${SRCDIR}/../../third_party/luau/VM/include
-#cgo CFLAGS: -I${SRCDIR}/../../third_party/luau/Common/include
-#cgo CFLAGS: -I${SRCDIR}/../../third_party/luau/Ast/include
-#cgo CFLAGS: -I${SRCDIR}/../../third_party/luau/Compiler/include
-#cgo CXXFLAGS: -std=c++17 -I${SRCDIR}
-#cgo CXXFLAGS: -I${SRCDIR}/../../third_party/luau/VM/include
-#cgo CXXFLAGS: -I${SRCDIR}/../../third_party/luau/Common/include
-#cgo CXXFLAGS: -I${SRCDIR}/../../third_party/luau/Ast/include
-#cgo CXXFLAGS: -I${SRCDIR}/../../third_party/luau/Compiler/include
-#cgo LDFLAGS: -L${SRCDIR}/lib -lluau
-#include <stdlib.h>
-#include "shim.h"
-*/
-import "C"
 
 import (
 	"crypto/sha256"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
-	"unsafe"
+	"time"
+
+	lua "github.com/yuin/gopher-lua"
+	"github.com/yuin/gopher-lua/parse"
 )
 
 // Status of a Start/Resume drive step.
@@ -34,216 +22,390 @@ type Status int
 
 const (
 	Finished Status = iota // loop returned (session over)
-	// Yielded is never named in Go — the actor/router handle the yielded op
-	// directly — but its VALUE is load-bearing: the C shim returns
-	// AF_YIELDED=1 / AF_ERROR=2, so removing this member renumbers Failed
-	// onto the yielded status and every op request reads as a Lua error.
-	Yielded // loop made an op request (see message)
-	Failed  // Lua error (see message)
+	Yielded                // loop made an op request (see message)
+	Failed                 // Lua error (see message)
 )
 
-// State is a Luau state + loop thread. Not safe for concurrent use.
+var (
+	closedChan           = make(chan struct{})
+	errInstructionBudget = errors.New("instruction budget exceeded")
+)
+
+func init() {
+	close(closedChan)
+}
+
+// budgetContext implements context.Context to enforce a deterministic
+// per-resume bytecode instruction limit inside gopher-lua's
+// mainLoopWithContext without spawning any goroutines or timers.
+type budgetContext struct {
+	max       int64
+	remaining int64
+	tripped   bool
+}
+
+func (b *budgetContext) arm() {
+	b.remaining = b.max
+	b.tripped = false
+}
+
+func (b *budgetContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (b *budgetContext) Value(any) any               { return nil }
+
+func (b *budgetContext) Done() <-chan struct{} {
+	if b.max <= 0 {
+		return nil
+	}
+	if b.tripped {
+		return closedChan
+	}
+	b.remaining--
+	if b.remaining <= 0 {
+		b.tripped = true
+		return closedChan
+	}
+	return nil
+}
+
+func (b *budgetContext) Err() error {
+	if b.tripped {
+		return errInstructionBudget
+	}
+	return nil
+}
+
+// State is a sandboxed Lua state + loop coroutine. Not safe for concurrent use.
 type State struct {
-	v *C.afvm
+	L           *lua.LState
+	T           *lua.LState
+	env         *lua.LTable
+	budget      *budgetContext
+	instrBudget int64
+	memCap      int64
+	fn          string
+	phase       int // 0 = running plugin chunk, 1 = running loop fn
+	sealed      map[*lua.LTable]bool
+	isSealed    bool
 }
 
-// New creates a sandboxed state. instrBudget limits interrupt hits per resume
-// (0 = unlimited).
+// New creates a sandboxed state. instrBudget limits bytecode instructions per
+// resume (0 = unlimited).
 func New(instrBudget int64) *State {
-	return &State{v: C.afvm_new(C.long(instrBudget))}
+	L := lua.NewState(lua.Options{
+		SkipOpenLibs:        true,
+		IncludeGoStackTrace: false,
+		MinimizeStackMemory: true,
+		RegistrySize:        1024,
+		RegistryMaxSize:     65535,
+	})
+	s := &State{
+		L:           L,
+		instrBudget: instrBudget,
+		sealed:      map[*lua.LTable]bool{},
+	}
+	if instrBudget > 0 {
+		s.budget = &budgetContext{max: instrBudget, remaining: instrBudget}
+	}
+	s.openLibs()
+	return s
 }
 
-// SetMemoryCap caps the state's total allocation, in bytes (0 = uncapped, the
-// default). Exceeding it fails allocations, which Luau raises as an
-// out-of-memory script error — the same death as exceeding the instruction
-// budget, so an oversized state dies under the same crash-restart rule. It is
-// the engine's bound (E18's per-tenant VM budget is this cap times the
-// per-tenant session cap), not a Lua-visible setting, so it is set from the
-// host after New.
+// SetMemoryCap configures a soft memory limit in bytes for this state
+// (0 = uncapped, the default). Under pure-Go gopher-lua, Go's garbage
+// collector manages the heap, so this cap enforces guards on large string and
+// table allocations (such as string.rep and table.concat) rather than a hard
+// per-byte C allocator cap. Exceeding a guard raises an "out of memory" Lua
+// error.
 func (s *State) SetMemoryCap(capBytes int64) {
-	if s.v != nil {
-		C.afvm_set_memcap(s.v, C.long(capBytes))
+	if s == nil {
+		return
 	}
+	s.memCap = capBytes
 }
 
-// Close destroys the state.
+// Close destroys the state and releases its resources.
 func (s *State) Close() {
-	if s.v != nil {
-		C.afvm_close(s.v)
-		s.v = nil
+	if s.T != nil {
+		s.T.Close()
+		s.T = nil
+	}
+	if s.L != nil {
+		s.L.Close()
+		s.L = nil
 	}
 }
 
-// Chunk compilation is the dominant cost of a cold session spawn: the prelude
-// is tens of kilobytes, the support chunks add more, and the loop chunk is
-// compiled after them. None of it changes between spawns, so bytecode is cached
-// process-wide keyed by the source's SHA-256. Content addressing makes a stale
-// entry impossible — an edited file has a different hash and compiles anew —
-// and covers the hot-reload case without an mtime check.
-//
-// The cache is bounded: a deployment with hundreds of distinct loop files fits,
-// and a pathological stream of distinct sources resets it rather than growing
-// without limit.
-const (
-	compileCacheMaxBytes  = 64 << 20
-	compileCacheMaxChunks = 4096
-)
+// Chunk compilation is cached process-wide keyed by (name, SHA-256(source)) so
+// repeated session spawns reuse immutable compiled FunctionProtos while hot
+// reloads compile changed sources anew and preserve exact chunk names in stack
+// traces and compile error messages.
+const compileCacheMaxChunks = 4096
 
 type compiledChunk struct {
-	bytecode []byte
-	err      string // the compiler's message, without a chunk name
+	proto *lua.FunctionProto
+	err   string
 }
 
 var compilation = struct {
 	sync.RWMutex
 	chunks map[[32]byte]compiledChunk
-	bytes  int
 }{chunks: map[[32]byte]compiledChunk{}}
 
-// compileChunk compiles source to Luau bytecode, or returns the compiler's
-// error with the chunk name prefixed exactly as luau_load would have reported
-// it.
-func compileChunk(name, code string) ([]byte, error) {
-	key := sha256.Sum256([]byte(code))
+func cacheKey(name, code string) [32]byte {
+	h := sha256.New()
+	h.Write([]byte(name))
+	h.Write([]byte{0})
+	h.Write([]byte(code))
+	var out [32]byte
+	h.Sum(out[:0])
+	return out
+}
+
+func formatCompileError(name string, err error) string {
+	var pe *parse.Error
+	if errors.As(err, &pe) {
+		if pe.Pos.Line == parse.EOF {
+			return fmt.Sprintf("%s:EOF: %s", name, pe.Message)
+		}
+		if pe.Token != "" {
+			return fmt.Sprintf("%s:%d:%d: %s near %q", name, pe.Pos.Line, pe.Pos.Column, pe.Message, pe.Token)
+		}
+		return fmt.Sprintf("%s:%d:%d: %s", name, pe.Pos.Line, pe.Pos.Column, pe.Message)
+	}
+	msg := strings.TrimSpace(err.Error())
+	if strings.HasPrefix(msg, name+":") {
+		return msg
+	}
+	return fmt.Sprintf("%s: %s", name, msg)
+}
+
+func compileChunk(name, code string) (*lua.FunctionProto, error) {
+	key := cacheKey(name, code)
 	compilation.RLock()
 	entry, ok := compilation.chunks[key]
 	compilation.RUnlock()
 	if ok {
 		if entry.err != "" {
-			return nil, errors.New(name + entry.err)
+			return nil, errors.New(entry.err)
 		}
-		return entry.bytecode, nil
+		return entry.proto, nil
 	}
 
-	ccode := C.CString(code)
-	defer C.free(unsafe.Pointer(ccode))
-	errbuf := make([]byte, 4096)
-	var n C.size_t
-	ptr := C.afvm_compile(ccode, C.size_t(len(code)), &n,
-		(*C.char)(unsafe.Pointer(&errbuf[0])), C.size_t(len(errbuf)))
-	if ptr == nil {
-		msg := C.GoString((*C.char)(unsafe.Pointer(&errbuf[0])))
-		compilation.Lock()
-		if len(compilation.chunks) >= compileCacheMaxChunks {
-			compilation.chunks = map[[32]byte]compiledChunk{}
-			compilation.bytes = 0
-		}
-		compilation.chunks[key] = compiledChunk{err: msg}
-		compilation.Unlock()
-		return nil, errors.New(name + msg)
+	stmts, err := parse.Parse(strings.NewReader(code), name)
+	if err != nil {
+		msg := formatCompileError(name, err)
+		cacheStore(key, compiledChunk{err: msg})
+		return nil, errors.New(msg)
 	}
-	bc := C.GoBytes(unsafe.Pointer(ptr), C.int(n))
-
-	compilation.Lock()
-	if compilation.bytes+len(bc) > compileCacheMaxBytes || len(compilation.chunks) >= compileCacheMaxChunks {
-		compilation.chunks = map[[32]byte]compiledChunk{}
-		compilation.bytes = 0
+	proto, err := lua.Compile(stmts, name)
+	if err != nil {
+		msg := formatCompileError(name, err)
+		cacheStore(key, compiledChunk{err: msg})
+		return nil, errors.New(msg)
 	}
-	compilation.chunks[key] = compiledChunk{bytecode: bc}
-	compilation.bytes += len(bc)
-	compilation.Unlock()
-	return bc, nil
+	cacheStore(key, compiledChunk{proto: proto})
+	return proto, nil
 }
 
-// Eval compiles and executes a chunk (e.g. to define the loop global). The
-// bytecode cache means the second state built from the same source loads it
-// instead of compiling it.
+func cacheStore(key [32]byte, entry compiledChunk) {
+	compilation.Lock()
+	if len(compilation.chunks) >= compileCacheMaxChunks {
+		compilation.chunks = map[[32]byte]compiledChunk{}
+	}
+	compilation.chunks[key] = entry
+	compilation.Unlock()
+}
+
+// Eval compiles and executes a chunk on the main state (e.g. to load the
+// prelude or support chunks before Start).
 func (s *State) Eval(name, code string) error {
-	bc, err := compileChunk(name, code)
+	proto, err := compileChunk(name, code)
 	if err != nil {
 		return err
 	}
-	return s.evalBytecode(name, bc)
-}
-
-func (s *State) evalBytecode(name string, bc []byte) error {
-	cname := C.CString(name)
-	defer C.free(unsafe.Pointer(cname))
-	errbuf := make([]byte, 4096)
-	rc := C.afvm_eval_bytecode(s.v, cname, (*C.char)(unsafe.Pointer(&bc[0])), C.size_t(len(bc)),
-		(*C.char)(unsafe.Pointer(&errbuf[0])), C.size_t(len(errbuf)))
-	if rc != 0 {
-		return errors.New(C.GoString((*C.char)(unsafe.Pointer(&errbuf[0]))))
+	// Apply the instruction budget on non-base Eval chunks so runaway code
+	// evaluated directly via Eval still terminates, while trusted prelude
+	// loading always succeeds even under tight test budgets.
+	useBudget := s.budget != nil && name != "@json" && name != "@prelude"
+	if useBudget {
+		s.budget.arm()
+		s.L.SetContext(s.budget)
+		defer s.L.RemoveContext()
+	}
+	fn := s.L.NewFunctionFromProto(proto)
+	s.L.Push(fn)
+	if err := s.L.PCall(0, 0, nil); err != nil {
+		return errors.New(formatLuaError(err))
 	}
 	return nil
 }
 
-// Start seals globals, loads the plugin chunk onto the loop thread, runs it
-// (top-level code may yield), then resumes the named global as the loop.
+// sealGlobals freezes the main state's globals and reachable stdlib/prelude
+// tables read-only before user code runs in Start.
+func (s *State) sealGlobals() {
+	if s.isSealed {
+		return
+	}
+	s.isSealed = true
+
+	roMT := s.L.NewTable()
+	roMT.RawSetString("__newindex", s.L.NewFunction(func(L *lua.LState) int {
+		L.RaiseError("attempt to modify a readonly table")
+		return 0
+	}))
+	roMT.RawSetString("__metatable", lua.LString("The metatable is locked"))
+
+	var seal func(tbl *lua.LTable)
+	seal = func(tbl *lua.LTable) {
+		if tbl == nil || s.sealed[tbl] {
+			return
+		}
+		s.sealed[tbl] = true
+		tbl.ForEach(func(_, v lua.LValue) {
+			if child, ok := v.(*lua.LTable); ok {
+				seal(child)
+			}
+		})
+		if tbl.Metatable == lua.LNil {
+			tbl.Metatable = roMT
+		}
+	}
+	seal(s.L.G.Global)
+}
+
+func (s *State) newLoopThread() *lua.LState {
+	th, cancel := s.L.NewThread()
+	if cancel != nil {
+		cancel()
+	}
+	th.Env = s.env
+	if s.budget != nil {
+		th.SetContext(s.budget)
+	}
+	return th
+}
+
+// Start seals globals, loads the plugin chunk onto the sandboxed loop thread,
+// runs it (top-level code may yield), then resumes the named global as the
+// loop.
 //
-// name identifies the chunk in a version refusal, and is the file path where
-// there is one: it is what the operator is told to go and edit.
-//
-// The chunk is version-gated here as well as at builtins.Resolve, because this
-// is the one point a loop source is loaded into a VM. A source that never
-// passed through Resolve — an AgentDef's in-memory LoopSrc, a route source
-// handed straight to the router — reaches the engine no other way, so without
-// the check here the embedding path could run Lua written against a different
-// prelude. A source that did pass through Resolve is checked a second time,
-// which costs a scan of the leading comment block and can never disagree:
-// Resolve returns only what this same check accepted.
-//
-// A refusal is returned as Failed carrying the gate's own message, so a caller
-// that already has a Failed path — the session restart, the router rebuild —
-// treats it the way it treats a Lua error. That is deliberate: nothing here can
-// repair the chunk, and the alternative to failing loudly is running against an
-// API the chunk was not written for.
+// name identifies the chunk in a version refusal and compile errors.
 func (s *State) Start(fn, name, code string) (Status, string) {
 	if err := CheckChunkVersion(name, code); err != nil {
 		return Failed, err.Error()
 	}
-	bc, err := compileChunk(name, code)
+	proto, err := compileChunk(name, code)
 	if err != nil {
 		return Failed, err.Error()
 	}
-	return s.startBytecode(fn, bc)
+
+	s.sealGlobals()
+
+	// Create a fresh sandboxed environment inheriting sealed globals read-only.
+	env := s.L.NewTable()
+	envMT := s.L.NewTable()
+	envMT.RawSetString("__index", s.L.G.Global)
+	envMT.RawSetString("__metatable", lua.LString("The metatable is locked"))
+	env.Metatable = envMT
+	env.RawSetString("_G", env)
+	s.env = env
+
+	s.fn = fn
+	s.phase = 0
+	s.T = s.newLoopThread()
+
+	chunkFn := s.T.NewFunctionFromProto(proto)
+	return s.drive(chunkFn)
 }
 
-func (s *State) startBytecode(fn string, bc []byte) (Status, string) {
-	cfn := C.CString(fn)
-	defer C.free(unsafe.Pointer(cfn))
-	errbuf := make([]byte, 4096)
-	rc := C.afvm_start_bytecode(s.v, cfn, (*C.char)(unsafe.Pointer(&bc[0])), C.size_t(len(bc)),
-		(*C.char)(unsafe.Pointer(&errbuf[0])), C.size_t(len(errbuf)))
-	status := Status(rc)
-	if status == Failed {
-		return status, C.GoString((*C.char)(unsafe.Pointer(&errbuf[0])))
-	}
-	return status, s.lastMsg()
-}
-
-// Resume answers a yielded op request. ok=false raises in Lua.
+// Resume answers a yielded op request by passing (respJSON, ok) as return
+// values to the yielded __af_op call.
 func (s *State) Resume(respJSON string, ok bool) (Status, string) {
-	cresp := C.CString(respJSON)
-	defer C.free(unsafe.Pointer(cresp))
-	cok := C.int(0)
-	if ok {
-		cok = 1
+	if s.T == nil {
+		return Failed, "cannot resume unstarted VM state"
 	}
-	return Status(C.afvm_resume(s.v, cresp, C.size_t(len(respJSON)), cok)), s.lastMsg()
+	return s.drive(nil, lua.LString(respJSON), lua.LBool(ok))
 }
 
-func (s *State) lastMsg() string {
-	n := C.afvm_lastmsg(s.v, nil, 0)
-	if n == 0 {
+// drive runs the active coroutine; when the plugin chunk finishes (from Start
+// or from a later Resume), it chains into the named loop function transparently.
+func (s *State) drive(fn *lua.LFunction, args ...lua.LValue) (Status, string) {
+	st, msg := s.doResume(fn, args...)
+	if st == Finished && s.phase == 0 {
+		s.phase = 1
+		loopVal := s.L.GetField(s.env, s.fn)
+		loopFn, ok := loopVal.(*lua.LFunction)
+		if !ok {
+			return Failed, fmt.Sprintf("global '%s' is not defined (loop plugin must define it)", s.fn)
+		}
+		// Phase 0's thread is dead after returning; start phase 1 on a fresh
+		// thread sharing the exact same sandboxed environment.
+		s.T = s.newLoopThread()
+		st, msg = s.doResume(loopFn)
+	}
+	return st, msg
+}
+
+func (s *State) doResume(fn *lua.LFunction, args ...lua.LValue) (Status, string) {
+	if s.budget != nil {
+		s.budget.arm()
+	}
+	resState, err, values := s.L.Resume(s.T, fn, args...)
+	switch resState {
+	case lua.ResumeYield:
+		if len(values) > 0 {
+			return Yielded, valueToMsg(values[0])
+		}
+		return Yielded, ""
+	case lua.ResumeOK:
+		return Finished, ""
+	default:
+		return Failed, formatLuaError(err)
+	}
+}
+
+func valueToMsg(v lua.LValue) string {
+	switch tv := v.(type) {
+	case lua.LString:
+		return string(tv)
+	case lua.LNumber:
+		return tv.String()
+	case *lua.LNilType:
+		return ""
+	default:
+		return fmt.Sprintf("(non-string error: %s)", v.Type().String())
+	}
+}
+
+func formatLuaError(err error) string {
+	if err == nil {
 		return ""
 	}
-	buf := make([]byte, n)
-	C.afvm_lastmsg(s.v, (*C.char)(unsafe.Pointer(&buf[0])), C.size_t(n))
-	return string(buf)
+	var aerr *lua.ApiError
+	if errors.As(err, &aerr) {
+		if aerr.Object != nil {
+			switch tv := aerr.Object.(type) {
+			case lua.LString:
+				return string(tv)
+			case lua.LNumber:
+				return tv.String()
+			default:
+				return fmt.Sprintf("(non-string error: %s)", aerr.Object.Type().String())
+			}
+		}
+	}
+	return err.Error()
 }
 
-// CompileCheck validates that code parses (used by hot reload before swap).
+// CompileCheck validates that code parses and compiles cleanly (used by hot
+// reload and CLI validation before swapping loops).
 func CompileCheck(name, code string) error {
-	cname := C.CString(name)
-	defer C.free(unsafe.Pointer(cname))
-	ccode := C.CString(code)
-	defer C.free(unsafe.Pointer(ccode))
-	errbuf := make([]byte, 4096)
-	rc := C.afvm_check(cname, ccode, C.size_t(len(code)),
-		(*C.char)(unsafe.Pointer(&errbuf[0])), C.size_t(len(errbuf)))
-	if rc != 0 {
-		return errors.New(C.GoString((*C.char)(unsafe.Pointer(&errbuf[0]))))
+	stmts, err := parse.Parse(strings.NewReader(code), name)
+	if err != nil {
+		return errors.New(formatCompileError(name, err))
+	}
+	if _, err := lua.Compile(stmts, name); err != nil {
+		return errors.New(formatCompileError(name, err))
 	}
 	return nil
 }

@@ -3,6 +3,6 @@
     "library": ["./api/luau"]
   },
   "diagnostics": {
-    "globals": ["session", "llm", "tools", "agent", "store", "memory", "http", "shell", "files", "scheduler", "log", "time", "json", "credential", "runtime", "tool"]
+    "globals": ["af", "session", "llm", "tools", "agent", "store", "memory", "http", "mail", "shell", "files", "scheduler", "user", "openai", "log", "time", "json", "credential", "runtime", "tool", "token_budget"]
   }
 }

@@ -27,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"agentflow/internal/core/media"
 	"agentflow/internal/core/netguard"
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/tools"
@@ -56,6 +57,13 @@ type Client struct {
 	// server is network egress and requires net.http; a stdio child process is
 	// not, so it stays governed by tools/agent policy alone.
 	requiresCapability string
+	media              *media.Service
+}
+
+// SetMedia attaches the centralized media service so MCP image/audio/blob
+// tool results are ingested into handles instead of dropped.
+func (c *Client) SetMedia(svc *media.Service) {
+	c.media = svc
 }
 
 // NewClient starts an MCP server as a child process and completes the handshake
@@ -206,12 +214,62 @@ func (c *Client) makeInvoker(toolName string) func(context.Context, map[string]a
 			return tools.ResultUnavailable("mcp:"+c.name+"/"+toolName, err.Error()), nil
 		}
 		var text string
+		var parts []media.Part
+		scope := session.ScopePrefixFromCtx(ctx)
+		if scope == "" {
+			scope = "agent:mcp:" + c.name
+		}
 		for _, content := range res.Content {
-			if tc, ok := content.(*mcpsdk.TextContent); ok {
-				text += tc.Text
+			switch item := content.(type) {
+			case *mcpsdk.TextContent:
+				text += item.Text
+			case *mcpsdk.ImageContent:
+				if c.media != nil && len(item.Data) > 0 {
+					if p, ierr := c.media.IngestBytes(ctx, item.Data, media.IngestOptions{
+						MIME:   item.MIMEType,
+						Scope:  scope,
+						Origin: "mcp",
+						Policy: media.Policy{MaxBytes: 50 << 20},
+					}); ierr == nil {
+						parts = append(parts, p)
+					} else {
+						c.log.Warn("mcp image ingest failed", "tool", toolName, "err", ierr)
+					}
+				}
+			case *mcpsdk.AudioContent:
+				if c.media != nil && len(item.Data) > 0 {
+					if p, ierr := c.media.IngestBytes(ctx, item.Data, media.IngestOptions{
+						MIME:   item.MIMEType,
+						Scope:  scope,
+						Origin: "mcp",
+						Policy: media.Policy{MaxBytes: 50 << 20},
+					}); ierr == nil {
+						parts = append(parts, p)
+					} else {
+						c.log.Warn("mcp audio ingest failed", "tool", toolName, "err", ierr)
+					}
+				}
+			case *mcpsdk.EmbeddedResource:
+				if c.media != nil && item.Resource != nil && len(item.Resource.Blob) > 0 {
+					if p, ierr := c.media.IngestBytes(ctx, item.Resource.Blob, media.IngestOptions{
+						MIME:   item.Resource.MIMEType,
+						Name:   item.Resource.URI,
+						Scope:  scope,
+						Origin: "mcp",
+						Policy: media.Policy{MaxBytes: 50 << 20},
+					}); ierr == nil {
+						parts = append(parts, p)
+					} else {
+						c.log.Warn("mcp resource ingest failed", "tool", toolName, "err", ierr)
+					}
+				}
 			}
 		}
-		return map[string]any{"ok": !res.IsError, "text": text}, nil
+		out := map[string]any{"ok": !res.IsError, "text": text}
+		if len(parts) > 0 {
+			out["media"] = parts
+		}
+		return out, nil
 	}
 }
 

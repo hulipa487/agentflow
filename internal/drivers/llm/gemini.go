@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"agentflow/internal/config"
+	"agentflow/internal/core/media"
 
 	"google.golang.org/genai"
 	"google.golang.org/genai/interactions/models/apierrors"
@@ -213,6 +214,7 @@ func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs
 	var text string
 	var thoughtBlocks []map[string]any
 	var thoughts []string
+	var outMedia []media.Part
 	for _, st := range out.Steps {
 		stepType, _ := st["type"].(string)
 		// A thought step is the API's own shape for reasoning — the SDK models it
@@ -245,6 +247,9 @@ func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs
 			if stepType == "model_output" {
 				if t, ok := c["text"].(string); ok && c["type"] == "text" {
 					text += t
+				}
+				if p, ok := geminiOutputMediaPart(c); ok {
+					outMedia = append(outMedia, p)
 				}
 			}
 		}
@@ -286,9 +291,34 @@ func geminiOpen(ctx context.Context, client *http.Client, cfg config.Model, msgs
 		if text != "" {
 			events <- event{delta: text}
 		}
-		events <- event{usage: Usage{Input: inTok, Output: outTok, Cached: cached}, thinking: thoughtText, thinkingBlocks: thoughtBlocks}
+		events <- event{usage: Usage{Input: inTok, Output: outTok, Cached: cached}, media: outMedia, thinking: thoughtText, thinkingBlocks: thoughtBlocks}
 	}()
 	return events, false, nil
+}
+
+// geminiOutputMediaPart extracts a generated image/audio/video/document part
+// from a Gemini Interactions model_output content block.
+func geminiOutputMediaPart(c map[string]any) (media.Part, bool) {
+	typ, _ := c["type"].(string)
+	switch typ {
+	case "image", "audio", "video", "document":
+	default:
+		return media.Part{}, false
+	}
+	mime, _ := c["mime_type"].(string)
+	data, _ := c["data"].(string)
+	uri, _ := c["uri"].(string)
+	if data == "" && uri == "" {
+		return media.Part{}, false
+	}
+	partType := typ
+	if partType == "document" {
+		partType = "file"
+	}
+	if mime != "" {
+		partType = media.Classify(mime)
+	}
+	return media.Part{Type: partType, MIME: mime, Data: data, URL: uri}, true
 }
 
 // splitGeminiBase splits the configured endpoint prefix into the SDK's two

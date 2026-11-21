@@ -56,9 +56,19 @@ const (
 	callTimeout   = 15 * time.Second
 	uploadTimeout = 60 * time.Second
 
+	// defaultPresignTTL is how long S3 presigned GET URLs handed to QQ stay
+	// valid. QQ downloads the URL during the /files upload call (or shortly
+	// after for guild image links), so 10 minutes absorbs clock skew and CDN
+	// retries while keeping links short-lived.
+	defaultPresignTTL = 10 * time.Minute
+
 	// defaultMaxMediaBytes caps a single inbound download when the media policy
 	// sets no limit of its own.
 	defaultMaxMediaBytes = 8 << 20
+
+	// maxOutboundMediaBytes caps inline base64 attachments staged to the blob
+	// store before presigning (matches the Telegram driver ceiling).
+	maxOutboundMediaBytes = 50 << 20
 )
 
 // Scene names, as configured and as the prefix of a reply target.
@@ -100,6 +110,13 @@ type Options struct {
 	// messages (msg_type 2), which the platform grants per bot. A refused
 	// markdown message is resent as plain text.
 	Markdown bool
+	// PresignTTL overrides how long presigned media URLs stay valid
+	// (default 10m).
+	PresignTTL time.Duration
+	// Media is the centralized media service used for format negotiation
+	// (e.g. WebP/PNG → JPEG), unified store lookup, and URL presigning
+	// (S3 or FS HMAC-HTTP). When nil, falls back to the raw store parameter.
+	Media *media.Service
 }
 
 // Driver is the QQ Bot channel driver. It implements gateway.Driver for
@@ -122,7 +139,9 @@ type Driver struct {
 	mdOffUntil time.Time
 	// mdLimit is the longest markdown message the platform is known to
 	// take, once it refused a longer one; zero until then.
-	mdLimit int
+	mdLimit    int
+	presignTTL time.Duration
+	media      *media.Service
 	store      media.Store // nil = media disabled
 	pol        media.Policy
 	sink       router.Sink
@@ -169,29 +188,35 @@ func New(name, agent string, opts Options, sink router.Sink, srv *httpd.Server, 
 	for _, s := range list {
 		scenes[strings.ToLower(strings.TrimSpace(s))] = true
 	}
+	presignTTL := opts.PresignTTL
+	if presignTTL <= 0 {
+		presignTTL = defaultPresignTTL
+	}
 	client := &http.Client{Timeout: uploadTimeout}
 	priv := signingKey(opts.Secret)
 	d := &Driver{
-		name:      name,
-		agent:     agent,
-		appID:     opts.AppID,
-		mode:      mode,
-		path:      opts.Path,
-		public:    strings.TrimRight(opts.PublicURL, "/"),
-		scenes:    scenes,
-		apiBase:   base,
-		markdown:  opts.Markdown,
-		store:     store,
-		pol:       pol,
-		sink:      sink,
-		log:       log.With("driver", "qq", "channel", name, "mode", mode),
-		client:    client,
-		tokens:    newTokenSource(opts.AppID, opts.Secret, base+"/app/getAppAccessToken", client),
-		priv:      priv,
-		pub:       priv.Public().(ed25519.PublicKey),
-		refs:      map[string]*replyRef{},
-		seen:      newDedup(4096, 30*time.Minute),
-		retryBase: time.Second,
+		name:       name,
+		agent:      agent,
+		appID:      opts.AppID,
+		mode:       mode,
+		path:       opts.Path,
+		public:     strings.TrimRight(opts.PublicURL, "/"),
+		scenes:     scenes,
+		apiBase:    base,
+		markdown:   opts.Markdown,
+		presignTTL: presignTTL,
+		media:      opts.Media,
+		store:      store,
+		pol:        pol,
+		sink:       sink,
+		log:        log.With("driver", "qq", "channel", name, "mode", mode),
+		client:     client,
+		tokens:     newTokenSource(opts.AppID, opts.Secret, base+"/app/getAppAccessToken", client),
+		priv:       priv,
+		pub:        priv.Public().(ed25519.PublicKey),
+		refs:       map[string]*replyRef{},
+		seen:       newDedup(4096, 30*time.Minute),
+		retryBase:  time.Second,
 	}
 	if mode == "webhook" {
 		if d.path == "" {

@@ -242,58 +242,25 @@ func (f *agentFile) spawnProfile() (SpawnProfile, error) {
 	if a.Persistent {
 		return SpawnProfile{}, fmt.Errorf("spawn profile %q: persistent applies to agents, not spawn profiles", f.Name)
 	}
-	if a.Singleton {
-		return SpawnProfile{}, fmt.Errorf("spawn profile %q: singleton applies to agents, not spawn profiles", f.Name)
-	}
-	if len(a.Taps) > 0 {
-		return SpawnProfile{}, fmt.Errorf("spawn profile %q: taps apply to agents, not spawn profiles", f.Name)
-	}
-	if len(a.Channels) > 0 {
-		return SpawnProfile{}, fmt.Errorf("spawn profile %q: channels apply to agents, not spawn profiles", f.Name)
-	}
-	if len(a.Lifecycle) > 0 {
-		return SpawnProfile{}, fmt.Errorf("spawn profile %q: lifecycle applies to agents, not spawn profiles", f.Name)
-	}
 	if a.Memory.IsInline {
 		return SpawnProfile{}, fmt.Errorf("spawn profile %q: spawn profiles reference memory profiles by name, not inline stores", f.Name)
 	}
-	sp := SpawnProfile{
-		Model:        a.Model,
-		Loop:         a.Loop,
-		Instructions: a.Instructions,
-		Memory:       a.Memory.Profile,
-		Shell:        a.Shell,
-		Safety:       a.Safety,
-		Skills:       a.Skills,
-		Capabilities: a.Capabilities,
-		CanContact:   a.CanContact,
-		Credentials:  a.Credentials,
-		Extras:       a.Extras,
-	}
-	if len(a.Budget) > 0 {
-		sp.Budget = BudgetConfig{
-			TokensPerDay: budgetMapInt(a.Budget, "tokens_per_day"),
-			Window:       budgetMapString(a.Budget, "window"),
-		}
-	}
-	return sp, nil
-}
-
-func budgetMapInt(m map[string]any, key string) int64 {
-	switch n := m[key].(type) {
-	case int:
-		return int64(n)
-	case int64:
-		return n
-	case float64:
-		return int64(n)
-	}
-	return 0
-}
-
-func budgetMapString(m map[string]any, key string) string {
-	s, _ := m[key].(string)
-	return s
+	return SpawnProfile{
+		Model:         a.Model,
+		Loop:          a.Loop,
+		Instructions:  a.Instructions,
+		HistoryBudget: a.HistoryBudget,
+		Memory:        a.Memory.Profile,
+		Shell:         a.Shell,
+		Safety:        a.Safety,
+		Skills:        a.Skills,
+		Capabilities:  a.Capabilities,
+		CanContact:    a.CanContact,
+		Credentials:   a.Credentials,
+		InheritUser:   a.InheritUser,
+		Extras:        a.Extras,
+		Budget:        a.Budget,
+	}, nil
 }
 
 // rebaseConfigPaths makes dir the resolution base for every relative path in
@@ -315,11 +282,17 @@ func rebaseConfigPaths(dir string, c *Config) {
 	}
 	c.Gateway.Route = rebasePath(dir, c.Gateway.Route)
 	c.Runtime.Persistence = rebasePersistence(dir, c.Runtime.Persistence)
-	c.Runtime.Cluster.Persistence = rebasePersistence(dir, c.Runtime.Cluster.Persistence)
 	c.Runtime.Identity.Persistence = rebasePersistence(dir, c.Runtime.Identity.Persistence)
-	c.Runtime.Credentials.Path = rebasePersistence(dir, c.Runtime.Credentials.Path)
+	c.Runtime.Credentials.Persistence = rebasePersistence(dir, c.Runtime.Credentials.Persistence)
 	c.Runtime.LogPlane.Persistence = rebasePersistence(dir, c.Runtime.LogPlane.Persistence)
 	c.Media.Dir = rebasePath(dir, c.Media.Dir)
+	c.Files.Dir = rebasePath(dir, c.Files.Dir)
+	c.Runtime.Studio.Workspace = rebasePath(dir, c.Runtime.Studio.Workspace)
+	c.Runtime.Sandbox.DataDir = rebasePath(dir, c.Runtime.Sandbox.DataDir)
+	for name, e := range c.Environments {
+		e.Rootfs = rebasePath(dir, e.Rootfs)
+		c.Environments[name] = e
+	}
 	c.Plugins.Dir = rebasePath(dir, c.Plugins.Dir)
 	for name, p := range c.Packages {
 		c.Packages[name] = rebasePath(dir, p)

@@ -29,23 +29,33 @@ type EnvSpec struct {
 // Environment is a resolved environment, ready to run jobs in.
 type Environment struct {
 	Name   string
+	Image  string
 	Rootfs string
 	Env    map[string]string
 }
 
-// Envs resolves environment names to root filesystems. An image is pulled the
-// first time an environment is used, into a directory named by its digest:
-// the digest is the cache key, so changing the pin in the config is all it
-// takes to move to a new image, and two environments on one image share it.
+// Envs resolves environment names to root filesystems (gVisor) or native OCI
+// image references (microsandbox). An image is pulled the first time an
+// environment is used, into a directory named by its digest: the digest is the
+// cache key, so changing the pin in the config is all it takes to move to a
+// new image, and two environments on one image share it.
 type Envs struct {
-	dir    string
-	specs  map[string]EnvSpec
-	client *http.Client
-	scheme string
-	log    *slog.Logger
+	dir          string
+	specs        map[string]EnvSpec
+	nativeImages bool
+	client       *http.Client
+	scheme       string
+	log          *slog.Logger
 
 	mu    sync.Mutex
 	pulls map[string]*sync.Mutex // per image digest: one download at a time
+}
+
+// SetNativeImages tells Envs that the active sandbox provider pulls and runs
+// OCI images directly (e.g. microsandbox), so Resolve validates the pinned
+// image ref without extracting layers into a host directory.
+func (e *Envs) SetNativeImages(v bool) {
+	e.nativeImages = v
 }
 
 // NewEnvs builds the environment store over the sandbox data directory.
@@ -94,6 +104,12 @@ func (e *Envs) Resolve(ctx context.Context, name string) (*Environment, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%w: environment %q: %v", ErrUnavailable, name, err)
 		}
+		if e.nativeImages {
+			for k, v := range spec.Env {
+				env[k] = v
+			}
+			return &Environment{Name: name, Image: spec.Image, Env: env}, nil
+		}
 		var imageEnv []string
 		if rootfs, imageEnv, err = e.image(ctx, ref); err != nil {
 			return nil, fmt.Errorf("%w: environment %q: %v", ErrUnavailable, name, err)
@@ -110,7 +126,7 @@ func (e *Envs) Resolve(ctx context.Context, name string) (*Environment, error) {
 	for k, v := range spec.Env {
 		env[k] = v
 	}
-	return &Environment{Name: name, Rootfs: rootfs, Env: env}, nil
+	return &Environment{Name: name, Image: spec.Image, Rootfs: rootfs, Env: env}, nil
 }
 
 // image returns the unpacked root filesystem of an image, pulling it once.

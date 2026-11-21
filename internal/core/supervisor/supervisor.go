@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"agentflow/internal/builtins"
 	"agentflow/internal/core/gateway"
+	"agentflow/internal/core/media"
 	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/pool"
 	"agentflow/internal/core/request"
@@ -21,6 +21,7 @@ import (
 	"agentflow/internal/core/scheduler"
 	"agentflow/internal/core/session"
 	"agentflow/internal/drivers/shell"
+	"agentflow/internal/luacode"
 )
 
 // AgentDef is a configured agent with its resolved loop source and shared
@@ -81,6 +82,9 @@ type Supervisor struct {
 	// EgressJournal, when set, is attached to every spawned actor so all
 	// session egress lands in the core-owned message journal.
 	EgressJournal session.EgressJournalFunc
+
+	// media is the centralized media service attached to every spawned actor.
+	media *media.Service
 
 	// hub, when set, decides whether a delivered message is this instance's to
 	// handle or belongs to the instance that owns the session. Nil — the
@@ -192,6 +196,10 @@ func (s *Supervisor) SetUserResolver(r session.UserResolver) { s.users = r }
 // Called by main; nil (the default) leaves every user on the agent's own model
 // and prompts.
 func (s *Supervisor) SetProfileSettings(p session.ProfileSettings) { s.profileSettings = p }
+
+// SetMedia installs the centralized media service used by session actors to
+// normalize inbound/outbound attachments and enforce per-scope handle grants.
+func (s *Supervisor) SetMedia(svc *media.Service) { s.media = svc }
 
 // SetSessionCap sets the per-tenant bound on live sessions (E18): a tenant
 // whose sessions are all busy with it cannot spawn actors without bound. 0
@@ -592,7 +600,7 @@ func (s *Supervisor) ensureSession(agent, skey string, def *AgentDef, tenant str
 	}
 	s.mu.Unlock()
 
-	support, err := builtins.SupportChunks()
+	support, err := luacode.SupportChunks()
 	if err != nil {
 		return nil, err
 	}
@@ -617,6 +625,7 @@ func (s *Supervisor) ensureSession(agent, skey string, def *AgentDef, tenant str
 	a.MemBudget = s.vmMemory
 	a.Tracer = s.tracer
 	a.TracePayloads = s.tracePayloads
+	a.Media = s.media
 	actorCtx, cancel := context.WithCancel(s.ctx)
 
 	s.mu.Lock()

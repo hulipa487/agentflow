@@ -18,15 +18,14 @@ import (
 	stdruntime "runtime"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/mattn/go-isatty"
 
+	"agentflow/internal/adminapi"
 	"agentflow/internal/builtins"
 
 	"agentflow/internal/config"
@@ -92,8 +91,7 @@ import (
 	"agentflow/internal/drivers/volatile"
 	"agentflow/internal/drivers/webhook"
 	"agentflow/internal/llog"
-	"agentflow/internal/tui"
-	"agentflow/internal/webui"
+	"agentflow/internal/luacode"
 )
 
 // version is stamped via -ldflags "-X main.version=..." on release builds.
@@ -112,7 +110,7 @@ func main() {
 	if !ok {
 		os.Exit(code)
 	}
-	cfgPath, noTUI, noConsole, forceSingle := &flags.config, &flags.noTUI, &flags.noConsole, &flags.forceSingle
+	cfgPath, forceSingle := &flags.config, &flags.forceSingle
 
 	startedAt := time.Now()
 
@@ -148,7 +146,6 @@ func main() {
 		log.Error("config source", "err", err)
 		os.Exit(2)
 	}
-	consoleEnabled := !*noConsole
 	if cfgSource.Legacy {
 		log.Warn("using config.yaml; rename it to agentflow.yaml so both the engine and the CLI discover the same file")
 	}
@@ -165,17 +162,19 @@ func main() {
 		log.Warn("no agents configured; starting as an admin/Studio control plane (create an agent in Studio or add one to the config)")
 	}
 
-	// plugins.dir may shadow any builtin Lua (loops, routes, support chunks)
-	// by name — wire it before the first builtins.Resolve below.
-	builtins.SetPluginDir(cfg.Plugins.Dir)
-	builtins.SetPackages(cfg.Packages)
+	// Register the runtime's core-contract embedded Lua chunks and wire
+	// plugins.dir (which may shadow any registered builtin by name) plus
+	// packages before the first luacode.Resolve below.
+	builtins.Register()
+	luacode.SetPluginDir(cfg.Plugins.Dir)
+	luacode.SetPackages(cfg.Packages)
 
 	// Every session loads the support chunks into its Lua state before its loop,
 	// so they are policy exactly as a loop is, and a chunk this core cannot
 	// serve is refused at boot for the same reason a loop is: the deployment
 	// stops here, loudly, instead of coming up and failing session by session
-	// against an API its Lua was not written for. See builtins.SupportChunks.
-	if _, err := builtins.SupportChunks(); err != nil {
+	// against an API its Lua was not written for. See luacode.SupportChunks.
+	if _, err := luacode.SupportChunks(); err != nil {
 		log.Error("support chunk refused", "err", err)
 		os.Exit(1)
 	}
@@ -190,15 +189,10 @@ func main() {
 	ctx, cancelRun := context.WithCancel(context.Background())
 	defer cancelRun()
 
-	// The dashboard reads stdin for keys, so it sees a ctrl+c typed into a
-	// pseudo-terminal (Git Bash/mintty, some IDE terminals) even though Windows
-	// never turns that keystroke into a console control event. Without the TUI
-	// nothing reads stdin; watch it so the same ctrl+c still stops the engine.
-	// A real console is unaffected: its ctrl+c arrives as SIGINT, not a byte.
-	tuiActive := !*noTUI && isatty.IsTerminal(os.Stdout.Fd())
-	if !tuiActive {
-		watchStdinInterrupt(stop)
-	}
+	// Watch stdin so a ctrl+c byte typed into a pseudo-terminal (Git
+	// Bash/mintty, some IDE terminals) still stops the engine on Windows. A
+	// real console is unaffected: its ctrl+c arrives as SIGINT, not a byte.
+	watchStdinInterrupt(stop)
 
 	// Encrypted per-tenant credential store. Enabled via runtime.credentials;
 	// the master key is read from the named env var (never the config file).
@@ -320,8 +314,6 @@ func main() {
 	}
 	memMgr := memory.NewManager(memReg, log)
 	warnUnenforceableGC(cfg, log)
-	warnInertConfig(cfg, log)
-	warnDeprecatedConfig(cfg, log)
 	warnTopologyConfig(cfg, log)
 
 	// Drivers and shared infrastructure.
@@ -520,7 +512,7 @@ func main() {
 		}
 		// An unlinked handle carries no personal scope unless the deployment
 		// opts back into claiming a profile on first contact.
-		identReg.SetAutoClaim(!cfg.Runtime.Users.RegistrationRequired())
+		identReg.SetAutoClaim(!cfg.Runtime.Identity.RegistrationRequired())
 
 		// Channel traits, keyed by the name drivers report. The built-in
 		// defaults are per driver *type*, and drivers report the configured
@@ -600,20 +592,77 @@ func main() {
 		return out, nil
 	}
 
-	// User-scoped file store: same blob-store family as media (fs or S3),
-	// snapshot metadata in the runtime store's files_meta table. An
-	// unresolvable S3 credential pair disables the store with a warning (the
-	// media rule), never a boot failure; agents without the files capability
-	// never touch it.
-	var filesMgr *files.Manager
-	if cfg.Files.Backend == "s3" {
-		s3cfg, ok := resolveMediaS3(ctx, credResolver, cfg.Files.S3, "files", log)
+	// Centralized media + files blob plane (Option 1B).
+	//
+	// Media owns one primary blob store (fs under <data_dir>/media or s3).
+	// When files.* does not configure an explicit separate backend/dir/s3,
+	// filesMgr shares that same blob store and one unified mark-sweep GC runs
+	// over the union of files_meta handles and media grants. When files.*
+	// configures its own separate store, it stays independent and mediaSvc
+	// registers it as a read fallback.
+	var mediaStore media.Store
+	if cfg.Media.Backend == "s3" {
+		s3cfg, ok := resolveMediaS3(ctx, credResolver, cfg.Media.S3, "media", log)
 		if ok {
-			blobStore, err := s3media.New(s3cfg)
-			if err != nil {
-				log.Error("files store failed", "err", err)
+			mediaStore, err = s3media.New(s3cfg)
+		}
+	} else {
+		mediaDir := cfg.Media.Dir
+		if mediaDir == "" {
+			mediaDir = filepath.Join(cfg.DataDir(), "media")
+		}
+		mediaStore, err = media.Open(mediaDir)
+	}
+	if err != nil {
+		log.Error("media store failed", "err", err)
+		os.Exit(1)
+	}
+
+	// Optional HMAC-SHA256 temporary HTTP URL publisher for serving blobs
+	// (including local fs blobs) to URL-only channels such as QQ.
+	var tempURLHandler *media.HTTPPresigner
+	if cfg.Media.TempURL.Enabled && mediaStore != nil {
+		secret := cfg.Media.TempURL.Secret
+		secretOK := true
+		if secret != "" {
+			v, ok := credResolver.Resolve(ctx, secret)
+			if !ok {
+				log.Warn("media temp_url skipped: unresolved credential",
+					"field", "media.temp_url.secret", "credential", config.CredentialName(secret))
+				secretOK = false
+			} else {
+				secret = v
+			}
+		} else if cfg.Topology() != "single" {
+			log.Warn("media.temp_url.secret is unset in a multi-instance topology; ephemeral per-boot signing keys cannot be verified across peers")
+		}
+		if secretOK {
+			hp, herr := media.NewHTTPPresigner(mediaStore, cfg.Gateway.PublicURL, cfg.Media.TempURL.MediaTempURLPath(), secret)
+			if herr != nil {
+				log.Error("media temp_url setup failed", "err", herr)
 				os.Exit(1)
 			}
+			tempURLHandler = hp
+		}
+	}
+
+	// User-scoped file store: shares mediaStore by default (Option 1B), or
+	// opens its own separate fs/S3 store when files.* configures one explicitly.
+	var filesMgr *files.Manager
+	var separateFilesStore media.Store
+	sharedBlobStore := false
+	if !cfg.Files.HasExplicitStore() && mediaStore != nil {
+		filesMgr = files.New(mediaStore, rtStore, cfg.Files.FilesScratchTTL(), cfg.Files.FilesMaxBytes(), log)
+		sharedBlobStore = true
+	} else if cfg.Files.Backend == "s3" {
+		s3cfg, ok := resolveMediaS3(ctx, credResolver, cfg.Files.S3, "files", log)
+		if ok {
+			blobStore, serr := s3media.New(s3cfg)
+			if serr != nil {
+				log.Error("files store failed", "err", serr)
+				os.Exit(1)
+			}
+			separateFilesStore = blobStore
 			filesMgr = files.New(blobStore, rtStore, cfg.Files.FilesScratchTTL(), cfg.Files.FilesMaxBytes(), log)
 		}
 	} else {
@@ -621,17 +670,37 @@ func main() {
 		if filesDir == "" {
 			filesDir = filepath.Join(cfg.DataDir(), "files")
 		}
-		blobStore, err := media.Open(filesDir)
-		if err != nil {
-			log.Error("files store failed", "err", err)
+		blobStore, ferr := media.Open(filesDir)
+		if ferr != nil {
+			log.Error("files store failed", "err", ferr)
 			os.Exit(1)
 		}
+		separateFilesStore = blobStore
 		filesMgr = files.New(blobStore, rtStore, cfg.Files.FilesScratchTTL(), cfg.Files.FilesMaxBytes(), log)
 	}
+
+	// Centralized media service: handle ingestion, per-scope grant checks,
+	// image transcoding + derived-variant caching, and presigned URL delivery.
+	var mediaPresigner media.Presigner
+	if tempURLHandler != nil {
+		mediaPresigner = tempURLHandler
+	} else if p, ok := mediaStore.(media.Presigner); ok {
+		mediaPresigner = p
+	}
+	mediaSvc := media.NewService(media.ServiceOptions{
+		Primary:      mediaStore,
+		Secondary:    separateFilesStore,
+		Presigner:    mediaPresigner,
+		Catalog:      media.NewCatalog(runtime.MediaKV(rtStore)),
+		Retention:    cfg.Media.MediaRetention(),
+		DerivedTTL:   cfg.Media.MediaDerivedTTL(),
+		PresignTTL:   cfg.Media.TempURL.MediaTempURLTTL(),
+		HTTPClient:   &http.Client{Transport: netPolicy.Transport(), Timeout: 60 * time.Second},
+		EnforceScope: true,
+	})
+
 	if filesMgr != nil {
-		// Scratch expiry and blob GC ran only at boot, so a long-lived instance
-		// accumulated scratch until it restarted. They now tick hourly too; the
-		// lease is hourly plus slack, so a fleet still runs each pass once.
+		// Scratch expiry ticks hourly under a cluster lease.
 		sweepScratch := func() {
 			if n, err := filesMgr.SweepScratch(ctx); err != nil {
 				log.Warn("files scratch sweep failed", "err", err)
@@ -644,23 +713,64 @@ func main() {
 		every(ctx, time.Hour, func() {
 			singletonFor(ctx, "files-scratch", housekeepingTTL(time.Hour), sweepScratch)
 		})
-		// Blob GC: mark-and-sweep unreferenced blobs past the grace window.
-		// Disabled with files.gc_grace: "0". One instance sweeps: two concurrent
-		// mark-and-sweeps over one blob store can delete what the other is still
-		// writing.
-		if grace := cfg.Files.FilesGCGrace(); grace > 0 {
-			sweepBlobs := func() {
-				if live, swept, err := filesMgr.GC(ctx, grace); err != nil {
-					log.Warn("files blob gc failed", "err", err)
+	}
+	if sharedBlobStore && mediaSvc != nil && filesMgr != nil {
+		// Unified mark-and-sweep over the shared blob store: preserve the
+		// union of files_meta handles and unexpired media grants/variants.
+		grace := cfg.Media.MediaGCGrace()
+		if cfg.Media.GCGrace == "" && cfg.Files.GCGrace != "" {
+			grace = cfg.Files.FilesGCGrace()
+		}
+		if grace > 0 {
+			sweepShared := func() {
+				filesLive, err := filesMgr.LiveHandles(ctx)
+				if err != nil {
+					log.Warn("unified blob gc skipped: failed to list live file handles", "err", err)
+					return
+				}
+				if live, swept, err := mediaSvc.GC(ctx, grace, filesLive); err != nil {
+					log.Warn("unified blob gc failed", "err", err)
 				} else if swept > 0 {
 					metrics.Add("agentflow_files_gc_swept", int64(swept))
-					log.Info("files blob gc swept", "live", live, "swept", swept)
+					log.Info("unified blob gc swept", "live", live, "swept", swept)
 				}
 			}
-			singletonFor(ctx, "files-gc", housekeepingTTL(time.Hour), sweepBlobs)
+			singletonFor(ctx, "media-gc", housekeepingTTL(time.Hour), sweepShared)
 			every(ctx, time.Hour, func() {
-				singletonFor(ctx, "files-gc", housekeepingTTL(time.Hour), sweepBlobs)
+				singletonFor(ctx, "media-gc", housekeepingTTL(time.Hour), sweepShared)
 			})
+		}
+	} else {
+		if filesMgr != nil {
+			if grace := cfg.Files.FilesGCGrace(); grace > 0 {
+				sweepBlobs := func() {
+					if live, swept, err := filesMgr.GC(ctx, grace); err != nil {
+						log.Warn("files blob gc failed", "err", err)
+					} else if swept > 0 {
+						metrics.Add("agentflow_files_gc_swept", int64(swept))
+						log.Info("files blob gc swept", "live", live, "swept", swept)
+					}
+				}
+				singletonFor(ctx, "files-gc", housekeepingTTL(time.Hour), sweepBlobs)
+				every(ctx, time.Hour, func() {
+					singletonFor(ctx, "files-gc", housekeepingTTL(time.Hour), sweepBlobs)
+				})
+			}
+		}
+		if mediaStore != nil && mediaSvc != nil {
+			if grace := cfg.Media.MediaGCGrace(); grace > 0 {
+				sweepMedia := func() {
+					if live, swept, err := mediaSvc.GC(ctx, grace); err != nil {
+						log.Warn("media blob gc failed", "err", err)
+					} else if swept > 0 {
+						log.Info("media blob gc swept", "live", live, "swept", swept)
+					}
+				}
+				singletonFor(ctx, "media-gc", housekeepingTTL(time.Hour), sweepMedia)
+				every(ctx, time.Hour, func() {
+					singletonFor(ctx, "media-gc", housekeepingTTL(time.Hour), sweepMedia)
+				})
+			}
 		}
 	}
 
@@ -686,17 +796,22 @@ func main() {
 	tools.RegisterLegalBuiltins(toolReg, legalSet)
 	tools.RegisterBrowserBuiltins(toolReg, browserClient, filesMgr)
 	tools.RegisterFetchBuiltins(toolReg, fetch.New(netPolicy), log, filesMgr)
-	// Sandbox jobs: one command, one gVisor sandbox, on a project from the
-	// files store. Nothing is probed or started here — a deployment with no
-	// sandbox shell profile never runs runsc — and an instance where the
-	// sandbox cannot work still boots: the first shell call says why.
+	// Sandbox jobs: one command, one ephemeral sandbox (gVisor runsc or
+	// microsandbox msb), on a project from the files store. Nothing is probed
+	// or started here — a deployment with no sandbox shell profile never invokes
+	// the runtime — and an instance where the sandbox cannot work still boots:
+	// the first shell call says why.
 	envSpecs := make(map[string]sandbox.EnvSpec, len(cfg.Environments))
 	for name, e := range cfg.Environments {
 		envSpecs[name] = sandbox.EnvSpec{Image: e.Image, Rootfs: e.Rootfs, Env: e.Env}
 	}
 	sbx := cfg.Runtime.Sandbox
 	sandboxDir := cfg.SandboxDataDir()
-	sandboxRunner := sandbox.NewRunsc(sbx.Runsc, sandboxDir, log)
+	sandboxRunner, sandboxInspector := newSandboxRunner(sbx, sandboxDir, log)
+	sandboxEnvs := sandbox.NewEnvs(sandboxDir, envSpecs, log)
+	if sbx.ProviderName() == "microsandbox" {
+		sandboxEnvs.SetNativeImages(true)
+	}
 	shellJobs := shelljobs.New(shelljobs.Config{
 		Concurrency:          sbx.Concurrency,
 		PerScope:             sbx.PerUser,
@@ -712,7 +827,7 @@ func main() {
 			PIDs:        sbx.PIDs,
 		},
 		WriteBack: workspace.Limits{MaxFiles: sbx.WriteBackFiles(), MaxBytes: sbx.WriteBackBytes()},
-	}, sandboxRunner, sandbox.NewEnvs(sandboxDir, envSpecs, log),
+	}, sandboxRunner, sandboxEnvs,
 		workspace.New(filepath.Join(sandboxDir, "workspaces"), filesMgr, log), filesMgr, log)
 	// Background jobs are recorded in the runtime store, so a session that
 	// moved to another instance can still ask about the one it started.
@@ -730,7 +845,7 @@ func main() {
 	if sandboxInUse(cfg) {
 		if err := shellJobs.Available(); err != nil {
 			log.Warn("an agent has a sandbox shell profile, but shell jobs cannot run on this instance", "err", err)
-		} else if enforced, note := sandboxRunner.Limiting(); !enforced {
+		} else if enforced, note := sandboxInspector.Limiting(); !enforced {
 			log.Warn("shell jobs will run without memory and CPU limits", "why", strings.TrimPrefix(note, "memory and CPU limits are not enforced: "))
 		}
 	}
@@ -779,6 +894,7 @@ func main() {
 			log.Warn("mcp server failed", "server", sname, "err", err)
 			continue
 		}
+		c.SetMedia(mediaSvc)
 		mcpClients[sname] = c
 		mts, err := c.ListTools(ctx)
 		if err != nil {
@@ -809,29 +925,6 @@ func main() {
 	if pending := luaOverrides.Pending(); len(pending) > 0 {
 		log.Info("tools.policy.overrides: not registered; held for a Lua-declared tool",
 			"tools", pending)
-	}
-
-	// Media blob store: one per process. Channels with a media policy land
-	// inbound media here; llm caps resolve handles at request time. Backend
-	// is fs (rooted beside the runtime persistence data) or s3. S3
-	// credentials may be lazy references: unresolvable skips the store with a
-	// warning (channels then run with media disabled), never a boot failure.
-	var mediaStore media.Store
-	if cfg.Media.Backend == "s3" {
-		s3cfg, ok := resolveMediaS3(ctx, credResolver, cfg.Media.S3, "media", log)
-		if ok {
-			mediaStore, err = s3media.New(s3cfg)
-		}
-	} else {
-		mediaDir := cfg.Media.Dir
-		if mediaDir == "" {
-			mediaDir = filepath.Join(cfg.DataDir(), "media")
-		}
-		mediaStore, err = media.Open(mediaDir)
-	}
-	if err != nil {
-		log.Error("media store failed", "err", err)
-		os.Exit(1)
 	}
 
 	// Resolve per-agent memory and build handler maps.
@@ -919,9 +1012,9 @@ func main() {
 	// webui's BuildAgent) both go through it, so an agent installed live is
 	// built exactly like a boot one.
 	buildAgentDef := func(name string, a config.Agent) (*supervisor.AgentDef, error) {
-		src, watchPath, err := builtins.Resolve(a.Loop)
+		src, watchPath, err := luacode.Resolve(a.Loop)
 		if err != nil {
-			if h := loopHint(a.Loop, toolReg.Names(), builtins.Names()); h != "" {
+			if h := loopHint(a.Loop, toolReg.Names(), luacode.Names()); h != "" {
 				return nil, fmt.Errorf("loop %q: %w (hint: %s)", a.Loop, err, h)
 			}
 			return nil, fmt.Errorf("loop %q: %w", a.Loop, err)
@@ -975,7 +1068,7 @@ func main() {
 		// A skills entry naming a builtin loop matches no tool and is dropped
 		// silently, so say so rather than letting the agent look toolless.
 		for _, s := range a.Skills {
-			if h := skillHint(s, builtins.Names()); h != "" {
+			if h := skillHint(s, luacode.Names()); h != "" {
 				log.Warn("skills entry names a loop, not a tool", "agent", name, "skill", s, "hint", h)
 			}
 		}
@@ -1007,6 +1100,7 @@ func main() {
 			Events:   usageEvents,
 			Log:      log,
 			Requests: openaiRequests,
+			Media:    mediaSvc,
 		})
 		for k, h := range gateOps(enforce, name, effectiveCaps, "llm.chat", llmHandlers, &withheld) {
 			handlers[k] = h
@@ -1026,7 +1120,7 @@ func main() {
 		for k, h := range gateOps(enforce, name, effectiveCaps, "net.mail", caps.MailHandlers(log, credStore), &withheld) {
 			handlers[k] = limitEgress(h)
 		}
-		for k, h := range gateOps(enforce, name, effectiveCaps, "files", caps.FileHandlers(filesMgr, name), &withheld) {
+		for k, h := range gateOps(enforce, name, effectiveCaps, "files", caps.FileHandlersWithMedia(filesMgr, name, mediaSvc), &withheld) {
 			handlers[k] = h
 		}
 		for k, h := range gateOps(enforce, name, effectiveCaps, "session.state", caps.SessionStateHandlers{Store: rtStore}.Handlers(), &withheld) {
@@ -1102,10 +1196,10 @@ func main() {
 	// grants are validated against the global ceiling at config load; the
 	// supervisor attenuates them against the parent at spawn time.
 	for pname, p := range cfg.Profiles.Agent {
-		src, watchPath, err := builtins.Resolve(p.Loop)
+		src, watchPath, err := luacode.Resolve(p.Loop)
 		if err != nil {
 			fields := []any{"profile", pname, "err", err}
-			if h := loopHint(p.Loop, toolReg.Names(), builtins.Names()); h != "" {
+			if h := loopHint(p.Loop, toolReg.Names(), luacode.Names()); h != "" {
 				fields = append(fields, "hint", h)
 			}
 			log.Error("spawn profile loop resolve failed", fields...)
@@ -1149,7 +1243,7 @@ func main() {
 		agentSet := toolReg.Expose(p.Skills, toolPolicyFor(cfg.Tools.Policy, profileCaps), false).
 			RequireCapabilities(profileCaps)
 		for _, s := range p.Skills {
-			if h := skillHint(s, builtins.Names()); h != "" {
+			if h := skillHint(s, luacode.Names()); h != "" {
 				log.Warn("skills entry names a loop, not a tool", "profile", pname, "skill", s, "hint", h)
 			}
 		}
@@ -1182,6 +1276,7 @@ func main() {
 			Events:   usageEvents,
 			Log:      log,
 			Requests: openaiRequests,
+			Media:    mediaSvc,
 		})
 		for k, h := range gateOps(enforce, pname, profileCaps, "llm.chat", llmHandlers, &withheld) {
 			handlers[k] = h
@@ -1196,12 +1291,12 @@ func main() {
 			handlers[k] = h
 		}
 		for k, h := range gateOps(enforce, pname, profileCaps, "net.http", caps.HTTPHandlers(log, credStore, netPolicy, filesMgr), &withheld) {
-			handlers[k] = h
+			handlers[k] = limitEgress(h)
 		}
 		for k, h := range gateOps(enforce, pname, profileCaps, "net.mail", caps.MailHandlers(log, credStore), &withheld) {
-			handlers[k] = h
+			handlers[k] = limitEgress(h)
 		}
-		for k, h := range gateOps(enforce, pname, profileCaps, "files", caps.FileHandlers(filesMgr, pname), &withheld) {
+		for k, h := range gateOps(enforce, pname, profileCaps, "files", caps.FileHandlersWithMedia(filesMgr, pname, mediaSvc), &withheld) {
 			handlers[k] = h
 		}
 		for k, h := range gateOps(enforce, pname, profileCaps, "session.state", caps.SessionStateHandlers{Store: rtStore}.Handlers(), &withheld) {
@@ -1230,6 +1325,10 @@ func main() {
 			log.Error("spawn profile safety resolution failed", "profile", pname, "err", err)
 			os.Exit(1)
 		}
+		historyBudget := p.HistoryBudget
+		if historyBudget <= 0 {
+			historyBudget = 6000
+		}
 		tmpl := &supervisor.SpawnTemplate{
 			Name:          pname,
 			LoopFile:      watchPath,
@@ -1247,7 +1346,7 @@ func main() {
 				Name:          "spawn:" + pname,
 				Model:         p.Model,
 				Instructions:  instructions,
-				HistoryBudget: 6000,
+				HistoryBudget: historyBudget,
 				Memory:        amPtr,
 				Skills:        p.Skills,
 				Capabilities:  p.Capabilities,
@@ -1284,54 +1383,10 @@ func main() {
 
 	memMgr.StartGC(ctx, 5*time.Minute, agentMemories)
 
-	// Terminal dashboard: only when attached to a TTY and not disabled. The tee
-	// handler mirrors slog records into the TUI log pane and drops the stderr
-	// copy (the TUI owns the screen). On non-TTY output (piped logs, systemd)
-	// the plain stderr logger stays. The snapshot closure reads sup lazily so
-	// the dashboard can be created before the supervisor.
-	var sup *supervisor.Supervisor
-	var dash *tui.Dashboard
-	// exit is os.Exit for everything after this point. os.Exit skips deferred
-	// calls, so a boot failure once the dashboard owns the terminal used to
-	// leave the shell in raw mode on the alternate screen; Stop restores it
-	// first (and is a no-op without a dashboard).
-	exit := func(code int) {
-		dash.Stop()
-		os.Exit(code)
-	}
-	if tuiActive {
-		dash = tui.Start(tui.Source{
-			// Bubble Tea owns the terminal in raw mode, so ctrl+c is a key
-			// event here, not SIGINT. Cancel the engine context with the
-			// dashboard; stop() also restores the default signal behavior so
-			// a second ctrl+c can force-kill a stubborn shutdown.
-			Quit: stop,
-			Snapshot: func() (int, int) {
-				if sup == nil {
-					return 0, 0
-				}
-				// The dashboard shows the live counts only; per-session rows
-				// are the admin API's job.
-				_, active, idle := sup.Snapshot()
-				return active, idle
-			},
-			Metrics: metricReg.Snapshot,
-			Spark: func(name string) []int64 {
-				pts := history.Series(name)
-				out := make([]int64, len(pts))
-				for i, p := range pts {
-					out[i] = p.Value
-				}
-				return out
-			},
-		})
-		log = slog.New(dash.LogHandler(llog.NewTextHandler(io.Discard, lvl)))
-		slog.SetDefault(log)
-		defer dash.Stop()
-	}
-
-	sup = supervisor.New(defs, gw, opPool, shellMgr, log)
+	exit := os.Exit
+	sup := supervisor.New(defs, gw, opPool, shellMgr, log)
 	sup.SetShellJobs(shellJobs)
+	sup.SetMedia(mediaSvc)
 	deliverJobResult := caps.JobDeliverer(func(owner string, msg session.Message) {
 		agent, key, ok := sessionhub.SplitSessionKey(owner)
 		if !ok {
@@ -1396,11 +1451,13 @@ func main() {
 	// (default 30m, 0 disables). The loop starts from the top on the next
 	// message; durable state belongs in session.state.*.
 	sup.SetIdleUnload(cfg.Runtime.IdleUnload())
-	if mem, err := parseByteSize(cfg.Runtime.VM.MemoryLimit); err != nil {
-		log.Error("runtime.vm.memory_limit is not a size", "value", *cfg.Runtime.VM.MemoryLimit, "err", err)
-		exit(1)
-	} else if mem > 0 {
-		sup.SetVMMemory(mem)
+	if cfg.Runtime.VM.MemoryLimit != nil && strings.TrimSpace(*cfg.Runtime.VM.MemoryLimit) != "" {
+		if mem, err := config.ParseByteSize(*cfg.Runtime.VM.MemoryLimit); err != nil {
+			log.Error("runtime.vm.memory_limit is not a size", "value", *cfg.Runtime.VM.MemoryLimit, "err", err)
+			exit(1)
+		} else if mem > 0 {
+			sup.SetVMMemory(mem)
+		}
 	}
 
 	// Session hub. A conversation runs on one instance at a time, and in a
@@ -1622,11 +1679,10 @@ func main() {
 		}
 	}
 
-	// Web-console log tail: mirror every record into a ring buffer so the web
-	// UI's SSE endpoint can stream it. Wraps whichever handler is current
-	// (plain stderr, or the TUI tee) so both views see the same lines.
-	logRing := webui.NewLogRing(500)
-	log = slog.New(webui.NewTeeHandler(log.Handler(), logRing))
+	// Admin API log tail: mirror every record into a ring buffer so Studio's
+	// SSE log endpoint can stream it.
+	logRing := adminapi.NewLogRing(500)
+	log = slog.New(adminapi.NewTeeHandler(log.Handler(), logRing))
 	slog.SetDefault(log)
 
 	sup.SetScheduler(schedSvc)
@@ -1641,7 +1697,7 @@ func main() {
 	// shadow or file behind the ref, "" for an unshadowed builtin (the embedded
 	// handler has no file to poll). It is kept and handed to the reload watcher
 	// below — routing is policy, and policy is hot-reloadable here.
-	routeSrc, routeWatchPath, err := builtins.Resolve(routeRef)
+	routeSrc, routeWatchPath, err := luacode.Resolve(routeRef)
 	if err != nil {
 		log.Error("route plugin resolve failed", "err", err)
 		exit(1)
@@ -1730,7 +1786,7 @@ func main() {
 				log.Warn("identity reply failed", "channel", channel, "err", err)
 			}
 		})
-		sc.SetRejectUnregistered(cfg.Runtime.Users.RejectUnregistered())
+		sc.SetRejectUnregistered(cfg.Runtime.Identity.RejectUnregistered())
 		sink = sc
 		sup.SetUserResolver(identReg)
 		// Per-user overrides: a profile's model and instruction layer reach every
@@ -1742,7 +1798,7 @@ func main() {
 		// storedb.Display, not the raw target: in a fleet this is a DSN, and a
 		// DSN carries a password.
 		log.Info("identity layer enabled", "store", storedb.Display(cfg.IdentityStore()),
-			"require_registration", cfg.Runtime.Users.RegistrationRequired())
+			"require_registration", cfg.Runtime.Identity.RegistrationRequired())
 	}
 
 	// Channels. All HTTP channels (webhook, ghhook, telegram-webhook/auto)
@@ -1761,6 +1817,12 @@ func main() {
 
 	httpdLog := log.With("module", "httpd")
 	httpSrv := httpd.New(cfg.Gateway.Listen, httpdLog)
+	if tempURLHandler != nil {
+		httpSrv.Handle(tempURLHandler.Path(), tempURLHandler.ServeHTTP)
+		log.Info("media temporary URL endpoint enabled",
+			"path", tempURLHandler.Path(),
+			"ttl", cfg.Media.TempURL.MediaTempURLTTL().String())
+	}
 	// The OpenAI channel refuses requests while the instance drains. The admin
 	// server is constructed later in this function (it needs the stores), after
 	// the listener is already serving, so the check is published atomically:
@@ -1847,9 +1909,15 @@ func main() {
 				continue
 			}
 			d := telegram.New(name, token, ch.Agent, ch.Mode, ch.AllowUsers, ch.Path, cfg.Gateway.PublicURL, secretToken, sink, httpSrv, mstore, mpol, log)
+			d.SetMedia(mediaSvc)
 			gw.Register(d)
 			telegramDrivers = append(telegramDrivers, d)
 		case "qq":
+			if mediaSvc == nil || !mediaSvc.CanPresign() {
+				log.Warn("channel skipped: qq requires public media URLs — configure media.backend: s3 or media.temp_url.enabled: true (with gateway.public_url)",
+					"channel", name)
+				continue
+			}
 			secret, ok := credResolver.Resolve(ctx, ch.Secret)
 			if !ok {
 				log.Warn("channel skipped: unresolved credential",
@@ -1857,15 +1925,17 @@ func main() {
 				continue
 			}
 			d := qqbot.New(name, ch.Agent, qqbot.Options{
-				AppID:     ch.AppID,
-				Secret:    secret,
-				Mode:      ch.Mode,
-				Path:      ch.QQPath(),
-				PublicURL: cfg.Gateway.PublicURL,
-				Scenes:    ch.Scenes,
-				APIBase:   ch.APIBase,
-				Markdown:  ch.Markdown,
-			}, sink, httpSrv, mstore, mpol, log)
+				AppID:      ch.AppID,
+				Secret:     secret,
+				Mode:       ch.Mode,
+				Path:       ch.QQPath(),
+				PublicURL:  cfg.Gateway.PublicURL,
+				Scenes:     ch.Scenes,
+				APIBase:    ch.APIBase,
+				Markdown:   ch.Markdown,
+				Media:      mediaSvc,
+				PresignTTL: cfg.Media.TempURL.MediaTempURLTTL(),
+			}, sink, httpSrv, mediaStore, mpol, log)
 			gw.Register(d)
 			qqDrivers = append(qqDrivers, d)
 		case "ghhook":
@@ -1909,6 +1979,7 @@ func main() {
 				Token:      token,
 				Timeout:    timeout,
 			}, sink, httpSrv, mstore, mpol, log)
+			d.SetMedia(mediaSvc)
 			gw.Register(d)
 		case "openai":
 			agents := ch.Agents
@@ -1999,8 +2070,8 @@ func main() {
 	// does not run in one), and a support chunk restarts every live session,
 	// because every session loads all of them.
 	watcher.SetRoute(&reload.RouteSource{Ref: routeRef, WatchPath: routeWatchPath, Apply: rtr.Reload})
-	watcher.SetSupport(&reload.SupportSource{Paths: builtins.SupportChunkPaths(), Reload: sup.ReloadAll})
-	watcher.SetPackages(&reload.PackageSource{Paths: builtins.PackagePaths(), Reload: sup.ReloadAll})
+	watcher.SetSupport(&reload.SupportSource{Paths: luacode.SupportChunkPaths(), Reload: sup.ReloadAll})
+	watcher.SetPackages(&reload.PackageSource{Paths: luacode.PackagePaths(), Reload: sup.ReloadAll})
 	watcher.Start()
 
 	// The admin plane: health, readiness, metrics, the admin API and the
@@ -2047,7 +2118,6 @@ func main() {
 		}
 		return infos
 	})
-	admin.SetCredentials(credStore)
 	{
 		// The full-fidelity user bundle: one person's profile, memory, files and
 		// re-encrypted credentials, for moving them between regional cells.
@@ -2061,7 +2131,7 @@ func main() {
 			Region:   cfg.Runtime.Region,
 			Log:      log,
 		}
-		console := webui.New(webui.Deps{
+		api := adminapi.New(adminapi.Deps{
 			ConfigPath: cfgSource.ConfigPath(),
 			ConfigDir:  cfgSource.ConfigDir(),
 			Cfg:        cfg,
@@ -2088,47 +2158,59 @@ func main() {
 			Channels:   channelsStore,
 			Safety:     safetyStore,
 			Memory:     memoryStore,
+			Media:      mediaSvc,
 			StudioCatalog: func() studio.Catalog {
+				curCfg := cfg
+				if loaded, err := cfgSource.Load(nil); err == nil && loaded != nil {
+					curCfg = loaded
+				}
 				models := make([]string, 0)
 				for name := range llmMgr.List() {
 					models = append(models, name)
 				}
 				safety := []string{"default", "none"}
-				for name := range cfg.Profiles.Safety {
+				for name := range curCfg.Profiles.Safety {
 					safety = append(safety, name)
 				}
-				memory := make([]string, 0)
-				for name := range cfg.Profiles.Memory {
+				memory := []string{"conversational"}
+				for name := range curCfg.Profiles.Memory {
 					memory = append(memory, name)
 				}
 				prompts := make([]string, 0)
-				for name := range cfg.Prompts {
+				for name := range curCfg.Prompts {
 					prompts = append(prompts, name)
 				}
-				return studio.NewCatalog(models, toolReg.Names(), safety, memory, prompts, config.DefaultCapabilities)
+				cat := studio.NewCatalog(models, toolReg.Names(), safety, memory, prompts, config.DefaultCapabilities)
+				for name := range curCfg.Profiles.Shell {
+					cat.ShellProfiles = append(cat.ShellProfiles, name)
+				}
+				sort.Strings(cat.ShellProfiles)
+				for name := range curCfg.Environments {
+					cat.Environments = append(cat.Environments, name)
+				}
+				sort.Strings(cat.Environments)
+				for name := range curCfg.Packages {
+					cat.Packages = append(cat.Packages, name)
+				}
+				sort.Strings(cat.Packages)
+				return cat
 			},
-			Users: webui.UserDeps{
+			Users: adminapi.UserDeps{
 				Identities: identReg,
 				Store:      rtStore,
 				Events:     eventLog,
 				Journal:    journalSink,
 				Quota:      userQuota,
 				Files:      filesMgr,
+				Media:      mediaSvc,
 				Purge:      rtStore,
 			},
 		})
-		admin.Mount("/admin/api/", console.API(), true)
-		if consoleEnabled {
-			// The console lives under /admin/, not at the root: the root of the
-			// shared listener is the public side, and channels mount there.
-			admin.Mount("/admin/", http.StripPrefix("/admin", console.Static()), false)
-			if tcpAdmin {
-				log.Info("web console enabled", "url", localURL(cfg.Gateway.Listen)+"/admin/")
-			} else {
-				log.Info("web console HTTP disabled; the API is served on the local admin socket")
-			}
+		admin.Mount("/admin/api/", api.API(), true)
+		if tcpAdmin {
+			log.Info("admin API enabled", "url", localURL(cfg.Gateway.Listen)+"/admin/api/")
 		} else {
-			log.Info("web console static files disabled; the admin and Studio APIs are still served")
+			log.Info("admin API HTTP disabled; serving on the local admin socket")
 		}
 	}
 	if tcpAdmin {
@@ -2243,75 +2325,6 @@ func main() {
 	httpSrv.Stop(shutdownCtx)
 }
 
-// warnInertConfig reports configuration that is parsed — so a config that sets
-// it keeps booting — and that nothing reads. Each one claims a behaviour the
-// engine does not have, so staying silent is how a deployment comes to believe
-// it configured something.
-//
-// Every field here is a pointer for the same reason: presence has to be
-// distinguishable from a zero value, and that is now their only purpose.
-// Deleting one outright would turn an existing config into a parse error, since
-// decoding is strict — a boot failure for a setting that does nothing.
-func warnInertConfig(cfg *config.Config, log *slog.Logger) {
-	// (runtime.vm.memory_limit used to warn here: it was inert — the Luau
-	// state had no allocator cap. It is live now: main parses it and the
-	// supervisor stamps every new session's state with the cap.)
-	if v := cfg.Runtime.VM.InstructionBudget; v != nil {
-		log.Warn("runtime.vm.instruction_budget has no effect: the per-resume budget is fixed at 5,000,000", "value", *v)
-	}
-	if v := cfg.Runtime.Reload.Watch; v != nil {
-		log.Warn("runtime.reload.watch has no effect: the reload watcher always runs", "value", *v)
-	}
-
-	reportStore := func(profile string, stores map[string]config.Store) {
-		for name, s := range stores {
-			if s.Collection != nil {
-				log.Warn("memory store collection has no effect: a store is bound by backend and table",
-					"profile", profile, "store", name, "value", *s.Collection)
-			}
-			if s.Policy != nil {
-				log.Warn("memory store policy has no effect: no policy knob is implemented for a store",
-					"profile", profile, "store", name, "value", *s.Policy)
-			}
-		}
-	}
-	reportStore("built-in", config.DefaultMemoryProfile().Stores)
-	for name, p := range cfg.Profiles.Memory {
-		reportStore(name, p.Stores)
-	}
-
-	if v := cfg.Tools.Policy.Write; v != nil {
-		log.Warn("tools.policy.write has no effect: no tool write policy is implemented", "value", *v)
-	}
-	// These three are accepted on an override and copied onto the tool, and
-	// nothing ever consults them — so a deployment that sets one is configuring
-	// a decision the engine does not make. (`permission` is the exception: it
-	// works, as the exact string "forbidden".)
-	for tname, o := range cfg.Tools.Policy.Overrides {
-		if o.CostLevel != nil {
-			log.Warn("tools.policy.overrides.cost_level has no effect: nothing reads a tool's cost level",
-				"tool", tname, "value", *o.CostLevel)
-		}
-		if o.UserVisible != nil {
-			log.Warn("tools.policy.overrides.user_visible has no effect: nothing reads a tool's visibility",
-				"tool", tname, "value", *o.UserVisible)
-		}
-		if o.Autonomous != nil {
-			log.Warn("tools.policy.overrides.autonomous has no effect: nothing reads a tool's autonomy",
-				"tool", tname, "value", *o.Autonomous)
-		}
-	}
-}
-
-// warnDeprecatedConfig reports settings that still work but are on their way
-// out, naming the replacement. A deprecation warning is not an error: an
-// existing config keeps booting, which is the same call the inert settings get.
-func warnDeprecatedConfig(cfg *config.Config, log *slog.Logger) {
-	if p := strings.TrimSpace(cfg.Runtime.Cluster.Persistence); p != "" {
-		log.Warn("runtime.cluster.persistence is deprecated: leases and the session inbox always live in the runtime store; remove it (a regional cell refuses any other target)")
-	}
-}
-
 // warnTopologyConfig reports the topology mistakes that validation cannot see.
 //
 // The first is a fleet that never declared itself: a PostgreSQL runtime store
@@ -2333,7 +2346,7 @@ func warnTopologyConfig(cfg *config.Config, log *slog.Logger) {
 		target string
 	}{
 		{"runtime.identity.persistence", cfg.Runtime.Identity.Persistence},
-		{"runtime.credentials.path", cfg.Runtime.Credentials.Path},
+		{"runtime.credentials.persistence", cfg.Runtime.Credentials.Persistence},
 	} {
 		if strings.TrimSpace(t.target) == "" {
 			continue
@@ -2382,6 +2395,11 @@ func warnUnenforceableGC(cfg *config.Config, log *slog.Logger) {
 	report("built-in", config.DefaultMemoryProfile().Stores)
 	for name, p := range cfg.Profiles.Memory {
 		report(name, p.Stores)
+	}
+	for name, a := range cfg.Agents {
+		if a.Memory.IsInline {
+			report("agent:"+name, a.Memory.Inline.Stores)
+		}
 	}
 }
 
@@ -2719,75 +2737,23 @@ func classifierOptions(name string, p config.ClassifierProfile, client *moderati
 	}
 }
 
-// budgetTokens extracts the tokens_per_day from the agent's budget config.
+// budgetTokens returns the agent's configured token budget.
 func budgetTokens(a config.Agent) int64 {
-	if a.Budget == nil {
-		return 0
-	}
-	v, ok := a.Budget["tokens_per_day"]
-	if !ok {
-		return 0
-	}
-	switch n := v.(type) {
-	case int:
-		return int64(n)
-	case int64:
-		return n
-	case float64:
-		return int64(n)
-	}
-	return 0
+	return a.Budget.TokensPerDay
 }
 
-// budgetWindow extracts the optional rolling-window duration from the agent's
-// budget config (e.g. budget: { tokens: N, window: "168h" }). Returns 0 when
-// unset, which selects the daily-reset accounting mode.
+// budgetWindow parses the optional rolling-window duration from the agent's
+// budget config (e.g. budget: { tokens_per_day: N, window: "168h" }). Returns 0
+// when unset, which selects the daily-reset accounting mode.
 func budgetWindow(a config.Agent) time.Duration {
-	if a.Budget == nil {
+	if a.Budget.Window == "" {
 		return 0
 	}
-	v, ok := a.Budget["window"]
-	if !ok {
-		return 0
-	}
-	s, ok := v.(string)
-	if !ok {
-		return 0
-	}
-	d, err := time.ParseDuration(s)
+	d, err := time.ParseDuration(a.Budget.Window)
 	if err != nil {
 		return 0
 	}
 	return d
-}
-
-// parseByteSize reads a byte size as a config value: a plain byte count, or a
-// number with a b/kb/mb/gb (case-insensitive, binary multiples) suffix — the
-// spellings "64mb" and "1048576" both work. nil or "" means unset.
-func parseByteSize(v *string) (int64, error) {
-	if v == nil || strings.TrimSpace(*v) == "" {
-		return 0, nil
-	}
-	s := strings.TrimSpace(strings.ToLower(*v))
-	mult := int64(1)
-	switch {
-	case strings.HasSuffix(s, "gb"):
-		mult, s = 1<<30, strings.TrimSuffix(s, "gb")
-	case strings.HasSuffix(s, "mb"):
-		mult, s = 1<<20, strings.TrimSuffix(s, "mb")
-	case strings.HasSuffix(s, "kb"):
-		mult, s = 1<<10, strings.TrimSuffix(s, "kb")
-	case strings.HasSuffix(s, "b"):
-		s = strings.TrimSuffix(s, "b")
-	}
-	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("not a byte size: %q", *v)
-	}
-	if n < 0 {
-		return 0, fmt.Errorf("a byte size cannot be negative: %q", *v)
-	}
-	return n * mult, nil
 }
 
 func memoryFromConfig(s config.Store) memory.Store {

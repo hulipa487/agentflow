@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"agentflow/internal/luacode"
 	"agentflow/internal/vm"
 )
 
@@ -14,15 +15,16 @@ import (
 // embedded builtin — for Resolve (loop/route refs, with a watch path for hot
 // reload) and for SupportChunks. Unshadowed builtins fall back to embedded.
 func TestPluginDirShadowsBuiltin(t *testing.T) {
+	Register()
 	dir := t.TempDir()
 	shadowSrc := directive() + "memory_recall_handler = function(q, o) return {} end\n"
 	if err := os.WriteFile(filepath.Join(dir, "recency.lua"), []byte(shadowSrc), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	SetPluginDir(dir)
-	defer SetPluginDir("")
+	luacode.SetPluginDir(dir)
+	defer luacode.SetPluginDir("")
 
-	src, watch, err := Resolve("plugin:recency")
+	src, watch, err := luacode.Resolve("plugin:recency")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +36,7 @@ func TestPluginDirShadowsBuiltin(t *testing.T) {
 	}
 
 	// SupportChunks carries the shadow in recency's position (3rd).
-	chunks, err := SupportChunks()
+	chunks, err := luacode.SupportChunks()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +48,7 @@ func TestPluginDirShadowsBuiltin(t *testing.T) {
 	}
 
 	// An unshadowed builtin still resolves to the embedded source, unwatched.
-	src, watch, err = Resolve("plugin:semantic")
+	src, watch, err = luacode.Resolve("plugin:semantic")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,15 +60,16 @@ func TestPluginDirShadowsBuiltin(t *testing.T) {
 // TestNoPluginDirKeepsEmbedded: with no plugins.dir set, behavior is exactly
 // the pre-shadowing loader.
 func TestNoPluginDirKeepsEmbedded(t *testing.T) {
-	SetPluginDir("")
-	src, watch, err := Resolve("plugin:recency")
+	Register()
+	luacode.SetPluginDir("")
+	src, watch, err := luacode.Resolve("plugin:recency")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if src != sources["recency"] || watch != "" {
 		t.Fatal("embedded builtin must resolve unwatched without plugins.dir")
 	}
-	chunks, err := SupportChunks()
+	chunks, err := luacode.SupportChunks()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,14 +83,15 @@ func TestNoPluginDirKeepsEmbedded(t *testing.T) {
 // a shadow. An embedded chunk is not a path and must not be reported as one, or
 // the watcher would poll something that does not exist.
 func TestSupportChunkPathsListsOnlyShadows(t *testing.T) {
+	Register()
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "recency.lua"), []byte("-- override\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	SetPluginDir(dir)
-	defer SetPluginDir("")
+	luacode.SetPluginDir(dir)
+	defer luacode.SetPluginDir("")
 
-	paths := SupportChunkPaths()
+	paths := luacode.SupportChunkPaths()
 	if len(paths) != 1 {
 		t.Fatalf("paths = %v, want only the shadowed chunk", paths)
 	}
@@ -105,8 +109,8 @@ func TestSupportChunkPathsListsOnlyShadows(t *testing.T) {
 	}
 
 	// Without a plugins.dir there are no shadows at all.
-	SetPluginDir("")
-	if got := SupportChunkPaths(); len(got) != 0 {
+	luacode.SetPluginDir("")
+	if got := luacode.SupportChunkPaths(); len(got) != 0 {
 		t.Fatalf("paths without plugins.dir = %v", got)
 	}
 }
@@ -116,98 +120,24 @@ func TestSupportChunkPathsListsOnlyShadows(t *testing.T) {
 // example, because "unknown plugin:per_chat" alone leaves you guessing at the
 // spelling.
 func TestUnknownBuiltinStillRejected(t *testing.T) {
-	SetPluginDir(t.TempDir())
-	defer SetPluginDir("")
-	if _, _, err := Resolve("plugin:nope"); err == nil || !strings.Contains(err.Error(), "unknown plugin") {
+	Register()
+	luacode.SetPluginDir(t.TempDir())
+	defer luacode.SetPluginDir("")
+	if _, _, err := luacode.Resolve("plugin:nope"); err == nil || !strings.Contains(err.Error(), "unknown plugin") {
 		t.Fatalf("expected unknown builtin error, got %v", err)
 	}
 }
 
-// TestVersionGateRefusesEveryRoute: each way a chunk can reach a session — a
-// shadowed builtin, a single file, a directory, a directory member — is refused
-// when the chunk targets another prelude version, or declares none. The gate is
-// only worth having if it covers every one of them: a route that skips it is a
-// route a core upgrade breaks silently, which is the failure the version exists
-// to prevent.
-func TestVersionGateRefusesEveryRoute(t *testing.T) {
-	stale := "-- af-prelude-version: 0\nfunction loop() end\n"
-	undeclared := "function loop() end\n"
-
-	// The directory case is the one worth being careful about: the first member
-	// is correct and only the second is stale. Checking the concatenation would
-	// pass, because the first member's directive is what leads the joined
-	// source.
-	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "loop.lua"), stale)
-	members := filepath.Join(dir, "members")
-	if err := os.Mkdir(members, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	writeFile(t, filepath.Join(members, "10-main.lua"), directive()+"function loop() end\n")
-	writeFile(t, filepath.Join(members, "20-tools.lua"), stale)
-	writeFile(t, filepath.Join(dir, "undeclared.lua"), undeclared)
-
-	shadows := t.TempDir()
-	writeFile(t, filepath.Join(shadows, "recency.lua"), stale)
-	SetPluginDir(shadows)
-	defer SetPluginDir("")
-
-	cases := []struct {
-		name   string
-		ref    string
-		wantIn []string // fragments the refusal must carry, so it is actionable
-	}{
-		{"shadowed builtin", "plugin:recency", []string{filepath.Join(shadows, "recency.lua")}},
-		{"single file", filepath.Join(dir, "loop.lua"), []string{filepath.Join(dir, "loop.lua")}},
-		// The refusal names the *member*, not the directory: that is the file
-		// the operator has to open.
-		{"directory loop", members, []string{filepath.Join(members, "20-tools.lua")}},
-		{"no declaration", filepath.Join(dir, "undeclared.lua"), []string{
-			filepath.Join(dir, "undeclared.lua"), "af-prelude-version",
-		}},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			src, watch, err := Resolve(c.ref)
-			if err == nil {
-				t.Fatalf("Resolve(%s) returned source (watch path %q) for a chunk this core cannot serve", c.ref, watch)
-			}
-			if !errors.Is(err, vm.ErrPreludeVersion) {
-				t.Fatalf("Resolve(%s) failed with %v; want a version refusal the hot-reload path can recognise", c.ref, err)
-			}
-			if src != "" {
-				t.Fatalf("Resolve(%s) returned source alongside the refusal", c.ref)
-			}
-			for _, want := range c.wantIn {
-				if !strings.Contains(err.Error(), want) {
-					t.Fatalf("refusal does not mention %q, so it cannot be acted on: %v", want, err)
-				}
-			}
-		})
-	}
-
-	// The gate must not refuse what it is supposed to serve.
-	if _, _, err := Resolve("plugin:semantic"); err != nil {
-		t.Fatalf("an embedded builtin at this core's own version was refused: %v", err)
-	}
-	writeFile(t, filepath.Join(dir, "ok.lua"), directive()+"function loop() end\n")
-	if _, _, err := Resolve(filepath.Join(dir, "ok.lua")); err != nil {
-		t.Fatalf("a chunk declaring this core's version was refused: %v", err)
-	}
-}
-
-// TestVersionGateCoversSupportChunks: the gate reaches the support chunks too,
-// shadowed or embedded. A support chunk is not a loop/route ref — nothing
-// resolves it — so SupportChunks is the only way one reaches a session, and a
-// shadow that skipped the gate there would be Lua running against an API it was
-// not written for, in every session of the deployment at once.
+// TestVersionGateCoversEmbeddedAndShadowedSupportChunks verifies embedded
+// support chunks pass the version gate and shadowed ones are refused when
+// stale or missing their prelude declaration.
 func TestVersionGateCoversSupportChunks(t *testing.T) {
+	Register()
 	dir := t.TempDir()
-	SetPluginDir(dir)
-	defer SetPluginDir("")
+	luacode.SetPluginDir(dir)
+	defer luacode.SetPluginDir("")
 
-	// The unexceptional case first: no shadow, so the embedded chunks load.
-	if _, err := SupportChunks(); err != nil {
+	if _, err := luacode.SupportChunks(); err != nil {
 		t.Fatalf("the embedded support chunks were refused: %v", err)
 	}
 
@@ -218,7 +148,7 @@ func TestVersionGateCoversSupportChunks(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			writeFile(t, filepath.Join(dir, "recency.lua"), c.src)
-			chunks, err := SupportChunks()
+			chunks, err := luacode.SupportChunks()
 			if err == nil {
 				t.Fatalf("a shadowed support chunk this core cannot serve was loaded (%d chunks)", len(chunks))
 			}
@@ -228,16 +158,14 @@ func TestVersionGateCoversSupportChunks(t *testing.T) {
 			if chunks != nil {
 				t.Fatalf("source returned alongside the refusal: %v", chunks)
 			}
-			// The refusal names the file the operator has to edit.
 			if !strings.Contains(err.Error(), filepath.Join(dir, "recency.lua")) {
 				t.Fatalf("refusal does not name the shadow: %v", err)
 			}
 		})
 	}
 
-	// The shadow was the only thing wrong: fix it and the chunks load again.
 	writeFile(t, filepath.Join(dir, "recency.lua"), directive()+"SUPPORT = 1\n")
-	chunks, err := SupportChunks()
+	chunks, err := luacode.SupportChunks()
 	if err != nil {
 		t.Fatalf("a shadow declaring this core's version was refused: %v", err)
 	}
@@ -251,8 +179,9 @@ func TestVersionGateCoversSupportChunks(t *testing.T) {
 // json.decode over that nil crashed the router on every new chat; the route
 // must reach deliver and park for the next message instead.
 func TestPerChatRoutesWithoutDurableMode(t *testing.T) {
-	SetPluginDir("")
-	src, _, err := Resolve("plugin:per_chat")
+	Register()
+	luacode.SetPluginDir("")
+	src, _, err := luacode.Resolve("plugin:per_chat")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,9 +192,6 @@ func TestPerChatRoutesWithoutDurableMode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// One inbound, a state miss, a deliver, then an error that stops the
-	// otherwise-infinite route loop. The bridge is stubbed after the prelude,
-	// before the route chunk runs.
 	stub := directive() + `
 local calls = 0
 function session.inbox()

@@ -11,10 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"agentflow/internal/builtins"
+	_ "agentflow/internal/builtins"
 	"agentflow/internal/core/gateway"
 	"agentflow/internal/core/pool"
 	"agentflow/internal/core/session"
+	"agentflow/internal/luacode"
 	"agentflow/internal/vm"
 )
 
@@ -54,7 +55,7 @@ func newTestSupervisor(t *testing.T) *Supervisor {
 	t.Cleanup(func() {
 		cancel()
 		// Wait for every actor to leave before the next test touches shared
-		// globals (builtins.SetPluginDir) that a running actor reads.
+		// globals (luacode.SetPluginDir) that a running actor reads.
 		waitCtx, waitCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer waitCancel()
 		sup.Wait(waitCtx)
@@ -74,8 +75,8 @@ func TestUngatedSupportShadowRefusesTheSession(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "token_budget.lua"), []byte("SUPPORT = 1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	builtins.SetPluginDir(dir)
-	t.Cleanup(func() { builtins.SetPluginDir("") })
+	luacode.SetPluginDir(dir)
+	t.Cleanup(func() { luacode.SetPluginDir("") })
 
 	sup := newTestSupervisor(t)
 	err := sup.Deliver("planner", "k", session.Message{ID: "m1", Type: "user", From: "u", Text: "hi"})

@@ -271,7 +271,15 @@ func (d *Driver) parseContent(raw json.RawMessage) (string, []media.Part, *apiEr
 			if !d.mediaAllowed(mime) {
 				return "", nil, mediaRefused(mime)
 			}
-			out = append(out, media.Part{Type: "audio", MIME: mime, Data: p.InputAudio.Data})
+			if d.opt.Store != nil {
+				part, aerr := d.mediaFromURL("audio", "data:"+mime+";base64,"+p.InputAudio.Data)
+				if aerr != nil {
+					return "", nil, aerr
+				}
+				out = append(out, part)
+			} else {
+				out = append(out, media.Part{Type: "audio", MIME: mime, Data: p.InputAudio.Data})
+			}
 		case "file":
 			// file.file_data is a data URL in the OpenAI API, so it takes the
 			// same path as an inline image: the channel's media policy decides

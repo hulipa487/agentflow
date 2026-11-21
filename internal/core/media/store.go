@@ -38,6 +38,7 @@ type Part struct {
 	Handle string `json:"handle,omitempty"` // "media:<sha256hex>" blob-store ref
 
 	Name string `json:"name,omitempty"` // filename for files (pdfs, ...)
+	Size int64  `json:"size,omitempty"` // byte length when known
 }
 
 // Classify maps a MIME type to a Part type. Unknown types become "file".
@@ -127,6 +128,22 @@ type Store interface {
 	List() ([]Blob, error)
 	// Delete removes one blob. Deleting a missing blob is not an error.
 	Delete(handle string) error
+}
+
+// PresignOptions carries optional S3 response header overrides for a presigned
+// GET URL. Zero value signs a plain GET URL.
+type PresignOptions struct {
+	ContentType string // optional response-content-type query override
+	Filename    string // optional filename for response-content-disposition
+}
+
+// Presigner is an optional capability implemented by remote blob stores (such
+// as s3media.Store) that can mint time-limited public HTTP(S) GET URLs for
+// stored blobs. Channels whose upstream API fetches outbound media by URL
+// (such as QQ) type-assert for it instead of requiring callers to host media
+// separately.
+type Presigner interface {
+	PresignGet(handle string, ttl time.Duration, opts PresignOptions) (string, error)
 }
 
 // Blob is one stored object reported by List: its handle, size, and last

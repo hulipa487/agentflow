@@ -20,7 +20,7 @@ runtime:
   persistence: sqlite://` + filepath.ToSlash(filepath.Join(dir, "agentflow.db")) + `
   credentials:
     enabled: true
-    path: ` + filepath.ToSlash(filepath.Join(dir, "credentials.db")) + `
+    persistence: ` + filepath.ToSlash(filepath.Join(dir, "credentials.db")) + `
     master_key_env: AF_TEST_MASTER_KEY
 agents:
   bot: { loop: plugin:per_chat }

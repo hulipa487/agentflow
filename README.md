@@ -15,9 +15,9 @@
 
 > TL;DR - A LLM Runtime with Lua programmable, hot reloadable loops
 
-AgentFlow is an open-source, single-binary Go runtime for LLM agents.
+AgentFlow is an open-source, pure-Go single-binary runtime for LLM agents.
 
-Configure all the routines - API keys, LLM Upstreams, Tools, Channels, Memory - with simple YAML, while you enjoy the fun of coding agentic loops in simple Lua (Luau, to be exact), and without sacrificing controls too! You name it, we've got it.
+Configure all the routines - API keys, LLM Upstreams, Tools, Channels, Memory - with simple YAML, while you enjoy the fun of coding agentic loops in Lua, without sacrificing control! You name it, we've got it.
 - [x] Direct r/w control over vectordb?
 - [x] User prompts accessible to Lua?
 - [x] Custom ReAct loops?
@@ -37,7 +37,7 @@ Interact with your agents with Telegram, QQ and Webhooks, or through our first-c
      │  gateway + router   │   who is this, and which agent gets it?
      └──────────┬──────────┘
                 ▼
-     ┌─────────────────────┐   one isolated Luau state per conversation,
+     ┌─────────────────────┐   one isolated Lua state per conversation,
      │  session (your loop)│   running *your* loop: inbox → think → send
      └──────────┬──────────┘
                 ▼
@@ -104,10 +104,10 @@ Edit the loop while it runs and every live session switches to the new code at i
 
 ## What's in the box
 
-**🧠 Loops in Luau**
-- A sandboxed Lua state per conversation, with a memory cap and an instruction budget.
+**🧠 Loops in Lua**
+- A sandboxed pure-Go Lua 5.1 (`gopher-lua`) state per conversation, with an instruction budget and memory guards.
 - One small API: `llm.chat` / `llm.stream` / `llm.embed` / `llm.rerank`, `memory.recall` / `memory.write`, `store.*`, `tools.run`, `http.request`, `files.*`, `shell.run`, `mail.*`, `scheduler.after` / `every` / `cron`, `agent.spawn` / `send` / `request`, `user.*`.
-- Built-in plugins for the boring parts: recency and semantic recall, fact extraction, per-chat routing, token budgets.
+- Built-in plugins for the boring parts: recency and semantic recall, per-chat routing, token budgets.
 - `agentflow loop test` runs scripted scenarios against a loop, so loops get tests too.
 
 **🔌 Models and channels**
@@ -123,7 +123,7 @@ Edit the loop while it runs and every live session switches to the new code at i
 **🧰 Tools and integrations**
 - Declarative HTTP tools in YAML, or generate them from an OpenAPI spec with `agentflow tools import-openapi`.
 - MCP servers as tool sources, a browser tool (Cloudflare Browser Rendering), web search and page fetch.
-- A shell that leaves nothing behind: each command is a one-off [gVisor](https://gvisor.dev) sandbox on a user's project files, with a declared toolchain image, a time limit and no network. Changes are stored when it ends; the next command can run on any instance. SSH is there for real remote machines.
+- A shell that leaves nothing behind: each command is a one-off [gVisor](https://gvisor.dev) (`provider: gvisor`, Linux) or [microsandbox](https://github.com/superradcompany/microsandbox) (`provider: microsandbox`, Linux KVM / macOS Apple Silicon / Windows WHP) sandbox on a user's project files, with a declared toolchain image, a time limit and no network. Changes are stored when it ends; the next command can run on any instance. SSH is there for real remote machines.
 - Media and files on local disk or S3.
 
 **👥 Users and tenancy**
@@ -138,9 +138,8 @@ Edit the loop while it runs and every live session switches to the new code at i
 - Every message carries where it came from, and tenancy is checked from that record, never from what the Lua claims.
 
 **📊 Operations**
-- One HTTP port for everything: the channels, and the admin plane under `/admin/` - an API for state, metrics, logs, agents, models, users, credentials and usage, plus a small web console.
-- A terminal dashboard, `doctor` checks (with `-online` probes of every backend), redacted support bundles.
-- Hot reload of loops and config; live model edits from Studio.
+- Pure headless runtime — one HTTP port for everything: the channels, `/healthz` / `/readyz` / `/metrics`, and the authenticated `/admin/api/` JSON & SSE API that **AgentFlow Studio** connects to.
+- `doctor` checks (with `-online` probes of every backend), redacted support bundles, hot reload of loops and config, and live model/agent edits from Studio.
 
 ## Deployment, from laptop to planet
 
@@ -160,32 +159,19 @@ agentflow user export u_abc -pubkey eu-move.pub -out u_abc.zip   # move one user
 
 ## Getting Started
 
-Run the following auto-install script.
+Run the following auto-install script:
 
 ```bash
 curl -fsSL agentflow.hulipa.my | sh
 ```
 
-OR
-
-Build from source. You need Go 1.26+, GNU make, and a C/C++ toolchain (gcc on Linux, Xcode's clang on macOS, [zig](https://ziglang.org) on Windows) for the vendored Luau:
+OR build from source — AgentFlow is 100% pure Go (`CGO_ENABLED=0`), so only Go 1.26+ is needed on Windows, macOS, or Linux (no C/C++ toolchain, no git submodules):
 
 ```bash
-git clone --recurse-submodules https://github.com/hulipa487/agentflow.git
+git clone https://github.com/hulipa487/agentflow.git
 cd agentflow
-make
+go build -o agentflow ./cmd/agentflow   # or `make`
 ./agentflow run -config agentflow.example.yaml
-```
-
-From the Gitee mirror, clone without submodules and let `make` fetch Luau from
-[its Gitee mirror](https://gitee.com/trusted-list/luau) as well. Gitee serves
-git over SSH only, so both need an SSH key on your Gitee account:
-
-```bash
-git clone git@gitee.com:chutszwai/agentflow.git
-cd agentflow
-make submodules-gitee
-make
 ```
 
 Starting your own deployment:
@@ -213,23 +199,24 @@ agentflow run -config mybot      # go
 
 `agentflow help <command>` prints a command's flags, generated from the binary itself.
 
-## AgentFlow Studio
+## AgentFlow Studio & Documentation
 
-The desktop companion: connect to any deployment and get an overview of sessions and instances, an agent builder with a Luau editor and analyzer, a playground with execution traces, and screens for models, channels, safety, users, credentials, usage and logs. The full documentation - configuration reference, Luau API reference, deployment guides - ships inside Studio and works offline.
+AgentFlow itself is strictly a headless runtime; all UI, full documentation, and runnable examples live in [**AgentFlow Studio**](https://github.com/hulipa487/agentflow-studio). Connect Studio (desktop or web) to any deployment's `/admin/api/` endpoint to get an overview of sessions and instances, an agent builder with a Lua editor and analyzer, a playground with execution traces, and screens for models, channels, safety, users, credentials, usage, and logs. The complete guides (getting started, architecture, configuration reference, Lua API reference, deployment guides) ship inside Studio offline, and full runnable scenarios & single-pattern loops live under Studio's [`examples/`](https://github.com/hulipa487/agentflow-studio/tree/main/examples).
 
 ## For developers
 
 | Path | What's there |
 |---|---|
 | `cmd/agentflow` | The binary: engine wiring and the CLI |
-| `internal/vm` | The Luau VM (cgo) and the prelude every loop runs on |
+| `internal/vm` | The pure-Go Lua 5.1 VM (`gopher-lua`) and the prelude every loop runs on |
+| `internal/adminapi` | The headless `/admin/api/*` JSON & SSE control plane for AgentFlow Studio |
 | `internal/core` | Sessions, supervisor, router, memory, leases, quotas, identity, safety... |
-| `internal/drivers` | Models, channels, memory backends, MCP, browser, S3... |
-| `internal/builtins` | The built-in Lua plugins |
-| `api/` | The contracts: the users OpenAPI spec and the Luau type stubs (`af.d.luau`) |
-| `examples/` | Runnable scenarios (QQ group chatbot with memory, Telegram RAG bot, GitHub PR code agents, chat/completions endpoint) and single-pattern loops to start from |
+| `internal/drivers` | Models, channels, memory backends, sandbox (`gVisor` & `microsandbox`), MCP, browser, S3... |
+| `internal/luacode` | Lua source, package (`-- af-import:`), and shadow loader |
+| `internal/builtins` | Core-contract embedded Lua defaults (router, memory handlers, `token_budget`) |
+| `api/` | The contracts: the users OpenAPI spec and the Lua type stubs (`af.d.luau`) |
 
-`make test` and `make vet` run with the right cgo toolchain for your OS. The core and the Lua API move together: every Lua file declares the prelude version it targets (`-- af-prelude-version: 1`), and a mismatch is refused at load instead of half-working.
+`go test ./...` and `go vet ./...` (or `make test` / `make vet`) work out of the box with `CGO_ENABLED=0`. The core and the Lua API move together: every Lua file declares the prelude version it targets (`-- af-prelude-version: 1`), and a mismatch is refused at load instead of half-working.
 
 ## Why exactly AgentFlow?
 - **Full Transparency**: All model parameters are within your control.

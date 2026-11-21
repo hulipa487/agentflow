@@ -257,17 +257,21 @@ func TestExpandEnvStringMatchesByteExpansion(t *testing.T) {
 	}
 }
 
-// TestLegacyLoadStillByteExpands: the single-file path is unchanged — the
-// whole document expands at load, so a secret field holds the expanded value
-// (or "" when missing), never a raw reference.
-func TestLegacyLoadStillByteExpands(t *testing.T) {
+// TestSingleFileUsesDeferredSecrets: single-file Load now shares the exact same
+// deferred secret-expansion semantics as LoadDir — secret registry fields stay
+// as raw ${VAR} references for lazy resolution while non-secret fields expand.
+func TestSingleFileUsesDeferredSecrets(t *testing.T) {
 	t.Setenv("LEGACY_KEY", "legacy-value")
 	dir := t.TempDir()
 	p := filepath.Join(dir, "agentflow.yaml")
 	if err := os.WriteFile(p, []byte(`
 version: "1"
 models:
-  default: { provider: openai, model: m, api_key: ${LEGACY_KEY}, base_url: ${MISSING_BASE:-http://localhost/v1} }
+  default:
+    provider: openai
+    model: m
+    api_key: ${LEGACY_KEY}
+    base_url: ${MISSING_BASE:-http://localhost/v1}
 agents:
   bot: { loop: plugin:per_chat, model: default }
 `), 0o600); err != nil {
@@ -277,11 +281,11 @@ agents:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cfg.Models["default"].APIKey; got != "legacy-value" {
-		t.Fatalf("legacy api_key must be expanded at load, got %q", got)
+	if got := cfg.Models["default"].APIKey; got != "${LEGACY_KEY}" {
+		t.Fatalf("secret api_key must stay raw for lazy resolution, got %q", got)
 	}
 	if got := cfg.Models["default"].BaseURL; got != "http://localhost/v1" {
-		t.Fatalf("legacy default expansion changed, got %q", got)
+		t.Fatalf("non-secret default expansion changed, got %q", got)
 	}
 	if !strings.Contains(string(expandEnv([]byte("${A:-b}"))), "b") {
 		t.Fatal("sanity: expandEnv default semantics")

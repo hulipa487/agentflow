@@ -87,7 +87,7 @@ end
 		{
 			Name:        "group-chat",
 			Title:       "Group chat with memory",
-			Description: "For QQ or Telegram groups: names each speaker, keeps the chat's recent exchanges (session.state capability) and recalls older ones (a memory profile with a dialogue store). Full scenario: examples/qq-group-chat.",
+			Description: "For QQ or Telegram groups: names each speaker, keeps the chat's recent exchanges (session.state capability) and recalls older ones (a memory profile with a dialogue store). Full scenario: agentflow-studio/examples/qq-group-chat.",
 			Loop: directive + `local CONTEXT_TURNS = 10
 
 -- Recent context lives in session.state, which needs the session.state
@@ -146,7 +146,7 @@ end
 		{
 			Name:        "rag",
 			Title:       "Knowledge base (RAG)",
-			Description: "Answers from passages recalled by meaning and cites them; /learn adds passages for editors. Needs a memory profile with a vector store named knowledge, embed_model and recall: plugin:semantic. Full scenario: examples/telegram-rag.",
+			Description: "Answers from passages recalled by meaning and cites them; /learn adds passages for editors. Needs a memory profile with a vector store named knowledge, embed_model and recall: plugin:semantic. Full scenario: agentflow-studio/examples/telegram-rag.",
 			Loop: directive + `local TOP_K = 4
 
 local function passages_for(question)
@@ -208,7 +208,7 @@ end
 		{
 			Name:        "single-turn-api",
 			Title:       "Single-turn API",
-			Description: "For the openai channel: answers each chat/completions request's last message with the agent's own instructions. Full scenario: examples/chat-completions.",
+			Description: "For the openai channel: answers each chat/completions request's last message with the agent's own instructions. Full scenario: agentflow-studio/examples/chat-completions.",
 			Loop: directive + `function loop()
   while true do
     local msg = session.inbox()
@@ -218,6 +218,19 @@ end
       { role = "user", content = msg.text or "" },
     })
     session.reply({ text = reply.text or "", finish_reason = reply.finish_reason, usage = reply.usage })
+  end
+end
+`,
+		},
+		{
+			Name:        "openai-passthrough",
+			Title:       "OpenAI pass-through",
+			Description: "For the openai channel: forwards the client's messages, tools and sampling parameters to the agent's model unchanged. Reference copy: agentflow-studio/examples/loops/openai_passthrough.lua.",
+			Loop: directive + `function loop()
+  while true do
+    local msg = session.inbox()
+    local reply = llm.forward()
+    session.reply(reply)
   end
 end
 `,

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -11,13 +12,24 @@ import (
 	"agentflow/internal/drivers/sandbox"
 )
 
+func newSandboxRunner(sbx config.SandboxConfig, dir string, log *slog.Logger) (sandbox.Runner, sandbox.Inspector) {
+	switch sbx.ProviderName() {
+	case "microsandbox":
+		m := sandbox.NewMicrosandbox(sbx.Microsandbox, dir, log)
+		return m, m
+	default:
+		r := sandbox.NewRunsc(sbx.Runsc, dir, log)
+		return r, r
+	}
+}
+
 // doctorSandbox reports whether shell jobs can run on this host, and what
 // each declared environment needs before its first job.
 //
 // A sandbox that cannot run is a warning, not a failure: the deployment still
-// boots and every other feature works, and a config written for a Linux fleet
-// is routinely checked on a laptop that is not one. The message says exactly
-// what a shell call would say.
+// boots and every other feature works, and a config written for a Linux/KVM
+// host is routinely checked on another machine. The message says exactly what
+// a shell call would say.
 func doctorSandbox(cfg *config.Config, add func(status, check, detail string)) {
 	inUse := sandboxInUse(cfg)
 	if !inUse && len(cfg.Environments) == 0 {
@@ -32,7 +44,8 @@ func doctorSandbox(cfg *config.Config, add func(status, check, detail string)) {
 		return
 	}
 	defer os.RemoveAll(scratch)
-	runner := sandbox.NewRunsc(cfg.Runtime.Sandbox.Runsc, scratch, nil)
+	provider := cfg.Runtime.Sandbox.ProviderName()
+	runner, inspector := newSandboxRunner(cfg.Runtime.Sandbox, scratch, nil)
 	if err := runner.Available(); err != nil {
 		detail := strings.TrimPrefix(err.Error(), sandbox.ErrUnavailable.Error()+": ")
 		if inUse {
@@ -41,12 +54,15 @@ func doctorSandbox(cfg *config.Config, add func(status, check, detail string)) {
 			add("SKIP", "sandbox", "not usable on this host ("+detail+"); no agent has a sandbox shell profile")
 		}
 	} else {
-		mode := "rootless"
-		if os.Geteuid() == 0 {
-			mode = "as root"
+		mode := "microVM"
+		if provider == "gvisor" {
+			mode = "rootless"
+			if os.Geteuid() == 0 {
+				mode = "as root"
+			}
 		}
-		add("PASS", "sandbox", fmt.Sprintf("%s, %s", runner.Version(), mode))
-		if enforced, note := runner.Limiting(); enforced {
+		add("PASS", "sandbox", fmt.Sprintf("%s (%s, %s)", provider, inspector.Version(), mode))
+		if enforced, note := inspector.Limiting(); enforced {
 			add("PASS", "sandbox limits", note)
 		} else {
 			add("WARN", "sandbox limits", note+". The process count, tmpfs sizes, time limit and output cap still apply")
@@ -74,6 +90,10 @@ func doctorSandbox(cfg *config.Config, add func(status, check, detail string)) {
 		ref, err := sandbox.ParseImageRef(e.Image)
 		if err != nil {
 			add("WARN", check, err.Error())
+			continue
+		}
+		if provider == "microsandbox" {
+			add("PASS", check, fmt.Sprintf("%s/%s, managed by microsandbox (pulled/cached by msb on first use)", ref.Registry, ref.Repo))
 			continue
 		}
 		cached := filepath.Join(cfg.SandboxDataDir(), "images", strings.TrimPrefix(ref.Digest, "sha256:"), "env.json")

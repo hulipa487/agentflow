@@ -14,8 +14,13 @@ import (
 // field has a default, so a deployment that only declares an environment and a
 // shell profile needs none of it.
 type SandboxConfig struct {
+	// Provider selects the sandbox backend: "gvisor" (default, Linux runsc) or
+	// "microsandbox" (superradcompany/microsandbox msb CLI over KVM/HVF/WHP).
+	Provider string `yaml:"provider"`
 	// Runsc is the gVisor runtime binary; empty means "runsc" on PATH.
 	Runsc string `yaml:"runsc"`
+	// Microsandbox is the microsandbox CLI binary; empty means "msb" on PATH.
+	Microsandbox string `yaml:"microsandbox"`
 	// DataDir holds workspaces, unpacked images and runsc's own state; empty
 	// means <data dir>/sandbox. It is a cache: everything in it is rebuilt
 	// from the files store and the registry.
@@ -69,6 +74,16 @@ func (c *Config) SandboxDataDir() string {
 		return d
 	}
 	return filepath.Join(c.DataDir(), "sandbox")
+}
+
+// ProviderName returns the configured sandbox provider ("gvisor" or
+// "microsandbox"), defaulting to "gvisor".
+func (s SandboxConfig) ProviderName() string {
+	p := strings.ToLower(strings.TrimSpace(s.Provider))
+	if p == "" {
+		return "gvisor"
+	}
+	return p
 }
 
 // The accessors below return a setting with its default applied. Validation
@@ -140,6 +155,11 @@ var imagePinRE = regexp.MustCompile(`^[^\s@]+@sha256:[0-9a-f]{64}$`)
 // by the first command somebody runs.
 func validateSandbox(path string, c *Config) error {
 	s := c.Runtime.Sandbox
+	switch s.ProviderName() {
+	case "gvisor", "microsandbox":
+	default:
+		return fmt.Errorf("%s: runtime.sandbox.provider %q is unknown (use gvisor or microsandbox)", path, s.Provider)
+	}
 	for name, v := range map[string]string{
 		"queue_timeout": s.QueueTimeout, "timeout": s.Timeout,
 		"max_timeout": s.MaxTimeout, "background_max_timeout": s.BackgroundMaxTimeout,
@@ -208,14 +228,9 @@ func validateShellProfile(path, owner, name string, p ShellProfile, c *Config) e
 			return fmt.Errorf("%s is provider ssh but missing required host", where)
 		}
 		return nil
-	case "docker":
-		return fmt.Errorf("%s uses provider docker, which was removed: shell commands now run as one-off gVisor jobs. Declare an environment (environments.<name>.image, pinned by digest) and set provider: sandbox with environment: <name>", where)
 	case "sandbox", "":
 	default:
 		return fmt.Errorf("%s has unknown provider %q (use sandbox or ssh)", where, p.Provider)
-	}
-	if p.Image != "" {
-		return fmt.Errorf("%s sets image, which a sandbox profile does not take: declare the image under environments.<name> and set environment: <name>", where)
 	}
 	if p.Environment == "" {
 		return fmt.Errorf("%s names no environment (declared: %s)", where, strings.Join(c.EnvironmentNames(), ", "))

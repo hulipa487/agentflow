@@ -60,6 +60,7 @@ type Driver struct {
 	opts  Options
 	sink  router.Sink
 	store media.Store
+	media *media.Service
 	pol   media.Policy
 	http  *http.Client
 	log   *slog.Logger
@@ -86,6 +87,11 @@ func New(name, agent string, opts Options, sink router.Sink, srv *httpd.Server, 
 }
 
 func (d *Driver) Name() string { return d.name }
+
+// SetMedia attaches the centralized media service so handle-only outbound
+// attachments are resolved into presigned URLs (when available) or base64 data
+// before crossing the HTTP boundary to an out-of-process bridge adapter.
+func (d *Driver) SetMedia(svc *media.Service) { d.media = svc }
 
 type inbound struct {
 	From        string       `json:"from"`
@@ -215,9 +221,41 @@ func (d *Driver) ingest(in []attachment) []media.Part {
 }
 
 // Deliver posts the reply to the adapter. The adapter owns the platform call;
-// this driver only knows the neutral outbound shape.
+// this driver only knows the neutral outbound shape. When a centralized
+// media.Service is wired, internal handles are materialized to presigned URLs
+// (preferred) or inline base64 so external bridge adapters never see opaque
+// internal handles they cannot read.
 func (d *Driver) Deliver(replyTo, text string, attachments []media.Part) error {
-	payload := outbound{To: replyTo, Text: text, Attachments: attachments}
+	resolved := attachments
+	if d.media != nil && len(attachments) > 0 {
+		resolved = make([]media.Part, len(attachments))
+		ctx, cancel := context.WithTimeout(context.Background(), d.opts.Timeout)
+		defer cancel()
+		for i, att := range attachments {
+			if att.Handle != "" && att.URL == "" && att.Data == "" {
+				if d.media.CanPresign() {
+					link, err := d.media.MaterializeURL(ctx, media.ScopeMaintenance, att, media.TargetSpec{AttachFilename: att.Type == "file"})
+					if err != nil {
+						return fmt.Errorf("bridge %q: presign attachment: %w", d.name, err)
+					}
+					att.URL = link
+					att.Handle = ""
+				} else {
+					blob, err := d.media.MaterializeBytes(ctx, media.ScopeMaintenance, att, media.TargetSpec{MaxBytes: 50 << 20})
+					if err != nil {
+						return fmt.Errorf("bridge %q: materialize attachment: %w", d.name, err)
+					}
+					att.Data = base64.StdEncoding.EncodeToString(blob.Bytes)
+					if blob.MIME != "" {
+						att.MIME = blob.MIME
+					}
+					att.Handle = ""
+				}
+			}
+			resolved[i] = att
+		}
+	}
+	payload := outbound{To: replyTo, Text: text, Attachments: resolved}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("bridge %q: marshal delivery: %w", d.name, err)

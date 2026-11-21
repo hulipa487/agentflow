@@ -11,65 +11,39 @@ jobs:
   test:
     name: build + test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      CGO_ENABLED: "0"
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
       - name: Build
-        run: make
-      - name: Vet
-        run: make vet
-      - name: Test
-        run: make test
-      - name: Config schema
-        run: ./agentflow config schema > /dev/null
-      - name: Loop checks
-        run: |
-          ./agentflow loop check examples/loops/echo.lua
-          ./agentflow loop test examples/loop-tests/echo.yaml
-          ./agentflow loop test examples/loop-tests/package.yaml
-
-  windows:
-    name: build + test (windows-latest)
-    runs-on: windows-latest
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-      - uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: 0.13.0
-      - name: Install make
-        run: choco install make -y --no-progress
-      - name: Build
-        shell: bash
-        run: make BIN=agentflow.exe
-      - name: Vet
-        shell: bash
-        run: make vet
-      - name: Test
-        shell: bash
-        run: make test
-      - name: Config schema
-        shell: bash
-        run: ./agentflow.exe config schema > /dev/null
-      - name: Loop checks
         shell: bash
         run: |
-          ./agentflow.exe loop check examples/loops/echo.lua
-          ./agentflow.exe loop test examples/loop-tests/echo.yaml
-          ./agentflow.exe loop test examples/loop-tests/package.yaml
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            go build -trimpath -o agentflow.exe ./cmd/agentflow
+          else
+            go build -trimpath -o agentflow ./cmd/agentflow
+          fi
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+      - name: Config schema & loop checks
+        shell: bash
+        run: |
+          BIN=./agentflow
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN=./agentflow.exe; fi
+          "$BIN" config schema > /dev/null
+          tmp=$(mktemp -d)
+          "$BIN" init "$tmp/starter"
+          "$BIN" validate -config "$tmp/starter"
+          "$BIN" loop check "$tmp/starter/loops/echo.lua"
+          rm -rf "$tmp"

@@ -6,9 +6,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"agentflow/internal/builtins"
 	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/session"
+	"agentflow/internal/luacode"
 )
 
 // SpawnResult is returned to the parent actor. The address is the runtime ID
@@ -75,7 +75,7 @@ func (s *Supervisor) Spawn(ctx context.Context, parent session.Identity, profile
 	// its loop was written against is the silent downgrade the gate exists to
 	// prevent. The error reaches the parent's spawn op, which is where a spawn
 	// profile that cannot be served belongs.
-	support, err := builtins.SupportChunks()
+	support, err := luacode.SupportChunks()
 	if err != nil {
 		return session.SpawnResult{}, fmt.Errorf("spawn profile %q: %w", profile, err)
 	}
@@ -111,6 +111,7 @@ func (s *Supervisor) Spawn(ctx context.Context, parent session.Identity, profile
 	a.OnExit = s.onActorExit
 	a.Journal = s.EgressJournal
 	a.MemBudget = s.vmMemory
+	a.Media = s.media
 
 	actorCtx, cancel := context.WithCancel(s.ctx)
 

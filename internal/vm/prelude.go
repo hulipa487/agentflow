@@ -1059,7 +1059,10 @@ function llm.stream(messages, opts)
     done = true
     op({ type = "llm.stream.close", stream = h.id })
   end
-  local function next_delta()
+  local function next_delta(...)
+    if select("#", ...) > 0 then
+      error("attempt to yield across a C-call boundary (call next_delta() in a while loop instead of generic for)", 2)
+    end
     if done then return nil end
     local r = op({ type = "llm.stream.next", stream = h.id })
     if r.done then close(); return nil end

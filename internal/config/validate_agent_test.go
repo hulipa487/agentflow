@@ -101,19 +101,11 @@ func TestValidateAgentRejectsBrokenReferences(t *testing.T) {
 	}
 }
 
-// The store-isolation rules: shared: is refused with its migration (it was
-// the multi-tenant footgun — §6.5), a pool binding takes no scope, and pool
-// names must be key-safe. These run deployment-wide over every profile, not
-// only where an agent references a store.
+// The store-isolation rules: a pool binding takes no scope, and pool names must
+// be key-safe. These run deployment-wide over every profile, not only where an
+// agent references a store.
 func TestValidateStoreScoping(t *testing.T) {
-	shared := true
-	refused := Store{Backend: "main_db", Table: "kb", Shared: &shared}
-	err := validateStoreScoping("test", "profile", "kb", refused)
-	if err == nil || !strings.Contains(err.Error(), "no longer supported") {
-		t.Fatalf("shared: true = %v; want the migration refusal", err)
-	}
-
-	err = validateStoreScoping("test", "profile", "kb", Store{
+	err := validateStoreScoping("test", "profile", "kb", Store{
 		Backend: "main_db", Table: "kb", Pool: "proj-x", Scope: "user",
 	})
 	if err == nil || !strings.Contains(err.Error(), "both pool and scope") {

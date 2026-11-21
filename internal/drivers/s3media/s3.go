@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,17 +28,23 @@ import (
 	"agentflow/internal/core/media"
 )
 
-// Store is an S3-backed media.Store.
+// Store is an S3-backed media.Store (and media.Presigner).
 type Store struct {
-	bucket   string
-	region   string
-	endpoint string // custom base (https://host[:port]); empty = AWS virtual-hosted
-	prefix   string
-	key      string
-	secret   string
-	http     *http.Client
-	now      func() time.Time // test hook
+	bucket         string
+	region         string
+	endpoint       string // custom base (https://host[:port]); empty = AWS virtual-hosted
+	publicEndpoint string // optional public base URL for presigned GETs; empty = endpoint
+	prefix         string
+	key            string
+	secret         string
+	http           *http.Client
+	now            func() time.Time // test hook
 }
+
+var _ media.Presigner = (*Store)(nil)
+
+// maxPresignTTL is the AWS SigV4 hard ceiling for presigned URLs (7 days).
+const maxPresignTTL = 7 * 24 * time.Hour
 
 // New builds an S3 media store from config.
 func New(cfg config.MediaS3) (*Store, error) {
@@ -47,20 +54,27 @@ func New(cfg config.MediaS3) (*Store, error) {
 	if cfg.AccessKey == "" || cfg.SecretKey == "" {
 		return nil, fmt.Errorf("s3media: access_key and secret_key are required")
 	}
-	ep := strings.TrimSuffix(cfg.Endpoint, "/")
-	if ep != "" && !strings.HasPrefix(ep, "http") {
+	ep := normalizeEndpoint(cfg.Endpoint)
+	pub := normalizeEndpoint(cfg.PublicEndpoint)
+	return &Store{
+		bucket:         cfg.Bucket,
+		region:         cfg.Region,
+		endpoint:       ep,
+		publicEndpoint: pub,
+		prefix:         strings.Trim(cfg.Prefix, "/"),
+		key:            cfg.AccessKey,
+		secret:         cfg.SecretKey,
+		http:           &http.Client{Timeout: 60 * time.Second},
+		now:            time.Now,
+	}, nil
+}
+
+func normalizeEndpoint(raw string) string {
+	ep := strings.TrimSuffix(strings.TrimSpace(raw), "/")
+	if ep != "" && !strings.HasPrefix(ep, "http://") && !strings.HasPrefix(ep, "https://") {
 		ep = "https://" + ep
 	}
-	return &Store{
-		bucket:   cfg.Bucket,
-		region:   cfg.Region,
-		endpoint: ep,
-		prefix:   strings.Trim(cfg.Prefix, "/"),
-		key:      cfg.AccessKey,
-		secret:   cfg.SecretKey,
-		http:     &http.Client{Timeout: 60 * time.Second},
-		now:      time.Now,
-	}, nil
+	return ep
 }
 
 // objectKey maps a blob handle onto its S3 object key.
@@ -75,10 +89,125 @@ func (s *Store) objectKey(handle string) string {
 // objectURL builds the request URL for key: virtual-hosted style against AWS,
 // path style against a custom endpoint.
 func (s *Store) objectURL(key string) string {
-	if s.endpoint != "" {
-		return s.endpoint + "/" + s.bucket + "/" + key
+	return s.objectURLWithBase(s.endpoint, key)
+}
+
+func (s *Store) presignObjectURL(key string) string {
+	base := s.publicEndpoint
+	if base == "" {
+		base = s.endpoint
+	}
+	return s.objectURLWithBase(base, key)
+}
+
+func (s *Store) objectURLWithBase(base, key string) string {
+	if base != "" {
+		return base + "/" + s.bucket + "/" + key
 	}
 	return fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", s.bucket, s.region, key)
+}
+
+// PresignGet mints a SigV4 query-string-authenticated GET URL for handle,
+// valid for ttl (1s..168h). It performs no network I/O and uses public_endpoint
+// when configured so internal endpoints (e.g. Docker MinIO) can still sign URLs
+// reachable by external platforms such as QQ.
+func (s *Store) PresignGet(handle string, ttl time.Duration, opts media.PresignOptions) (string, error) {
+	if !media.ValidHandle(handle) {
+		return "", fmt.Errorf("s3media: malformed handle %q", handle)
+	}
+	return s.presignURL(s.presignObjectURL(s.objectKey(handle)), ttl, opts)
+}
+
+func (s *Store) presignURL(rawURL string, ttl time.Duration, opts media.PresignOptions) (string, error) {
+	if ttl <= 0 || ttl > maxPresignTTL {
+		return "", fmt.Errorf("s3media: presign ttl %s must be between 1s and %s", ttl, maxPresignTTL)
+	}
+	expires := int64(ttl / time.Second)
+	if expires < 1 {
+		expires = 1
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("s3media: parse presign url: %w", err)
+	}
+
+	t := s.now().UTC()
+	amzDate := t.Format("20060102T150405Z")
+	date := t.Format("20060102")
+	scope := date + "/" + s.region + "/s3/aws4_request"
+
+	q := url.Values{}
+	q.Set("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
+	q.Set("X-Amz-Credential", s.key+"/"+scope)
+	q.Set("X-Amz-Date", amzDate)
+	q.Set("X-Amz-Expires", strconv.FormatInt(expires, 10))
+	q.Set("X-Amz-SignedHeaders", "host")
+	if ct := strings.TrimSpace(opts.ContentType); ct != "" {
+		q.Set("response-content-type", ct)
+	}
+	if fn := strings.TrimSpace(opts.Filename); fn != "" {
+		if cd := contentDisposition(fn); cd != "" {
+			q.Set("response-content-disposition", cd)
+		}
+	}
+
+	canonQ := canonicalQuery(q)
+	canonURI := canonicalURI(u)
+	canonReq := strings.Join([]string{
+		http.MethodGet,
+		canonURI,
+		canonQ,
+		"host:" + u.Host + "\n",
+		"host",
+		"UNSIGNED-PAYLOAD",
+	}, "\n")
+
+	stringToSign := "AWS4-HMAC-SHA256\n" + amzDate + "\n" + scope + "\n" + hexSHA256(canonReq)
+
+	kDate := hmacSHA256([]byte("AWS4"+s.secret), date)
+	kRegion := hmacSHA256(kDate, s.region)
+	kService := hmacSHA256(kRegion, "s3")
+	kSigning := hmacSHA256(kService, "aws4_request")
+	sig := hex.EncodeToString(hmacSHA256(kSigning, stringToSign))
+
+	return u.Scheme + "://" + u.Host + canonURI + "?" + canonQ + "&X-Amz-Signature=" + sig, nil
+}
+
+// contentDisposition builds a safe RFC 6266 attachment header value for name.
+// Control characters, quotes, backslashes, and path separators are stripped so
+// an attachment name can never inject headers.
+func contentDisposition(name string) string {
+	// Keep only the base filename component.
+	if i := strings.LastIndexAny(name, `/\`); i >= 0 {
+		name = name[i+1:]
+	}
+	var clean strings.Builder
+	var ascii strings.Builder
+	nonASCII := false
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f || r == '"' || r == '\\' {
+			continue
+		}
+		clean.WriteRune(r)
+		if r < 0x80 {
+			ascii.WriteRune(r)
+		} else {
+			nonASCII = true
+			ascii.WriteByte('_')
+		}
+	}
+	utf8Name := strings.TrimSpace(clean.String())
+	if utf8Name == "" {
+		return ""
+	}
+	if !nonASCII {
+		return `attachment; filename="` + utf8Name + `"`
+	}
+	fallback := strings.TrimSpace(ascii.String())
+	if fallback == "" {
+		fallback = "file"
+	}
+	return `attachment; filename="` + fallback + `"; filename*=UTF-8''` + awsQueryEscape(utf8Name)
 }
 
 // Put streams r into S3 under the policy ceiling, content-addressed by

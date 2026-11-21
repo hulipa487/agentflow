@@ -20,12 +20,12 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"agentflow/internal/builtins"
 	"agentflow/internal/core/gateway"
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/pool"
 	"agentflow/internal/core/safety"
 	"agentflow/internal/core/session"
+	"agentflow/internal/luacode"
 )
 
 // Scenario is the YAML shape. Only Loop is required.
@@ -90,13 +90,13 @@ func Run(sc *Scenario, out io.Writer) error {
 		for name, dir := range sc.Packages {
 			resolved[name] = resolve(dir, sc.baseDir)
 		}
-		builtins.SetPackages(resolved)
+		luacode.SetPackages(resolved)
 	}
-	src, watch, err := builtins.Resolve(loopRef)
+	src, watch, err := luacode.Resolve(loopRef)
 	if err != nil {
 		return fmt.Errorf("loop: %w", err)
 	}
-	support, err := builtins.SupportChunks()
+	support, err := luacode.SupportChunks()
 	if err != nil {
 		return fmt.Errorf("support chunks: %w", err)
 	}

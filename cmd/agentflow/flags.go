@@ -30,10 +30,12 @@ type cmdInfo struct {
 // apply to every command; a command with its own removals passes them to
 // parseArgs, and those win.
 var removedFlags = map[string]string{
-	"configdir": "use -config DIR",
-	"log-json":  "use -log-format json",
-	"no-webui":  "use -no-console",
-	"workers":   "set runtime.scheduler.workers in the config",
+	"configdir":  "use -config DIR",
+	"log-json":   "use -log-format json",
+	"no-tui":     "the terminal dashboard was removed; use AgentFlow Studio",
+	"no-console": "the embedded web UI was removed; use AgentFlow Studio",
+	"no-webui":   "the embedded web UI was removed; use AgentFlow Studio",
+	"workers":    "set runtime.scheduler.workers in the config",
 }
 
 // newCommand builds a command's flag set. Errors and usage go to w.

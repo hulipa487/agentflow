@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"agentflow/internal/config"
+	"agentflow/internal/core/media"
 
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
@@ -167,10 +168,12 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 		}
 		accByIndex := map[int64]*acc{}
 		var order []int64
+		var outMedia []media.Part
 		var finish string
 
 		handle := func(c openai.ChatCompletionChunk) bool {
 			reason.WriteString(openaiReasoningDelta(c.RawJSON()))
+			outMedia = append(outMedia, openaiChunkMedia(c.RawJSON())...)
 			// JSON.Usage.Valid() is false for the `"usage": null` the provider
 			// sends on every chunk but the last, which is exactly the previous
 			// client's `ev.Usage != nil` test.
@@ -237,7 +240,7 @@ func openaiChatOpen(ctx context.Context, client *http.Client, cfg config.Model, 
 			}
 			events <- event{toolCalls: calls, thinking: reason.String()}
 		}
-		events <- event{usage: usage, thinking: reason.String(), finish: normalizeFinish(finish)}
+		events <- event{usage: usage, media: outMedia, thinking: reason.String(), finish: normalizeFinish(finish)}
 	}()
 	return events, false, nil
 }
@@ -267,15 +270,147 @@ func openaiChatWhole(ctx context.Context, api openai.Client, params openai.ChatC
 		Cached:    int(resp.Usage.PromptTokensDetails.CachedTokens),
 		Reasoning: int(resp.Usage.CompletionTokensDetails.ReasoningTokens),
 	}
+	outMedia := openaiWholeMedia(resp.RawJSON())
 	if text != "" {
 		events <- event{delta: text}
 	}
 	if len(calls) > 0 {
 		events <- event{toolCalls: calls}
 	}
-	events <- event{usage: usage, finish: normalizeFinish(finish)}
+	events <- event{usage: usage, media: outMedia, finish: normalizeFinish(finish)}
 	close(events)
 	return events, false, nil
+}
+
+// openaiChunkMedia extracts generated image/audio parts returned on
+// OpenAI-compatible streaming deltas (e.g. OpenRouter/Gemini-compatible
+// delta.images or delta.audio).
+func openaiChunkMedia(raw string) []media.Part {
+	if raw == "" {
+		return nil
+	}
+	var chunk struct {
+		Choices []struct {
+			Delta struct {
+				Images []openaiImageItem `json:"images"`
+				Audio  *struct {
+					Data   string `json:"data"`
+					Format string `json:"format"`
+				} `json:"audio"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal([]byte(raw), &chunk); err != nil || len(chunk.Choices) == 0 {
+		return nil
+	}
+	d := chunk.Choices[0].Delta
+	var out []media.Part
+	for _, img := range d.Images {
+		if p, ok := partFromOpenAIImage(img); ok {
+			out = append(out, p)
+		}
+	}
+	if d.Audio != nil && d.Audio.Data != "" {
+		out = append(out, media.Part{Type: "audio", MIME: audioFormatMIME(d.Audio.Format), Data: d.Audio.Data})
+	}
+	return out
+}
+
+type openaiImageItem struct {
+	ImageURL struct {
+		URL string `json:"url"`
+	} `json:"image_url"`
+	URL      string `json:"url"`
+	B64JSON  string `json:"b64_json"`
+	MIMEType string `json:"mime_type"`
+}
+
+func partFromOpenAIImage(img openaiImageItem) (media.Part, bool) {
+	u := img.ImageURL.URL
+	if u == "" {
+		u = img.URL
+	}
+	if p, ok := partFromImageURL(u); ok {
+		return p, true
+	}
+	if img.B64JSON != "" {
+		mime := strings.TrimSpace(img.MIMEType)
+		if mime == "" {
+			mime = "image/png"
+		}
+		return media.Part{Type: media.Classify(mime), MIME: mime, Data: img.B64JSON}, true
+	}
+	return media.Part{}, false
+}
+
+// openaiWholeMedia extracts generated image/audio parts from a non-streamed
+// Chat Completions response (message.images / message.audio).
+func openaiWholeMedia(raw string) []media.Part {
+	if raw == "" {
+		return nil
+	}
+	var resp struct {
+		Choices []struct {
+			Message struct {
+				Images []openaiImageItem `json:"images"`
+				Audio  *struct {
+					Data   string `json:"data"`
+					Format string `json:"format"`
+				} `json:"audio"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal([]byte(raw), &resp); err != nil || len(resp.Choices) == 0 {
+		return nil
+	}
+	m := resp.Choices[0].Message
+	var out []media.Part
+	for _, img := range m.Images {
+		if p, ok := partFromOpenAIImage(img); ok {
+			out = append(out, p)
+		}
+	}
+	if m.Audio != nil && m.Audio.Data != "" {
+		out = append(out, media.Part{Type: "audio", MIME: audioFormatMIME(m.Audio.Format), Data: m.Audio.Data})
+	}
+	return out
+}
+
+func partFromImageURL(u string) (media.Part, bool) {
+	u = strings.TrimSpace(u)
+	if u == "" {
+		return media.Part{}, false
+	}
+	if rest, ok := strings.CutPrefix(u, "data:"); ok {
+		meta, payload, ok := strings.Cut(rest, ",")
+		if !ok || !strings.HasSuffix(meta, ";base64") || payload == "" {
+			return media.Part{}, false
+		}
+		mime := strings.TrimSuffix(meta, ";base64")
+		if mime == "" {
+			mime = "image/png"
+		}
+		return media.Part{Type: media.Classify(mime), MIME: mime, Data: payload}, true
+	}
+	if strings.HasPrefix(u, "https://") || strings.HasPrefix(u, "http://") {
+		return media.Part{Type: "image", URL: u}, true
+	}
+	return media.Part{}, false
+}
+
+func audioFormatMIME(format string) string {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "mp3", "mpeg":
+		return "audio/mpeg"
+	case "opus":
+		return "audio/opus"
+	case "flac":
+		return "audio/flac"
+	case "ogg":
+		return "audio/ogg"
+	default:
+		return "audio/wav"
+	}
 }
 
 // openaiErrDetail adds the response body to an API error whose message the

@@ -27,7 +27,10 @@ import (
 // Anything NOT listed here is environment-expanded at load, as today.
 var secretPathPatterns = []string{
 	"models.*.api_key",
+	"runtime.admin.operators.*",
+	"mcp.servers.*.token",
 	"search.engines.*.api_key",
+	"legal_search.engines.*.api_key",
 	"gateway.channels.[].token",
 	"gateway.channels.[].secret",
 	"gateway.channels.[].secret_token",
@@ -37,6 +40,7 @@ var secretPathPatterns = []string{
 	"memory.backends.*.config.api_key",
 	"media.s3.access_key",
 	"media.s3.secret_key",
+	"media.temp_url.secret",
 	"files.s3.access_key",
 	"files.s3.secret_key",
 	"browser.api_token",

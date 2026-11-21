@@ -131,11 +131,12 @@ func (b *Broker) Deliver(replyTo, text string, attachments []media.Part) error {
 
 // ChatRequest is one playground turn.
 type ChatRequest struct {
-	Agent   string
-	Thread  string // empty starts a new thread
-	Text    string
-	ActAs   string // optional profile uuid to act as
-	Timeout time.Duration
+	Agent       string
+	Thread      string // empty starts a new thread
+	Text        string
+	Attachments []media.Part
+	ActAs       string // optional profile uuid to act as
+	Timeout     time.Duration
 }
 
 // ChatResult summarizes a finished (or timed-out) turn.
@@ -171,7 +172,7 @@ func (e *LoopError) Error() string { return "the loop failed: " + e.Reason }
 // committing to a 200, so the refusal reaches the client as a status rather
 // than as a stream that ends without a word. Chat runs it too.
 func (b *Broker) Check(req ChatRequest) error {
-	if strings.TrimSpace(req.Text) == "" {
+	if strings.TrimSpace(req.Text) == "" && len(req.Attachments) == 0 {
 		return ErrEmptyText
 	}
 	actAs := strings.TrimSpace(req.ActAs)
@@ -227,15 +228,16 @@ func (b *Broker) Chat(ctx context.Context, req ChatRequest, emit func(ChatEvent)
 		prov.UserUUID = &actAs
 	}
 	msg := session.Message{
-		ID:         uuid.NewString(),
-		Type:       "user",
-		From:       "studio:operator",
-		Text:       req.Text,
-		Channel:    ChannelName,
-		ReplyTo:    requestID,
-		Payload:    map[string]any{"chat_id": thread, "studio": true, "text": req.Text},
-		Provenance: prov,
-		Ts:         time.Now().Unix(),
+		ID:          uuid.NewString(),
+		Type:        "user",
+		From:        "studio:operator",
+		Text:        req.Text,
+		Attachments: req.Attachments,
+		Channel:     ChannelName,
+		ReplyTo:     requestID,
+		Payload:     map[string]any{"chat_id": thread, "studio": true, "text": req.Text},
+		Provenance:  prov,
+		Ts:          time.Now().Unix(),
 	}
 	b.journalInbound(ctx, req.Agent, thread, actAs, msg)
 

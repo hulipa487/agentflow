@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"agentflow/internal/config"
 	"agentflow/internal/core/media"
@@ -278,5 +279,117 @@ func TestCanonicalRequestMatchesAWSVector(t *testing.T) {
 	q := url.Values{"prefix": {"a b"}}
 	if got := canonicalQuery(q); got != "prefix=a%20b" {
 		t.Errorf("space encoding = %q, want %q", got, "prefix=a%20b")
+	}
+}
+
+// TestPresignGetMatchesAWSVector verifies our stdlib SigV4 presigner against
+// the published AWS S3 query-string authentication test vector (GET /test.txt
+// on examplebucket.s3.amazonaws.com, 20130524T000000Z, 86400s).
+func TestPresignGetMatchesAWSVector(t *testing.T) {
+	s, err := New(config.MediaS3{
+		Bucket:    "examplebucket",
+		Region:    "us-east-1",
+		AccessKey: "AKIAIOSFODNN7EXAMPLE",
+		SecretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.now = func() time.Time {
+		return time.Date(2013, 5, 24, 0, 0, 0, 0, time.UTC)
+	}
+	got, err := s.presignURL("https://examplebucket.s3.amazonaws.com/test.txt", 24*time.Hour, media.PresignOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "https://examplebucket.s3.amazonaws.com/test.txt" +
+		"?X-Amz-Algorithm=AWS4-HMAC-SHA256" +
+		"&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request" +
+		"&X-Amz-Date=20130524T000000Z" +
+		"&X-Amz-Expires=86400" +
+		"&X-Amz-SignedHeaders=host" +
+		"&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"
+	if got != want {
+		t.Fatalf("presigned URL mismatch:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestPresignGetRoundTripAndOptions(t *testing.T) {
+	srv, _ := newMockS3(t)
+	s := newStore(t, srv.URL)
+	s.now = func() time.Time {
+		return time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
+	}
+
+	ref, err := s.Put(strings.NewReader("png-bytes"), "image/png", media.Policy{Allow: []string{"image/*"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	link, err := s.PresignGet(ref.Handle, 5*time.Minute, media.PresignOptions{
+		ContentType: "image/png",
+		Filename:    `dir/报告 "1".png`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(link, "sekret") {
+		t.Fatalf("secret key must never appear in presigned URL: %s", link)
+	}
+	u, err := url.Parse(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := u.Query()
+	if q.Get("X-Amz-Algorithm") != "AWS4-HMAC-SHA256" || q.Get("X-Amz-Expires") != "300" || q.Get("X-Amz-Signature") == "" {
+		t.Fatalf("missing SigV4 params: %s", link)
+	}
+	if q.Get("response-content-type") != "image/png" {
+		t.Fatalf("response-content-type = %q", q.Get("response-content-type"))
+	}
+	if cd := q.Get("response-content-disposition"); !strings.Contains(cd, "filename*=UTF-8''") || strings.Contains(cd, "dir/") || strings.Contains(cd, `""`) {
+		t.Fatalf("response-content-disposition = %q", cd)
+	}
+
+	// The minted URL must fetch the stored blob directly.
+	resp, err := http.Get(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || string(body) != "png-bytes" {
+		t.Fatalf("GET presigned URL = %d %q", resp.StatusCode, body)
+	}
+}
+
+func TestPresignGetPublicEndpointAndValidation(t *testing.T) {
+	s, err := New(config.MediaS3{
+		Bucket:         "media-bucket",
+		Region:         "us-east-1",
+		Endpoint:       "http://minio.internal:9000",
+		PublicEndpoint: "https://media.example.com",
+		Prefix:         "af",
+		AccessKey:      "AKID",
+		SecretKey:      "sekret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := "media:" + strings.Repeat("a", 64)
+	link, err := s.PresignGet(h, 10*time.Minute, media.PresignOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(link, "https://media.example.com/media-bucket/af/"+strings.Repeat("a", 64)+"?") {
+		t.Fatalf("PublicEndpoint not used: %s", link)
+	}
+	if _, err := s.PresignGet("../bad", 5*time.Minute, media.PresignOptions{}); err == nil {
+		t.Fatal("malformed handle should be rejected")
+	}
+	if _, err := s.PresignGet(h, 0, media.PresignOptions{}); err == nil {
+		t.Fatal("zero ttl should be rejected")
+	}
+	if _, err := s.PresignGet(h, 8*24*time.Hour, media.PresignOptions{}); err == nil {
+		t.Fatal("ttl > 7d should be rejected")
 	}
 }

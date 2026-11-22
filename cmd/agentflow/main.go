@@ -70,6 +70,7 @@ import (
 	"agentflow/internal/drivers/bridge"
 	"agentflow/internal/drivers/browser"
 	"agentflow/internal/drivers/chatapi"
+	"agentflow/internal/drivers/feishu"
 	"agentflow/internal/drivers/fetch"
 	"agentflow/internal/drivers/ghhook"
 	"agentflow/internal/drivers/httpd"
@@ -91,6 +92,7 @@ import (
 	"agentflow/internal/drivers/telegram"
 	"agentflow/internal/drivers/volatile"
 	"agentflow/internal/drivers/webhook"
+	"agentflow/internal/drivers/wecom"
 	"agentflow/internal/llog"
 	"agentflow/internal/luacode"
 )
@@ -1893,6 +1895,8 @@ func main() {
 	}
 	var telegramDrivers []*telegram.Driver
 	var qqDrivers []*qqbot.Driver
+	var feishuDrivers []*feishu.Driver
+	var wecomDrivers []*wecom.Driver
 	for i, ch := range cfg.Gateway.Channels {
 		name := ch.Name
 		if name == "" {
@@ -1902,6 +1906,18 @@ func main() {
 		var mstore media.Store
 		if mok {
 			mstore = mediaStore
+		}
+		resolveField := func(field, raw string, required bool) (string, bool) {
+			if raw == "" {
+				return "", !required
+			}
+			v, ok := credResolver.Resolve(ctx, raw)
+			if !ok {
+				log.Warn("channel skipped: unresolved credential",
+					"channel", name, "field", field, "credential", config.CredentialName(raw))
+				return "", false
+			}
+			return v, true
 		}
 		switch ch.Type {
 		case "webhook":
@@ -1955,6 +1971,61 @@ func main() {
 			}, sink, httpSrv, mediaStore, mpol, log)
 			gw.Register(d)
 			qqDrivers = append(qqDrivers, d)
+		case "feishu":
+			secret, ok := resolveField("secret", ch.Secret, true)
+			if !ok {
+				continue
+			}
+			token, ok := resolveField("token", ch.Token, false)
+			if !ok {
+				continue
+			}
+			encryptKey, ok := resolveField("encrypt_key", ch.EncryptKey, false)
+			if !ok {
+				continue
+			}
+			d := feishu.New(name, ch.Agent, feishu.Options{
+				AppID:      ch.AppID,
+				Secret:     secret,
+				Token:      token,
+				EncryptKey: encryptKey,
+				Mode:       ch.Mode,
+				Path:       ch.FeishuPath(),
+				PublicURL:  cfg.Gateway.PublicURL,
+				Scenes:     ch.Scenes,
+				APIBase:    ch.APIBase,
+				Markdown:   ch.Markdown,
+				Media:      mediaSvc,
+			}, sink, httpSrv, mediaStore, mpol, log)
+			gw.Register(d)
+			feishuDrivers = append(feishuDrivers, d)
+		case "wecom":
+			secret, ok := resolveField("secret", ch.Secret, true)
+			if !ok {
+				continue
+			}
+			token, ok := resolveField("token", ch.Token, true)
+			if !ok {
+				continue
+			}
+			encryptKey, ok := resolveField("encrypt_key", ch.EncryptKey, true)
+			if !ok {
+				continue
+			}
+			d := wecom.New(name, ch.Agent, wecom.Options{
+				CorpID:     ch.CorpID,
+				AgentID:    ch.AgentID,
+				Secret:     secret,
+				Token:      token,
+				EncryptKey: encryptKey,
+				Path:       ch.WeComPath(),
+				PublicURL:  cfg.Gateway.PublicURL,
+				APIBase:    ch.APIBase,
+				Markdown:   ch.Markdown,
+				Media:      mediaSvc,
+			}, sink, httpSrv, mediaStore, mpol, log)
+			gw.Register(d)
+			wecomDrivers = append(wecomDrivers, d)
 		case "ghhook":
 			secret := ch.Secret
 			if secret != "" {
@@ -2067,6 +2138,18 @@ func main() {
 		}
 	}
 	for _, d := range qqDrivers {
+		if err := d.Start(ctx); err != nil {
+			log.Error("channel start failed", "channel", d.Name(), "err", err)
+			exit(1)
+		}
+	}
+	for _, d := range feishuDrivers {
+		if err := d.Start(ctx); err != nil {
+			log.Error("channel start failed", "channel", d.Name(), "err", err)
+			exit(1)
+		}
+	}
+	for _, d := range wecomDrivers {
 		if err := d.Start(ctx); err != nil {
 			log.Error("channel start failed", "channel", d.Name(), "err", err)
 			exit(1)

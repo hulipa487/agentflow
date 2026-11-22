@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/url"
@@ -224,11 +225,19 @@ func validateChannelList(path string, c *Config, channels []Channel) error {
 			if err := validateQQChannel(path, ch); err != nil {
 				return err
 			}
+		case "feishu":
+			if err := validateFeishuChannel(path, ch); err != nil {
+				return err
+			}
+		case "wecom":
+			if err := validateWeComChannel(path, ch); err != nil {
+				return err
+			}
 		default:
 			return fmt.Errorf("%s: unsupported channel type %q (channel %q)", path, ch.Type, ch.Name)
 		}
-		if ch.Markdown && ch.Type != "qq" {
-			return fmt.Errorf("%s: channel %q sets markdown, which only the qq channel type uses", path, ch.Name)
+		if ch.Markdown && ch.Type != "qq" && ch.Type != "feishu" && ch.Type != "wecom" {
+			return fmt.Errorf("%s: channel %q sets markdown, which only qq, feishu and wecom channel types use", path, ch.Name)
 		}
 		switch ch.JournalMode() {
 		case "full", "metadata", "off":
@@ -242,8 +251,13 @@ func validateChannelList(path string, c *Config, channels []Channel) error {
 			return fmt.Errorf("%s: channel %q media.max_bytes must be >= 0", path, ch.Name)
 		}
 		key := ch.Path
-		if ch.Type == "qq" {
+		switch ch.Type {
+		case "qq":
 			key = ch.QQPath()
+		case "feishu":
+			key = ch.FeishuPath()
+		case "wecom":
+			key = ch.WeComPath()
 		}
 		if ch.Type == "openai" {
 			p := key
@@ -302,19 +316,134 @@ func validateChannelList(path string, c *Config, channels []Channel) error {
 	return nil
 }
 
+// FeishuPath is the route a feishu channel in webhook mode mounts: its path,
+// or /webhook/feishu/<name>/ so multiple Feishu bots never collide. Empty in
+// websocket mode.
+func (ch Channel) FeishuPath() string {
+	if ch.Mode != "webhook" {
+		return ""
+	}
+	return defaultWebhookPath("/webhook/feishu/", ch)
+}
+
+// WeComPath is the route a wecom channel mounts: its path, or
+// /webhook/wecom/<name>/ so multiple WeCom apps never collide.
+func (ch Channel) WeComPath() string {
+	return defaultWebhookPath("/webhook/wecom/", ch)
+}
+
+func defaultWebhookPath(prefix string, ch Channel) string {
+	if ch.Path != "" {
+		return ch.Path
+	}
+	if ch.Name != "" {
+		return prefix + ch.Name + "/"
+	}
+	return prefix
+}
+
 // QQPath is the route a qq channel in webhook mode mounts: its path, or
 // /webhook/qq/<name>/ so two QQ bots never share one. Empty in websocket mode.
 func (ch Channel) QQPath() string {
 	if ch.Mode != "webhook" {
 		return ""
 	}
-	if ch.Path != "" {
-		return ch.Path
+	return defaultWebhookPath("/webhook/qq/", ch)
+}
+
+func validateOptionalAPIBase(path, kind string, ch Channel) error {
+	if ch.APIBase == "" {
+		return nil
 	}
-	if ch.Name != "" {
-		return "/webhook/qq/" + ch.Name + "/"
+	u, err := url.Parse(ch.APIBase)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("%s: %s channel %q api_base must be an absolute http(s) URL", path, kind, ch.Name)
 	}
-	return "/webhook/qq/"
+	return nil
+}
+
+// validateFeishuChannel checks a Feishu / Lark channel. Secrets may be lazy
+// references (${VAR} / cred:<service>), so only presence is checked here.
+func validateFeishuChannel(path string, ch Channel) error {
+	if strings.TrimSpace(ch.AppID) == "" {
+		return fmt.Errorf("%s: feishu channel %q has no app_id; copy the App ID from the Feishu/Lark Developer Console", path, ch.Name)
+	}
+	if ch.Secret == "" {
+		return fmt.Errorf("%s: feishu channel %q has no secret; set secret to the App Secret, e.g. ${FEISHU_APP_SECRET}", path, ch.Name)
+	}
+	switch ch.Mode {
+	case "", "websocket":
+		if ch.Path != "" {
+			return fmt.Errorf("%s: feishu channel %q sets path, which only webhook mode uses; remove it or set mode: webhook", path, ch.Name)
+		}
+	case "webhook":
+		if !strings.HasSuffix(ch.FeishuPath(), "/") {
+			return fmt.Errorf("%s: feishu channel %q path must end with / (got %q)", path, ch.Name, ch.Path)
+		}
+		if ch.Token == "" && ch.EncryptKey == "" {
+			return fmt.Errorf("%s: feishu channel %q webhook mode requires token (Verification Token) and/or encrypt_key so callbacks can be authenticated", path, ch.Name)
+		}
+	default:
+		return fmt.Errorf("%s: feishu channel %q has unsupported mode %q (use websocket or webhook)", path, ch.Name, ch.Mode)
+	}
+	for _, s := range ch.Scenes {
+		switch strings.ToLower(strings.TrimSpace(s)) {
+		case "p2p", "group", "group_all":
+		default:
+			return fmt.Errorf("%s: feishu channel %q has unknown scene %q (use p2p, group or group_all)", path, ch.Name, s)
+		}
+	}
+	if err := validateOptionalAPIBase(path, "feishu", ch); err != nil {
+		return err
+	}
+	if len(ch.AllowUsers) > 0 {
+		return fmt.Errorf("%s: feishu channel %q sets allow_users, which only telegram uses", path, ch.Name)
+	}
+	return nil
+}
+
+// validateWeComChannel checks a WeCom (企业微信) callback channel.
+func validateWeComChannel(path string, ch Channel) error {
+	if strings.TrimSpace(ch.CorpID) == "" {
+		return fmt.Errorf("%s: wecom channel %q has no corp_id; copy CorpID from WeCom Admin", path, ch.Name)
+	}
+	if ch.AgentID <= 0 {
+		return fmt.Errorf("%s: wecom channel %q needs agent_id > 0", path, ch.Name)
+	}
+	if ch.Secret == "" {
+		return fmt.Errorf("%s: wecom channel %q has no secret; set secret to the app CorpSecret, e.g. ${WECOM_SECRET}", path, ch.Name)
+	}
+	if ch.Token == "" {
+		return fmt.Errorf("%s: wecom channel %q has no token; set token to the callback Token", path, ch.Name)
+	}
+	if ch.EncryptKey == "" {
+		return fmt.Errorf("%s: wecom channel %q has no encrypt_key; set encrypt_key to the 43-character EncodingAESKey", path, ch.Name)
+	}
+	ref := ParseSecretRef(ch.EncryptKey)
+	if ref.Env == "" && ref.Cred == "" {
+		raw, err := base64.StdEncoding.DecodeString(ref.Literal + "=")
+		if len(ref.Literal) != 43 || err != nil || len(raw) != 32 {
+			return fmt.Errorf("%s: wecom channel %q encrypt_key must be a 43-character base64 EncodingAESKey", path, ch.Name)
+		}
+	}
+	switch ch.Mode {
+	case "", "webhook":
+	default:
+		return fmt.Errorf("%s: wecom channel %q has unsupported mode %q (only webhook is supported)", path, ch.Name, ch.Mode)
+	}
+	if !strings.HasSuffix(ch.WeComPath(), "/") {
+		return fmt.Errorf("%s: wecom channel %q path must end with / (got %q)", path, ch.Name, ch.Path)
+	}
+	if err := validateOptionalAPIBase(path, "wecom", ch); err != nil {
+		return err
+	}
+	if len(ch.Scenes) > 0 {
+		return fmt.Errorf("%s: wecom channel %q sets scenes, which wecom does not use", path, ch.Name)
+	}
+	if len(ch.AllowUsers) > 0 {
+		return fmt.Errorf("%s: wecom channel %q sets allow_users, which only telegram uses", path, ch.Name)
+	}
+	return nil
 }
 
 // validateQQChannel checks a QQ Bot channel. The secret may be a lazy
@@ -345,11 +474,8 @@ func validateQQChannel(path string, ch Channel) error {
 			return fmt.Errorf("%s: qq channel %q has unknown scene %q (use c2c, group, group_all, guild or dm)", path, ch.Name, s)
 		}
 	}
-	if ch.APIBase != "" {
-		u, err := url.Parse(ch.APIBase)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			return fmt.Errorf("%s: qq channel %q api_base must be an absolute http(s) URL", path, ch.Name)
-		}
+	if err := validateOptionalAPIBase(path, "qq", ch); err != nil {
+		return err
 	}
 	if len(ch.AllowUsers) > 0 {
 		return fmt.Errorf("%s: qq channel %q sets allow_users, which only telegram uses (QQ ids are openids, not numbers)", path, ch.Name)
@@ -504,6 +630,9 @@ func (ch Channel) MarshalYAML() (any, error) {
 		Token           string        `yaml:"token,omitempty"`
 		Secret          string        `yaml:"secret,omitempty"`
 		AppID           string        `yaml:"app_id,omitempty"`
+		CorpID          string        `yaml:"corp_id,omitempty"`
+		AgentID         int64         `yaml:"agent_id,omitempty"`
+		EncryptKey      string        `yaml:"encrypt_key,omitempty"`
 		Scenes          []string      `yaml:"scenes,omitempty"`
 		APIBase         string        `yaml:"api_base,omitempty"`
 		Markdown        bool          `yaml:"markdown,omitempty"`
@@ -522,7 +651,8 @@ func (ch Channel) MarshalYAML() (any, error) {
 	o := out{
 		Name: ch.Name, Type: ch.Type, Mode: ch.Mode, Agent: ch.Agent, Agents: ch.Agents,
 		Path: ch.Path, Token: ch.Token, Secret: ch.Secret, SecretToken: ch.SecretToken,
-		AppID: ch.AppID, Scenes: ch.Scenes, APIBase: ch.APIBase, Markdown: ch.Markdown,
+		AppID: ch.AppID, CorpID: ch.CorpID, AgentID: ch.AgentID, EncryptKey: ch.EncryptKey,
+		Scenes: ch.Scenes, APIBase: ch.APIBase, Markdown: ch.Markdown,
 		Auth: ch.Auth, Keys: ch.Keys, MaxRequestBytes: ch.MaxRequestBytes,
 		ExposeReasoning: ch.ExposeReasoning, Journal: ch.Journal,
 		AllowUsers: ch.AllowUsers, Timeout: ch.Timeout, Async: ch.Async,

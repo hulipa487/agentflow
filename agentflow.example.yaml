@@ -296,6 +296,32 @@ gateway:
     #   scenes: [c2c, group, guild] # c2c | group | guild | dm
     #   markdown: true             # markdown replies (private chats and groups)
     #
+    # Feishu / Lark Open Platform bot. websocket mode (default) connects out over
+    # Feishu's persistent WS gateway; webhook mode mounts /webhook/feishu/<name>/.
+    # - type: feishu
+    #   name: feishu
+    #   agent: assistant
+    #   app_id: cli_xxxxxxxxx
+    #   secret: ${FEISHU_APP_SECRET}
+    #   mode: websocket            # websocket | webhook
+    #   # token: ${FEISHU_VERIFICATION_TOKEN}   # required for webhook unless encrypt_key set
+    #   # encrypt_key: ${FEISHU_ENCRYPT_KEY}    # optional AES-256-CBC webhook encryption
+    #   # api_base: https://open.larksuite.com  # use Lark international domain if needed
+    #   scenes: [p2p, group]       # p2p | group | group_all
+    #   markdown: true
+    #
+    # WeCom (企业微信) self-built app callback. Receive Message URL defaults to
+    # <public https url>/webhook/wecom/<name>/ with SHA-1 + AES-256-CBC crypto.
+    # - type: wecom
+    #   name: wecom
+    #   agent: assistant
+    #   corp_id: wwxxxxxxxxx
+    #   agent_id: 1000002
+    #   secret: ${WECOM_SECRET}
+    #   token: ${WECOM_CALLBACK_TOKEN}
+    #   encrypt_key: ${WECOM_ENCODING_AES_KEY}  # 43-character EncodingAESKey
+    #   markdown: true
+    #
     # - type: ghhook
     #   name: github
     #   agent: assistant

@@ -71,7 +71,11 @@ var channelDefaults = map[string]ChannelTraits{
 	"telegram": {Trust: TrustVerified, Deliverable: true, Linkable: true},
 	// QQ authenticates the sender's openid; a bot can message a user later,
 	// within the platform's proactive-message limits.
-	"qq":        {Trust: TrustVerified, Deliverable: true, Linkable: true},
+	"qq": {Trust: TrustVerified, Deliverable: true, Linkable: true},
+	// Feishu / Lark authenticates the sender's open_id and delivers into chats.
+	"feishu": {Trust: TrustVerified, Deliverable: true, Linkable: true},
+	// WeCom authenticates corporate UserID and delivers via agent message API.
+	"wecom":     {Trust: TrustVerified, Deliverable: true, Linkable: true},
 	oidcChannel: {Trust: TrustVerified}, // a login, not an address: nothing to deliver to
 	"webhook":   {Trust: TrustAsserted, Deliverable: false, Linkable: false},
 	"ghhook":    {Trust: TrustSystem, Deliverable: false, Linkable: false},

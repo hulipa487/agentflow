@@ -251,7 +251,7 @@ func TestValidateQQChannel(t *testing.T) {
 		{name: "api base", mutate: func(ch *Channel) { ch.APIBase = "ftp://x" }, wantErr: "api_base"},
 		{name: "allow_users", mutate: func(ch *Channel) { ch.AllowUsers = []int64{1} }, wantErr: "only telegram uses"},
 		{name: "markdown", mutate: func(ch *Channel) { ch.Markdown = true }},
-		{name: "markdown off-type", mutate: func(ch *Channel) { ch.Type = "webhook"; ch.Markdown = true }, wantErr: "only the qq channel type uses"},
+		{name: "markdown off-type", mutate: func(ch *Channel) { ch.Type = "webhook"; ch.Markdown = true }, wantErr: "only qq, feishu and wecom channel types use"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -297,6 +297,128 @@ func TestQQChannelMarshalsItsFields(t *testing.T) {
 	for _, want := range []string{"app_id: \"1024\"", "scenes:", "- c2c", "api_base: https://proxy.example.com", "secret: ${S}", "markdown: true"} {
 		if !strings.Contains(string(out), want) {
 			t.Fatalf("yaml lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestValidateFeishuChannel(t *testing.T) {
+	base := func() Channel {
+		return Channel{Name: "feishu", Type: "feishu", Agent: "coder", AppID: "cli_123", Secret: "${FEISHU_SECRET}"}
+	}
+	cases := []struct {
+		name    string
+		mutate  func(*Channel)
+		wantErr string
+	}{
+		{name: "websocket by default", mutate: func(*Channel) {}},
+		{name: "webhook with token", mutate: func(ch *Channel) { ch.Mode = "webhook"; ch.Token = "${VERIF}" }},
+		{name: "webhook with encrypt_key", mutate: func(ch *Channel) { ch.Mode = "webhook"; ch.EncryptKey = "${ENC}" }},
+		{name: "scenes", mutate: func(ch *Channel) { ch.Scenes = []string{"p2p", "GROUP_ALL"} }},
+		{name: "markdown", mutate: func(ch *Channel) { ch.Markdown = true }},
+		{name: "app id required", mutate: func(ch *Channel) { ch.AppID = " " }, wantErr: "has no app_id"},
+		{name: "secret required", mutate: func(ch *Channel) { ch.Secret = "" }, wantErr: "has no secret"},
+		{name: "unknown mode", mutate: func(ch *Channel) { ch.Mode = "polling" }, wantErr: "use websocket or webhook"},
+		{name: "path only in webhook mode", mutate: func(ch *Channel) { ch.Path = "/webhook/feishu/" }, wantErr: "only webhook mode uses"},
+		{name: "webhook requires auth", mutate: func(ch *Channel) { ch.Mode = "webhook" }, wantErr: "requires token"},
+		{name: "webhook path slash", mutate: func(ch *Channel) { ch.Mode = "webhook"; ch.Token = "t"; ch.Path = "/feishu" }, wantErr: "must end with /"},
+		{name: "unknown scene", mutate: func(ch *Channel) { ch.Scenes = []string{"guild"} }, wantErr: "unknown scene"},
+		{name: "api base", mutate: func(ch *Channel) { ch.APIBase = "ftp://x" }, wantErr: "api_base"},
+		{name: "allow_users", mutate: func(ch *Channel) { ch.AllowUsers = []int64{1} }, wantErr: "only telegram uses"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ch := base()
+			tc.mutate(&ch)
+			err := ValidateChannels(openAIConfig(), []Channel{ch})
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %v; want one containing %q", err, tc.wantErr)
+			}
+		})
+	}
+	a := Channel{Name: "fs-a", Type: "feishu", Agent: "coder", AppID: "1", Secret: "s", Mode: "webhook", Token: "t"}
+	b := Channel{Name: "fs-b", Type: "feishu", Agent: "coder", AppID: "2", Secret: "s", Mode: "webhook", Token: "t"}
+	if a.FeishuPath() != "/webhook/feishu/fs-a/" {
+		t.Fatalf("default path = %q", a.FeishuPath())
+	}
+	if err := ValidateChannels(openAIConfig(), []Channel{a, b}); err != nil {
+		t.Fatalf("two feishu webhooks collided: %v", err)
+	}
+	if (Channel{Type: "feishu"}).FeishuPath() != "" {
+		t.Fatal("websocket mode mounts no route")
+	}
+}
+
+func TestValidateWeComChannel(t *testing.T) {
+	validAES := "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG" // 43 base64 chars -> 32 bytes
+	base := func() Channel {
+		return Channel{
+			Name:       "wecom",
+			Type:       "wecom",
+			Agent:      "coder",
+			CorpID:     "ww123456",
+			AgentID:    1000002,
+			Secret:     "${WECOM_SECRET}",
+			Token:      "${WECOM_TOKEN}",
+			EncryptKey: validAES,
+		}
+	}
+	cases := []struct {
+		name    string
+		mutate  func(*Channel)
+		wantErr string
+	}{
+		{name: "valid default webhook", mutate: func(*Channel) {}},
+		{name: "valid env aes ref", mutate: func(ch *Channel) { ch.EncryptKey = "${WECOM_AES}" }},
+		{name: "valid markdown", mutate: func(ch *Channel) { ch.Markdown = true }},
+		{name: "corp_id required", mutate: func(ch *Channel) { ch.CorpID = "" }, wantErr: "has no corp_id"},
+		{name: "agent_id required", mutate: func(ch *Channel) { ch.AgentID = 0 }, wantErr: "agent_id > 0"},
+		{name: "secret required", mutate: func(ch *Channel) { ch.Secret = "" }, wantErr: "has no secret"},
+		{name: "token required", mutate: func(ch *Channel) { ch.Token = "" }, wantErr: "has no token"},
+		{name: "encrypt_key required", mutate: func(ch *Channel) { ch.EncryptKey = "" }, wantErr: "has no encrypt_key"},
+		{name: "bad literal encrypt_key", mutate: func(ch *Channel) { ch.EncryptKey = "too-short" }, wantErr: "43-character base64"},
+		{name: "unsupported mode", mutate: func(ch *Channel) { ch.Mode = "websocket" }, wantErr: "only webhook"},
+		{name: "path slash", mutate: func(ch *Channel) { ch.Path = "/wecom" }, wantErr: "must end with /"},
+		{name: "api base", mutate: func(ch *Channel) { ch.APIBase = "ftp://x" }, wantErr: "api_base"},
+		{name: "scenes forbidden", mutate: func(ch *Channel) { ch.Scenes = []string{"group"} }, wantErr: "does not use"},
+		{name: "allow_users forbidden", mutate: func(ch *Channel) { ch.AllowUsers = []int64{1} }, wantErr: "only telegram uses"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ch := base()
+			tc.mutate(&ch)
+			err := ValidateChannels(openAIConfig(), []Channel{ch})
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %v; want one containing %q", err, tc.wantErr)
+			}
+		})
+	}
+	a := Channel{Name: "wc-a", Type: "wecom", Agent: "coder", CorpID: "ww1", AgentID: 1, Secret: "s", Token: "t", EncryptKey: "${K}"}
+	b := Channel{Name: "wc-b", Type: "wecom", Agent: "coder", CorpID: "ww2", AgentID: 2, Secret: "s", Token: "t", EncryptKey: "${K}"}
+	if a.WeComPath() != "/webhook/wecom/wc-a/" {
+		t.Fatalf("default path = %q", a.WeComPath())
+	}
+	if err := ValidateChannels(openAIConfig(), []Channel{a, b}); err != nil {
+		t.Fatalf("two wecom webhooks collided: %v", err)
+	}
+	raw, err := yaml.Marshal(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"corp_id: ww1", "agent_id: 1", "encrypt_key: ${K}"} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("yaml lacks %q:\n%s", want, raw)
 		}
 	}
 }

@@ -300,3 +300,44 @@ channels:
 		t.Fatalf("the unused key reference is still in channels.yaml:\n%s", raw)
 	}
 }
+
+func TestChannelsFeishuAndWeComRoundTrip(t *testing.T) {
+	t.Setenv("FS_SECRET", "fs-secret")
+	t.Setenv("WC_SECRET", "wc-secret")
+	t.Setenv("WC_TOKEN", "wc-token")
+	t.Setenv("WC_AES", "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG")
+	dir := writeFiles(t, map[string]string{
+		"system.yaml":           channelSystem,
+		"profiles/greeter.yaml": greeterProfile,
+		"channels.yaml": `
+channels:
+  - { name: fs, type: feishu, agent: greeter, app_id: cli_1, secret: "${FS_SECRET}", encrypt_key: "${WC_AES}" }
+  - { name: wc, type: wecom, agent: greeter, corp_id: ww1, agent_id: 1000002, secret: "${WC_SECRET}", token: "${WC_TOKEN}", encrypt_key: "${WC_AES}" }
+`,
+	})
+	cfg, err := config.LoadDir(dir, testLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewChannels(cfg, dir, "", agentsFor("greeter"), testLog())
+	list, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Channels) != 2 {
+		t.Fatalf("channels = %d; want 2", len(list.Channels))
+	}
+	wc := list.Channels[1]
+	if wc.CorpID != "ww1" || wc.AgentID != 1000002 || !wc.HasEncryptKey || wc.EncryptKeyRef != "${WC_AES}" {
+		t.Fatalf("wecom view = %+v", wc)
+	}
+	saved, err := store.Save(1, ChannelDraft{
+		Name: "wc", Type: "wecom", Agent: "greeter", CorpID: "ww1", AgentID: 1000002, Markdown: true,
+	}, list.MTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !saved.Channels[1].HasEncryptKey || saved.Channels[1].EncryptKeyRef != "${WC_AES}" {
+		t.Fatalf("encrypt_key lost on save: %+v", saved.Channels[1])
+	}
+}

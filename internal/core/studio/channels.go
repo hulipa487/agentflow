@@ -44,6 +44,10 @@ type ChannelDraft struct {
 	Async           bool     `json:"async,omitempty"`
 	DeliverURL      string   `json:"deliver_url,omitempty"`
 	AppID           string   `json:"app_id,omitempty"`
+	CorpID          string   `json:"corp_id,omitempty"`
+	AgentID         int64    `json:"agent_id,omitempty"`
+	EncryptKey      string   `json:"encrypt_key,omitempty"`
+	ClearEncryptKey bool     `json:"clear_encrypt_key,omitempty"`
 	Scenes          []string `json:"scenes,omitempty"`
 	APIBase         string   `json:"api_base,omitempty"`
 	Markdown        bool     `json:"markdown,omitempty"`
@@ -66,6 +70,8 @@ type ChannelView struct {
 	Async           bool     `json:"async,omitempty"`
 	DeliverURL      string   `json:"deliver_url,omitempty"`
 	AppID           string   `json:"app_id,omitempty"`
+	CorpID          string   `json:"corp_id,omitempty"`
+	AgentID         int64    `json:"agent_id,omitempty"`
 	Scenes          []string `json:"scenes,omitempty"`
 	APIBase         string   `json:"api_base,omitempty"`
 	Markdown        bool     `json:"markdown,omitempty"`
@@ -79,10 +85,12 @@ type ChannelView struct {
 	HasToken        bool     `json:"has_token"`
 	HasSecret       bool     `json:"has_secret"`
 	HasSecretTok    bool     `json:"has_secret_token"`
+	HasEncryptKey   bool     `json:"has_encrypt_key"`
 	HasKeys         bool     `json:"has_keys"`
 	TokenRef        string   `json:"token_ref,omitempty"`
 	SecretRef       string   `json:"secret_ref,omitempty"`
 	SecretTokRef    string   `json:"secret_token_ref,omitempty"`
+	EncryptKeyRef   string   `json:"encrypt_key_ref,omitempty"`
 	KeyRefs         []string `json:"key_refs,omitempty"`
 	Live            bool     `json:"live"`
 }
@@ -174,12 +182,15 @@ func (c *Channels) view(i int, ch config.Channel) ChannelView {
 	v := ChannelView{
 		Index: i, Name: ch.Name, Type: ch.Type, Agent: ch.Agent, Agents: ch.Agents,
 		Mode: ch.Mode, Path: ch.Path, Timeout: ch.Timeout, Async: ch.Async,
-		DeliverURL: ch.DeliverURL, AppID: ch.AppID, Scenes: ch.Scenes, APIBase: ch.APIBase, Markdown: ch.Markdown,
+		DeliverURL: ch.DeliverURL, AppID: ch.AppID, CorpID: ch.CorpID, AgentID: ch.AgentID,
+		Scenes: ch.Scenes, APIBase: ch.APIBase, Markdown: ch.Markdown,
 		Auth: ch.Auth, MaxRequestBytes: ch.MaxRequestBytes, ExposeReasoning: ch.ExposeReasoning,
 		Journal:    ch.Journal,
 		AllowUsers: ch.AllowUsers, MediaAllow: ch.Media.Allow, MediaMaxBytes: ch.Media.MaxBytes,
 		HasToken: ch.Token != "", HasSecret: ch.Secret != "", HasSecretTok: ch.SecretToken != "",
-		TokenRef: secretRef(ch.Token), SecretRef: secretRef(ch.Secret), SecretTokRef: secretRef(ch.SecretToken),
+		HasEncryptKey: ch.EncryptKey != "",
+		TokenRef:      secretRef(ch.Token), SecretRef: secretRef(ch.Secret), SecretTokRef: secretRef(ch.SecretToken),
+		EncryptKeyRef: secretRef(ch.EncryptKey),
 	}
 	for _, k := range ch.Keys {
 		v.HasKeys = true
@@ -205,7 +216,8 @@ func (c *Channels) live(i int, raw config.Channel) bool {
 		l.ExposeReasoning == raw.ExposeReasoning &&
 		l.Mode == raw.Mode && l.Path == raw.Path && l.Timeout == raw.Timeout &&
 		l.Async == raw.Async && l.DeliverURL == raw.DeliverURL &&
-		l.AppID == raw.AppID && equalStrings(l.Scenes, raw.Scenes) && l.APIBase == raw.APIBase && l.Markdown == raw.Markdown &&
+		l.AppID == raw.AppID && l.CorpID == raw.CorpID && l.AgentID == raw.AgentID &&
+		equalStrings(l.Scenes, raw.Scenes) && l.APIBase == raw.APIBase && l.Markdown == raw.Markdown &&
 		equalInts(l.AllowUsers, raw.AllowUsers) &&
 		equalStrings(l.Media.Allow, raw.Media.Allow)
 }
@@ -355,13 +367,14 @@ func channelFromDraft(d ChannelDraft, existing *config.Channel) config.Channel {
 		Agent: strings.TrimSpace(d.Agent), Agents: d.Agents, Mode: strings.TrimSpace(d.Mode),
 		Path: strings.TrimSpace(d.Path), Timeout: strings.TrimSpace(d.Timeout),
 		Async: d.Async, DeliverURL: strings.TrimSpace(d.DeliverURL), AllowUsers: d.AllowUsers,
-		AppID: strings.TrimSpace(d.AppID), Scenes: d.Scenes, APIBase: strings.TrimSpace(d.APIBase), Markdown: d.Markdown,
+		AppID: strings.TrimSpace(d.AppID), CorpID: strings.TrimSpace(d.CorpID), AgentID: d.AgentID,
+		Scenes: d.Scenes, APIBase: strings.TrimSpace(d.APIBase), Markdown: d.Markdown,
 		Auth: strings.TrimSpace(d.Auth), MaxRequestBytes: d.MaxRequestBytes,
 		ExposeReasoning: d.ExposeReasoning, Journal: strings.TrimSpace(d.Journal),
 		Media: config.ChannelMedia{Allow: d.MediaAllow, MaxBytes: d.MediaMaxBytes},
 	}
 	if existing != nil {
-		ch.Token, ch.Secret, ch.SecretToken = existing.Token, existing.Secret, existing.SecretToken
+		ch.Token, ch.Secret, ch.SecretToken, ch.EncryptKey = existing.Token, existing.Secret, existing.SecretToken, existing.EncryptKey
 		ch.Keys = existing.Keys
 		// A draft that does not mention the audit mode keeps the stored one.
 		// The setting exists on every channel type, but an editor may only
@@ -385,6 +398,11 @@ func channelFromDraft(d ChannelDraft, existing *config.Channel) config.Channel {
 		ch.SecretToken = d.SecretToken
 	} else if d.ClearSecretTok {
 		ch.SecretToken = ""
+	}
+	if d.EncryptKey != "" {
+		ch.EncryptKey = d.EncryptKey
+	} else if d.ClearEncryptKey {
+		ch.EncryptKey = ""
 	}
 	if len(d.Keys) > 0 {
 		ch.Keys = d.Keys

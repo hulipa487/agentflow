@@ -24,7 +24,7 @@ var sensitiveKeys = map[string]bool{
 	// Missed by the original list, so these sat in cleartext in the view the
 	// console labels "secrets masked": S3 keys, the Cloudflare browser token,
 	// and a channel's webhook secret token.
-	"secret_key": true, "access_key": true, "api_token": true, "secret_token": true,
+	"secret_key": true, "access_key": true, "api_token": true, "secret_token": true, "encrypt_key": true,
 	// A store target is a path or a DSN, and a DSN can carry a password
 	// (postgres://user:pass@host/db) in every one of its four homes:
 	// runtime.persistence, runtime.identity.persistence,

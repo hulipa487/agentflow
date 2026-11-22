@@ -1347,15 +1347,22 @@ type Gateway struct {
 
 type Channel struct {
 	Name   string   `yaml:"name"`
-	Type   string   `yaml:"type"` // webhook | telegram | ghhook | bridge | openai | qq
-	Mode   string   `yaml:"mode"` // telegram: polling (default) | webhook | auto; qq: websocket (default) | webhook
+	Type   string   `yaml:"type"` // webhook | telegram | ghhook | bridge | openai | qq | feishu | wecom
+	Mode   string   `yaml:"mode"` // telegram: polling (default) | webhook | auto; qq | feishu: websocket (default) | webhook; wecom: webhook
 	Agent  string   `yaml:"agent"`
 	Agents []string `yaml:"agents"` // openai: the agents exposed as model ids
 	Path   string   `yaml:"path"`   // route mounted on the shared server, e.g. /webhook/<chan>/<uuid>/
 	Token  string   `yaml:"token"`
-	Secret string   `yaml:"secret"` // ghhook: webhook secret for HMAC verification; qq: the app secret (env-interpolated)
-	// AppID is the qq channel's bot AppID from the QQ Open Platform console.
+	Secret string   `yaml:"secret"` // ghhook: webhook secret; qq/feishu: AppSecret; wecom: CorpSecret (env-interpolated)
+	// AppID is the bot AppID for qq (q.qq.com) or feishu/lark (open.feishu.cn).
 	AppID string `yaml:"app_id"`
+	// CorpID is the wecom enterprise CorpID (ww...).
+	CorpID string `yaml:"corp_id"`
+	// AgentID is the wecom self-built application AgentID.
+	AgentID int64 `yaml:"agent_id"`
+	// EncryptKey is the feishu webhook Encrypt Key (optional unless encrypting
+	// callbacks) or the wecom 43-character EncodingAESKey.
+	EncryptKey string `yaml:"encrypt_key"`
 	// Scenes are where a qq channel takes messages from: c2c (private chats),
 	// group (@-mentions in groups), guild (@-mentions in guild channels) and dm
 	// (guild direct messages). Empty means c2c, group and guild.

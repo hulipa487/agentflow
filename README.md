@@ -27,12 +27,12 @@ Configure all the routines - API keys, LLM Upstreams, Tools, Channels, Memory - 
 - [x] Hot reload without dropping a conversation?
 - [ ] Flying pigs? (working on it)
 
-Interact with your agents with Telegram, QQ and Webhooks, or through our first-class desktop tool **AgentFlow Studio**.
+Interact with your agents with Telegram, QQ, Feishu/Lark, WeCom and Webhooks, or through our first-class desktop tool **AgentFlow Studio**.
 
 ## How it works
 
 ```
- Telegram / QQ / Webhook / GitHub / Bridge
+ Telegram / QQ / Feishu / WeCom / Webhook / Bridge
                 │
                 ▼
      ┌─────────────────────┐
@@ -115,7 +115,7 @@ Edit the loop while it runs and every live session switches to the new code at i
 **🔌 Models and channels**
 - Anthropic, OpenAI (Chat Completions and Responses), Gemini, and anything OpenAI-compatible (Ollama, vLLM, LiteLLM, OpenRouter...).
 - Streaming, tool calls, thinking/reasoning capture, prompt-cache accounting, multimodal input.
-- Telegram, QQ Bot (Tencent's official QQ Open Platform API, over its websocket gateway or signed webhooks), generic webhooks (sync or async with a callback), GitHub webhooks, a `bridge` channel for forwarding between deployments, and an `openai` channel that makes an agent answer the OpenAI Chat Completions API — clients need only a base URL and a key.
+- Telegram, QQ Bot (Tencent's official QQ Open Platform API, over its websocket gateway or signed webhooks), Feishu / Lark (`feishu`: persistent WebSocket or encrypted webhooks), WeCom (`wecom`: encrypted corporate callbacks & active messaging), generic webhooks (sync or async with a callback), GitHub webhooks, a `bridge` channel for forwarding between deployments, and an `openai` channel that makes an agent answer the OpenAI Chat Completions API — clients need only a base URL and a key.
 
 **🗄️ Memory**
 - SQLite (vectors built in), PostgreSQL (with or without pgvector), Qdrant, Redis, Redis vector search, and an in-process volatile store.

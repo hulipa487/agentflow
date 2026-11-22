@@ -46,11 +46,12 @@ type Config struct {
 	Legal    LegalSearch      `yaml:"legal_search"`
 	Browser  Browser          `yaml:"browser"`
 	Net      NetConfig        `yaml:"net"`
-	Media    MediaConfig      `yaml:"media"`
-	Files    FilesConfig      `yaml:"files"`
-	Audit    AuditConfig      `yaml:"audit"`
-	Usage    UsageConfig      `yaml:"usage"`
-	Agents   map[string]Agent `yaml:"agents"`
+	Media    MediaConfig         `yaml:"media"`
+	Files    FilesConfig         `yaml:"files"`
+	Audit    AuditConfig         `yaml:"audit"`
+	Usage    UsageConfig         `yaml:"usage"`
+	Observability ObservabilityConfig `yaml:"observability"`
+	Agents   map[string]Agent    `yaml:"agents"`
 	// Environments are the declared toolchains shell jobs run in: a name, a
 	// pinned image or a local root filesystem, and variables. A shell profile
 	// picks one; a project may pick another.
@@ -281,6 +282,37 @@ func (u UsageConfig) UsageRetention() int {
 		return 30
 	}
 	return *u.RetentionDays
+}
+
+// ObservabilityConfig controls external telemetry export (OTLP/HTTP and
+// Langfuse) derived from runtime execution trace events.
+type ObservabilityConfig struct {
+	Tracing TracingConfig `yaml:"tracing"`
+}
+
+// TracingConfig exports turn/op/reply/safety spans asynchronously over
+// OTLP/HTTP JSON (including Langfuse's /api/public/otel/v1/traces endpoint).
+type TracingConfig struct {
+	Enabled         bool              `yaml:"enabled"`
+	Provider        string            `yaml:"provider"`         // otlp (default) | langfuse
+	Endpoint        string            `yaml:"endpoint"`         // collector base URL or .../v1/traces
+	ServiceName     string            `yaml:"service_name"`     // default "agentflow"
+	Headers         map[string]string `yaml:"headers"`          // optional HTTP headers (e.g. Authorization)
+	PublicKey       string            `yaml:"public_key"`       // Langfuse public key
+	SecretKey       string            `yaml:"secret_key"`       // Langfuse secret key
+	SampleRate      *float64          `yaml:"sample_rate"`      // [0, 1]; default 1.0 when enabled
+	IncludePayloads bool              `yaml:"include_payloads"` // opt-in text capture
+	BatchSize       int               `yaml:"batch_size"`       // default 64
+	FlushInterval   string            `yaml:"flush_interval"`   // default "5s"
+	Timeout         string            `yaml:"timeout"`          // default "10s"
+}
+
+// Sample returns the configured sampling fraction in [0, 1] (default 1.0).
+func (t TracingConfig) Sample() float64 {
+	if t.SampleRate == nil {
+		return 1.0
+	}
+	return *t.SampleRate
 }
 
 // Runtime contains instance-wide tuning and persistence.
@@ -744,10 +776,46 @@ type SafetyProfile struct {
 	Filters []string `yaml:"filters"`
 }
 
-// SafetyConfig holds deployment-wide model classifiers. Profiles reference
-// them by name as "classifier:<name>" in profiles.safety.<name>.filters.
+// SafetyConfig holds deployment-wide model classifiers and custom Lua filters.
+// Profiles reference them by name as "classifier:<name>" or "lua:<name>" in
+// profiles.safety.<name>.filters.
 type SafetyConfig struct {
-	Classifiers map[string]ClassifierProfile `yaml:"classifiers"`
+	Classifiers map[string]ClassifierProfile `yaml:"classifiers,omitempty"`
+	LuaFilters  map[string]LuaFilterProfile  `yaml:"lua_filters,omitempty"`
+}
+
+// LuaFilterProfile defines one sandboxed Lua 5.1 ingress/egress safety filter.
+type LuaFilterProfile struct {
+	Source      string   `yaml:"source,omitempty" json:"source,omitempty"`
+	File        string   `yaml:"file,omitempty" json:"file,omitempty"`
+	Resolved    string   `yaml:"-" json:"-"`
+	Directions  []string `yaml:"directions,omitempty" json:"directions,omitempty"`
+	Sources     []string `yaml:"sources,omitempty" json:"sources,omitempty"`
+	Timeout     string   `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	InstrBudget int64    `yaml:"instr_budget,omitempty" json:"instr_budget,omitempty"`
+	OnError     string   `yaml:"on_error,omitempty" json:"on_error,omitempty"` // pass | block
+	Refusal     string   `yaml:"refusal,omitempty" json:"refusal,omitempty"`
+	Fallback    string   `yaml:"fallback,omitempty" json:"fallback,omitempty"`
+}
+
+// TimeoutD returns the Lua filter timeout, defaulting to 200ms.
+func (p LuaFilterProfile) TimeoutD() time.Duration {
+	if p.Timeout == "" {
+		return 200 * time.Millisecond
+	}
+	d, err := time.ParseDuration(p.Timeout)
+	if err != nil || d <= 0 {
+		return 200 * time.Millisecond
+	}
+	return d
+}
+
+// EffectiveSource returns the resolved Lua source (inline or loaded from file).
+func (p LuaFilterProfile) EffectiveSource() string {
+	if p.Resolved != "" {
+		return p.Resolved
+	}
+	return p.Source
 }
 
 // ClassifierProfile is one model-backed moderation/classification policy.
@@ -1774,13 +1842,19 @@ func validateSafetyProfiles(path string, c *Config) error {
 	for _, n := range safety.FilterNames() {
 		known[n] = true
 	}
-	var classifierRefs []string
+	var customRefs []string
 	for name := range c.Safety.Classifiers {
 		ref := "classifier:" + name
 		known[ref] = true
-		classifierRefs = append(classifierRefs, ref)
+		customRefs = append(customRefs, ref)
 	}
-	knownList := append(append([]string{}, safety.FilterNames()...), classifierRefs...)
+	for name := range c.Safety.LuaFilters {
+		ref := "lua:" + name
+		known[ref] = true
+		customRefs = append(customRefs, ref)
+	}
+	sort.Strings(customRefs)
+	knownList := append(append([]string{}, safety.FilterNames()...), customRefs...)
 	for pname, p := range c.Profiles.Safety {
 		for _, f := range p.Filters {
 			if !known[f] {
@@ -1813,18 +1887,21 @@ func validateSafetyProfiles(path string, c *Config) error {
 }
 
 // ValidateSafetySections checks a proposed replacement for the deployment's
-// safety profiles and classifiers against the rest of the config. It runs the
-// same two checks boot runs, so a Studio edit is refused for the reasons a
-// restart would fail: an unknown filter, a classifier that names an unknown or
-// user-keyed model, or a profile an agent still references disappearing.
-func ValidateSafetySections(path string, base *Config, profiles map[string]SafetyProfile, classifiers map[string]ClassifierProfile) error {
+// safety profiles, model-backed classifiers, and custom Lua filters against the
+// rest of the config. It runs the same checks boot runs, so a Studio edit is
+// refused for the reasons a restart would fail.
+func ValidateSafetySections(path string, base *Config, profiles map[string]SafetyProfile, classifiers map[string]ClassifierProfile, luaFilters map[string]LuaFilterProfile) error {
 	if base == nil {
 		return fmt.Errorf("%s: no configuration to validate against", path)
 	}
 	clone := *base
 	clone.Profiles.Safety = profiles
 	clone.Safety.Classifiers = classifiers
+	clone.Safety.LuaFilters = luaFilters
 	if err := validateClassifiers(path, &clone); err != nil {
+		return err
+	}
+	if err := validateLuaFilters(path, &clone); err != nil {
 		return err
 	}
 	return validateSafetyProfiles(path, &clone)
@@ -1936,6 +2013,81 @@ func validateClassifiers(path string, c *Config) error {
 		}
 		if p.Budget.TokensPerDay < 0 {
 			return fmt.Errorf("%s: safety.classifiers.%s: budget.tokens_per_day must not be negative", path, name)
+		}
+	}
+	return nil
+}
+
+func validateLuaFilters(path string, c *Config) error {
+	validSource := map[string]bool{
+		"channel": true, "agent": true, "scheduler": true, "system": true,
+	}
+	baseDir := ""
+	if path != "" && path != "config" && path != "test" {
+		if info, err := os.Stat(path); err == nil && info.IsDir() {
+			baseDir = path
+		} else {
+			baseDir = filepath.Dir(path)
+		}
+	}
+	for name, p := range c.Safety.LuaFilters {
+		if name == "" || strings.ContainsAny(name, " \t/:|") || len(name) > 64 {
+			return fmt.Errorf("%s: safety.lua_filters: %q is not a valid lua filter name", path, name)
+		}
+		hasSrc := strings.TrimSpace(p.Source) != ""
+		hasFile := strings.TrimSpace(p.File) != ""
+		if hasSrc && hasFile {
+			return fmt.Errorf("%s: safety.lua_filters.%s: cannot set both source and file", path, name)
+		}
+		if !hasSrc && !hasFile {
+			return fmt.Errorf("%s: safety.lua_filters.%s: source or file is required", path, name)
+		}
+		resolved := p.Source
+		if hasFile {
+			filePath := strings.TrimSpace(p.File)
+			if !filepath.IsAbs(filePath) && baseDir != "" {
+				filePath = filepath.Join(baseDir, filePath)
+			}
+			raw, err := os.ReadFile(filePath)
+			if err != nil {
+				return fmt.Errorf("%s: safety.lua_filters.%s: read file %q: %w", path, name, p.File, err)
+			}
+			resolved = string(raw)
+		}
+		if err := safety.ValidateLuaSource(resolved); err != nil {
+			return fmt.Errorf("%s: safety.lua_filters.%s: %w", path, name, err)
+		}
+		p.Resolved = resolved
+		c.Safety.LuaFilters[name] = p
+
+		for _, d := range p.Directions {
+			switch d {
+			case "ingress", "egress":
+			default:
+				return fmt.Errorf("%s: safety.lua_filters.%s: direction %q is not ingress or egress", path, name, d)
+			}
+		}
+		for _, s := range p.Sources {
+			if !validSource[s] {
+				return fmt.Errorf("%s: safety.lua_filters.%s: source %q is not channel, agent, scheduler, or system", path, name, s)
+			}
+		}
+		if p.Timeout != "" {
+			d, err := time.ParseDuration(p.Timeout)
+			if err != nil || d <= 0 {
+				return fmt.Errorf("%s: safety.lua_filters.%s: timeout %q must be a positive duration", path, name, p.Timeout)
+			}
+			if d > 10*time.Second {
+				return fmt.Errorf("%s: safety.lua_filters.%s: timeout %q must be at most 10s", path, name, p.Timeout)
+			}
+		}
+		if p.InstrBudget < 0 {
+			return fmt.Errorf("%s: safety.lua_filters.%s: instr_budget must not be negative", path, name)
+		}
+		switch p.OnError {
+		case "", "pass", "block":
+		default:
+			return fmt.Errorf("%s: safety.lua_filters.%s: on_error %q is not pass or block", path, name, p.OnError)
 		}
 	}
 	return nil
@@ -2257,8 +2409,11 @@ func validate(path string, c *Config) error {
 		return err
 	}
 
-	// Model-backed classifiers must resolve before profiles reference them.
+	// Model-backed classifiers and custom Lua filters must resolve before profiles reference them.
 	if err := validateClassifiers(path, c); err != nil {
+		return err
+	}
+	if err := validateLuaFilters(path, c); err != nil {
 		return err
 	}
 
@@ -2526,6 +2681,9 @@ func validate(path string, c *Config) error {
 	}
 	if c.Usage.DefaultTokensPerDay < 0 {
 		return fmt.Errorf("%s: usage.default_tokens_per_day must be >= 0 (0 = unlimited)", path)
+	}
+	if err := validateObservability(path, c.Observability); err != nil {
+		return err
 	}
 
 	// The users API needs the identity layer: profiles, channel links and
@@ -3017,4 +3175,54 @@ func (c *Config) CredentialsMasterKeyEnv() string {
 		return c.Runtime.Credentials.MasterKeyEnv
 	}
 	return "CREDENTIALS_MASTER_KEY"
+}
+
+func validateObservability(path string, obs ObservabilityConfig) error {
+	tr := obs.Tracing
+	if !tr.Enabled {
+		return nil
+	}
+	provider := strings.ToLower(strings.TrimSpace(tr.Provider))
+	switch provider {
+	case "", "otlp":
+		if strings.TrimSpace(tr.Endpoint) == "" {
+			return fmt.Errorf("%s: observability.tracing.endpoint is required when enabled with provider otlp", path)
+		}
+	case "langfuse":
+		hasAuth := false
+		for k, v := range tr.Headers {
+			if strings.EqualFold(strings.TrimSpace(k), "authorization") && strings.TrimSpace(v) != "" {
+				hasAuth = true
+				break
+			}
+		}
+		if !hasAuth && (strings.TrimSpace(tr.PublicKey) == "" || strings.TrimSpace(tr.SecretKey) == "") {
+			return fmt.Errorf("%s: observability.tracing with provider langfuse requires public_key and secret_key (or Authorization header)", path)
+		}
+	default:
+		return fmt.Errorf("%s: observability.tracing.provider must be otlp or langfuse (got %q)", path, tr.Provider)
+	}
+	if ep := strings.TrimSpace(tr.Endpoint); ep != "" {
+		u, err := url.Parse(ep)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("%s: observability.tracing.endpoint must be an http(s) URL (got %q)", path, tr.Endpoint)
+		}
+	}
+	if tr.SampleRate != nil && (*tr.SampleRate < 0 || *tr.SampleRate > 1) {
+		return fmt.Errorf("%s: observability.tracing.sample_rate must be between 0 and 1", path)
+	}
+	if tr.BatchSize < 0 {
+		return fmt.Errorf("%s: observability.tracing.batch_size must be >= 0", path)
+	}
+	if strings.TrimSpace(tr.FlushInterval) != "" {
+		if _, err := ParseEvery(tr.FlushInterval); err != nil {
+			return fmt.Errorf("%s: observability.tracing.flush_interval: %w", path, err)
+		}
+	}
+	if strings.TrimSpace(tr.Timeout) != "" {
+		if _, err := ParseEvery(tr.Timeout); err != nil {
+			return fmt.Errorf("%s: observability.tracing.timeout: %w", path, err)
+		}
+	}
+	return nil
 }

@@ -7,6 +7,7 @@
 package adminapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/studio"
 	"agentflow/internal/core/supervisor"
+	"agentflow/internal/looptest"
 	"agentflow/internal/vm"
 )
 
@@ -96,12 +98,17 @@ func (u *UI) handleStudioAgents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "agents": out})
 }
 
-func (u *UI) handleStudioAgentGet(w http.ResponseWriter, r *http.Request) {
-	_, ws, ok := u.studioReady(w)
-	if !ok {
-		return
-	}
-	name := r.PathValue("name")
+type loadedAgentDef struct {
+	agent     config.Agent
+	loopSrc   string
+	instrSrc  string
+	files     studio.AgentFiles
+	source    string
+	persisted bool
+	def       *supervisor.AgentDef
+}
+
+func (u *UI) loadAgentDefinition(ws *studio.Workspace, name string) (loadedAgentDef, int, error) {
 	sup := u.deps.Agents
 	var def *supervisor.AgentDef
 	if sup != nil {
@@ -125,8 +132,7 @@ func (u *UI) handleStudioAgentGet(w http.ResponseWriter, r *http.Request) {
 		case persisted:
 			pa, ploop, pinstr, pf, err := ws.Load(name)
 			if err != nil {
-				writeErr(w, http.StatusInternalServerError, err.Error())
-				return
+				return loadedAgentDef{}, http.StatusInternalServerError, err
 			}
 			a, loopSrc, instrSrc, files = pa, ploop, pinstr, pf
 			source = "persisted"
@@ -137,8 +143,7 @@ func (u *UI) handleStudioAgentGet(w http.ResponseWriter, r *http.Request) {
 			a = agentFromDef(name, def)
 			source = "runtime"
 		default:
-			writeErr(w, http.StatusNotFound, "no such agent")
-			return
+			return loadedAgentDef{}, http.StatusNotFound, errors.New("no such agent")
 		}
 	}
 
@@ -168,6 +173,29 @@ func (u *UI) handleStudioAgentGet(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	return loadedAgentDef{
+		agent:     a,
+		loopSrc:   loopSrc,
+		instrSrc:  instrSrc,
+		files:     files,
+		source:    source,
+		persisted: persisted,
+		def:       def,
+	}, http.StatusOK, nil
+}
+
+func (u *UI) handleStudioAgentGet(w http.ResponseWriter, r *http.Request) {
+	_, ws, ok := u.studioReady(w)
+	if !ok {
+		return
+	}
+	name := r.PathValue("name")
+	loaded, status, err := u.loadAgentDefinition(ws, name)
+	if err != nil {
+		writeErr(w, status, err.Error())
+		return
+	}
+	a, def := loaded.agent, loaded.def
 	yamlText, err := studio.MarshalAgent(a)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -185,13 +213,13 @@ func (u *UI) handleStudioAgentGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":           true,
 		"name":         name,
-		"source":       source,
+		"source":       loaded.source,
 		"agent_yaml":   yamlText,
 		"agent":        agentJSON(a),
-		"loop":         loopSrc,
-		"instructions": instrSrc,
-		"files":        files,
-		"persisted":    persisted,
+		"loop":         loaded.loopSrc,
+		"instructions": loaded.instrSrc,
+		"files":        loaded.files,
+		"persisted":    loaded.persisted,
 		"spawn":        def != nil && def.SpawnTemplate != nil,
 		"persistent":   def != nil && def.Persistent,
 		"model":        a.Model,
@@ -855,4 +883,89 @@ func (u *UI) handleStudioMedia(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(blob.Bytes)
+}
+
+type studioLoopTestRequest struct {
+	YAML         string `json:"yaml"`
+	Agent        string `json:"agent,omitempty"`
+	LoopSource   string `json:"loop_source,omitempty"`
+	Instructions string `json:"instructions,omitempty"`
+	Model        string `json:"model,omitempty"`
+}
+
+func (u *UI) handleStudioLoopTest(w http.ResponseWriter, r *http.Request) {
+	_, ws, ok := u.studioReady(w)
+	if !ok {
+		return
+	}
+	var req studioLoopTestRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if strings.TrimSpace(req.YAML) == "" {
+		writeErr(w, http.StatusBadRequest, "yaml is required")
+		return
+	}
+	sc, err := looptest.Load([]byte(req.YAML))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("invalid scenario YAML: %v", err))
+		return
+	}
+	if agent := strings.TrimSpace(req.Agent); agent != "" {
+		sc.Agent = agent
+	}
+	if strings.TrimSpace(req.LoopSource) != "" {
+		sc.LoopSource = req.LoopSource
+	}
+	if strings.TrimSpace(req.Instructions) != "" {
+		sc.Instructions = req.Instructions
+	}
+	if strings.TrimSpace(req.Model) != "" {
+		sc.Model = req.Model
+	}
+	if strings.TrimSpace(sc.LoopSource) == "" && strings.TrimSpace(sc.Agent) != "" {
+		loaded, status, loadErr := u.loadAgentDefinition(ws, sc.Agent)
+		if loadErr != nil {
+			if strings.TrimSpace(sc.Loop) == "" {
+				writeErr(w, status, loadErr.Error())
+				return
+			}
+		} else {
+			if strings.TrimSpace(sc.Loop) == "" && strings.TrimSpace(loaded.loopSrc) != "" {
+				sc.LoopSource = loaded.loopSrc
+				if loaded.agent.Loop != "" {
+					sc.Loop = loaded.agent.Loop
+				} else {
+					sc.Loop = sc.Agent + ".lua"
+				}
+			}
+			if strings.TrimSpace(sc.Instructions) == "" {
+				sc.Instructions = loaded.instrSrc
+			}
+			if strings.TrimSpace(sc.Model) == "" {
+				sc.Model = loaded.agent.Model
+			}
+			if strings.TrimSpace(sc.Safety) == "" && (loaded.agent.Safety == "default" || loaded.agent.Safety == "none") {
+				sc.Safety = loaded.agent.Safety
+			}
+		}
+	}
+	if sc.Timeout != "" {
+		if d, err := time.ParseDuration(sc.Timeout); err == nil && d > 30*time.Second {
+			sc.Timeout = "30s"
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	res, err := looptest.RunWithResult(ctx, sc)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"result": res,
+	})
 }

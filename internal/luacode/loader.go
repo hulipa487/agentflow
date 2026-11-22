@@ -429,18 +429,37 @@ func Resolve(ref string) (src string, watchPath string, err error) {
 	return expanded, ref, nil
 }
 
+// ResolveSource validates an inline Lua chunk against the prelude version gate
+// and expands any "-- af-import:" directives, without writing to disk.
+func ResolveSource(name, src string) (string, error) {
+	if err := vm.CheckChunkVersion(name, src); err != nil {
+		return "", err
+	}
+	mu.RLock()
+	expanded, err := expandImportsLocked(src, nil)
+	mu.RUnlock()
+	if err != nil {
+		return "", err
+	}
+	return expanded, nil
+}
+
 // CheckSource validates a Lua chunk against the prelude version gate, expands
 // any "-- af-import:" directives, and checks Lua syntax/compilation. When
 // selfPkg is non-empty it seeds the import cycle stack so a package file
 // importing itself fails cleanly.
 func CheckSource(name, src, selfPkg string) error {
+	if selfPkg == "" {
+		expanded, err := ResolveSource(name, src)
+		if err != nil {
+			return err
+		}
+		return vm.CompileCheck(name, expanded)
+	}
 	if err := vm.CheckChunkVersion(name, src); err != nil {
 		return err
 	}
-	var stack []string
-	if selfPkg != "" {
-		stack = []string{selfPkg}
-	}
+	stack := []string{selfPkg}
 	mu.RLock()
 	expanded, err := expandImportsLocked(src, stack)
 	mu.RUnlock()

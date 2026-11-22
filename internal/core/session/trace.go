@@ -54,6 +54,31 @@ type TraceEvent struct {
 // Lua steps.
 type Tracer func(TraceEvent)
 
+// MultiTracer fans TraceEvents out to every non-nil tracer in order. A panic in
+// one sink never prevents delivery to the others.
+func MultiTracer(tracers ...Tracer) Tracer {
+	var active []Tracer
+	for _, t := range tracers {
+		if t != nil {
+			active = append(active, t)
+		}
+	}
+	if len(active) == 0 {
+		return nil
+	}
+	if len(active) == 1 {
+		return active[0]
+	}
+	return func(ev TraceEvent) {
+		for _, t := range active {
+			func() {
+				defer func() { _ = recover() }()
+				t(ev)
+			}()
+		}
+	}
+}
+
 // maxTraceText bounds any payload captured in a trace event. The ring that
 // stores events is bounded too; this keeps one large completion from crowding
 // out the metadata of every other step.

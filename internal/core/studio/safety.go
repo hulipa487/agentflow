@@ -74,7 +74,38 @@ type SafetyProfileView struct {
 	Agents        []string `json:"agents"`
 	SpawnProfiles []string `json:"spawn_profiles"`
 	Classifiers   []string `json:"classifiers"`
+	LuaFilters    []string `json:"lua_filters"`
 	Live          bool     `json:"live"`
+}
+
+// LuaFilterDraft is the editable shape of one custom Lua safety filter.
+type LuaFilterDraft struct {
+	Name        string   `json:"name"`
+	Source      string   `json:"source,omitempty"`
+	File        string   `json:"file,omitempty"`
+	Directions  []string `json:"directions,omitempty"`
+	Sources     []string `json:"sources,omitempty"`
+	Timeout     string   `json:"timeout,omitempty"`
+	InstrBudget int64    `json:"instr_budget,omitempty"`
+	OnError     string   `json:"on_error,omitempty"`
+	Refusal     string   `json:"refusal,omitempty"`
+	Fallback    string   `json:"fallback,omitempty"`
+}
+
+// LuaFilterView is one custom Lua safety filter plus its references and live status.
+type LuaFilterView struct {
+	Name        string   `json:"name"`
+	Source      string   `json:"source,omitempty"`
+	File        string   `json:"file,omitempty"`
+	Directions  []string `json:"directions,omitempty"`
+	Sources     []string `json:"sources,omitempty"`
+	Timeout     string   `json:"timeout,omitempty"`
+	InstrBudget int64    `json:"instr_budget,omitempty"`
+	OnError     string   `json:"on_error,omitempty"`
+	Refusal     string   `json:"refusal,omitempty"`
+	Fallback    string   `json:"fallback,omitempty"`
+	UsedBy      []string `json:"used_by"`
+	Live        bool     `json:"live"`
 }
 
 // ClassifierView is one model-backed classifier. It carries the same knobs as
@@ -103,8 +134,8 @@ type ClassifierView struct {
 	Live           bool              `json:"live"`
 }
 
-// SafetyList is the whole editable safety surface: profiles, classifiers and
-// the names an editor may reference.
+// SafetyList is the whole editable safety surface: profiles, classifiers,
+// custom Lua filters, and the names an editor may reference.
 type SafetyList struct {
 	Mode           string              `json:"mode"` // configdir | file
 	Path           string              `json:"path,omitempty"`
@@ -113,6 +144,7 @@ type SafetyList struct {
 	BuiltinFilters []string            `json:"builtin_filters"`
 	Profiles       []SafetyProfileView `json:"profiles"`
 	Classifiers    []ClassifierView    `json:"classifiers"`
+	LuaFilters     []LuaFilterView     `json:"lua_filters"`
 	Models         []string            `json:"models"`
 	Prompts        []string            `json:"prompts"`
 	Note           string              `json:"note"`
@@ -147,18 +179,23 @@ func NewSafety(cfg *config.Config, configDir, configPath string, log *slog.Logge
 type safetySections struct {
 	profiles    map[string]config.SafetyProfile
 	classifiers map[string]config.ClassifierProfile
+	luaFilters  map[string]config.LuaFilterProfile
 }
 
 func (s safetySections) clone() safetySections {
 	out := safetySections{
 		profiles:    make(map[string]config.SafetyProfile, len(s.profiles)),
 		classifiers: make(map[string]config.ClassifierProfile, len(s.classifiers)),
+		luaFilters:  make(map[string]config.LuaFilterProfile, len(s.luaFilters)),
 	}
 	for k, v := range s.profiles {
 		out.profiles[k] = v
 	}
 	for k, v := range s.classifiers {
 		out.classifiers[k] = v
+	}
+	for k, v := range s.luaFilters {
+		out.luaFilters[k] = v
 	}
 	return out
 }
@@ -194,6 +231,7 @@ func (s *Safety) listLocked() (SafetyList, error) {
 		BuiltinFilters: safety.FilterNames(),
 		Profiles:       []SafetyProfileView{},
 		Classifiers:    []ClassifierView{},
+		LuaFilters:     []LuaFilterView{},
 		Models:         classifierModels(lists),
 		Prompts:        promptNames(lists),
 		Note:           "Safety profiles are core-owned and bind when agentflow starts; saved changes take effect after a restart.",
@@ -230,11 +268,15 @@ func (s *Safety) listLocked() (SafetyList, error) {
 		}
 	}
 	classifierUse := map[string][]string{}
+	luaUse := map[string][]string{}
 	for pname, p := range sec.profiles {
 		for _, f := range p.Filters {
 			if strings.HasPrefix(f, "classifier:") {
-				classifierUse[strings.TrimPrefix(f, "classifier:")] = append(
-					classifierUse[strings.TrimPrefix(f, "classifier:")], pname)
+				cname := strings.TrimPrefix(f, "classifier:")
+				classifierUse[cname] = append(classifierUse[cname], pname)
+			} else if strings.HasPrefix(f, "lua:") {
+				lname := strings.TrimPrefix(f, "lua:")
+				luaUse[lname] = append(luaUse[lname], pname)
 			}
 		}
 	}
@@ -247,6 +289,7 @@ func (s *Safety) listLocked() (SafetyList, error) {
 			Agents:        sorted(agentUse[name]),
 			SpawnProfiles: sorted(spawnUse[name]),
 			Classifiers:   classifierRefs(p.Filters),
+			LuaFilters:    luaFilterRefs(p.Filters),
 			Live:          profileLive(s.boot(), name, p),
 		}
 		out.Profiles = append(out.Profiles, v)
@@ -257,6 +300,13 @@ func (s *Safety) listLocked() (SafetyList, error) {
 		v.UsedBy = sorted(classifierUse[name])
 		v.Live = classifierLive(s.boot(), name, c)
 		out.Classifiers = append(out.Classifiers, v)
+	}
+	for _, name := range sortedKeys(sec.luaFilters) {
+		lf := sec.luaFilters[name]
+		v := luaFilterView(name, lf)
+		v.UsedBy = sorted(luaUse[name])
+		v.Live = luaFilterLive(s.boot(), name, lf)
+		out.LuaFilters = append(out.LuaFilters, v)
 	}
 	return out, nil
 }
@@ -392,6 +442,71 @@ func (s *Safety) DeleteClassifier(name string, expectMTime int64) (SafetyList, e
 	return s.listLocked()
 }
 
+// ValidateLuaFilter dry-runs a custom Lua filter draft against the deployment.
+func (s *Safety) ValidateLuaFilter(d LuaFilterDraft, creating bool) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sec, err := s.readSections()
+	if err != nil {
+		return []string{err.Error()}
+	}
+	next, errs := mergeLuaFilter(sec, d, creating)
+	if len(errs) > 0 {
+		return errs
+	}
+	return s.validateSections(next)
+}
+
+// SaveLuaFilter creates or updates one custom Lua safety filter.
+func (s *Safety) SaveLuaFilter(d LuaFilterDraft, creating bool, expectMTime int64) (SafetyList, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkMTime(expectMTime); err != nil {
+		return SafetyList{}, err
+	}
+	sec, err := s.readSections()
+	if err != nil {
+		return SafetyList{}, err
+	}
+	next, errs := mergeLuaFilter(sec, d, creating)
+	if len(errs) > 0 {
+		return SafetyList{}, errors.New(strings.Join(errs, "; "))
+	}
+	if errs := s.validateSections(next); len(errs) > 0 {
+		return SafetyList{}, errors.New(strings.Join(errs, "; "))
+	}
+	if err := s.writeSections(next); err != nil {
+		return SafetyList{}, err
+	}
+	return s.listLocked()
+}
+
+// DeleteLuaFilter removes one custom Lua safety filter and refuses while a
+// profile still references lua:<name>.
+func (s *Safety) DeleteLuaFilter(name string, expectMTime int64) (SafetyList, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkMTime(expectMTime); err != nil {
+		return SafetyList{}, err
+	}
+	sec, err := s.readSections()
+	if err != nil {
+		return SafetyList{}, err
+	}
+	if _, ok := sec.luaFilters[name]; !ok {
+		return SafetyList{}, fmt.Errorf("lua safety filter %q does not exist", name)
+	}
+	next := sec.clone()
+	delete(next.luaFilters, name)
+	if errs := s.validateSections(next); len(errs) > 0 {
+		return SafetyList{}, errors.New(strings.Join(errs, "; "))
+	}
+	if err := s.writeSections(next); err != nil {
+		return SafetyList{}, err
+	}
+	return s.listLocked()
+}
+
 func mergeProfile(sec safetySections, d SafetyProfileDraft, creating bool) (safetySections, []string) {
 	name := strings.TrimSpace(d.Name)
 	var errs []string
@@ -482,12 +597,49 @@ func mergeClassifier(sec safetySections, d ClassifierDraft, creating bool) (safe
 	return next, nil
 }
 
+func mergeLuaFilter(sec safetySections, d LuaFilterDraft, creating bool) (safetySections, []string) {
+	name := strings.TrimSpace(d.Name)
+	var errs []string
+	switch {
+	case name == "":
+		errs = append(errs, "a lua filter name is required")
+	case strings.ContainsAny(name, " \t/:|"):
+		errs = append(errs, "lua filter name may not contain spaces or : / |")
+	case len(name) > 64:
+		errs = append(errs, "lua filter name must be at most 64 characters")
+	}
+	if _, exists := sec.luaFilters[name]; exists && creating {
+		errs = append(errs, fmt.Sprintf("lua safety filter %q already exists", name))
+	}
+	if !creating {
+		if _, exists := sec.luaFilters[name]; !exists {
+			errs = append(errs, fmt.Sprintf("lua safety filter %q does not exist", name))
+		}
+	}
+	if len(errs) > 0 {
+		return safetySections{}, errs
+	}
+	next := sec.clone()
+	next.luaFilters[name] = config.LuaFilterProfile{
+		Source:      strings.ReplaceAll(d.Source, "\r\n", "\n"),
+		File:        strings.TrimSpace(d.File),
+		Directions:  trimList(d.Directions),
+		Sources:     trimList(d.Sources),
+		Timeout:     strings.TrimSpace(d.Timeout),
+		InstrBudget: d.InstrBudget,
+		OnError:     strings.TrimSpace(d.OnError),
+		Refusal:     strings.TrimSpace(d.Refusal),
+		Fallback:    strings.TrimSpace(d.Fallback),
+	}
+	return next, nil
+}
+
 func (s *Safety) validateSections(next safetySections) []string {
 	base, err := s.diskConfig()
 	if err != nil {
 		return []string{"the current config does not load: " + err.Error()}
 	}
-	if err := config.ValidateSafetySections(s.sourcePath(), base, next.profiles, next.classifiers); err != nil {
+	if err := config.ValidateSafetySections(s.sourcePath(), base, next.profiles, next.classifiers, next.luaFilters); err != nil {
 		return []string{err.Error()}
 	}
 	return nil
@@ -543,7 +695,11 @@ func promptNames(cfg *config.Config) []string {
 }
 
 func (s *Safety) readSections() (safetySections, error) {
-	empty := safetySections{profiles: map[string]config.SafetyProfile{}, classifiers: map[string]config.ClassifierProfile{}}
+	empty := safetySections{
+		profiles:    map[string]config.SafetyProfile{},
+		classifiers: map[string]config.ClassifierProfile{},
+		luaFilters:  map[string]config.LuaFilterProfile{},
+	}
 	path := s.sourcePath()
 	if path == "" {
 		return empty, nil
@@ -569,6 +725,9 @@ func (s *Safety) readSections() (safetySections, error) {
 	}
 	if frag.Safety.Classifiers != nil {
 		empty.classifiers = frag.Safety.Classifiers
+	}
+	if frag.Safety.LuaFilters != nil {
+		empty.luaFilters = frag.Safety.LuaFilters
 	}
 	for name, p := range empty.profiles {
 		if p.Filters == nil {
@@ -630,11 +789,11 @@ func (s *Safety) writeSections(sec safetySections) error {
 }
 
 func applySafety(root *yaml.Node, sec safetySections) error {
-	if len(sec.classifiers) == 0 {
+	if len(sec.classifiers) == 0 && len(sec.luaFilters) == 0 {
 		config.DeleteMapKey(root, "safety")
 	} else {
 		var v yaml.Node
-		if err := v.Encode(config.SafetyConfig{Classifiers: sec.classifiers}); err != nil {
+		if err := v.Encode(config.SafetyConfig{Classifiers: sec.classifiers, LuaFilters: sec.luaFilters}); err != nil {
 			return err
 		}
 		config.SetMapKey(root, "safety", &v)
@@ -816,6 +975,54 @@ func classifierRefs(filters []string) []string {
 		}
 	}
 	return out
+}
+
+func luaFilterRefs(filters []string) []string {
+	out := []string{}
+	for _, f := range filters {
+		if strings.HasPrefix(f, "lua:") {
+			out = append(out, strings.TrimPrefix(f, "lua:"))
+		}
+	}
+	return out
+}
+
+func luaFilterLive(cfg *config.Config, name string, p config.LuaFilterProfile) bool {
+	if cfg == nil {
+		return false
+	}
+	live, ok := cfg.Safety.LuaFilters[name]
+	if !ok {
+		return false
+	}
+	return reflect.DeepEqual(normalizeLuaFilter(live), normalizeLuaFilter(p))
+}
+
+func normalizeLuaFilter(p config.LuaFilterProfile) config.LuaFilterProfile {
+	p.Resolved = ""
+	if len(p.Directions) == 0 {
+		p.Directions = nil
+	}
+	if len(p.Sources) == 0 {
+		p.Sources = nil
+	}
+	return p
+}
+
+func luaFilterView(name string, f config.LuaFilterProfile) LuaFilterView {
+	return LuaFilterView{
+		Name:        name,
+		Source:      f.Source,
+		File:        f.File,
+		Directions:  nonNil(f.Directions),
+		Sources:     nonNil(f.Sources),
+		Timeout:     f.Timeout,
+		InstrBudget: f.InstrBudget,
+		OnError:     f.OnError,
+		Refusal:     f.Refusal,
+		Fallback:    f.Fallback,
+		UsedBy:      []string{},
+	}
 }
 
 func sortedKeys[V any](m map[string]V) []string {

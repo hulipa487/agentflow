@@ -884,6 +884,11 @@ type Actor struct {
 	refusalMu   sync.Mutex
 	lastRefusal time.Time
 
+	// turnDirectives holds core-authored safety directives produced by the
+	// ingress safety chain for the active turn; prepended to llm.chat/stream.
+	directivesMu   sync.Mutex
+	turnDirectives []string
+
 	// pendingDef stages a def snapshot pushed by the runtime agent registry;
 	// applied on the actor goroutine at the top of runOnce (applyDefAtRestart).
 	pendingDef atomic.Pointer[DefUpdate]
@@ -1274,8 +1279,9 @@ func (a *Actor) dispatchInline(ctx context.Context, op Op, current *Message) (re
 			// the loop sees it. A classifier block skips the turn entirely;
 			// other drops preserve the historical "empty message" behavior.
 			res := a.safety.Ingress(turnCtx, safety.IngressInput{
-				Message: m.Text,
-				Source:  ingressSource(m.Type),
+				Message:   m.Text,
+				Source:    ingressSource(m.Type),
+				SessionID: a.Identity.SessionID,
 			})
 			if res.Drop || res.Skip {
 				a.log.Info("safety ingress dropped message", "reason", res.Reason)
@@ -1294,10 +1300,11 @@ func (a *Actor) dispatchInline(ctx context.Context, op Op, current *Message) (re
 				m.Text = "" // legacy drop: loop sees an empty message
 				break
 			}
+			a.setTurnDirectives(res.Directives)
 			if res.Text != m.Text {
 				m.Text = res.Text
 				a.trace(TraceEvent{Kind: "safety", Op: "ingress", Turn: m.ID, OK: true, Err: "rewritten", Safety: res.Meta})
-			} else if res.Meta != nil {
+			} else if res.Meta != nil || len(res.Directives) > 0 || res.Annotations["support-offer"] != "" {
 				a.trace(TraceEvent{Kind: "safety", Op: "ingress", Turn: m.ID, OK: true, Err: res.Reason, Safety: res.Meta})
 			}
 			break
@@ -1557,6 +1564,11 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 		}
 	}
 	if h, found := a.handlers[op.Type]; found {
+		if (op.Type == "llm.chat" || op.Type == "llm.stream") && len(op.Messages) > 0 {
+			if dirs := a.snapshotTurnDirectives(); len(dirs) > 0 {
+				op.Messages = injectSafetyDirectives(op.Messages, dirs)
+			}
+		}
 		return h(ctx, op)
 	}
 	r, _ := jsonString("unknown op " + op.Type)
@@ -1725,7 +1737,11 @@ func (a *Actor) checkEgress(ctx context.Context, channel, replyTo, text, inReply
 	if a.safety == nil || text == "" {
 		return text, true
 	}
-	res := a.safety.Egress(ctx, safety.EgressInput{Text: text, Source: "agent"})
+	res := a.safety.Egress(ctx, safety.EgressInput{
+		Text:      text,
+		Source:    "agent",
+		SessionID: a.Identity.SessionID,
+	})
 	if res.Drop {
 		a.log.Info("safety egress dropped reply", "reason", res.Reason)
 		metrics.Inc("agentflow_safety_drops")
@@ -1750,7 +1766,7 @@ func (a *Actor) checkEgress(ctx context.Context, channel, replyTo, text, inReply
 		}
 		return "", false
 	}
-	if res.Meta != nil {
+	if res.Text != text || res.Meta != nil {
 		a.trace(TraceEvent{Kind: "safety", Op: "egress", Turn: inReplyTo, OK: true, Err: res.Reason, Safety: res.Meta})
 	}
 	return res.Text, true
@@ -1825,7 +1841,11 @@ func (a *Actor) flushTurnDeltas(ctx context.Context, m *Message, turnErr error) 
 	reason := ""
 	blocked := false
 	if a.safety != nil {
-		res := a.safety.Egress(ctx, safety.EgressInput{Text: text, Source: "agent"})
+		res := a.safety.Egress(ctx, safety.EgressInput{
+			Text:      text,
+			Source:    "agent",
+			SessionID: a.Identity.SessionID,
+		})
 		if res.Drop {
 			blocked = true
 			reason = res.Reason
@@ -1833,6 +1853,9 @@ func (a *Actor) flushTurnDeltas(ctx context.Context, m *Message, turnErr error) 
 			metrics.Inc("agentflow_safety_drops")
 			a.trace(TraceEvent{Kind: "safety", Op: "egress", Turn: m.ID, Err: res.Reason, Safety: res.Meta})
 		} else {
+			if res.Text != text || res.Meta != nil {
+				a.trace(TraceEvent{Kind: "safety", Op: "egress", Turn: m.ID, OK: true, Err: res.Reason, Safety: res.Meta})
+			}
 			text = res.Text
 		}
 	}
@@ -1860,6 +1883,45 @@ func (a *Actor) resetTurnDeltas() {
 	a.turnDeltaText.Reset()
 	a.pendingDeltas.Reset()
 	a.deltaMu.Unlock()
+	a.setTurnDirectives(nil)
+}
+
+func (a *Actor) setTurnDirectives(dirs []string) {
+	a.directivesMu.Lock()
+	if len(dirs) == 0 {
+		a.turnDirectives = nil
+	} else {
+		a.turnDirectives = append([]string(nil), dirs...)
+	}
+	a.directivesMu.Unlock()
+}
+
+func (a *Actor) snapshotTurnDirectives() []string {
+	a.directivesMu.Lock()
+	defer a.directivesMu.Unlock()
+	if len(a.turnDirectives) == 0 {
+		return nil
+	}
+	return append([]string(nil), a.turnDirectives...)
+}
+
+func injectSafetyDirectives(msgs []ChatMessage, dirs []string) []ChatMessage {
+	if len(dirs) == 0 {
+		return msgs
+	}
+	directiveMsg := ChatMessage{
+		Role:    "system",
+		Content: strings.Join(dirs, "\n"),
+	}
+	insertAt := 0
+	for insertAt < len(msgs) && msgs[insertAt].Role == "system" {
+		insertAt++
+	}
+	out := make([]ChatMessage, 0, len(msgs)+1)
+	out = append(out, msgs[:insertAt]...)
+	out = append(out, directiveMsg)
+	out = append(out, msgs[insertAt:]...)
+	return out
 }
 
 // streamsLive reports whether deltas may go to the channel as they arrive. D9:

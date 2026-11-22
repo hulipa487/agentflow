@@ -150,6 +150,17 @@ memory:
 #       budget: { tokens_per_day: 500000 }
 #       refusal: ""                      # optional ingress refusal text
 #       fallback: ""                     # optional egress fallback text
+#   lua_filters:
+#     pii_mask:
+#       directions: [ingress, egress]
+#       timeout: 200ms
+#       instr_budget: 100000
+#       on_error: pass                   # pass | block
+#       source: |
+#         function egress(input)
+#           local out = string.gsub(input.text, "sk%-[A-Za-z0-9]+", "[REDACTED]")
+#           return { text = out }
+#         end
 
 profiles:
   memory:
@@ -357,6 +368,21 @@ gateway:
 # usage:
 #   events: true                             # per-call detail (default off)
 #   retention_days: 30
+#
+# observability:
+#   tracing:
+#     enabled: false
+#     provider: otlp                         # otlp (OTLP/HTTP JSON) | langfuse
+#     endpoint: https://otel.example.com     # or https://cloud.langfuse.com for langfuse
+#     service_name: agentflow
+#     # headers: { Authorization: "Bearer ${OTEL_TOKEN}" } # generic OTLP headers
+#     # public_key: ${LANGFUSE_PUBLIC_KEY}                 # langfuse Basic auth
+#     # secret_key: ${LANGFUSE_SECRET_KEY}                 # langfuse Basic auth
+#     sample_rate: 1.0
+#     include_payloads: false
+#     batch_size: 64
+#     flush_interval: 5s
+#     timeout: 10s
 
 # prompts:
 #   assistant: { file: ./prompts/assistant.md }   # shared prompt registry

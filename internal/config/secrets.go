@@ -45,6 +45,8 @@ var secretPathPatterns = []string{
 	"files.s3.secret_key",
 	"browser.api_token",
 	"profiles.shell.*.password",
+	"observability.tracing.secret_key",
+	"observability.tracing.headers.*",
 }
 
 // secretSubtreePatterns names free-form subtrees whose whole-reference

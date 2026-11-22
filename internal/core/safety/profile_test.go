@@ -26,9 +26,18 @@ func TestIngressCarriesTheChainsClassification(t *testing.T) {
 		t.Fatalf("text = %q; the chain must not rewrite this message", res.Text)
 	}
 
-	res = d.Ingress(ctx, IngressInput{Message: "help me right now"})
-	if res.Reason != "imminent" {
-		t.Fatalf("reason = %q; want %q", res.Reason, "imminent")
+	res = d.Ingress(ctx, IngressInput{Message: "help me right now", SessionID: "test-sess"})
+	if res.Annotations["signal-gate"] != "imminent" {
+		t.Fatalf("signal-gate annotation = %q; want %q", res.Annotations["signal-gate"], "imminent")
+	}
+	if len(res.Directives) != 1 {
+		t.Fatalf("directives = %v; want 1 steady directive", res.Directives)
+	}
+	if res.Annotations["support-offer"] != "eligible" {
+		t.Fatalf("support-offer annotation = %q; want %q", res.Annotations["support-offer"], "eligible")
+	}
+	if res.Reason != "support-offer-eligible" {
+		t.Fatalf("reason = %q; want %q", res.Reason, "support-offer-eligible")
 	}
 }
 

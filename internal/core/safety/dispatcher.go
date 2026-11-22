@@ -16,8 +16,10 @@ import (
 
 // IngressInput is what the dispatcher receives before the loop processes a turn.
 type IngressInput struct {
-	Message string // the user/agent/timer text
-	Source  string // channel | agent | scheduler | system
+	Message     string            // the user/agent/timer text
+	Source      string            // channel | agent | scheduler | system
+	SessionID   string            // stable session identifier when known
+	Annotations map[string]string // per-chain filter outputs keyed by filter name
 }
 
 // SafetyMeta describes a classifier verdict for the trace and audit journal.
@@ -37,29 +39,34 @@ type SafetyMeta struct {
 // without handing the loop an empty message; Refusal, when set, is a
 // core-authored reply delivered instead. Otherwise Text replaces the original.
 type IngressResult struct {
-	Text    string
-	Drop    bool
-	Skip    bool   // drop the turn rather than passing an empty message
-	Refusal string // optional core-authored reply for a dropped turn
-	Reason  string // auditable reason code, never logged with raw content
-	Meta    *SafetyMeta
+	Text        string
+	Drop        bool
+	Skip        bool              // drop the turn rather than passing an empty message
+	Refusal     string            // optional core-authored reply for a dropped turn
+	Reason      string            // auditable reason code, never logged with raw content
+	Meta        *SafetyMeta
+	Annotations map[string]string // per-turn filter annotations propagated down the chain
+	Directives  []string          // core-authored system directives prepended to turn LLM calls
 }
 
 // EgressInput is what the dispatcher receives before the gateway sends a reply.
 type EgressInput struct {
-	Text   string
-	Source string
+	Text        string
+	Source      string
+	SessionID   string
+	Annotations map[string]string
 }
 
 // EgressResult is the dispatcher's decision. If Drop is true, the reply is
 // suppressed (nothing is sent). Fallback, when set, is a core-authored reply
 // delivered instead of the blocked text. Otherwise Text replaces the original.
 type EgressResult struct {
-	Text     string
-	Drop     bool
-	Fallback string
-	Reason   string
-	Meta     *SafetyMeta
+	Text        string
+	Drop        bool
+	Fallback    string
+	Reason      string
+	Meta        *SafetyMeta
+	Annotations map[string]string
 }
 
 // Filter is a single safety filter. Filters are chained in profile order.
@@ -107,20 +114,43 @@ func (d *Dispatcher) Ingress(ctx context.Context, in IngressInput) IngressResult
 	text := in.Message
 	reason := ""
 	var meta *SafetyMeta
+	annotations := copyAnnotations(in.Annotations)
+	var directives []string
 	for _, f := range d.profile.Filters {
-		res := f.Ingress(ctx, IngressInput{Message: text, Source: in.Source})
+		res := f.Ingress(ctx, IngressInput{
+			Message:     text,
+			Source:      in.Source,
+			SessionID:   in.SessionID,
+			Annotations: copyAnnotations(annotations),
+		})
 		if res.Drop || res.Skip {
+			if len(res.Annotations) == 0 && len(annotations) > 0 {
+				res.Annotations = annotations
+			}
 			return res
 		}
 		text = res.Text
 		if res.Reason != "" {
 			reason = res.Reason
+			annotations[f.Name()] = res.Reason
+		}
+		for k, v := range res.Annotations {
+			annotations[k] = v
+		}
+		if len(res.Directives) > 0 {
+			directives = append(directives, res.Directives...)
 		}
 		if res.Meta != nil {
 			meta = res.Meta
 		}
 	}
-	return IngressResult{Text: text, Reason: reason, Meta: meta}
+	return IngressResult{
+		Text:        text,
+		Reason:      reason,
+		Meta:        meta,
+		Annotations: annotations,
+		Directives:  directives,
+	}
 }
 
 // Egress runs all egress filters in order. If any filter drops, the chain stops.
@@ -132,20 +162,41 @@ func (d *Dispatcher) Egress(ctx context.Context, in EgressInput) EgressResult {
 	text := in.Text
 	reason := ""
 	var meta *SafetyMeta
+	annotations := copyAnnotations(in.Annotations)
 	for _, f := range d.profile.Filters {
-		res := f.Egress(ctx, EgressInput{Text: text, Source: in.Source})
+		res := f.Egress(ctx, EgressInput{
+			Text:        text,
+			Source:      in.Source,
+			SessionID:   in.SessionID,
+			Annotations: copyAnnotations(annotations),
+		})
 		if res.Drop {
+			if len(res.Annotations) == 0 && len(annotations) > 0 {
+				res.Annotations = annotations
+			}
 			return res
 		}
 		text = res.Text
 		if res.Reason != "" {
 			reason = res.Reason
+			annotations[f.Name()] = res.Reason
+		}
+		for k, v := range res.Annotations {
+			annotations[k] = v
 		}
 		if res.Meta != nil {
 			meta = res.Meta
 		}
 	}
-	return EgressResult{Text: text, Reason: reason, Meta: meta}
+	return EgressResult{Text: text, Reason: reason, Meta: meta, Annotations: annotations}
+}
+
+func copyAnnotations(src map[string]string) map[string]string {
+	out := make(map[string]string, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
 }
 
 // Profile returns the active profile name.

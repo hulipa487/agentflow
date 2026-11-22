@@ -3,6 +3,7 @@ package safety
 import (
 	"context"
 	"strings"
+	"sync"
 )
 
 // SourceAttribution classifies whether the message is direct user intent vs
@@ -60,46 +61,167 @@ func (SignalGate) Egress(_ context.Context, in EgressInput) EgressResult {
 	return EgressResult{Text: in.Text}
 }
 
-// SteadyDirective injects a stabilization directive at the front of the reply
-// system prompt when the signal is non-none. In Phase 4c this is a no-op on
-// egress (the directive would be injected at prompt-assembly time, which is
-// loop domain). It does not mutate user-facing text.
-type SteadyDirective struct{}
+const (
+	defaultSteadyDirective = "Respond calmly, concisely, and supportively; avoid amplifying distress, urgency, or hopelessness."
+	defaultSupportOffer    = "If you are going through a difficult moment, consider reaching out to someone you trust or a local support helpline."
+	maxTrackedSessions     = 4096
+)
+
+// SteadyDirective injects a core-owned stabilization system directive for the
+// turn when earlier ingress classification indicates an active signal on direct
+// (non-quoted) traffic. It does not mutate user-facing text directly.
+type SteadyDirective struct {
+	Directive      string
+	TriggerSignals []string
+}
 
 func (SteadyDirective) Name() string { return "steady-directive" }
 
-func (SteadyDirective) Ingress(_ context.Context, in IngressInput) IngressResult {
-	return IngressResult{Text: in.Message}
+func (d SteadyDirective) Ingress(_ context.Context, in IngressInput) IngressResult {
+	if strings.EqualFold(in.Annotations["source-attribution"], "quoted") {
+		return IngressResult{Text: in.Message}
+	}
+	signal := in.Annotations["signal-gate"]
+	if signal == "" {
+		return IngressResult{Text: in.Message}
+	}
+	triggers := d.TriggerSignals
+	if len(triggers) == 0 {
+		triggers = []string{"explicit", "imminent"}
+	}
+	matched := false
+	for _, want := range triggers {
+		if strings.EqualFold(signal, want) {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return IngressResult{Text: in.Message}
+	}
+	dir := strings.TrimSpace(d.Directive)
+	if dir == "" {
+		dir = defaultSteadyDirective
+	}
+	return IngressResult{
+		Text:        in.Message,
+		Reason:      "steady-directive-applied",
+		Directives:  []string{dir},
+		Annotations: map[string]string{"steady-directive": "applied"},
+	}
 }
 
 func (SteadyDirective) Egress(_ context.Context, in EgressInput) EgressResult {
 	return EgressResult{Text: in.Text}
 }
 
-// SupportOffer enforces a per-session delivery cap on resource offers. It does
-// not autonomously contact external services. In Phase 4c it's a stateful
-// ingress filter that annotates the turn if an offer has already been made.
+// SupportOffer enforces a per-session delivery cap on support resource offers.
+// When imminent distress signal is detected on direct (non-quoted) ingress and
+// the session has remaining quota, Ingress marks the turn eligible and Egress
+// appends a concise support note once per session. It does not autonomously
+// contact external services.
 type SupportOffer struct {
 	PerSessionLimit int
-	offered         map[string]int // keyed by session
+	OfferText       string
+
+	mu      sync.Mutex
+	offered map[string]int  // keyed by session
+	pending map[string]bool // active turn eligibility keyed by session
 }
 
 func NewSupportOffer(limit int) *SupportOffer {
-	return &SupportOffer{PerSessionLimit: limit, offered: map[string]int{}}
+	return &SupportOffer{
+		PerSessionLimit: limit,
+		OfferText:       defaultSupportOffer,
+		offered:         map[string]int{},
+		pending:         map[string]bool{},
+	}
 }
 
 func (s *SupportOffer) Name() string { return "support-offer" }
 
+func (s *SupportOffer) sessionKey(sessionID, source string) string {
+	if sessionID != "" {
+		return sessionID
+	}
+	if source != "" {
+		return source
+	}
+	return "default"
+}
+
+func (s *SupportOffer) ensureMapsLocked() {
+	if s.offered == nil {
+		s.offered = map[string]int{}
+	}
+	if s.pending == nil {
+		s.pending = map[string]bool{}
+	}
+}
+
 func (s *SupportOffer) Ingress(_ context.Context, in IngressInput) IngressResult {
-	// This filter is a placeholder for the full implementation which would
-	// track per-session offer counts and annotate the turn context. Phase 4c
-	// keeps it stateless-deterministic; the full per-session state requires
-	// the session ID which the dispatcher passes via source, not message.
-	return IngressResult{Text: in.Message}
+	key := s.sessionKey(in.SessionID, in.Source)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ensureMapsLocked()
+	delete(s.pending, key)
+
+	if s.PerSessionLimit <= 0 ||
+		strings.EqualFold(in.Annotations["source-attribution"], "quoted") ||
+		!strings.EqualFold(in.Annotations["signal-gate"], "imminent") {
+		return IngressResult{Text: in.Message}
+	}
+	if len(s.offered) > maxTrackedSessions {
+		clear(s.offered)
+	}
+	if s.offered[key] >= s.PerSessionLimit {
+		return IngressResult{
+			Text:        in.Message,
+			Reason:      "support-offer-capped",
+			Annotations: map[string]string{"support-offer": "capped"},
+		}
+	}
+	if len(s.pending) > maxTrackedSessions {
+		clear(s.pending)
+	}
+	s.pending[key] = true
+	return IngressResult{
+		Text:        in.Message,
+		Reason:      "support-offer-eligible",
+		Annotations: map[string]string{"support-offer": "eligible"},
+	}
 }
 
 func (s *SupportOffer) Egress(_ context.Context, in EgressInput) EgressResult {
-	return EgressResult{Text: in.Text}
+	key := s.sessionKey(in.SessionID, in.Source)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ensureMapsLocked()
+	wasPending := s.pending[key]
+	delete(s.pending, key)
+
+	eligible := wasPending || strings.EqualFold(in.Annotations["support-offer"], "eligible")
+	if !eligible || s.PerSessionLimit <= 0 || in.Text == "" || s.offered[key] >= s.PerSessionLimit {
+		return EgressResult{Text: in.Text}
+	}
+	offer := strings.TrimSpace(s.OfferText)
+	if offer == "" {
+		offer = defaultSupportOffer
+	}
+	if strings.Contains(strings.ToLower(in.Text), strings.ToLower(offer)) {
+		s.offered[key]++
+		return EgressResult{
+			Text:        in.Text,
+			Reason:      "support-offer-appended",
+			Annotations: map[string]string{"support-offer": "appended"},
+		}
+	}
+	s.offered[key]++
+	return EgressResult{
+		Text:        strings.TrimRight(in.Text, "\n") + "\n\n" + offer,
+		Reason:      "support-offer-appended",
+		Annotations: map[string]string{"support-offer": "appended"},
+	}
 }
 
 // AffectGuard blocks nihilistic/world-weary output in the agent's own voice.
@@ -144,7 +266,10 @@ func DefaultProfile() *Profile {
 				ExplicitPhrases: []string{"i want to", "i need to", "help me"},
 				ImminentPhrases: []string{"right now", "immediately", "can't wait"},
 			},
-			SteadyDirective{},
+			SteadyDirective{
+				Directive:      defaultSteadyDirective,
+				TriggerSignals: []string{"explicit", "imminent"},
+			},
 			NewSupportOffer(1),
 			AffectGuard{
 				Patterns: []string{

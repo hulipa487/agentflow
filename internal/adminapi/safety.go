@@ -44,6 +44,14 @@ func safetyResult(list studio.SafetyList, note string) safetyResponse {
 			}
 		}
 	}
+	if !restart {
+		for _, lf := range list.LuaFilters {
+			if !lf.Live {
+				restart = true
+				break
+			}
+		}
+	}
 	return safetyResponse{SafetyList: list, OK: true, RestartRequired: restart, SavedNote: note}
 }
 
@@ -69,15 +77,16 @@ func (u *UI) handleStudioSafety(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, safetyResult(list, ""))
 }
 
-// safetyValidateRequest names one draft. Kind is "profile" or "classifier".
+// safetyValidateRequest names one draft. Kind is "profile", "classifier", or "lua_filter".
 type safetyValidateRequest struct {
 	Kind       string                     `json:"kind"`
 	Creating   bool                       `json:"creating"`
 	Profile    *studio.SafetyProfileDraft `json:"profile,omitempty"`
 	Classifier *studio.ClassifierDraft    `json:"classifier,omitempty"`
+	LuaFilter  *studio.LuaFilterDraft     `json:"lua_filter,omitempty"`
 }
 
-// handleStudioSafetyValidate dry-runs one profile or classifier. It returns
+// handleStudioSafetyValidate dry-runs one profile, classifier, or Lua filter. It returns
 // every error rather than only the first so the form can show them all.
 func (u *UI) handleStudioSafetyValidate(w http.ResponseWriter, r *http.Request) {
 	s, ok := u.safetyReady(w)
@@ -103,8 +112,14 @@ func (u *UI) handleStudioSafetyValidate(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		errs = s.ValidateClassifier(*req.Classifier, req.Creating)
+	case "lua_filter":
+		if req.LuaFilter == nil {
+			writeErr(w, http.StatusBadRequest, "lua_filter draft is required")
+			return
+		}
+		errs = s.ValidateLuaFilter(*req.LuaFilter, req.Creating)
 	default:
-		writeErr(w, http.StatusBadRequest, "kind must be profile or classifier")
+		writeErr(w, http.StatusBadRequest, "kind must be profile, classifier, or lua_filter")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -229,4 +244,62 @@ func (u *UI) handleStudioSafetyClassifierDelete(w http.ResponseWriter, r *http.R
 		return
 	}
 	writeJSON(w, http.StatusOK, safetyResult(list, "classifier deleted; restart agentflow to drop it"))
+}
+
+type safetyLuaFilterRequest struct {
+	LuaFilter studio.LuaFilterDraft `json:"lua_filter"`
+	MTime     int64                 `json:"mtime"`
+}
+
+// handleStudioSafetyLuaFilterCreate appends a custom Lua safety filter.
+func (u *UI) handleStudioSafetyLuaFilterCreate(w http.ResponseWriter, r *http.Request) {
+	u.saveSafetyLuaFilter(w, r, true, "")
+}
+
+// handleStudioSafetyLuaFilterPut replaces one custom Lua safety filter. The
+// name is immutable so profiles referencing lua:<name> stay valid.
+func (u *UI) handleStudioSafetyLuaFilterPut(w http.ResponseWriter, r *http.Request) {
+	u.saveSafetyLuaFilter(w, r, false, r.PathValue("name"))
+}
+
+func (u *UI) saveSafetyLuaFilter(w http.ResponseWriter, r *http.Request, creating bool, name string) {
+	s, ok := u.safetyReady(w)
+	if !ok {
+		return
+	}
+	var req safetyLuaFilterRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if name != "" {
+		if req.LuaFilter.Name != "" && req.LuaFilter.Name != name {
+			writeErr(w, http.StatusBadRequest, "a lua filter name cannot be changed")
+			return
+		}
+		req.LuaFilter.Name = name
+	}
+	list, err := s.SaveLuaFilter(req.LuaFilter, creating, req.MTime)
+	if err != nil {
+		u.writeSafetyErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, safetyResult(list,
+		fmt.Sprintf("lua filter %q saved; restart agentflow to apply it", req.LuaFilter.Name)))
+}
+
+// handleStudioSafetyLuaFilterDelete removes a custom Lua safety filter and
+// refuses while a profile still references lua:<name>.
+func (u *UI) handleStudioSafetyLuaFilterDelete(w http.ResponseWriter, r *http.Request) {
+	s, ok := u.safetyReady(w)
+	if !ok {
+		return
+	}
+	mtime, _ := strconv.ParseInt(r.URL.Query().Get("mtime"), 10, 64)
+	list, err := s.DeleteLuaFilter(r.PathValue("name"), mtime)
+	if err != nil {
+		u.writeSafetyErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, safetyResult(list, "lua filter deleted; restart agentflow to drop it"))
 }

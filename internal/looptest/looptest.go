@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -28,12 +29,14 @@ import (
 	"agentflow/internal/luacode"
 )
 
-// Scenario is the YAML shape. Only Loop is required.
+// Scenario is the YAML shape. Loop or LoopSource is required.
 type Scenario struct {
 	Agent        string            `yaml:"agent"`
 	Loop         string            `yaml:"loop"`
+	LoopSource   string            `yaml:"loop_source,omitempty"`
 	Instructions string            `yaml:"instructions"`
 	Model        string            `yaml:"model"`
+	Safety       string            `yaml:"safety,omitempty"` // ""|"none" | "default"
 	Packages     map[string]string `yaml:"packages"`
 	Timeout      string            `yaml:"timeout"`
 	Messages     []Input           `yaml:"messages"`
@@ -60,48 +63,138 @@ type Input struct {
 	Text string `yaml:"text"`
 }
 
+type LLMUsage struct {
+	Input     int `yaml:"input" json:"input,omitempty"`
+	Output    int `yaml:"output" json:"output,omitempty"`
+	Reasoning int `yaml:"reasoning" json:"reasoning,omitempty"`
+}
+
 type LLMReply struct {
 	Match     string           `yaml:"match"`
 	Text      string           `yaml:"text"`
 	ToolCalls []map[string]any `yaml:"tool_calls"`
+	Usage     *LLMUsage        `yaml:"usage,omitempty"`
 }
+
+// AssertionResult captures one evaluated scenario expectation.
+type AssertionResult struct {
+	Kind     string `json:"kind"` // expect | expect_contains | expect_ops | runtime
+	Index    int    `json:"index"`
+	Expected string `json:"expected"`
+	Actual   string `json:"actual,omitempty"`
+	OK       bool   `json:"ok"`
+	Err      string `json:"err,omitempty"`
+}
+
+// Result holds the structured outcome, outputs, assertion checks, and full
+// execution trace of a scenario run.
+type Result struct {
+	OK         bool                 `json:"ok"`
+	Error      string               `json:"error,omitempty"`
+	Agent      string               `json:"agent,omitempty"`
+	Loop       string               `json:"loop,omitempty"`
+	Model      string               `json:"model,omitempty"`
+	DurationMS int64                `json:"duration_ms"`
+	Sends      []string             `json:"sends"`
+	Ops        []string             `json:"ops"`
+	Assertions []AssertionResult    `json:"assertions"`
+	Events     []session.TraceEvent `json:"events"`
+}
+
+var pkgMu sync.Mutex
 
 // Run executes a scenario and returns a readable failure. It never panics on a
 // loop error: the actor logs it and the expectation check reports what the
 // loop actually produced.
 func Run(sc *Scenario, out io.Writer) error {
-	if sc.Loop == "" {
-		return fmt.Errorf("scenario: loop is required")
+	res, err := RunWithResult(context.Background(), sc)
+	if err != nil {
+		return err
 	}
-	if len(sc.Messages) == 0 {
-		sc.Messages = []Input{{From: "tester", Text: "hello"}}
+	if !res.OK {
+		return fmt.Errorf("%s", res.Error)
+	}
+	if out != nil {
+		fmt.Fprintf(out, "ok: %s (%d sends, %d ops)\n", first(sc.Loop, sc.Agent), len(res.Sends), len(res.Ops))
+		for _, s := range res.Sends {
+			fmt.Fprintf(out, "  -> %s\n", s)
+		}
+	}
+	return nil
+}
+
+// RunWithResult executes a scenario and returns structured sends, ops,
+// assertion outcomes, and captured session trace events.
+func RunWithResult(ctx context.Context, sc *Scenario) (*Result, error) {
+	if sc == nil {
+		return nil, fmt.Errorf("scenario is nil")
+	}
+	if strings.TrimSpace(sc.Loop) == "" && strings.TrimSpace(sc.LoopSource) == "" {
+		return nil, fmt.Errorf("scenario: loop or loop_source is required")
+	}
+	msgs := append([]Input(nil), sc.Messages...)
+	if len(msgs) == 0 {
+		msgs = []Input{{From: "tester", Text: "hello"}}
 	}
 	timeout := 3 * time.Second
 	if sc.Timeout != "" {
 		d, err := time.ParseDuration(sc.Timeout)
 		if err != nil || d <= 0 {
-			return fmt.Errorf("scenario: timeout %q is not a positive duration", sc.Timeout)
+			return nil, fmt.Errorf("scenario: timeout %q is not a positive duration", sc.Timeout)
 		}
 		timeout = d
 	}
-	loopRef := resolve(sc.Loop, sc.baseDir)
+
+	var safeProfile *safety.Profile
+	switch strings.ToLower(strings.TrimSpace(sc.Safety)) {
+	case "", "none":
+		safeProfile = safety.None
+	case "default":
+		safeProfile = safety.DefaultProfile()
+	default:
+		return nil, fmt.Errorf("scenario: unknown safety profile %q (want none or default)", sc.Safety)
+	}
+
 	if sc.Packages != nil {
+		pkgMu.Lock()
+		prev := luacode.Packages()
+		defer func() {
+			luacode.SetPackages(prev)
+			pkgMu.Unlock()
+		}()
 		resolved := make(map[string]string, len(sc.Packages))
 		for name, dir := range sc.Packages {
 			resolved[name] = resolve(dir, sc.baseDir)
 		}
 		luacode.SetPackages(resolved)
 	}
-	src, watch, err := luacode.Resolve(loopRef)
-	if err != nil {
-		return fmt.Errorf("loop: %w", err)
+
+	var (
+		src   string
+		watch string
+		err   error
+	)
+	if strings.TrimSpace(sc.LoopSource) != "" {
+		name := first(sc.Loop, "inline.lua")
+		src, err = luacode.ResolveSource(name, sc.LoopSource)
+		if err != nil {
+			return nil, fmt.Errorf("loop: %w", err)
+		}
+	} else {
+		loopRef := resolve(sc.Loop, sc.baseDir)
+		src, watch, err = luacode.Resolve(loopRef)
+		if err != nil {
+			return nil, fmt.Errorf("loop: %w", err)
+		}
 	}
 	support, err := luacode.SupportChunks()
 	if err != nil {
-		return fmt.Errorf("support chunks: %w", err)
+		return nil, fmt.Errorf("support chunks: %w", err)
 	}
 
+	started := time.Now()
 	rec := &recorder{}
+	tc := &traceCollector{}
 	handlers, ops := scenarioHandlers(sc, rec)
 	info := &session.Info{
 		Name:         first(sc.Agent, "scenario"),
@@ -115,23 +208,29 @@ func Run(sc *Scenario, out io.Writer) error {
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	a := session.New("looptest", identity, info, rec,
-		noAgents{}, noScheduler{}, noUsers{}, safety.New(safety.None), handlers, pool.New(2), log)
+		noAgents{}, noScheduler{}, noUsers{}, safety.New(safeProfile), handlers, pool.New(2), log)
 	a.LoopFile = watch
 	a.LoopSrc = src
 	a.SupportSrcs = support
+	a.TracePayloads = true
+	a.Tracer = tc.record
 
-	ctx, cancel := context.WithCancel(context.Background())
+	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	go a.Run(ctx)
+	go a.Run(runCtx)
 
-	for i, in := range sc.Messages {
+	for i, in := range msgs {
+		if runCtx.Err() != nil {
+			break
+		}
 		from := in.From
 		if from == "" {
 			from = "tester"
 		}
-		before := rec.count()
+		turnID := fmt.Sprintf("scenario-%d", i)
+		errBefore := tc.errCount()
 		a.Mailbox <- session.Message{
-			ID:      fmt.Sprintf("scenario-%d", i),
+			ID:      turnID,
 			Type:    "user",
 			From:    "user:" + from,
 			Text:    in.Text,
@@ -139,50 +238,93 @@ func Run(sc *Scenario, out io.Writer) error {
 			ReplyTo: "reply",
 			Ts:      time.Now().Unix(),
 		}
-		// If this turn is expected to produce output, wait for it before
-		// sending the next input; otherwise give the loop a short turn.
-		if len(sc.Expect) > before {
-			if !waitFor(rec, before+1, timeout) {
-				break
-			}
-		} else {
-			time.Sleep(30 * time.Millisecond)
+		if !waitForTurnOrError(runCtx, tc, turnID, errBefore, timeout) {
+			break
 		}
 	}
-	// Give a final asynchronous send a moment to land.
-	waitFor(rec, len(sc.Expect), timeout)
+	// Give any final asynchronous send a moment to land.
+	if len(sc.Expect) > 0 {
+		waitFor(rec, len(sc.Expect), timeout)
+	}
 	cancel()
 
 	sends := rec.sendsSnapshot()
 	gotOps := ops.snapshot()
-	if err := checkSends(sc, sends); err != nil {
-		return err
+	events := tc.snapshot()
+	if sends == nil {
+		sends = []string{}
 	}
-	if err := checkOps(sc, gotOps); err != nil {
-		return err
+	if gotOps == nil {
+		gotOps = []string{}
 	}
-	if out != nil {
-		fmt.Fprintf(out, "ok: %s (%d sends, %d ops)\n", sc.Loop, len(sends), len(gotOps))
-		for _, s := range sends {
-			fmt.Fprintf(out, "  -> %s\n", s)
-		}
+	if events == nil {
+		events = []session.TraceEvent{}
 	}
-	return nil
+
+	assertions, firstErr := evalAssertions(sc, sends, gotOps, events)
+	if assertions == nil {
+		assertions = []AssertionResult{}
+	}
+	res := &Result{
+		OK:         firstErr == nil,
+		Agent:      info.Name,
+		Loop:       sc.Loop,
+		Model:      info.Model,
+		DurationMS: time.Since(started).Milliseconds(),
+		Sends:      sends,
+		Ops:        gotOps,
+		Assertions: assertions,
+		Events:     events,
+	}
+	if firstErr != nil {
+		res.Error = firstErr.Error()
+	}
+	return res, nil
 }
 
-func checkSends(sc *Scenario, sends []string) error {
+func evalAssertions(sc *Scenario, sends, ops []string, events []session.TraceEvent) ([]AssertionResult, error) {
+	var out []AssertionResult
+	var firstErr error
+	recordErr := func(err error) {
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+
 	if len(sc.Expect) > 0 {
 		if len(sends) != len(sc.Expect) {
-			return fmt.Errorf("expected %d send(s), got %d: %q", len(sc.Expect), len(sends), sends)
-		}
-		for i := range sc.Expect {
-			if strings.TrimSpace(sends[i]) != strings.TrimSpace(sc.Expect[i]) {
-				return fmt.Errorf("send %d: expected %q, got %q", i+1, sc.Expect[i], sends[i])
+			err := fmt.Errorf("expected %d send(s), got %d: %q", len(sc.Expect), len(sends), sends)
+			recordErr(err)
+			out = append(out, AssertionResult{
+				Kind:     "expect",
+				Index:    0,
+				Expected: fmt.Sprintf("%d send(s)", len(sc.Expect)),
+				Actual:   fmt.Sprintf("%d send(s)", len(sends)),
+				OK:       false,
+				Err:      err.Error(),
+			})
+		} else {
+			for i, exp := range sc.Expect {
+				ok := strings.TrimSpace(sends[i]) == strings.TrimSpace(exp)
+				ar := AssertionResult{
+					Kind:     "expect",
+					Index:    i,
+					Expected: exp,
+					Actual:   sends[i],
+					OK:       ok,
+				}
+				if !ok {
+					err := fmt.Errorf("send %d: expected %q, got %q", i+1, exp, sends[i])
+					recordErr(err)
+					ar.Err = err.Error()
+				}
+				out = append(out, ar)
 			}
 		}
 	}
+
 	cursor := 0
-	for _, want := range sc.ExpectContains {
+	for i, want := range sc.ExpectContains {
 		found := false
 		for cursor < len(sends) {
 			if strings.Contains(sends[cursor], want) {
@@ -192,28 +334,120 @@ func checkSends(sc *Scenario, sends []string) error {
 			}
 			cursor++
 		}
-		if !found {
-			return fmt.Errorf("no send contains %q (got %q)", want, sends)
+		ar := AssertionResult{
+			Kind:     "expect_contains",
+			Index:    i,
+			Expected: want,
+			OK:       found,
 		}
+		if !found {
+			err := fmt.Errorf("no send contains %q (got %q)", want, sends)
+			recordErr(err)
+			ar.Actual = strings.Join(sends, "\n")
+			ar.Err = err.Error()
+		}
+		out = append(out, ar)
 	}
-	return nil
-}
 
-func checkOps(sc *Scenario, ops []string) error {
-	if len(sc.ExpectOps) == 0 {
-		return nil
-	}
 	j := 0
-	for _, want := range sc.ExpectOps {
+	for i, want := range sc.ExpectOps {
 		for j < len(ops) && ops[j] != want {
 			j++
 		}
-		if j == len(ops) {
-			return fmt.Errorf("expected op %q; saw %v", want, ops)
+		found := j < len(ops)
+		if found {
+			j++
 		}
-		j++
+		ar := AssertionResult{
+			Kind:     "expect_ops",
+			Index:    i,
+			Expected: want,
+			OK:       found,
+		}
+		if !found {
+			err := fmt.Errorf("expected op %q; saw %v", want, ops)
+			recordErr(err)
+			ar.Actual = strings.Join(ops, ", ")
+			ar.Err = err.Error()
+		}
+		out = append(out, ar)
 	}
-	return nil
+
+	if len(out) == 0 {
+		for _, ev := range events {
+			if ev.Kind == "error" && ev.Err != "" {
+				err := fmt.Errorf("loop error: %s", ev.Err)
+				recordErr(err)
+				out = append(out, AssertionResult{
+					Kind:     "runtime",
+					Index:    0,
+					Expected: "no loop errors",
+					Actual:   ev.Err,
+					OK:       false,
+					Err:      err.Error(),
+				})
+				break
+			}
+		}
+	}
+
+	return out, firstErr
+}
+
+type traceCollector struct {
+	seq    atomic.Int64
+	mu     sync.Mutex
+	events []session.TraceEvent
+	ended  map[string]bool
+	errs   int
+}
+
+func (c *traceCollector) record(ev session.TraceEvent) {
+	ev.Seq = c.seq.Add(1)
+	c.mu.Lock()
+	if c.ended == nil {
+		c.ended = map[string]bool{}
+	}
+	c.events = append(c.events, ev)
+	if ev.Kind == "turn.end" && ev.Turn != "" {
+		c.ended[ev.Turn] = true
+	}
+	if ev.Kind == "error" {
+		c.errs++
+	}
+	c.mu.Unlock()
+}
+
+func (c *traceCollector) turnDone(turn string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ended[turn]
+}
+
+func (c *traceCollector) errCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.errs
+}
+
+func (c *traceCollector) snapshot() []session.TraceEvent {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]session.TraceEvent(nil), c.events...)
+}
+
+func waitForTurnOrError(ctx context.Context, tc *traceCollector, turn string, errBefore int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			return false
+		}
+		if tc.turnDone(turn) || tc.errCount() > errBefore {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
 }
 
 func waitFor(rec *recorder, n int, timeout time.Duration) bool {
@@ -308,7 +542,11 @@ func scenarioHandlers(sc *Scenario, rec *recorder) (map[string]session.OpHandler
 		"llm.chat": func(ctx context.Context, op session.Op) (string, bool) {
 			log.add(op.Type)
 			reply := pickReply(sc.LLM, op.Messages)
-			return ok(map[string]any{"text": reply.Text, "tool_calls": reply.ToolCalls})
+			payload := map[string]any{"text": reply.Text, "tool_calls": reply.ToolCalls}
+			if reply.Usage != nil {
+				payload["usage"] = reply.Usage
+			}
+			return ok(payload)
 		},
 		"tools.list": func(ctx context.Context, op session.Op) (string, bool) {
 			log.add(op.Type)

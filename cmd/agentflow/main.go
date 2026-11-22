@@ -61,6 +61,7 @@ import (
 	"agentflow/internal/core/storedb"
 	"agentflow/internal/core/studio"
 	"agentflow/internal/core/supervisor"
+	"agentflow/internal/core/telemetry"
 	"agentflow/internal/core/tenancy"
 	"agentflow/internal/core/tools"
 	"agentflow/internal/core/triggers"
@@ -1425,7 +1426,6 @@ func main() {
 			},
 		}, log)
 		gw.Register(studioBroker)
-		sup.SetTracer(studioBroker.Trace, cfg.Runtime.Studio.TracePayloads)
 		studioWS = studio.NewWorkspace(cfgSource.ConfigDir(), cfgSource.ConfigPath(), cfg.Runtime.Studio.Workspace, cfg, log)
 		channelsStore = studio.NewChannels(cfg, cfgSource.ConfigDir(), cfgSource.ConfigPath(), func() []string {
 			names := make([]string, 0, len(sup.Agents()))
@@ -1439,6 +1439,23 @@ func main() {
 		}, log)
 		safetyStore = studio.NewSafety(cfg, cfgSource.ConfigDir(), cfgSource.ConfigPath(), log)
 		memoryStore = studio.NewMemory(cfg, cfgSource.ConfigDir(), cfgSource.ConfigPath(), log)
+	}
+
+	var telemetryExporter *telemetry.Exporter
+	if cfg.Observability.Tracing.Enabled {
+		telemetryExporter = startTelemetryExporter(ctx, cfg.Observability.Tracing, credResolver, log)
+	}
+	var tracers []session.Tracer
+	if studioBroker != nil {
+		tracers = append(tracers, studioBroker.Trace)
+	}
+	if telemetryExporter != nil {
+		tracers = append(tracers, telemetryExporter.Trace)
+	}
+	if combined := session.MultiTracer(tracers...); combined != nil {
+		tracePayloads := (studioBroker != nil && cfg.Runtime.Studio.TracePayloads) ||
+			(telemetryExporter != nil && cfg.Observability.Tracing.IncludePayloads)
+		sup.SetTracer(combined, tracePayloads)
 	}
 	// Per-tenant resource bounds (E18). Both are opt-in: 0 disables. The op
 	// pool's fairness, the sharpest bound, is not here — it is how the pool
@@ -2319,6 +2336,13 @@ func main() {
 		log.Warn("sessions still running after shutdown wait; releasing their leases anyway")
 	}
 	waitCancel()
+	if telemetryExporter != nil {
+		texCtx, texCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := telemetryExporter.Shutdown(texCtx); err != nil {
+			log.Warn("telemetry exporter shutdown error", "err", err)
+		}
+		texCancel()
+	}
 	// Before the stores close: the hub gives up its sessions so the rest of the
 	// fleet picks them up at once instead of waiting out the leases. ctx is
 	// cancelled by now, and the store refuses a cancelled context, so the
@@ -2356,6 +2380,66 @@ func main() {
 // store is on a different PostgreSQL server from the runtime store: still
 // shared by every instance, so not refused, but a different failure domain from
 // the one the cell is designed around.
+func startTelemetryExporter(ctx context.Context, tc config.TracingConfig, resolver *config.Resolver, log *slog.Logger) *telemetry.Exporter {
+	pk := tc.PublicKey
+	if pk != "" && resolver != nil {
+		if v, ok := resolver.Resolve(ctx, pk); ok {
+			pk = v
+		} else {
+			log.Warn("telemetry exporter public_key unresolved; exporter disabled", "credential", config.CredentialName(pk))
+			return nil
+		}
+	}
+	sk := tc.SecretKey
+	if sk != "" && resolver != nil {
+		if v, ok := resolver.Resolve(ctx, sk); ok {
+			sk = v
+		} else {
+			log.Warn("telemetry exporter secret_key unresolved; exporter disabled", "credential", config.CredentialName(sk))
+			return nil
+		}
+	}
+	headers := make(map[string]string, len(tc.Headers))
+	for k, raw := range tc.Headers {
+		val := raw
+		if val != "" && resolver != nil {
+			if v, ok := resolver.Resolve(ctx, raw); ok {
+				val = v
+			} else {
+				log.Warn("telemetry exporter header unresolved; exporter disabled", "header", k, "credential", config.CredentialName(raw))
+				return nil
+			}
+		}
+		headers[k] = val
+	}
+	var flushInterval, timeout time.Duration
+	if strings.TrimSpace(tc.FlushInterval) != "" {
+		flushInterval, _ = config.ParseEvery(tc.FlushInterval)
+	}
+	if strings.TrimSpace(tc.Timeout) != "" {
+		timeout, _ = config.ParseEvery(tc.Timeout)
+	}
+	exp, err := telemetry.New(telemetry.Options{
+		Provider:        tc.Provider,
+		Endpoint:        tc.Endpoint,
+		ServiceName:     tc.ServiceName,
+		Headers:         headers,
+		PublicKey:       pk,
+		SecretKey:       sk,
+		SampleRate:      tc.Sample(),
+		IncludePayloads: tc.IncludePayloads,
+		BatchSize:       tc.BatchSize,
+		FlushInterval:   flushInterval,
+		Timeout:         timeout,
+	}, log)
+	if err != nil {
+		log.Warn("telemetry exporter disabled", "err", err)
+		return nil
+	}
+	log.Info("telemetry tracing enabled", "provider", tc.Provider, "endpoint", tc.Endpoint, "payloads", tc.IncludePayloads)
+	return exp
+}
+
 func warnTopologyConfig(cfg *config.Config, log *slog.Logger) {
 	if strings.TrimSpace(cfg.Runtime.Topology) == "" && storedb.BackendFor(cfg.Runtime.Persistence) == storedb.BackendPostgres {
 		log.Warn("runtime.persistence is PostgreSQL but runtime.topology is unset: this looks like a fleet; set runtime.topology: regional so the tier's requirements are checked")
@@ -2710,6 +2794,18 @@ func resolveSafety(cfg *config.Config, ref string, classifiers map[string]*moder
 			filters = append(filters, safety.NewClassifierFilter(classifierOptions(cname, profile, client, agent)))
 			continue
 		}
+		if lname, ok := strings.CutPrefix(name, "lua:"); ok {
+			profile, exists := cfg.Safety.LuaFilters[lname]
+			if !exists {
+				return nil, fmt.Errorf("safety profile %q references lua filter %q, which is not configured", ref, lname)
+			}
+			lf, err := safety.NewLuaFilter(luaFilterOptions(lname, profile))
+			if err != nil {
+				return nil, fmt.Errorf("safety profile %q lua filter %q: %w", ref, lname, err)
+			}
+			filters = append(filters, lf)
+			continue
+		}
 		f, ok := safety.Builtin(name)
 		if !ok {
 			return nil, fmt.Errorf("safety profile %q references unknown filter %q", ref, name)
@@ -2756,6 +2852,33 @@ func classifierOptions(name string, p config.ClassifierProfile, client *moderati
 		MaxInputChars: maxInput,
 		Refusal:       p.Refusal,
 		Fallback:      p.Fallback,
+	}
+}
+
+func luaFilterOptions(name string, p config.LuaFilterProfile) safety.LuaFilterOptions {
+	ingress, egress := true, true
+	if len(p.Directions) > 0 {
+		ingress, egress = false, false
+		for _, d := range p.Directions {
+			switch d {
+			case "ingress":
+				ingress = true
+			case "egress":
+				egress = true
+			}
+		}
+	}
+	return safety.LuaFilterOptions{
+		Name:        name,
+		Source:      p.EffectiveSource(),
+		Ingress:     ingress,
+		Egress:      egress,
+		Sources:     p.Sources,
+		Timeout:     p.TimeoutD(),
+		InstrBudget: p.InstrBudget,
+		OnError:     p.OnError,
+		Refusal:     p.Refusal,
+		Fallback:    p.Fallback,
 	}
 }
 

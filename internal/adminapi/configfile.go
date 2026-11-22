@@ -52,7 +52,8 @@ func maskValue(v any, ctx []string) any {
 			if sensitiveKeys[lk] ||
 				(lk == "path" && isStoreTargetContext(ctx)) ||
 				(lk == "url" && isMemoryBackendConfigContext(ctx)) ||
-				isOperatorsContext(ctx) {
+				isOperatorsContext(ctx) ||
+				isTracingHeadersContext(ctx) {
 				if s, ok := val.(string); ok {
 					switch {
 					case s == "", envPlaceholderRe.MatchString(s):
@@ -137,6 +138,10 @@ func isMemoryBackendConfigContext(ctx []string) bool {
 // runtime.admin.operators (whose map values are bearer tokens keyed by name).
 func isOperatorsContext(ctx []string) bool {
 	return len(ctx) > 0 && ctx[len(ctx)-1] == "operators"
+}
+
+func isTracingHeadersContext(ctx []string) bool {
+	return len(ctx) >= 2 && ctx[len(ctx)-2] == "tracing" && ctx[len(ctx)-1] == "headers"
 }
 
 // configDirFiles enumerates editable YAML fragments in a config directory in

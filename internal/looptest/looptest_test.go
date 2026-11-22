@@ -2,8 +2,10 @@ package looptest
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -121,4 +123,71 @@ func mustRead(t *testing.T, path string) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+func TestRunWithResultCapturesTraceUsageAndAssertions(t *testing.T) {
+	sc := &Scenario{
+		Agent: "eval-agent",
+		LoopSource: `-- af-prelude-version: 1
+function loop()
+  while true do
+    local msg = session.inbox()
+    local reply = llm.chat({ { role = "user", content = msg.text or "" } }, { model = "test-model" })
+    session.send(reply.text or "")
+  end
+end
+`,
+		Safety: "default",
+		LLM: []LLMReply{
+			{
+				Match: "help me right now",
+				Text:  "Take a slow breath.",
+				Usage: &LLMUsage{Input: 12, Output: 7, Reasoning: 2},
+			},
+		},
+		Messages:       []Input{{From: "alice", Text: "help me right now"}},
+		ExpectContains: []string{"Take a slow breath."},
+		ExpectOps:      []string{"llm.chat"},
+	}
+
+	res, err := RunWithResult(context.Background(), sc)
+	if err != nil {
+		t.Fatalf("RunWithResult: %v", err)
+	}
+	if !res.OK {
+		t.Fatalf("expected OK=true, got err=%q assertions=%+v", res.Error, res.Assertions)
+	}
+	if len(res.Sends) != 1 || !strings.Contains(res.Sends[0], "local support helpline") {
+		t.Fatalf("expected default safety SupportOffer append, got sends=%v", res.Sends)
+	}
+	if len(res.Assertions) != 2 || !res.Assertions[0].OK || !res.Assertions[1].OK {
+		t.Fatalf("unexpected assertions: %+v", res.Assertions)
+	}
+
+	var sawStart, sawOpUsage, sawSafety, sawEnd bool
+	for _, ev := range res.Events {
+		switch {
+		case ev.Kind == "turn.start":
+			sawStart = true
+		case ev.Kind == "op.end" && ev.Op == "llm.chat":
+			sawOpUsage = ev.TokensIn == 12 && ev.TokensOut == 7 && ev.TokensReasoning == 2
+		case ev.Kind == "safety":
+			sawSafety = true
+		case ev.Kind == "turn.end":
+			sawEnd = true
+		}
+	}
+	if !sawStart || !sawOpUsage || !sawSafety || !sawEnd {
+		t.Fatalf("missing expected trace events: start=%v opUsage=%v safety=%v end=%v (%+v)", sawStart, sawOpUsage, sawSafety, sawEnd, res.Events)
+	}
+
+	// Failing assertion populates res.OK=false with per-assertion failure info.
+	sc.Expect = []string{"something completely different"}
+	failRes, err := RunWithResult(context.Background(), sc)
+	if err != nil {
+		t.Fatalf("RunWithResult failing case: %v", err)
+	}
+	if failRes.OK || failRes.Error == "" {
+		t.Fatalf("expected failing result, got %+v", failRes)
+	}
 }

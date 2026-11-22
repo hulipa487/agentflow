@@ -349,3 +349,88 @@ func TestStudioDisabled(t *testing.T) {
 		t.Fatalf("disabled studio = %d", rec.Code)
 	}
 }
+
+func TestStudioLoopTest(t *testing.T) {
+	f := newStudioFixture(t)
+
+	// 1. Invalid YAML rejected cleanly with 400.
+	rec := do(t, f.ui.API(), "POST", "/admin/api/studio/loop/test", map[string]any{
+		"yaml": "messages: [not valid: yaml",
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid yaml code = %d, want 400 (%s)", rec.Code, rec.Body.String())
+	}
+
+	// 2. Inline loop_source scenario captures sends, ops, assertions, and trace events.
+	rec = do(t, f.ui.API(), "POST", "/admin/api/studio/loop/test", map[string]any{
+		"yaml": `
+messages:
+  - from: tester
+    text: ping
+expect:
+  - "echo:ping"
+`,
+		"loop_source": fmt.Sprintf("-- af-prelude-version: %d\nfunction loop()\n  while true do\n    local m = session.inbox()\n    session.send(\"echo:\" .. (m.text or \"\"))\n  end\nend\n", vm.PreludeVersion),
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("inline loop test code = %d: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			OK         bool     `json:"ok"`
+			Sends      []string `json:"sends"`
+			Ops        []string `json:"ops"`
+			Assertions []struct {
+				Kind string `json:"kind"`
+				OK   bool   `json:"ok"`
+			} `json:"assertions"`
+			Events []session.TraceEvent `json:"events"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if !out.OK || !out.Result.OK || len(out.Result.Sends) != 1 || out.Result.Sends[0] != "echo:ping" {
+		t.Fatalf("unexpected inline result: %+v", out)
+	}
+	if len(out.Result.Assertions) != 1 || !out.Result.Assertions[0].OK {
+		t.Fatalf("expected passing assertion, got %+v", out.Result.Assertions)
+	}
+	if len(out.Result.Events) == 0 {
+		t.Fatal("expected captured trace events")
+	}
+
+	// 3. Agent lookup scenario resolves loop_source from Studio workspace/supervisor.
+	if err := f.sup.UpsertAgent("replayer", &supervisor.AgentDef{
+		Info:     &session.Info{Name: "replayer", Model: "test-model"},
+		LoopSrc:  testLoopBody(),
+		Handlers: map[string]session.OpHandler{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rec = do(t, f.ui.API(), "POST", "/admin/api/studio/loop/test", map[string]any{
+		"yaml": `
+agent: replayer
+messages:
+  - from: alice
+    text: hello replay
+expect:
+  - "hello replay"
+`,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("agent lookup loop test code = %d: %s", rec.Code, rec.Body.String())
+	}
+	var out2 struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			OK    bool     `json:"ok"`
+			Sends []string `json:"sends"`
+		} `json:"result"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &out2)
+	if !out2.OK || !out2.Result.OK || len(out2.Result.Sends) != 1 || out2.Result.Sends[0] != "hello replay" {
+		t.Fatalf("unexpected agent lookup result: %+v (%s)", out2, rec.Body.String())
+	}
+}

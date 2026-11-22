@@ -100,6 +100,7 @@ type Deps struct {
 	Channels      *studio.Channels
 	Safety        *studio.Safety
 	Memory        *studio.Memory
+	Plugins       *studio.Plugins
 	Media         *media.Service
 	StudioCatalog func() studio.Catalog
 }
@@ -201,6 +202,14 @@ func (u *UI) API() http.Handler {
 	mux.HandleFunc("POST /admin/api/studio/memory/backends", u.handleStudioMemoryBackendCreate)
 	mux.HandleFunc("PUT /admin/api/studio/memory/backends/{name}", u.handleStudioMemoryBackendPut)
 	mux.HandleFunc("DELETE /admin/api/studio/memory/backends/{name}", u.handleStudioMemoryBackendDelete)
+	mux.HandleFunc("GET /admin/api/studio/plugins", u.handleStudioPlugins)
+	mux.HandleFunc("POST /admin/api/studio/plugins/validate", u.handleStudioPluginValidate)
+	mux.HandleFunc("PUT /admin/api/studio/plugins/builtins/{name}", u.handleStudioBuiltinPut)
+	mux.HandleFunc("DELETE /admin/api/studio/plugins/builtins/{name}", u.handleStudioBuiltinDelete)
+	mux.HandleFunc("POST /admin/api/studio/plugins/packages", u.handleStudioPackageCreate)
+	mux.HandleFunc("DELETE /admin/api/studio/plugins/packages/{name}", u.handleStudioPackageDelete)
+	mux.HandleFunc("PUT /admin/api/studio/plugins/packages/{name}/files/{file}", u.handleStudioPackageFilePut)
+	mux.HandleFunc("DELETE /admin/api/studio/plugins/packages/{name}/files/{file}", u.handleStudioPackageFileDelete)
 	return mux
 }
 

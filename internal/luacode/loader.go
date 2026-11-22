@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"gopkg.in/yaml.v3"
 
@@ -29,14 +30,17 @@ import (
 )
 
 var (
+	mu             sync.RWMutex
 	builtinSources map[string]string
 	supportOrder   []string
 )
 
 // SetBuiltins registers the embedded core-contract Lua chunks and the ordered
 // subset loaded into every session before its loop (support chunks).
-// Boot-time only; not synchronized.
+// Safe for boot-time and concurrent test/runtime inspection.
 func SetBuiltins(sources map[string]string, order []string) {
+	mu.Lock()
+	defer mu.Unlock()
 	if sources == nil {
 		builtinSources = nil
 	} else {
@@ -60,6 +64,8 @@ func SetBuiltins(sources map[string]string, order []string) {
 // spelling lets a caller compare a configured value against this list directly
 // and say which vocabulary it belongs to.
 func Names() []string {
+	mu.RLock()
+	defer mu.RUnlock()
 	out := make([]string, 0, len(builtinSources))
 	for n := range builtinSources {
 		out = append(out, "plugin:"+n)
@@ -68,15 +74,51 @@ func Names() []string {
 	return out
 }
 
-// pluginDir is the deployment's plugins.dir, set once at boot via
-// SetPluginDir. A file <pluginDir>/<name>.lua shadows a registered builtin of
-// the same name — for loop/route refs (Resolve) and support chunks
-// (SupportChunks) alike. Boot-time only; not synchronized.
+// BuiltinNames returns the raw sorted names of all registered builtins
+// (without the "plugin:" prefix).
+func BuiltinNames() []string {
+	mu.RLock()
+	defer mu.RUnlock()
+	out := make([]string, 0, len(builtinSources))
+	for n := range builtinSources {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// SupportOrder returns the ordered names of registered support chunks.
+func SupportOrder() []string {
+	mu.RLock()
+	defer mu.RUnlock()
+	return append([]string(nil), supportOrder...)
+}
+
+// BuiltinSource returns the embedded Lua source for a registered builtin name.
+func BuiltinSource(name string) (string, bool) {
+	mu.RLock()
+	defer mu.RUnlock()
+	src, ok := builtinSources[name]
+	return src, ok
+}
+
+// pluginDir is the deployment's plugins.dir, set at boot via SetPluginDir or
+// updated when Studio enables plugin overrides.
 var pluginDir string
 
 // SetPluginDir points the loader at the deployment's plugins dir.
-// Call once at boot, before any Resolve or SupportChunks.
-func SetPluginDir(dir string) { pluginDir = dir }
+func SetPluginDir(dir string) {
+	mu.Lock()
+	defer mu.Unlock()
+	pluginDir = dir
+}
+
+// PluginDir returns the active plugins.dir path.
+func PluginDir() string {
+	mu.RLock()
+	defer mu.RUnlock()
+	return pluginDir
+}
 
 // packages maps a deployment package name to its directory (config packages:).
 // A loop imports one with "-- af-import: <name>" or refers to it directly as
@@ -85,12 +127,37 @@ func SetPluginDir(dir string) { pluginDir = dir }
 // module: it defines tables/functions the importing loop uses.
 var packages map[string]string
 
-// SetPackages installs the deployment's package map. Call once at boot.
-func SetPackages(m map[string]string) { packages = m }
+// SetPackages installs the deployment's package map.
+func SetPackages(m map[string]string) {
+	mu.Lock()
+	defer mu.Unlock()
+	if m == nil {
+		packages = nil
+		return
+	}
+	cp := make(map[string]string, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	packages = cp
+}
+
+// Packages returns a copy of the registered package directories keyed by name.
+func Packages() map[string]string {
+	mu.RLock()
+	defer mu.RUnlock()
+	out := make(map[string]string, len(packages))
+	for k, v := range packages {
+		out[k] = v
+	}
+	return out
+}
 
 // PackagePaths returns the directories the reload watcher should poll. A
 // package edit changes every loop that imports it.
 func PackagePaths() []string {
+	mu.RLock()
+	defer mu.RUnlock()
 	out := make([]string, 0, len(packages))
 	for _, dir := range packages {
 		out = append(out, dir)
@@ -110,7 +177,8 @@ type packageManifest struct {
 }
 
 // packageSource loads one package, recursively expanding its own imports.
-func packageSource(name string, stack []string) (string, string, error) {
+// Caller must hold mu.RLock.
+func packageSourceLocked(name string, stack []string) (string, string, error) {
 	dir, ok := packages[name]
 	if !ok {
 		return "", "", fmt.Errorf("unknown package %q (declare it under packages:)", name)
@@ -165,7 +233,7 @@ func packageSource(name string, stack []string) (string, string, error) {
 		if err := vm.CheckChunkVersion(p, string(b)); err != nil {
 			return "", "", err
 		}
-		expanded, err := expandImports(string(b), append(stack, name))
+		expanded, err := expandImportsLocked(string(b), append(stack, name))
 		if err != nil {
 			return "", "", fmt.Errorf("package %q: %w", name, err)
 		}
@@ -174,10 +242,9 @@ func packageSource(name string, stack []string) (string, string, error) {
 	return strings.Join(parts, "\n"), dir, nil
 }
 
-// expandImports replaces "-- af-import: <name>" lines with the package's
-// source. Imports are positional: a package's definitions are available to
-// everything after the directive.
-func expandImports(src string, stack []string) (string, error) {
+// expandImportsLocked replaces "-- af-import: <name>" lines with the package's
+// source. Caller must hold mu.RLock.
+func expandImportsLocked(src string, stack []string) (string, error) {
 	lines := strings.Split(src, "\n")
 	out := make([]string, 0, len(lines)+8)
 	for _, line := range lines {
@@ -187,7 +254,7 @@ func expandImports(src string, stack []string) (string, error) {
 			if name == "" {
 				return "", fmt.Errorf("af-import: missing package name")
 			}
-			body, _, err := packageSource(name, stack)
+			body, _, err := packageSourceLocked(name, stack)
 			if err != nil {
 				return "", err
 			}
@@ -218,8 +285,9 @@ func stripPreludeDirective(src string) string {
 	return strings.Join(out, "\n")
 }
 
-// shadow returns the deployment's override for a builtin name, if one exists.
-func shadow(name string) (src, path string, ok bool) {
+// shadowLocked returns the deployment's override for a builtin name, if one exists.
+// Caller must hold mu.RLock.
+func shadowLocked(name string) (src, path string, ok bool) {
 	if pluginDir == "" {
 		return "", "", false
 	}
@@ -237,9 +305,11 @@ func shadow(name string) (src, path string, ok bool) {
 // deployment's reload watcher polls these, which is what makes a shadowed
 // support chunk hot-reloadable rather than new-session-only.
 func SupportChunkPaths() map[string]string {
+	mu.RLock()
+	defer mu.RUnlock()
 	out := map[string]string{}
 	for _, name := range supportOrder {
-		if _, path, ok := shadow(name); ok {
+		if _, path, ok := shadowLocked(name); ok {
 			out[name] = path
 		}
 	}
@@ -252,9 +322,11 @@ func SupportChunkPaths() map[string]string {
 // every session start — the first one and each reload restart — so a shadow
 // edit takes effect on the next restart of every session).
 func SupportChunks() ([]string, error) {
+	mu.RLock()
+	defer mu.RUnlock()
 	out := make([]string, 0, len(supportOrder))
 	for _, name := range supportOrder {
-		src, path, ok := shadow(name)
+		src, path, ok := shadowLocked(name)
 		if !ok {
 			src, path = builtinSources[name], "builtin:"+name
 		}
@@ -280,18 +352,20 @@ func SupportChunks() ([]string, error) {
 // joined source, so a support member written against an older prelude would be
 // invisible to a check on the result.
 func Resolve(ref string) (src string, watchPath string, err error) {
+	mu.RLock()
+	defer mu.RUnlock()
 	if name, ok := strings.CutPrefix(ref, "package:"); ok {
-		return packageSource(name, nil)
+		return packageSourceLocked(name, nil)
 	}
 	if name, ok := strings.CutPrefix(ref, "plugin:"); ok {
 		if _, found := builtinSources[name]; !found {
 			return "", "", fmt.Errorf("unknown plugin %q (builtins are named plugin:<name>, e.g. plugin:per_chat)", ref)
 		}
-		if src, path, ok := shadow(name); ok {
+		if src, path, ok := shadowLocked(name); ok {
 			if err := vm.CheckChunkVersion(path, src); err != nil {
 				return "", "", err
 			}
-			expanded, err := expandImports(src, nil)
+			expanded, err := expandImportsLocked(src, nil)
 			if err != nil {
 				return "", "", err
 			}
@@ -300,7 +374,7 @@ func Resolve(ref string) (src string, watchPath string, err error) {
 		if err := vm.CheckChunkVersion("builtin:"+name, builtinSources[name]); err != nil {
 			return "", "", err
 		}
-		expanded, err := expandImports(builtinSources[name], nil)
+		expanded, err := expandImportsLocked(builtinSources[name], nil)
 		if err != nil {
 			return "", "", err
 		}
@@ -318,7 +392,7 @@ func Resolve(ref string) (src string, watchPath string, err error) {
 		if err := vm.CheckChunkVersion(ref, string(b)); err != nil {
 			return "", "", err
 		}
-		expanded, err := expandImports(string(b), nil)
+		expanded, err := expandImportsLocked(string(b), nil)
 		if err != nil {
 			return "", "", err
 		}
@@ -348,9 +422,30 @@ func Resolve(ref string) (src string, watchPath string, err error) {
 	if len(parts) == 0 {
 		return "", "", fmt.Errorf("loop dir %s has no .lua files", ref)
 	}
-	expanded, err := expandImports(strings.Join(parts, "\n"), nil)
+	expanded, err := expandImportsLocked(strings.Join(parts, "\n"), nil)
 	if err != nil {
 		return "", "", err
 	}
 	return expanded, ref, nil
+}
+
+// CheckSource validates a Lua chunk against the prelude version gate, expands
+// any "-- af-import:" directives, and checks Lua syntax/compilation. When
+// selfPkg is non-empty it seeds the import cycle stack so a package file
+// importing itself fails cleanly.
+func CheckSource(name, src, selfPkg string) error {
+	if err := vm.CheckChunkVersion(name, src); err != nil {
+		return err
+	}
+	var stack []string
+	if selfPkg != "" {
+		stack = []string{selfPkg}
+	}
+	mu.RLock()
+	expanded, err := expandImportsLocked(src, stack)
+	mu.RUnlock()
+	if err != nil {
+		return err
+	}
+	return vm.CompileCheck(name, expanded)
 }

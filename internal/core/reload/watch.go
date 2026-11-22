@@ -45,6 +45,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"agentflow/internal/core/session"
@@ -118,6 +119,7 @@ type watchKey struct {
 
 // Watcher polls file mtimes (no fsnotify dependency).
 type Watcher struct {
+	mu       sync.Mutex
 	sup      *supervisor.Supervisor
 	prompts  *PromptSource
 	route    *RouteSource
@@ -167,7 +169,62 @@ func (w *Watcher) SetSupport(s *SupportSource) { w.support = s }
 // SetPackages registers the deployment's Lua package directories.
 func (w *Watcher) SetPackages(p *PackageSource) { w.packages = p }
 
+// RefreshSupport updates the watched support-chunk shadow map and seeds mtimes
+// for the new paths so an external or Studio write is tracked immediately.
+func (w *Watcher) RefreshSupport(paths map[string]string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.support == nil {
+		return
+	}
+	cp := make(map[string]string, len(paths))
+	for k, v := range paths {
+		cp[k] = v
+	}
+	w.support.Paths = cp
+	for k := range w.mtimes {
+		if strings.HasPrefix(k.agent, supportOwner) {
+			delete(w.mtimes, k)
+		}
+	}
+	for name, path := range cp {
+		w.seedPath(supportOwner+name, path)
+	}
+}
+
+// RefreshPackages updates the watched Lua package directories and records their
+// current fingerprint.
+func (w *Watcher) RefreshPackages(paths []string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.packages == nil {
+		return
+	}
+	cp := append([]string(nil), paths...)
+	w.packages.Paths = cp
+	w.pkgStamp = packageFingerprint(cp)
+}
+
+// RefreshRoute updates the watched route handler path and seeds its mtime.
+func (w *Watcher) RefreshRoute(watchPath string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.route == nil {
+		return
+	}
+	w.route.WatchPath = watchPath
+	for k := range w.mtimes {
+		if k.agent == routeOwner {
+			delete(w.mtimes, k)
+		}
+	}
+	if watchPath != "" {
+		w.seedPath(routeOwner, watchPath)
+	}
+}
+
 func (w *Watcher) Start() {
+	w.mu.Lock()
 	for name, def := range w.sup.Agents() {
 		for _, p := range []string{def.LoopFile, def.InstructionsPath} {
 			if p != "" {
@@ -179,7 +236,7 @@ func (w *Watcher) Start() {
 		w.seedPath(routeOwner, w.route.WatchPath)
 		w.log.Info("reload: watching route", "route", w.route.Ref, "file", w.route.WatchPath)
 	}
-	for name, path := range w.supportPaths() {
+	for name, path := range w.supportPathsLocked() {
 		w.seedPath(supportOwner+name, path)
 		w.log.Info("reload: watching support chunk", "chunk", name, "file", path)
 	}
@@ -188,12 +245,13 @@ func (w *Watcher) Start() {
 		w.log.Info("reload: watching Lua packages", "dirs", len(w.packages.Paths))
 	}
 	w.seedPrompts()
+	w.mu.Unlock()
 	go w.loop()
 }
 
-// supportPaths is the registered support-chunk watch list, nil when none is
-// registered or nothing is shadowed.
-func (w *Watcher) supportPaths() map[string]string {
+// supportPathsLocked is the registered support-chunk watch list, nil when none
+// is registered or nothing is shadowed. Caller must hold w.mu.
+func (w *Watcher) supportPathsLocked() map[string]string {
 	if w.support == nil {
 		return nil
 	}
@@ -279,6 +337,12 @@ func (w *Watcher) loop() {
 	}
 }
 
+func (w *Watcher) changedSynced(agent, path string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.changed(agent, path)
+}
+
 func (w *Watcher) poll() {
 	// Prompts are polled once per tick for the whole deployment, not per
 	// agent: one shared registry means one change fans out to everyone.
@@ -289,10 +353,10 @@ func (w *Watcher) poll() {
 	w.pollSupport()
 	w.pollPackages()
 	for name, def := range w.sup.Agents() {
-		if def.LoopFile != "" && w.changed(name, def.LoopFile) {
+		if def.LoopFile != "" && w.changedSynced(name, def.LoopFile) {
 			w.reloadLoop(name, def.LoopFile)
 		}
-		if def.InstructionsPath != "" && w.changed(name, def.InstructionsPath) {
+		if def.InstructionsPath != "" && w.changedSynced(name, def.InstructionsPath) {
 			w.reloadInstructions(name, def)
 		}
 	}
@@ -320,17 +384,23 @@ func packageFingerprint(dirs []string) string {
 // is expanded into every importing loop at load time, so there is no narrower
 // unit to reload without tracking which session imported what.
 func (w *Watcher) pollPackages() {
+	w.mu.Lock()
 	if w.packages == nil || len(w.packages.Paths) == 0 {
+		w.mu.Unlock()
 		return
 	}
 	stamp := packageFingerprint(w.packages.Paths)
 	if stamp == w.pkgStamp {
+		w.mu.Unlock()
 		return
 	}
 	w.pkgStamp = stamp
+	reloadFn := w.packages.Reload
+	w.mu.Unlock()
+
 	w.log.Info("reload: Lua package updated, restarting sessions")
-	if w.packages.Reload != nil {
-		w.packages.Reload()
+	if reloadFn != nil {
+		reloadFn()
 	}
 }
 
@@ -342,25 +412,30 @@ func (w *Watcher) pollPackages() {
 // down. Nothing is watched when the ref is an unshadowed builtin (WatchPath
 // ""); the embedded handler is not a file.
 func (w *Watcher) pollRoute() {
+	w.mu.Lock()
 	if w.route == nil || w.route.WatchPath == "" || w.route.Apply == nil {
+		w.mu.Unlock()
 		return
 	}
-	if !w.changed(routeOwner, w.route.WatchPath) {
+	ref, watchPath, apply := w.route.Ref, w.route.WatchPath, w.route.Apply
+	changed := w.changed(routeOwner, watchPath)
+	w.mu.Unlock()
+	if !changed {
 		return
 	}
-	src, _, err := luacode.Resolve(w.route.WatchPath)
+	src, _, err := luacode.Resolve(watchPath)
 	if err != nil {
-		w.log.Warn("reload: cannot read route", "route", w.route.Ref, "file", w.route.WatchPath, "err", err)
+		w.log.Warn("reload: cannot read route", "route", ref, "file", watchPath, "err", err)
 		return
 	}
-	if err := vm.CompileCheck("@"+w.route.WatchPath, src); err != nil {
+	if err := vm.CompileCheck("@"+watchPath, src); err != nil {
 		w.log.Warn("reload: route compile failed, keeping old version",
-			"route", w.route.Ref, "file", w.route.WatchPath, "err", err)
+			"route", ref, "file", watchPath, "err", err)
 		return
 	}
 	w.log.Info("reload: new route accepted, rebuilding the route state",
-		"route", w.route.Ref, "file", w.route.WatchPath)
-	w.route.Apply(src)
+		"route", ref, "file", watchPath)
+	apply(src)
 }
 
 // pollSupport re-reads each shadowed support chunk whose file changed and, if
@@ -371,17 +446,22 @@ func (w *Watcher) pollRoute() {
 // what is running, not what starts next: a session spawned while the bad edit
 // is on disk still reads the file, as it always has.
 func (w *Watcher) pollSupport() {
+	w.mu.Lock()
 	if w.support == nil {
+		w.mu.Unlock()
 		return
 	}
+	reloadFn := w.support.Reload
+	w.mu.Unlock()
+
 	changed := w.supportChanged()
 	if len(changed) == 0 {
 		return
 	}
 	w.log.Info("reload: support chunks updated, restarting sessions",
 		"chunks", strings.Join(changed, ","))
-	if w.support.Reload != nil {
-		w.support.Reload()
+	if reloadFn != nil {
+		reloadFn()
 	}
 }
 
@@ -390,27 +470,34 @@ func (w *Watcher) pollSupport() {
 // not block the others, and a chunk that fails to compile leaves the sessions
 // running what they already have.
 func (w *Watcher) supportChanged() []string {
+	type touchedChunk struct{ name, path string }
+	w.mu.Lock()
+	var touched []touchedChunk
+	for name, path := range w.supportPathsLocked() {
+		if w.changed(supportOwner+name, path) {
+			touched = append(touched, touchedChunk{name, path})
+		}
+	}
+	w.mu.Unlock()
+
 	var changed []string
-	for name, path := range w.supportPaths() {
-		if !w.changed(supportOwner+name, path) {
-			continue
-		}
-		b, err := os.ReadFile(path)
+	for _, item := range touched {
+		b, err := os.ReadFile(item.path)
 		if err != nil {
-			w.log.Warn("reload: cannot read support chunk", "chunk", name, "file", path, "err", err)
+			w.log.Warn("reload: cannot read support chunk", "chunk", item.name, "file", item.path, "err", err)
 			continue
 		}
-		if err := vm.CheckChunkVersion(path, string(b)); err != nil {
+		if err := vm.CheckChunkVersion(item.path, string(b)); err != nil {
 			w.log.Error("reload: support chunk version mismatch, keeping old version",
-				"chunk", name, "file", path, "err", err)
+				"chunk", item.name, "file", item.path, "err", err)
 			continue
 		}
-		if err := vm.CompileCheck("@"+path, string(b)); err != nil {
+		if err := vm.CompileCheck("@"+item.path, string(b)); err != nil {
 			w.log.Warn("reload: support chunk compile failed, keeping old version",
-				"chunk", name, "file", path, "err", err)
+				"chunk", item.name, "file", item.path, "err", err)
 			continue
 		}
-		changed = append(changed, name)
+		changed = append(changed, item.name)
 	}
 	sort.Strings(changed)
 	return changed

@@ -2131,6 +2131,27 @@ func main() {
 			Region:   cfg.Runtime.Region,
 			Log:      log,
 		}
+		var pluginsStore *studio.Plugins
+		if cfg.Runtime.Studio.IsEnabled() {
+			pluginsStore = studio.NewPlugins(cfg, cfgSource.ConfigDir(), cfgSource.ConfigPath(), studio.PluginHooks{
+				OnReloadSupport: func() {
+					sup.ReloadAll()
+					watcher.RefreshSupport(luacode.SupportChunkPaths())
+				},
+				OnReloadRoute: func() {
+					if routeRef == "plugin:per_chat" {
+						if src, watchPath, err := luacode.Resolve("plugin:per_chat"); err == nil {
+							rtr.Reload(src)
+							watcher.RefreshRoute(watchPath)
+						}
+					}
+				},
+				OnReloadPackages: func() {
+					sup.ReloadAll()
+					watcher.RefreshPackages(luacode.PackagePaths())
+				},
+			}, log)
+		}
 		api := adminapi.New(adminapi.Deps{
 			ConfigPath: cfgSource.ConfigPath(),
 			ConfigDir:  cfgSource.ConfigDir(),
@@ -2158,6 +2179,7 @@ func main() {
 			Channels:   channelsStore,
 			Safety:     safetyStore,
 			Memory:     memoryStore,
+			Plugins:    pluginsStore,
 			Media:      mediaSvc,
 			StudioCatalog: func() studio.Catalog {
 				curCfg := cfg

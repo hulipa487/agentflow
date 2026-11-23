@@ -197,3 +197,48 @@ models:
 		t.Fatalf("single-file config does not load after save: %v", err)
 	}
 }
+
+func TestNormalizeCategoriesPreservesRedirectModelCase(t *testing.T) {
+	got := normalizeCategories(map[string]string{
+		"safe":       " ALLOW ",
+		"harassment": "Review",
+		"medical":    " REDIRECT: DeepSeek-Safe ",
+	})
+	if got["safe"] != "allow" || got["harassment"] != "review" || got["medical"] != "redirect:DeepSeek-Safe" {
+		t.Fatalf("normalizeCategories = %#v", got)
+	}
+
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "system.yaml"), `
+version: "1"
+models:
+  default: { provider: openai, model: gpt-4o-mini, base_url: http://127.0.0.1:11434/v1 }
+  DeepSeek-Safe: { provider: openai, model: deepseek-safe, base_url: http://127.0.0.1:11434/v1 }
+`)
+	cfg, err := config.LoadDir(dir, safetyLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewSafety(cfg, dir, "", safetyLog())
+	list, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	list, err = s.SaveClassifier(ClassifierDraft{
+		Name:       "router",
+		Model:      "default",
+		Categories: map[string]string{"safe": "allow", "medical": "REDIRECT:DeepSeek-Safe"},
+	}, true, list.MTime)
+	if err != nil {
+		t.Fatalf("SaveClassifier with redirect failed: %v", err)
+	}
+	var found *ClassifierView
+	for i := range list.Classifiers {
+		if list.Classifiers[i].Name == "router" {
+			found = &list.Classifiers[i]
+		}
+	}
+	if found == nil || found.Categories["medical"] != "redirect:DeepSeek-Safe" {
+		t.Fatalf("saved classifier categories = %+v", found)
+	}
+}

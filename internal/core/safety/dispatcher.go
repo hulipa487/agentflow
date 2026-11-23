@@ -22,16 +22,17 @@ type IngressInput struct {
 	Annotations map[string]string // per-chain filter outputs keyed by filter name
 }
 
-// SafetyMeta describes a classifier verdict for the trace and audit journal.
-// It never carries message text.
+// SafetyMeta describes a classifier or filter verdict for the trace and audit
+// journal. It never carries message text.
 type SafetyMeta struct {
-	Classifier string  `json:"classifier,omitempty"`
-	Label      string  `json:"label,omitempty"`
-	Action     string  `json:"action,omitempty"`
-	Score      float64 `json:"score,omitempty"`
-	Model      string  `json:"model,omitempty"`
-	LatencyMS  int64   `json:"latency_ms,omitempty"`
-	Cached     bool    `json:"cached,omitempty"`
+	Classifier    string  `json:"classifier,omitempty"`
+	Label         string  `json:"label,omitempty"`
+	Action        string  `json:"action,omitempty"`
+	Score         float64 `json:"score,omitempty"`
+	Model         string  `json:"model,omitempty"`
+	RedirectModel string  `json:"redirect_model,omitempty"`
+	LatencyMS     int64   `json:"latency_ms,omitempty"`
+	Cached        bool    `json:"cached,omitempty"`
 }
 
 // IngressResult is the dispatcher's decision. If Drop is true, the message is
@@ -39,14 +40,15 @@ type SafetyMeta struct {
 // without handing the loop an empty message; Refusal, when set, is a
 // core-authored reply delivered instead. Otherwise Text replaces the original.
 type IngressResult struct {
-	Text        string
-	Drop        bool
-	Skip        bool              // drop the turn rather than passing an empty message
-	Refusal     string            // optional core-authored reply for a dropped turn
-	Reason      string            // auditable reason code, never logged with raw content
-	Meta        *SafetyMeta
-	Annotations map[string]string // per-turn filter annotations propagated down the chain
-	Directives  []string          // core-authored system directives prepended to turn LLM calls
+	Text          string
+	Drop          bool
+	Skip          bool              // drop the turn rather than passing an empty message
+	Refusal       string            // optional core-authored reply for a dropped turn
+	Reason        string            // auditable reason code, never logged with raw content
+	Meta          *SafetyMeta
+	Annotations   map[string]string // per-turn filter annotations propagated down the chain
+	Directives    []string          // core-authored system directives prepended to turn LLM calls
+	ModelOverride string            // core-enforced model override for this turn
 }
 
 // EgressInput is what the dispatcher receives before the gateway sends a reply.
@@ -113,6 +115,7 @@ func (d *Dispatcher) Ingress(ctx context.Context, in IngressInput) IngressResult
 	}
 	text := in.Message
 	reason := ""
+	modelOverride := ""
 	var meta *SafetyMeta
 	annotations := copyAnnotations(in.Annotations)
 	var directives []string
@@ -140,16 +143,31 @@ func (d *Dispatcher) Ingress(ctx context.Context, in IngressInput) IngressResult
 		if len(res.Directives) > 0 {
 			directives = append(directives, res.Directives...)
 		}
+		if res.ModelOverride != "" {
+			modelOverride = res.ModelOverride
+		}
 		if res.Meta != nil {
-			meta = res.Meta
+			m := *res.Meta
+			meta = &m
+		}
+	}
+	if reason == "" && modelOverride != "" {
+		reason = "redirect:" + modelOverride
+	}
+	if modelOverride != "" {
+		if meta == nil {
+			meta = &SafetyMeta{Action: "redirect", RedirectModel: modelOverride}
+		} else if meta.RedirectModel == "" {
+			meta.RedirectModel = modelOverride
 		}
 	}
 	return IngressResult{
-		Text:        text,
-		Reason:      reason,
-		Meta:        meta,
-		Annotations: annotations,
-		Directives:  directives,
+		Text:          text,
+		Reason:        reason,
+		Meta:          meta,
+		Annotations:   annotations,
+		Directives:    directives,
+		ModelOverride: modelOverride,
 	}
 }
 

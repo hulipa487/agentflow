@@ -143,3 +143,64 @@ func TestClassifierOversizedInputUsesErrorPolicy(t *testing.T) {
 		t.Fatalf("oversized input must fail closed without a model call; calls=%d res=%+v", fc.calls, res)
 	}
 }
+
+func TestCategoryActionHelpersPreserveRedirectCase(t *testing.T) {
+	if got := NormalizeCategoryAction(" REDIRECT:DeepSeek-Safe "); got != "redirect:DeepSeek-Safe" {
+		t.Fatalf("NormalizeCategoryAction = %q, want redirect:DeepSeek-Safe", got)
+	}
+	if got := NormalizeCategoryAction("  BLOCK "); got != "block" {
+		t.Fatalf("NormalizeCategoryAction(BLOCK) = %q, want block", got)
+	}
+	act, target := ParseCategoryAction("REDIRECT: DeepSeek-Safe ")
+	if act != "redirect" || target != "DeepSeek-Safe" {
+		t.Fatalf("ParseCategoryAction = (%q, %q), want (redirect, DeepSeek-Safe)", act, target)
+	}
+	if act, target := ParseCategoryAction("redirect: "); act != "" || target != "" {
+		t.Fatalf("empty redirect target must be rejected, got (%q, %q)", act, target)
+	}
+}
+
+func TestClassifierRedirectIngressShadowAndEgress(t *testing.T) {
+	newRedirectFilter := func(mode string, c Classifier) *ClassifierFilter {
+		return NewClassifierFilter(ClassifierOptions{
+			Name:       "routing",
+			Agent:      "assistant",
+			Classifier: c,
+			Ingress:    true,
+			Egress:     true,
+			Threshold:  0.7,
+			Categories: map[string]string{
+				"safe":    "allow",
+				"complex": "redirect:Strong-Model",
+			},
+			Mode:        mode,
+			Timeout:     time.Second,
+			OnError:     "block",
+			OnSaturated: "block",
+			OnBudget:    "block",
+		})
+	}
+
+	enforce := newRedirectFilter("enforce", &fakeClassifier{verdict: Verdict{Label: "complex", Score: 0.92, Model: "guard"}})
+	res := enforce.Ingress(context.Background(), IngressInput{Message: "derive navier-stokes", Source: "channel"})
+	if res.Drop || res.Skip || res.ModelOverride != "Strong-Model" {
+		t.Fatalf("enforce redirect ingress = %+v", res)
+	}
+	if res.Reason != "redirect:complex->Strong-Model" || res.Meta == nil || res.Meta.Action != "redirect" || res.Meta.RedirectModel != "Strong-Model" {
+		t.Fatalf("unexpected enforce redirect meta/reason: reason=%q meta=%+v", res.Reason, res.Meta)
+	}
+
+	shadow := newRedirectFilter("shadow", &fakeClassifier{verdict: Verdict{Label: "complex", Score: 0.92, Model: "guard"}})
+	sres := shadow.Ingress(context.Background(), IngressInput{Message: "derive navier-stokes", Source: "channel"})
+	if sres.Drop || sres.ModelOverride != "" {
+		t.Fatalf("shadow mode must not set ModelOverride: %+v", sres)
+	}
+	if sres.Reason != "shadow:redirect:Strong-Model" || sres.Meta == nil || sres.Meta.Action != "redirect" || sres.Meta.RedirectModel != "Strong-Model" {
+		t.Fatalf("unexpected shadow redirect meta/reason: reason=%q meta=%+v", sres.Reason, sres.Meta)
+	}
+
+	eg := enforce.Egress(context.Background(), EgressInput{Text: "answer", Source: "agent"})
+	if eg.Drop || eg.Reason != "review:complex" || eg.Meta == nil || eg.Meta.Action != "review" {
+		t.Fatalf("egress redirect should surface as review, got %+v", eg)
+	}
+}

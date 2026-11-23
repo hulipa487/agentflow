@@ -66,8 +66,31 @@ func TestValidateClassifierRejectsBadAction(t *testing.T) {
 	p := c.Safety.Classifiers["moderation"]
 	p.Categories = map[string]string{"safe": "allow", "violence": "ignore"}
 	c.Safety.Classifiers["moderation"] = p
-	if err := validateClassifiers("test", c); err == nil || !strings.Contains(err.Error(), "not allow, review, or block") {
+	if err := validateClassifiers("test", c); err == nil || !strings.Contains(err.Error(), "allow, review, block, or redirect:<model>") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestValidateClassifierRedirect(t *testing.T) {
+	c := classifierConfig()
+	c.Models["DeepSeek-Safe"] = Model{Provider: "openai", Model: "deepseek-chat"}
+	p := c.Safety.Classifiers["moderation"]
+	p.Categories = map[string]string{"safe": "allow", "legal": "redirect:DeepSeek-Safe"}
+	c.Safety.Classifiers["moderation"] = p
+	if err := validateClassifiers("test", c); err != nil {
+		t.Fatalf("valid redirect rejected: %v", err)
+	}
+
+	p.Categories = map[string]string{"safe": "allow", "legal": "redirect:missing-model"}
+	c.Safety.Classifiers["moderation"] = p
+	if err := validateClassifiers("test", c); err == nil || !strings.Contains(err.Error(), "unknown model") {
+		t.Fatalf("expected unknown model error, got %v", err)
+	}
+
+	p.Categories = map[string]string{"safe": "allow", "legal": "redirect:"}
+	c.Safety.Classifiers["moderation"] = p
+	if err := validateClassifiers("test", c); err == nil || !strings.Contains(err.Error(), "allow, review, block, or redirect:<model>") {
+		t.Fatalf("expected malformed redirect error, got %v", err)
 	}
 }
 

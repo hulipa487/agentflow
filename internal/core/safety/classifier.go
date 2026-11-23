@@ -58,7 +58,7 @@ type ClassifierOptions struct {
 	Egress        bool
 	Sources       []string
 	Threshold     float64
-	Categories    map[string]string // label -> allow | review | block
+	Categories    map[string]string // label -> allow | review | block | redirect:<model>
 	Mode          string            // enforce | shadow
 	Timeout       time.Duration
 	OnError       string // block | pass
@@ -104,9 +104,41 @@ func NewClassifierFilter(opts ClassifierOptions) *ClassifierFilter {
 
 func (f *ClassifierFilter) Name() string { return "classifier:" + f.opts.Name }
 
+// NormalizeCategoryAction lowercases a category action keyword while preserving
+// the target model name's case in redirect:<model>.
+func NormalizeCategoryAction(raw string) string {
+	s := strings.TrimSpace(raw)
+	const prefix = "redirect:"
+	if len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix) {
+		return prefix + strings.TrimSpace(s[len(prefix):])
+	}
+	return strings.ToLower(s)
+}
+
+// ParseCategoryAction parses a configured classifier category action.
+// Recognized forms are "allow", "review", "block", and "redirect:<model>"
+// (with a non-empty model name, case preserved). Unrecognized actions return
+// ("", "").
+func ParseCategoryAction(raw string) (action, target string) {
+	norm := NormalizeCategoryAction(raw)
+	if target, ok := strings.CutPrefix(norm, "redirect:"); ok {
+		if target == "" {
+			return "", ""
+		}
+		return "redirect", target
+	}
+	switch norm {
+	case "allow", "review", "block":
+		return norm, ""
+	default:
+		return "", ""
+	}
+}
+
 // Ingress classifies an inbound message. A blocking verdict drops the turn
-// (Skip) so the loop never sees the message; a review/allow verdict passes the
-// text through with metadata for the trace and journal.
+// (Skip) so the loop never sees the message; a redirect verdict reroutes the
+// turn to another configured model; a review/allow verdict passes the text
+// through with metadata for the trace and journal.
 func (f *ClassifierFilter) Ingress(ctx context.Context, in IngressInput) IngressResult {
 	if !f.opts.Ingress || !f.sources[strings.ToLower(in.Source)] {
 		return IngressResult{Text: in.Message}
@@ -115,7 +147,7 @@ func (f *ClassifierFilter) Ingress(ctx context.Context, in IngressInput) Ingress
 	if err != nil {
 		return f.errorResult(err, true, in.Message)
 	}
-	action := f.action(v)
+	action, target := f.action(v)
 	meta := f.meta(v, action)
 	switch action {
 	case "block":
@@ -125,6 +157,19 @@ func (f *ClassifierFilter) Ingress(ctx context.Context, in IngressInput) Ingress
 		}
 		metrics.Inc("agentflow_moderation_blocks")
 		return IngressResult{Drop: true, Skip: true, Refusal: f.opts.Refusal, Reason: "classifier:" + v.Label, Meta: meta}
+	case "redirect":
+		meta.RedirectModel = target
+		if f.opts.Mode == "shadow" {
+			metrics.Inc("agentflow_moderation_shadow_redirects")
+			return IngressResult{Text: in.Message, Reason: "shadow:redirect:" + target, Meta: meta}
+		}
+		metrics.Inc("agentflow_moderation_redirects")
+		return IngressResult{
+			Text:          in.Message,
+			ModelOverride: target,
+			Reason:        "redirect:" + v.Label + "->" + target,
+			Meta:          meta,
+		}
 	case "review":
 		metrics.Inc("agentflow_moderation_reviews")
 		return IngressResult{Text: in.Message, Reason: "review:" + v.Label, Meta: meta}
@@ -143,7 +188,7 @@ func (f *ClassifierFilter) Egress(ctx context.Context, in EgressInput) EgressRes
 	if err != nil {
 		return f.errorResultEgress(err, in.Text)
 	}
-	action := f.action(v)
+	action, _ := f.action(v)
 	meta := f.meta(v, action)
 	switch action {
 	case "block":
@@ -153,6 +198,12 @@ func (f *ClassifierFilter) Egress(ctx context.Context, in EgressInput) EgressRes
 		}
 		metrics.Inc("agentflow_moderation_blocks")
 		return EgressResult{Drop: true, Fallback: f.opts.Fallback, Reason: "classifier:" + v.Label, Meta: meta}
+	case "redirect":
+		// An already-generated reply cannot be rerouted to another model;
+		// surface it as a review verdict instead.
+		meta.Action = "review"
+		metrics.Inc("agentflow_moderation_reviews")
+		return EgressResult{Text: in.Text, Reason: "review:" + v.Label, Meta: meta}
 	case "review":
 		metrics.Inc("agentflow_moderation_reviews")
 		return EgressResult{Text: in.Text, Reason: "review:" + v.Label, Meta: meta}
@@ -184,18 +235,15 @@ func (f *ClassifierFilter) classify(ctx context.Context, direction, text, source
 
 // action maps a verdict to the policy action. A score below the threshold is
 // always allow, whatever the label; labels without a policy action are allow.
-func (f *ClassifierFilter) action(v Verdict) string {
+func (f *ClassifierFilter) action(v Verdict) (string, string) {
 	if v.Score < f.opts.Threshold {
-		return "allow"
+		return "allow", ""
 	}
-	switch strings.ToLower(f.opts.Categories[v.Label]) {
-	case "block":
-		return "block"
-	case "review":
-		return "review"
-	default:
-		return "allow"
+	act, target := ParseCategoryAction(f.opts.Categories[v.Label])
+	if act == "" {
+		return "allow", ""
 	}
+	return act, target
 }
 
 func (f *ClassifierFilter) meta(v Verdict, action string) *SafetyMeta {

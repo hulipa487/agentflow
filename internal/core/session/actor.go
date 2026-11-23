@@ -886,8 +886,10 @@ type Actor struct {
 
 	// turnDirectives holds core-authored safety directives produced by the
 	// ingress safety chain for the active turn; prepended to llm.chat/stream.
-	directivesMu   sync.Mutex
-	turnDirectives []string
+	// turnModelOverride holds a core-enforced model redirect for the active turn.
+	directivesMu      sync.Mutex
+	turnDirectives    []string
+	turnModelOverride string
 
 	// pendingDef stages a def snapshot pushed by the runtime agent registry;
 	// applied on the actor goroutine at the top of runOnce (applyDefAtRestart).
@@ -1174,8 +1176,16 @@ func (a *Actor) runOnce(ctx context.Context) (crashed bool) {
 		// boundary itself, and the rest are not observable work.
 		traced := op.Type != "inbox" && op.Type != "sleep" && op.Type != "log" && op.Type != "session.exit"
 		turn := current.ID
+		traceModel := op.Model
+		if op.Type == "llm.chat" || op.Type == "llm.stream.open" || op.Type == "llm.forward" {
+			if ov := a.snapshotTurnModelOverride(); ov != "" {
+				traceModel = ov
+			} else if traceModel == "" {
+				traceModel = a.turnModel(a.opContext(ctx, &current))
+			}
+		}
 		if traced {
-			ev := TraceEvent{Kind: "op.start", Op: op.Type, Tool: op.Tool, Model: op.Model, Turn: turn, Messages: len(op.Messages)}
+			ev := TraceEvent{Kind: "op.start", Op: op.Type, Tool: op.Tool, Model: traceModel, Turn: turn, Messages: len(op.Messages)}
 			if a.TracePayloads {
 				ev.Text = truncateTrace(traceOpPayload(op))
 			}
@@ -1193,7 +1203,7 @@ func (a *Actor) runOnce(ctx context.Context) (crashed bool) {
 		}
 		if traced {
 			ev := TraceEvent{
-				Op: op.Type, Tool: op.Tool, Model: op.Model, Turn: turn,
+				Op: op.Type, Tool: op.Tool, Model: traceModel, Turn: turn,
 				DurationMS: time.Since(started).Milliseconds(), Messages: len(op.Messages),
 			}
 			traceOpEnd(&ev, resp, ok)
@@ -1301,10 +1311,11 @@ func (a *Actor) dispatchInline(ctx context.Context, op Op, current *Message) (re
 				break
 			}
 			a.setTurnDirectives(res.Directives)
+			a.setTurnModelOverride(res.ModelOverride)
 			if res.Text != m.Text {
 				m.Text = res.Text
 				a.trace(TraceEvent{Kind: "safety", Op: "ingress", Turn: m.ID, OK: true, Err: "rewritten", Safety: res.Meta})
-			} else if res.Meta != nil || len(res.Directives) > 0 || res.Annotations["support-offer"] != "" {
+			} else if res.Meta != nil || len(res.Directives) > 0 || res.ModelOverride != "" || res.Annotations["support-offer"] != "" {
 				a.trace(TraceEvent{Kind: "safety", Op: "ingress", Turn: m.ID, OK: true, Err: res.Reason, Safety: res.Meta})
 			}
 			break
@@ -1401,16 +1412,18 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 	ctx = WithSessionKey(ctx, a.Identity.SessionID)
 	ctx = WithProvenanceKind(ctx, provenanceKindOf(current))
 	ctx = WithTurnMessage(ctx, current)
-	if a.Info != nil {
+	if op.Type == "llm.chat" || op.Type == "llm.stream.open" || op.Type == "llm.forward" {
+		// "The agent's model" for LLM calls is the model this turn runs on:
+		// a safety redirect override or per-user profile override applies here
+		// cleanly, and llm.chat / llm.stream.open / llm.forward fall back to it
+		// when op.Model is empty.
+		if tm := a.turnModel(ctx); tm != "" {
+			ctx = WithAgentModel(ctx, tm)
+		}
+	} else if a.Info != nil {
 		ctx = WithAgentModel(ctx, a.Info.Model)
 	}
 	if op.Type == "llm.forward" {
-		// "The agent's model" for a forwarded request is the model this
-		// person's turns run on: a profile's model override applies here
-		// exactly as it does to a loop that reads agent.info().model.
-		if a.Info != nil {
-			ctx = WithAgentModel(ctx, a.turnModel(ctx))
-		}
 		// Only llm.forward relays deltas; stamping the sink for every op would
 		// let a custom handler stream without the actor deciding whether the
 		// answer can still be vetoed.
@@ -1564,7 +1577,12 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 		}
 	}
 	if h, found := a.handlers[op.Type]; found {
-		if (op.Type == "llm.chat" || op.Type == "llm.stream") && len(op.Messages) > 0 {
+		if op.Type == "llm.chat" || op.Type == "llm.stream.open" || op.Type == "llm.forward" {
+			if ov := a.snapshotTurnModelOverride(); ov != "" {
+				op.Model = ov
+			}
+		}
+		if (op.Type == "llm.chat" || op.Type == "llm.stream" || op.Type == "llm.stream.open") && len(op.Messages) > 0 {
 			if dirs := a.snapshotTurnDirectives(); len(dirs) > 0 {
 				op.Messages = injectSafetyDirectives(op.Messages, dirs)
 			}
@@ -1785,6 +1803,10 @@ func (a *Actor) closeTurn(ctx context.Context, m *Message, turnErr error) {
 	}
 	a.turnEndedFor = m.ID
 	a.touch()
+	defer func() {
+		a.setTurnDirectives(nil)
+		a.setTurnModelOverride("")
+	}()
 	if a.gw == nil || m.Channel == "" {
 		a.resetTurnDeltas()
 		return
@@ -1884,6 +1906,19 @@ func (a *Actor) resetTurnDeltas() {
 	a.pendingDeltas.Reset()
 	a.deltaMu.Unlock()
 	a.setTurnDirectives(nil)
+	a.setTurnModelOverride("")
+}
+
+func (a *Actor) setTurnModelOverride(model string) {
+	a.directivesMu.Lock()
+	a.turnModelOverride = strings.TrimSpace(model)
+	a.directivesMu.Unlock()
+}
+
+func (a *Actor) snapshotTurnModelOverride() string {
+	a.directivesMu.Lock()
+	defer a.directivesMu.Unlock()
+	return a.turnModelOverride
 }
 
 func (a *Actor) setTurnDirectives(dirs []string) {
@@ -2061,15 +2096,21 @@ func (a *Actor) replyOp(ctx context.Context, current *Message, op Op) (string, b
 	return "true", true
 }
 
-// turnModel is the model this turn runs on: the agent's, unless the person the
-// turn acts for has a profile override.
+// turnModel is the model this turn runs on: any active safety redirect
+// override wins, then a per-user profile override, then the agent's own model.
 func (a *Actor) turnModel(ctx context.Context) string {
+	if ov := a.snapshotTurnModelOverride(); ov != "" {
+		return ov
+	}
 	if u := PersonalUUIDFromCtx(ctx); u != "" && a.profileSettings != nil {
 		if m, _, err := a.profileSettings.Settings(ctx, u); err == nil && m != "" {
 			return m
 		}
 	}
-	return a.Info.Model
+	if a.Info != nil {
+		return a.Info.Model
+	}
+	return ""
 }
 
 // configJSON answers the agent.config op: this agent's own profile as Lua
@@ -2157,6 +2198,9 @@ func (a *Actor) infoJSON(ctx context.Context) string {
 		if m, added, err := a.profileSettings.Settings(ctx, u); err == nil {
 			overrideModel, overrideInstructions = m, added
 		}
+	}
+	if ov := a.snapshotTurnModelOverride(); ov != "" {
+		overrideModel = ov
 	}
 
 	out := map[string]any{

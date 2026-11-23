@@ -376,6 +376,24 @@ func (f *LuaFilter) runIngress(ctx context.Context, in IngressInput) (IngressRes
 	} else if out.Drop {
 		out.Refusal = f.opts.Refusal
 	}
+	redirect, hasRedirect := luaStringField(tbl, "redirect")
+	if !hasRedirect || strings.TrimSpace(redirect) == "" {
+		if alt, ok := luaStringField(tbl, "model"); ok {
+			redirect = alt
+		}
+	}
+	redirect = strings.TrimSpace(redirect)
+	if redirect != "" && !out.Drop && !out.Skip {
+		out.ModelOverride = redirect
+		out.Meta = &SafetyMeta{
+			Classifier:    f.Name(),
+			Action:        "redirect",
+			RedirectModel: redirect,
+		}
+		if out.Reason == "" {
+			out.Reason = "redirect:" + redirect
+		}
+	}
 	return out, nil
 }
 

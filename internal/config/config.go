@@ -1989,13 +1989,18 @@ func validateClassifiers(path string, c *Config) error {
 			return fmt.Errorf("%s: safety.classifiers.%s: categories must name at least one label", path, name)
 		}
 		allow := false
-		for label, action := range p.Categories {
+		for label, rawAction := range p.Categories {
+			action, target := safety.ParseCategoryAction(rawAction)
 			switch action {
 			case "allow":
 				allow = true
 			case "review", "block":
+			case "redirect":
+				if _, ok := c.Models[target]; !ok {
+					return fmt.Errorf("%s: safety.classifiers.%s.categories.%s: redirect targets unknown model %q", path, name, label, target)
+				}
 			default:
-				return fmt.Errorf("%s: safety.classifiers.%s: category %q action %q is not allow, review, or block", path, name, label, action)
+				return fmt.Errorf("%s: safety.classifiers.%s: category %q action %q is not allow, review, block, or redirect:<model>", path, name, label, rawAction)
 			}
 		}
 		if !allow {

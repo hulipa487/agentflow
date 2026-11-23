@@ -34,6 +34,13 @@ func LLMHandlers(m *llm.Manager, ms media.Store) map[string]session.OpHandler {
 	return llmHandlers(m, ms, nil, "")
 }
 
+func effectiveModel(ctx context.Context, opModel string) string {
+	if opModel != "" {
+		return opModel
+	}
+	return session.AgentModelFromCtx(ctx)
+}
+
 func llmHandlers(m *llm.Manager, ms media.Store, mediaSvc *media.Service, agent string) map[string]session.OpHandler {
 	scopeOf := func(ctx context.Context) string {
 		if p := session.ScopePrefixFromCtx(ctx); p != "" {
@@ -109,7 +116,7 @@ func llmHandlers(m *llm.Manager, ms media.Store, mediaSvc *media.Service, agent 
 		if err != nil {
 			return failJSON(err)
 		}
-		reply, err := m.Chat(ctx, op.Model, msgs, optsOf(ctx, op))
+		reply, err := m.Chat(ctx, effectiveModel(ctx, op.Model), msgs, optsOf(ctx, op))
 		if err != nil {
 			return failJSON(err)
 		}
@@ -136,7 +143,7 @@ func llmHandlers(m *llm.Manager, ms media.Store, mediaSvc *media.Service, agent 
 		if err != nil {
 			return failJSON(err)
 		}
-		id, err := m.StreamOpen(ctx, op.Model, msgs, optsOf(ctx, op))
+		id, err := m.StreamOpen(ctx, effectiveModel(ctx, op.Model), msgs, optsOf(ctx, op))
 		if err != nil {
 			return failJSON(err)
 		}
@@ -499,6 +506,7 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]
 	base := llmHandlers(m, ms, mt.Media, mt.Agent)
 	chat := base["llm.chat"]
 	metered := func(ctx context.Context, op session.Op) (string, bool) {
+		op.Model = effectiveModel(ctx, op.Model)
 		// Reserve a conservative estimate before the call.
 		estimate := int64(op.MaxTokens)
 		if estimate <= 0 {
@@ -618,6 +626,7 @@ func MeteredLLMHandlers(m *llm.Manager, ms media.Store, mt Metering) map[string]
 
 	open := base["llm.stream.open"]
 	base["llm.stream.open"] = func(ctx context.Context, op session.Op) (string, bool) {
+		op.Model = effectiveModel(ctx, op.Model)
 		estimate := int64(op.MaxTokens)
 		if estimate <= 0 {
 			estimate = 4096

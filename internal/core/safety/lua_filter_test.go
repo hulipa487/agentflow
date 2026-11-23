@@ -159,3 +159,49 @@ function egress(input) return { text = "out:" .. input.text } end
 		t.Fatalf("egress disabled should pass through, got %+v", got)
 	}
 }
+
+func TestLuaFilterRedirectIngressAndDispatcher(t *testing.T) {
+	lf, err := NewLuaFilter(LuaFilterOptions{
+		Name:    "keyword_router",
+		Ingress: true,
+		Source: `
+function ingress(input)
+  if string.find(string.lower(input.message), "legal", 1, true) then
+    return { redirect = "Legal-Pro", directive = "Cite statutes." }
+  end
+  if string.find(string.lower(input.message), "code", 1, true) then
+    return { model = "Code-Max", reason = "code-route" }
+  end
+  return nil
+end
+`,
+	})
+	if err != nil {
+		t.Fatalf("NewLuaFilter: %v", err)
+	}
+	disp := New(&Profile{Name: "route", Filters: []Filter{SourceAttribution{}, lf}})
+
+	resLegal := disp.Ingress(context.Background(), IngressInput{Message: "Need legal contract advice", Source: "channel"})
+	if resLegal.Drop || resLegal.ModelOverride != "Legal-Pro" || resLegal.Reason != "redirect:Legal-Pro" {
+		t.Fatalf("unexpected resLegal = %+v", resLegal)
+	}
+	if len(resLegal.Directives) != 1 || resLegal.Directives[0] != "Cite statutes." {
+		t.Fatalf("expected directive preserved with redirect, got %+v", resLegal.Directives)
+	}
+	if resLegal.Meta == nil || resLegal.Meta.Action != "redirect" || resLegal.Meta.RedirectModel != "Legal-Pro" || resLegal.Meta.Classifier != "lua:keyword_router" {
+		t.Fatalf("unexpected resLegal meta = %+v", resLegal.Meta)
+	}
+
+	resCode := disp.Ingress(context.Background(), IngressInput{Message: "Fix this Go code", Source: "channel"})
+	if resCode.Drop || resCode.ModelOverride != "Code-Max" || resCode.Reason != "code-route" {
+		t.Fatalf("unexpected resCode = %+v", resCode)
+	}
+	if resCode.Meta == nil || resCode.Meta.RedirectModel != "Code-Max" {
+		t.Fatalf("unexpected resCode meta = %+v", resCode.Meta)
+	}
+
+	resPlain := disp.Ingress(context.Background(), IngressInput{Message: "hello", Source: "channel"})
+	if resPlain.ModelOverride != "" || resPlain.Meta != nil {
+		t.Fatalf("plain message should not redirect, got %+v", resPlain)
+	}
+}

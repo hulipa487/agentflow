@@ -962,7 +962,7 @@ func normalizeCategories(in map[string]string) map[string]string {
 		if label == "" {
 			continue
 		}
-		out[label] = strings.ToLower(strings.TrimSpace(action))
+		out[label] = safety.NormalizeCategoryAction(action)
 	}
 	return out
 }

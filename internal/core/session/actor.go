@@ -550,6 +550,7 @@ type Info struct {
 	HistoryBudget int
 	Memory        *memory.AgentMemory
 	Shell         map[string]any
+	SSH           map[string]any
 	Skills        []string
 	Capabilities  []string
 
@@ -701,6 +702,11 @@ var blockingOps = map[string]bool{
 	"shell.start":          true,
 	"shell.status":         true,
 	"shell.cancel":         true,
+	"ssh.spawn":            true,
+	"ssh.exec":             true,
+	"ssh.read":             true,
+	"ssh.write":            true,
+	"ssh.close":            true,
 	"http.request":         true,
 	"mail.imap.fetch":      true,
 	"mail.smtp.send":       true,
@@ -1447,6 +1453,7 @@ func (a *Actor) execBlocking(ctx context.Context, op Op, current *Message) (stri
 	op.Owner = a.Identity.SessionID
 	if a.Info != nil {
 		ctx = WithShell(ctx, a.Info.Shell)
+		ctx = WithSSH(ctx, a.Info.SSH)
 	}
 	if op.Type == "send" {
 		if current.Channel == "" {
@@ -2226,6 +2233,7 @@ func (a *Actor) infoJSON(ctx context.Context) string {
 		"history_budget": budget,
 		"memory":         mem,
 		"shell":          a.Info.Shell,
+		"ssh":            a.Info.SSH,
 		"skills":         a.Info.Skills,
 		"capabilities":   a.Info.Capabilities,
 	}
@@ -2439,6 +2447,26 @@ func ShellFromCtx(ctx context.Context) map[string]any {
 		return nil
 	}
 	v, _ := ctx.Value(shellKey).(map[string]any)
+	return v
+}
+
+type sshKeyType struct{}
+
+var sshKey sshKeyType
+
+// WithSSH returns a context carrying the session agent's bound SSH profile
+// (nil when unbound). The registry SSH tools (builtin:ssh.*) and ssh.* ops
+// resolve it to open or reuse the session's remote SSH connection.
+func WithSSH(ctx context.Context, profile map[string]any) context.Context {
+	return context.WithValue(ctx, sshKey, profile)
+}
+
+// SSHFromCtx extracts the bound SSH profile injected by WithSSH, or nil.
+func SSHFromCtx(ctx context.Context) map[string]any {
+	if ctx == nil {
+		return nil
+	}
+	v, _ := ctx.Value(sshKey).(map[string]any)
 	return v
 }
 

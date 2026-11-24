@@ -75,6 +75,22 @@ func TestValidateAgentRejectsBrokenReferences(t *testing.T) {
 	}
 
 	a = validAgent()
+	a.SSH = "no-such-ssh"
+	if err := c.ValidateAgent("newcomer", a, "test"); err == nil || !strings.Contains(err.Error(), "ssh profile") {
+		t.Fatalf("unknown ssh profile = %v", err)
+	}
+
+	c2 := validateTestConfig()
+	c2.Profiles.SSH = map[string]SSHProfile{"box": {Host: "10.0.0.1", User: "ops"}}
+	c2.Plugins.AllowCapabilities = []string{"memory", "llm.chat"}
+	aSSH := validAgent()
+	aSSH.Capabilities = []string{"memory", "llm.chat"}
+	aSSH.SSH = "box"
+	if err := c2.ValidateAgent("newcomer", aSSH, "test"); err == nil || !strings.Contains(err.Error(), "net.ssh") {
+		t.Fatalf("expected net.ssh capability refusal, got %v", err)
+	}
+
+	a = validAgent()
 	a.Memory.Profile = "conversational"
 	if err := c.ValidateAgent("newcomer", a, "test"); err != nil {
 		t.Fatalf("conversational profile refused: %v", err)

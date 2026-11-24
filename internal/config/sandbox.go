@@ -218,19 +218,16 @@ func (c *Config) EnvironmentNames() []string {
 	return out
 }
 
-// validateShellProfile checks a shell profile referenced by an agent or a
-// spawn profile.
+// validateShellProfile checks a sandbox shell profile referenced by an agent
+// or spawn profile.
 func validateShellProfile(path, owner, name string, p ShellProfile, c *Config) error {
 	where := fmt.Sprintf("%s: shell profile %q (used by %q)", path, name, owner)
 	switch p.Provider {
 	case "ssh":
-		if p.Host == "" {
-			return fmt.Errorf("%s is provider ssh but missing required host", where)
-		}
-		return nil
+		return fmt.Errorf("%s sets provider \"ssh\" — SSH profiles moved to profiles.ssh and agents.<name>.ssh (capability net.ssh)", where)
 	case "sandbox", "":
 	default:
-		return fmt.Errorf("%s has unknown provider %q (use sandbox or ssh)", where, p.Provider)
+		return fmt.Errorf("%s has unknown provider %q (use sandbox)", where, p.Provider)
 	}
 	if p.Environment == "" {
 		return fmt.Errorf("%s names no environment (declared: %s)", where, strings.Join(c.EnvironmentNames(), ", "))
@@ -253,6 +250,14 @@ func validateShellProfile(path, owner, name string, p ShellProfile, c *Config) e
 	}
 	if p.Project != "" && strings.ContainsAny(p.Project, "|/\\\x00") {
 		return fmt.Errorf("%s has project %q, which is not a usable project name", where, p.Project)
+	}
+	return nil
+}
+
+// validateSSHProfile checks a remote SSH profile referenced by an agent or spawn profile.
+func validateSSHProfile(path, owner, name string, p SSHProfile) error {
+	if strings.TrimSpace(p.Host) == "" {
+		return fmt.Errorf("%s: ssh profile %q (used by %q) is missing required host", path, name, owner)
 	}
 	return nil
 }

@@ -25,8 +25,7 @@ const maxLinks = 500
 // invisible to it — the trimmer keeps it and evicts real history to make room.
 // Reporting the untruncated length alongside the cut text is what lets a model
 // tell a short page from a clipped one and page through with a narrower
-// request; builtin:legal_read's start/max_chars/truncated contract is the
-// same idea.
+// request.
 const maxCharsDefault = 20000
 
 // RegisterBrowserBuiltins adds builtin:browser, backed by the configured

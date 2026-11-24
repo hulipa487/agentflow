@@ -12,7 +12,7 @@ import (
 // profile — and nothing in the string said which one a name belonged to. Only
 // tools keep it now, so a name from any of the others has to say where it went.
 func TestNamespaceHints(t *testing.T) {
-	tools := []string{"builtin:web_search", "builtin:fetch", "builtin:legal_read"}
+	tools := []string{"builtin:web_search", "builtin:fetch", "builtin:browser"}
 	loops := builtins.Names()
 
 	// A loop: field holding a tool name. This errors today but never says what

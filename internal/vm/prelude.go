@@ -441,6 +441,39 @@ af.version = 2;
     },
   };
 
+  global.ssh = {
+    spawn: function(opts) {
+      opts = opts || {};
+      return callOp({
+        type: "ssh.spawn",
+        workdir: opts.workdir,
+        env: opts.env,
+        host: opts.host,
+        user: opts.user,
+        password: opts.password,
+        key_file: opts.key_file,
+        volumes: opts.volumes,
+        project: opts.project,
+        ref: opts.ref,
+        scratch_mount: opts.scratch_mount,
+        shell_opts: opts.shell_opts,
+      });
+    },
+    exec: function(handle_id, command, opts) {
+      opts = opts || {};
+      return callOp({ type: "ssh.exec", shell_handle: handle_id, cmd: command, timeout: opts.timeout });
+    },
+    read: function(handle_id, filepath) {
+      return callOp({ type: "ssh.read", shell_handle: handle_id, path: filepath });
+    },
+    write: function(handle_id, filepath, content) {
+      return callOp({ type: "ssh.write", shell_handle: handle_id, path: filepath, content: content });
+    },
+    close: function(handle_id) {
+      return callOp({ type: "ssh.close", shell_handle: handle_id });
+    },
+  };
+
   const httpNS = {
     request: function(opts) {
       opts = opts || {};

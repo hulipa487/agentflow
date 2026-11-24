@@ -102,8 +102,17 @@ func TestProfileAndScopeComeFromTheContext(t *testing.T) {
 		p.MemoryBytes != 512<<20 || p.CPUs != 1.5 || p.Env["CI"] != "1" || len(p.Ignore) != 1 {
 		t.Errorf("profile = %+v", p)
 	}
-	if provider, _, _, _ := Profile(session.WithShell(ctx, map[string]any{"provider": "ssh"})); provider != SSH {
-		t.Errorf("provider = %q", provider)
+	if _, ok := SSHProfile(context.Background()); ok {
+		t.Fatal("a context with no SSH profile reported one")
+	}
+	sshCtx := session.WithSSH(ctx, map[string]any{
+		"host": "box:22", "user": "dev", "password": "pw", "key_file": "/id",
+		"workdir": "/srv/work", "env": map[string]string{"FOO": "bar"},
+	})
+	opts, ok := SSHProfile(sshCtx)
+	if !ok || opts.Host != "box:22" || opts.User != "dev" || opts.Password != "pw" ||
+		opts.KeyFile != "/id" || opts.WorkDir != "/srv/work" || opts.Env["FOO"] != "bar" {
+		t.Errorf("SSHProfile = ok:%v %+v", ok, opts)
 	}
 
 	if got := Scope(context.Background(), "coder"); got != "agent:coder" {

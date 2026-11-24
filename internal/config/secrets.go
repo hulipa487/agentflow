@@ -30,7 +30,6 @@ var secretPathPatterns = []string{
 	"runtime.admin.operators.*",
 	"mcp.servers.*.token",
 	"search.engines.*.api_key",
-	"legal_search.engines.*.api_key",
 	"gateway.channels.[].token",
 	"gateway.channels.[].secret",
 	"gateway.channels.[].secret_token",
@@ -45,7 +44,7 @@ var secretPathPatterns = []string{
 	"files.s3.access_key",
 	"files.s3.secret_key",
 	"browser.api_token",
-	"profiles.shell.*.password",
+	"profiles.ssh.*.password",
 	"observability.tracing.secret_key",
 	"observability.tracing.headers.*",
 }

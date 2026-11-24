@@ -202,16 +202,17 @@ profiles:
 # profiles:
 #   shell:
 #     code:
-#       provider: sandbox        # sandbox (default) | ssh
+#       provider: sandbox        # sandbox only (default)
 #       environment: python
 #       project: workspace       # the files-store project jobs run in
 #       timeout: 90s             # capped by runtime.sandbox.max_timeout
 #       ignore: ["node_modules/", "__pycache__/"]   # created by jobs, never stored
+#   ssh:
 #     box:
-#       provider: ssh            # a real remote machine, with a real connection
 #       host: build.example.com:22
 #       user: dev
 #       key_file: /etc/agentflow/id_ed25519
+#       workdir: /srv/work
 #
 # runtime:
 #   sandbox:                     # every setting has a default
@@ -227,10 +228,11 @@ profiles:
 #     memory: 1GiB               # enforced where the host allows; doctor says
 #     output_limit: 256KiB
 #
-# A project may customise its agent's profile with .agentflow/shell.yaml
+# A project may customise its agent's sandbox profile with .agentflow/shell.yaml
 # (environment, env, workdir, timeout, ignore) — nothing that raises a limit.
 #
-# An agent uses a profile with `shell: code` and the shell.exec capability.
+# An agent binds a sandbox profile with `shell: code` and capability `shell.exec`,
+# and binds a remote SSH profile with `ssh: box` and capability `net.ssh`.
 
 # ---------------------------------------------------------------------------
 # Agents

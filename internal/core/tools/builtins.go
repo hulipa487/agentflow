@@ -13,7 +13,6 @@ import (
 	"agentflow/internal/core/shellops"
 	"agentflow/internal/drivers/sandbox"
 	"agentflow/internal/drivers/search"
-	"agentflow/internal/drivers/shell"
 )
 
 // RegisterBuiltins adds the phase-2 builtin tools to the registry. searcher is
@@ -192,49 +191,198 @@ func argCount(v any) int {
 
 // RegisterShellBuiltins adds the model-facing shell and file tools.
 //
-// They act on the calling agent's bound shell profile (agents.<name>.shell,
-// carried in the op context), so a model never handles a handle. With a
-// sandbox profile each command is a one-off job on the profile's project and
-// the file tools read and write that project directly; with an SSH profile
-// the tools keep one connection per session, opened on first use. An agent
-// without a bound profile gets honest-unavailable, never a raw error.
-// Visibility is gated on the shell.exec capability at wiring time (main.go
-// policy-forbids these tools for agents without it).
+// RegisterShellBuiltins registers builtin:shell.exec and the local project file
+// tools (builtin:fs.read, builtin:fs.write).
+//
+// They act on the calling agent's bound local shell profile (agents.<name>.shell,
+// carried in the op context), so a model never handles a handle. Each command
+// runs as a one-off sandbox job on the profile's project and the file tools
+// read and write that project directly. An agent without a bound profile gets
+// honest-unavailable, never a raw error. Visibility is gated on the shell.exec
+// capability at both registry filtering (RequiresCapability) and policy wiring
+// in cmd/agentflow.
 func RegisterShellBuiltins(r *Registry, front *shellops.Front) {
 	registerShellProfileBuiltins(r, front)
 	registerFSBuiltins(r, front)
 }
 
-// bound is the calling session's shell, resolved from the op context.
-type bound struct {
-	owner, agent string
-	ssh          bool
-	opts         shell.SpawnOpts // ssh only
+// RegisterSSHBuiltins registers builtin:ssh.{exec,read,write,close}.
+//
+// They act on the calling agent's bound SSH profile (agents.<name>.ssh, carried
+// in the op context) — lazily opening and reusing one connection per session —
+// or on an explicit handle_id opened by a loop via ssh.spawn. Visibility is
+// gated on the net.ssh capability at both registry filtering and policy wiring.
+func RegisterSSHBuiltins(r *Registry, front *shellops.Front) {
+	// sshTarget resolves either an explicit handle_id or the session's bound
+	// SSH profile (opening/reusing the per-session connection when autoSpawn).
+	sshTarget := func(ctx context.Context, tool string, args map[string]any, autoSpawn bool) (owner, handleID string, haveProfile bool, unavail map[string]any) {
+		owner = session.OwnerFromCtx(ctx)
+		if owner == "" {
+			return "", "", false, ResultUnavailable(tool, "This agent has no SSH profile bound (agents.<name>.ssh).")
+		}
+		if front == nil || front.SSH == nil {
+			return "", "", false, ResultUnavailable(tool, "This engine has no remote SSH support.")
+		}
+		opts, ok := shellops.SSHProfile(ctx)
+		if handleID, _ = args["handle_id"].(string); handleID != "" {
+			if shellops.IsSandboxHandle(handleID) {
+				return "", "", ok, failed(tool, errors.New("expected an SSH handle_id (use builtin:shell.exec / builtin:fs.* for sandbox handles)"))
+			}
+			return owner, handleID, ok, nil
+		}
+		if !ok {
+			return "", "", false, ResultUnavailable(tool, "This agent has no SSH profile bound (agents.<name>.ssh).")
+		}
+		if !autoSpawn {
+			return owner, "", true, nil
+		}
+		h, err := front.SSH.Ensure(ctx, owner, shellops.SSH, opts)
+		if err != nil {
+			return owner, "", true, failed(tool, err)
+		}
+		return owner, h.ID, true, nil
+	}
+
+	r.Register(ToolSpec{
+		Name:               "builtin:ssh.exec",
+		Description:        "Run a command over SSH on this agent's bound remote host (opening and reusing a per-session connection), or on an explicit SSH handle_id. Returns handle_id, stdout, stderr, exit_code and duration_ms.",
+		RequiresCapability: "net.ssh",
+		Parameters: objectSchema(map[string]any{
+			"command":   map[string]any{"type": "string", "description": "Command to run"},
+			"handle_id": map[string]any{"type": "string", "description": "Optional: SSH handle_id from ssh.spawn instead of the bound SSH profile"},
+		}, []string{"command"}),
+		Permission:   "write",
+		NeedsConfirm: true,
+		Autonomous:   false,
+		Invoke: func(ctx context.Context, args map[string]any) (any, error) {
+			const tool = "builtin:ssh.exec"
+			owner, hid, _, unavail := sshTarget(ctx, tool, args, true)
+			if unavail != nil {
+				return unavail, nil
+			}
+			cmd, _ := args["command"].(string)
+			if cmd == "" {
+				return map[string]any{"ok": false, "tool": tool, "error": "missing command"}, nil
+			}
+			res, err := front.SSH.Exec(ctx, owner, hid, cmd)
+			if err != nil {
+				return failed(tool, err), nil
+			}
+			return map[string]any{
+				"ok": true, "tool": tool, "handle_id": hid,
+				"stdout": res.Stdout, "stderr": res.Stderr,
+				"exit_code": res.ExitCode, "duration_ms": res.Duration,
+			}, nil
+		},
+	})
+
+	r.Register(ToolSpec{
+		Name:               "builtin:ssh.read",
+		Description:        "Read a text file over SSH from this agent's bound remote host (or an explicit SSH handle_id).",
+		RequiresCapability: "net.ssh",
+		Parameters: objectSchema(map[string]any{
+			"path":      map[string]any{"type": "string", "description": "Remote file path"},
+			"handle_id": map[string]any{"type": "string", "description": "Optional: SSH handle_id from ssh.spawn instead of the bound SSH profile"},
+		}, []string{"path"}),
+		Permission: "read",
+		Autonomous: true,
+		Invoke: func(ctx context.Context, args map[string]any) (any, error) {
+			const tool = "builtin:ssh.read"
+			owner, hid, _, unavail := sshTarget(ctx, tool, args, true)
+			if unavail != nil {
+				return unavail, nil
+			}
+			path, _ := args["path"].(string)
+			if path == "" {
+				return map[string]any{"ok": false, "tool": tool, "error": "missing path"}, nil
+			}
+			b, err := front.SSH.Read(ctx, owner, hid, path)
+			if err != nil {
+				return failed(tool, err), nil
+			}
+			return map[string]any{"ok": true, "tool": tool, "handle_id": hid, "path": path, "content": string(b)}, nil
+		},
+	})
+
+	r.Register(ToolSpec{
+		Name:               "builtin:ssh.write",
+		Description:        "Write a text file over SSH on this agent's bound remote host (or an explicit SSH handle_id).",
+		RequiresCapability: "net.ssh",
+		Parameters: objectSchema(map[string]any{
+			"path":      map[string]any{"type": "string", "description": "Remote file path"},
+			"content":   map[string]any{"type": "string", "description": "File content"},
+			"handle_id": map[string]any{"type": "string", "description": "Optional: SSH handle_id from ssh.spawn instead of the bound SSH profile"},
+		}, []string{"path", "content"}),
+		Permission:   "write",
+		NeedsConfirm: true,
+		Autonomous:   false,
+		Invoke: func(ctx context.Context, args map[string]any) (any, error) {
+			const tool = "builtin:ssh.write"
+			owner, hid, _, unavail := sshTarget(ctx, tool, args, true)
+			if unavail != nil {
+				return unavail, nil
+			}
+			path, _ := args["path"].(string)
+			content, _ := args["content"].(string)
+			if path == "" {
+				return map[string]any{"ok": false, "tool": tool, "error": "missing path"}, nil
+			}
+			if err := front.SSH.Write(ctx, owner, hid, path, []byte(content)); err != nil {
+				return failed(tool, err), nil
+			}
+			return map[string]any{"ok": true, "tool": tool, "handle_id": hid, "path": path}, nil
+		},
+	})
+
+	r.Register(ToolSpec{
+		Name:               "builtin:ssh.close",
+		Description:        "Close this agent's active remote SSH connection (or a specific SSH handle_id); a later ssh call opens a fresh one.",
+		RequiresCapability: "net.ssh",
+		Parameters: objectSchema(map[string]any{
+			"handle_id": map[string]any{"type": "string", "description": "Optional: SSH handle_id to close; defaults to the session's bound SSH connection"},
+		}, nil),
+		Permission:   "write",
+		NeedsConfirm: true,
+		Autonomous:   false,
+		Invoke: func(ctx context.Context, args map[string]any) (any, error) {
+			const tool = "builtin:ssh.close"
+			owner, hid, _, unavail := sshTarget(ctx, tool, args, false)
+			if unavail != nil {
+				return unavail, nil
+			}
+			if hid == "" {
+				h := front.SSH.Current(owner)
+				if h == nil {
+					return map[string]any{"ok": true, "tool": tool, "closed": false}, nil
+				}
+				hid = h.ID
+			}
+			if err := front.SSH.Destroy(ctx, owner, hid); err != nil {
+				return failed(tool, err), nil
+			}
+			return map[string]any{"ok": true, "tool": tool, "closed": true, "handle_id": hid}, nil
+		},
+	})
 }
 
-// boundShell resolves the calling session's bound shell profile. The second
-// return value is the honest-unavailable result — non-nil exactly when the
-// agent has no shell profile bound (or the context carries no owner), in which
-// case the caller returns it without doing anything.
-func boundShell(ctx context.Context, tool string) (bound, map[string]any) {
+// bound is the calling session's local sandbox shell, resolved from the op context.
+type bound struct {
+	owner, agent string
+}
+
+// boundShell resolves the calling session's bound local shell profile. The
+// second return value is the honest-unavailable result — non-nil exactly when
+// the agent has no shell profile bound (or the context carries no owner).
+func boundShell(ctx context.Context, front *shellops.Front, tool string) (bound, map[string]any) {
 	owner := session.OwnerFromCtx(ctx)
-	provider, _, raw, ok := shellops.Profile(ctx)
+	_, _, _, ok := shellops.Profile(ctx)
 	if owner == "" || !ok {
 		return bound{}, ResultUnavailable(tool, "This agent has no shell profile bound (agents.<name>.shell).")
 	}
-	b := bound{owner: owner, agent: shellops.AgentOf(owner), ssh: provider == shellops.SSH}
-	if b.ssh {
-		str := func(key string) string {
-			s, _ := raw[key].(string)
-			return s
-		}
-		b.opts = shell.SpawnOpts{
-			WorkDir: str("workdir"), Host: str("host"), User: str("user"),
-			Password: str("password"), KeyFile: str("key_file"),
-		}
-		b.opts.Env, _ = raw["env"].(map[string]string)
+	if front == nil {
+		return bound{}, ResultUnavailable(tool, "This engine has no shell support.")
 	}
-	return b, nil
+	return bound{owner: owner, agent: shellops.AgentOf(owner)}, nil
 }
 
 // failed is a tool result for something that went wrong, or the
@@ -248,8 +396,9 @@ func failed(tool string, err error) map[string]any {
 
 func registerShellProfileBuiltins(r *Registry, front *shellops.Front) {
 	r.Register(ToolSpec{
-		Name:        "builtin:shell.exec",
-		Description: "Run a shell command in this agent's project. Each call starts fresh in the project directory: files the command writes there are kept, but nothing else carries over between calls — no background processes, no shell variables, no files outside the project. Returns stdout, stderr, exit_code, duration_ms, timed_out and the project files it changed.",
+		Name:               "builtin:shell.exec",
+		Description:        "Run a shell command in this agent's project. Each call starts fresh in the project directory: files the command writes there are kept, but nothing else carries over between calls — no background processes, no shell variables, no files outside the project. Returns stdout, stderr, exit_code, duration_ms, timed_out and the project files it changed.",
+		RequiresCapability: "shell.exec",
 		Parameters: objectSchema(map[string]any{
 			"command": map[string]any{"type": "string", "description": "Command to run"},
 		}, []string{"command"}),
@@ -258,31 +407,13 @@ func registerShellProfileBuiltins(r *Registry, front *shellops.Front) {
 		Autonomous:   false,
 		Invoke: func(ctx context.Context, args map[string]any) (any, error) {
 			const tool = "builtin:shell.exec"
-			b, unavail := boundShell(ctx, tool)
+			b, unavail := boundShell(ctx, front, tool)
 			if unavail != nil {
 				return unavail, nil
 			}
 			cmd, _ := args["command"].(string)
 			if cmd == "" {
 				return map[string]any{"ok": false, "error": "missing command"}, nil
-			}
-			if b.ssh {
-				if front.SSH == nil {
-					return ResultUnavailable(tool, "This engine has no remote shell support."), nil
-				}
-				h, err := front.SSH.Ensure(ctx, b.owner, shellops.SSH, b.opts)
-				if err != nil {
-					return failed(tool, err), nil
-				}
-				res, err := front.SSH.Exec(ctx, b.owner, h.ID, cmd)
-				if err != nil {
-					return failed(tool, err), nil
-				}
-				return map[string]any{
-					"ok": true, "tool": tool, "handle_id": h.ID,
-					"stdout": res.Stdout, "stderr": res.Stderr,
-					"exit_code": res.ExitCode, "duration_ms": res.Duration,
-				}, nil
 			}
 			res, err := front.Run(ctx, b.agent, cmd, shellops.Options{}, 0)
 			if err != nil {
@@ -292,144 +423,48 @@ func registerShellProfileBuiltins(r *Registry, front *shellops.Front) {
 			return res, nil
 		},
 	})
-
-	r.Register(ToolSpec{
-		Name:        "builtin:shell.write",
-		Description: "Write a text file in this agent's project (or, with a remote shell profile, on the remote machine).",
-		Parameters: objectSchema(map[string]any{
-			"path":    map[string]any{"type": "string", "description": "File path, relative to the project"},
-			"content": map[string]any{"type": "string", "description": "File content"},
-		}, []string{"path", "content"}),
-		Permission:   "write",
-		NeedsConfirm: true,
-		Autonomous:   false,
-		Invoke: func(ctx context.Context, args map[string]any) (any, error) {
-			const tool = "builtin:shell.write"
-			b, unavail := boundShell(ctx, tool)
-			if unavail != nil {
-				return unavail, nil
-			}
-			path, _ := args["path"].(string)
-			content, _ := args["content"].(string)
-			if path == "" {
-				return map[string]any{"ok": false, "error": "missing path"}, nil
-			}
-			if b.ssh {
-				if front.SSH == nil {
-					return ResultUnavailable(tool, "This engine has no remote shell support."), nil
-				}
-				h, err := front.SSH.Ensure(ctx, b.owner, shellops.SSH, b.opts)
-				if err != nil {
-					return failed(tool, err), nil
-				}
-				if err := front.SSH.Write(ctx, b.owner, h.ID, path, []byte(content)); err != nil {
-					return failed(tool, err), nil
-				}
-				return map[string]any{"ok": true, "path": path, "handle_id": h.ID}, nil
-			}
-			rel, err := front.Write(ctx, b.agent, shellops.Options{}, path, []byte(content))
-			if err != nil {
-				return failed(tool, err), nil
-			}
-			return map[string]any{"ok": true, "path": rel}, nil
-		},
-	})
-
-	r.Register(ToolSpec{
-		Name:         "builtin:shell.destroy",
-		Description:  "Close this agent's remote shell connection; a later shell call opens a fresh one. With a sandbox profile there is nothing to close and this does nothing.",
-		Parameters:   objectSchema(map[string]any{}, nil),
-		Permission:   "write",
-		NeedsConfirm: true,
-		Autonomous:   false,
-		Invoke: func(ctx context.Context, args map[string]any) (any, error) {
-			const tool = "builtin:shell.destroy"
-			b, unavail := boundShell(ctx, tool)
-			if unavail != nil {
-				return unavail, nil
-			}
-			if !b.ssh || front.SSH == nil {
-				return map[string]any{"ok": true, "destroyed": false}, nil
-			}
-			h := front.SSH.Current(b.owner)
-			if h == nil {
-				return map[string]any{"ok": true, "destroyed": false}, nil
-			}
-			if err := front.SSH.Destroy(ctx, b.owner, h.ID); err != nil {
-				return failed(tool, err), nil
-			}
-			return map[string]any{"ok": true, "destroyed": true, "handle_id": h.ID}, nil
-		},
-	})
 }
 
-// registerFSBuiltins registers builtin:fs.read and builtin:fs.write. With a
-// sandbox profile they are plain project file operations and need no sandbox:
-// the project is in the files store, and reading a file does not take running
-// anything. handle_id is only for a remote shell opened by a loop.
+// registerFSBuiltins registers builtin:fs.read and builtin:fs.write. Both act
+// on the agent's local project (and require a bound agents.<name>.shell
+// profile); reading and writing files goes through the project files store
+// without starting a sandbox job. Optional handle_id is restricted to a sandbox
+// handle from shell.spawn so its mount/workdir options apply.
 func registerFSBuiltins(r *Registry, front *shellops.Front) {
-	// target decides where a file call goes: a remote handle, or the project.
-	target := func(ctx context.Context, tool string, args map[string]any) (owner, agent, handleID string, opts shellops.Options, remote bool, unavail map[string]any) {
-		owner = session.OwnerFromCtx(ctx)
-		agent = shellops.AgentOf(owner)
-		handleID, _ = args["handle_id"].(string)
-		if handleID != "" && !shellops.IsSandboxHandle(handleID) {
-			// A remote handle a loop opened: the shell manager checks that this
-			// session owns it.
-			return owner, agent, handleID, opts, true, nil
-		}
-		// Everything else acts on the agent's project, and that takes a bound
-		// shell profile — the same condition as running a command. A sandbox
-		// handle is only options, and a model can write one out by hand: it
-		// must never be a way to reach a project without a shell.
-		b, unavail := boundShell(ctx, tool)
+	target := func(ctx context.Context, tool string, args map[string]any) (agent string, opts shellops.Options, unavail map[string]any) {
+		b, unavail := boundShell(ctx, front, tool)
 		if unavail != nil {
-			return owner, agent, "", opts, false, unavail
+			return "", opts, unavail
 		}
-		if handleID != "" {
-			if b.ssh {
-				return owner, agent, "", opts, false, failed(tool, errors.New("this agent's shell is a remote connection; a sandbox handle does not apply to it"))
+		if handleID, _ := args["handle_id"].(string); handleID != "" {
+			if !shellops.IsSandboxHandle(handleID) {
+				return "", opts, failed(tool, errors.New("not a sandbox handle (use builtin:ssh.read / builtin:ssh.write for SSH handles)"))
 			}
 			o, err := shellops.DecodeHandle(handleID)
 			if err != nil {
-				return owner, agent, handleID, opts, false, failed(tool, err)
+				return "", opts, failed(tool, err)
 			}
-			return owner, agent, handleID, o, false, nil
+			return b.agent, o, nil
 		}
-		if b.ssh && front.SSH != nil {
-			if h := front.SSH.Current(b.owner); h != nil {
-				return owner, agent, h.ID, opts, true, nil
-			}
-			return owner, agent, "", opts, false, ResultUnavailable(tool, "No remote shell is open yet; run a command first.")
-		}
-		return owner, agent, "", opts, false, nil
+		return b.agent, opts, nil
 	}
 
 	r.Register(ToolSpec{
-		Name:        "builtin:fs.read",
-		Description: "Read a text file from this agent's project.",
+		Name:               "builtin:fs.read",
+		Description:        "Read a text file from this agent's project.",
+		RequiresCapability: "shell.exec",
 		Parameters: objectSchema(map[string]any{
 			"path":      map[string]any{"type": "string", "description": "File path, relative to the project"},
-			"handle_id": map[string]any{"type": "string", "description": "Optional: a shell handle to read from instead"},
+			"handle_id": map[string]any{"type": "string", "description": "Optional: a sandbox handle from shell.spawn whose mount and workdir options apply"},
 		}, []string{"path"}),
 		Permission: "read",
 		Autonomous: true,
 		Invoke: func(ctx context.Context, args map[string]any) (any, error) {
 			const tool = "builtin:fs.read"
 			path, _ := args["path"].(string)
-			owner, agent, handleID, opts, remote, unavail := target(ctx, tool, args)
+			agent, opts, unavail := target(ctx, tool, args)
 			if unavail != nil {
 				return unavail, nil
-			}
-			if remote {
-				if front.SSH == nil {
-					return ResultUnavailable(tool, "This engine has no remote shell support."), nil
-				}
-				b, err := front.SSH.Read(ctx, owner, handleID, path)
-				if err != nil {
-					return failed(tool, err), nil
-				}
-				return map[string]any{"ok": true, "content": string(b), "path": path}, nil
 			}
 			content, rel, truncated, err := front.Read(ctx, agent, opts, path)
 			if err != nil {
@@ -440,12 +475,13 @@ func registerFSBuiltins(r *Registry, front *shellops.Front) {
 	})
 
 	r.Register(ToolSpec{
-		Name:        "builtin:fs.write",
-		Description: "Write a text file in this agent's project.",
+		Name:               "builtin:fs.write",
+		Description:        "Write a text file in this agent's project.",
+		RequiresCapability: "shell.exec",
 		Parameters: objectSchema(map[string]any{
 			"path":      map[string]any{"type": "string", "description": "File path, relative to the project"},
 			"content":   map[string]any{"type": "string", "description": "File content"},
-			"handle_id": map[string]any{"type": "string", "description": "Optional: a shell handle to write to instead"},
+			"handle_id": map[string]any{"type": "string", "description": "Optional: a sandbox handle from shell.spawn whose mount and workdir options apply"},
 		}, []string{"path", "content"}),
 		Permission:   "write",
 		NeedsConfirm: true,
@@ -454,18 +490,9 @@ func registerFSBuiltins(r *Registry, front *shellops.Front) {
 			const tool = "builtin:fs.write"
 			path, _ := args["path"].(string)
 			content, _ := args["content"].(string)
-			owner, agent, handleID, opts, remote, unavail := target(ctx, tool, args)
+			agent, opts, unavail := target(ctx, tool, args)
 			if unavail != nil {
 				return unavail, nil
-			}
-			if remote {
-				if front.SSH == nil {
-					return ResultUnavailable(tool, "This engine has no remote shell support."), nil
-				}
-				if err := front.SSH.Write(ctx, owner, handleID, path, []byte(content)); err != nil {
-					return failed(tool, err), nil
-				}
-				return map[string]any{"ok": true, "path": path}, nil
 			}
 			rel, err := front.Write(ctx, agent, opts, path, []byte(content))
 			if err != nil {

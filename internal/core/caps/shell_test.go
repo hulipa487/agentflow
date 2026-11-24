@@ -320,10 +320,11 @@ func TestShellCancelStopsABackgroundJob(t *testing.T) {
 	}
 }
 
-func TestAnSSHProfileDoesNotSilentlyRunInASandbox(t *testing.T) {
+func TestShellSpawnRejectsSSHProvider(t *testing.T) {
 	f := newSandboxFixture(t)
-	f.ctx = session.WithShell(f.ctx, map[string]any{"provider": "ssh", "host": "box:22"})
-	f.fails(t, session.Op{Type: "shell.run", Cmd: "ls"}, "is an SSH connection")
+	if resp, ok := f.h["shell.spawn"](f.ctx, session.Op{Type: "shell.spawn", ShellProvider: "ssh"}); ok || !strings.Contains(resp, "ssh.spawn") {
+		t.Fatalf("shell.spawn with ssh provider should direct to ssh.spawn, got ok=%v %s", ok, resp)
+	}
 }
 
 func TestShellHandlerNoOwner(t *testing.T) {
@@ -379,14 +380,14 @@ func sshHandlers(t *testing.T, fm *files.Manager) (*testShellProvider, map[strin
 	t.Helper()
 	tp := &testShellProvider{name: "ssh"}
 	front := &shellops.Front{SSH: shell.NewManager([]shell.ShellProvider{tp}, nil), Files: fm}
-	return tp, ShellHandlers(front, "tester", nil)
+	return tp, SSHHandlers(front, "tester")
 }
 
 func TestSSHShellKeepsRealHandles(t *testing.T) {
 	tp, h := sshHandlers(t, nil)
 	ctx := session.WithOwner(context.Background(), "session-1")
 
-	resp, ok := h["shell.spawn"](ctx, session.Op{Type: "shell.spawn", ShellProvider: "ssh", Host: "box:22", User: "dev",
+	resp, ok := h["ssh.spawn"](ctx, session.Op{Type: "ssh.spawn", Host: "box:22", User: "dev",
 		ShellOpts: map[string]any{"region": "ewr"}})
 	spawn := decodeJSON(t, resp, ok)
 	handleID, _ := spawn["id"].(string)
@@ -397,7 +398,7 @@ func TestSSHShellKeepsRealHandles(t *testing.T) {
 		t.Fatalf("spawn options not plumbed: %+v", tp.lastOpts)
 	}
 
-	resp, ok = h["shell.exec"](ctx, session.Op{Type: "shell.exec", ShellHandle: handleID, Cmd: "echo hello"})
+	resp, ok = h["ssh.exec"](ctx, session.Op{Type: "ssh.exec", ShellHandle: handleID, Cmd: "echo hello"})
 	var execResult struct {
 		Stdout   string `json:"stdout"`
 		ExitCode int    `json:"exit_code"`
@@ -405,8 +406,50 @@ func TestSSHShellKeepsRealHandles(t *testing.T) {
 	if !ok || json.Unmarshal([]byte(resp), &execResult) != nil || execResult.Stdout != "ok: echo hello" {
 		t.Fatalf("exec = %s", resp)
 	}
-	if resp, ok = h["shell.destroy"](ctx, session.Op{Type: "shell.destroy", ShellHandle: handleID}); !ok || resp != "true" {
-		t.Fatalf("destroy failed: %s", resp)
+	if resp, ok = h["ssh.write"](ctx, session.Op{Type: "ssh.write", ShellHandle: handleID, Path: "/tmp/a.txt", Content: "hi"}); !ok || resp != "true" {
+		t.Fatalf("ssh.write failed: ok=%v %s", ok, resp)
+	}
+	resp, ok = h["ssh.read"](ctx, session.Op{Type: "ssh.read", ShellHandle: handleID, Path: "/tmp/a.txt"})
+	readRes := decodeJSON(t, resp, ok)
+	if readRes["ok"] != true || readRes["path"] != "/tmp/a.txt" || readRes["content"] != "content:/tmp/a.txt" {
+		t.Fatalf("ssh.read = %v", readRes)
+	}
+	if resp, ok = h["ssh.close"](ctx, session.Op{Type: "ssh.close", ShellHandle: handleID}); !ok || resp != "true" {
+		t.Fatalf("ssh.close failed: %s", resp)
+	}
+}
+
+func TestSSHSpawnInheritsContextProfile(t *testing.T) {
+	tp, h := sshHandlers(t, nil)
+	ctx := session.WithSSH(session.WithOwner(context.Background(), "session-1"), map[string]any{
+		"host": "bound:22", "user": "alice", "workdir": "/srv/app", "env": map[string]string{"A": "1", "B": "2"},
+	})
+	resp, ok := h["ssh.spawn"](ctx, session.Op{Type: "ssh.spawn", User: "bob", ShellEnv: map[string]string{"B": "override", "C": "3"}})
+	if !ok {
+		t.Fatalf("ssh.spawn failed: %s", resp)
+	}
+	if tp.lastOpts.Host != "bound:22" || tp.lastOpts.User != "bob" || tp.lastOpts.WorkDir != "/srv/app" {
+		t.Fatalf("merged opts = %+v", tp.lastOpts)
+	}
+	if tp.lastOpts.Env["A"] != "1" || tp.lastOpts.Env["B"] != "override" || tp.lastOpts.Env["C"] != "3" {
+		t.Fatalf("merged env = %v", tp.lastOpts.Env)
+	}
+}
+
+func TestShellAndSSHOpsRejectCrossHandles(t *testing.T) {
+	f := newSandboxFixture(t)
+	_, sshH := sshHandlers(t, nil)
+	sbID, _ := (shellops.Options{}).Encode()
+
+	for _, op := range []string{"shell.exec", "shell.write", "shell.destroy"} {
+		if resp, ok := f.h[op](f.ctx, session.Op{Type: op, ShellHandle: "h-1", Cmd: "ls", Path: "a.txt", Content: "x"}); ok || !strings.Contains(resp, "ssh.") {
+			t.Fatalf("%s accepted SSH handle: ok=%v %s", op, ok, resp)
+		}
+	}
+	for _, op := range []string{"ssh.exec", "ssh.read", "ssh.write", "ssh.close"} {
+		if resp, ok := sshH[op](f.ctx, session.Op{Type: op, ShellHandle: sbID, Cmd: "ls", Path: "a.txt", Content: "x"}); ok || !strings.Contains(resp, "shell.*") {
+			t.Fatalf("%s accepted sandbox handle: ok=%v %s", op, ok, resp)
+		}
 	}
 }
 
@@ -428,7 +471,7 @@ func TestShellSpawnCheckoutMaterializes(t *testing.T) {
 	tp, h := sshHandlers(t, fm)
 	ctx := session.WithOwner(fctx, "session-1")
 
-	resp, ok := h["shell.spawn"](ctx, session.Op{Type: "shell.spawn", ShellProvider: "ssh",
+	resp, ok := h["ssh.spawn"](ctx, session.Op{Type: "ssh.spawn",
 		Project: "proj", Ref: "main", Volumes: []string{"/host/work:/work"}})
 	if !ok {
 		t.Fatalf("spawn with checkout failed: %s", resp)
@@ -445,7 +488,7 @@ func TestShellSpawnCheckoutRequiresVolume(t *testing.T) {
 	tp, h := sshHandlers(t, testFileManager(t))
 	ctx := session.WithOwner(context.Background(), "session-1")
 
-	resp, ok := h["shell.spawn"](ctx, session.Op{Type: "shell.spawn", ShellProvider: "ssh", Project: "proj"})
+	resp, ok := h["ssh.spawn"](ctx, session.Op{Type: "ssh.spawn", Project: "proj"})
 	if ok || !strings.Contains(resp, "requires a volume mount") {
 		t.Fatalf("expected volume-mount error, got ok=%v %s", ok, resp)
 	}
@@ -466,7 +509,7 @@ func TestShellSpawnCheckoutFailureNamesCheckout(t *testing.T) {
 	tp, h := sshHandlers(t, testFileManager(t))
 	ctx := session.WithOwner(context.Background(), "session-1")
 
-	resp, ok := h["shell.spawn"](ctx, session.Op{Type: "shell.spawn", ShellProvider: "ssh",
+	resp, ok := h["ssh.spawn"](ctx, session.Op{Type: "ssh.spawn",
 		Project: "never-committed", Ref: "main", Volumes: []string{"/host/work:/work"}})
 	if ok {
 		t.Fatalf("a checkout that cannot resolve must fail the spawn: %s", resp)
@@ -489,7 +532,7 @@ func TestShellSpawnScratchMount(t *testing.T) {
 	tp, h := sshHandlers(t, fm)
 	ctx := session.WithOwner(context.Background(), "session-1")
 
-	resp, ok := h["shell.spawn"](ctx, session.Op{Type: "shell.spawn", ShellProvider: "ssh", Owner: "sess:X", ScratchMount: "/scratch"})
+	resp, ok := h["ssh.spawn"](ctx, session.Op{Type: "ssh.spawn", Owner: "sess:X", ScratchMount: "/scratch"})
 	if !ok {
 		t.Fatalf("spawn with scratch mount failed: %s", resp)
 	}

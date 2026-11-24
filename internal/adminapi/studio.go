@@ -238,6 +238,7 @@ type studioAgentJSON struct {
 	HistoryBudget int    `json:"history_budget"`
 	Safety        string `json:"safety"`
 	Shell         string `json:"shell,omitempty"`
+	SSH           string `json:"ssh,omitempty"`
 	// Memory is the memory profile the agent names ("conversational" is the
 	// built-in one). MemoryInline is an inline profile, as the file spells it,
 	// which the builder keeps as it is and the raw YAML pane edits.
@@ -266,6 +267,7 @@ func agentJSON(a config.Agent) studioAgentJSON {
 		HistoryBudget:      a.HistoryBudget,
 		Safety:             a.Safety,
 		Shell:              a.Shell,
+		SSH:                a.SSH,
 		Memory:             a.Memory.Profile,
 		MemoryInline:       inlineMemory(a.Memory),
 		Skills:             append([]string(nil), a.Skills...),

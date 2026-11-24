@@ -15,6 +15,7 @@ export interface HTTPRequest {
   auth_service?: string;
   auth?: AuthRef;
   timeout_ms?: number;
+  response_encoding?: "text" | "base64";
 }
 
 export interface HTTPResponse {
@@ -22,6 +23,7 @@ export interface HTTPResponse {
   status: number;
   headers: Record<string, string>;
   body: string;
+  body_base64?: string;
   truncated?: boolean;
 }
 

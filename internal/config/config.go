@@ -43,7 +43,6 @@ type Config struct {
 	MCP      MCP              `yaml:"mcp"`
 	Tools    Tools            `yaml:"tools"`
 	Search   Search           `yaml:"search"`
-	Legal    LegalSearch      `yaml:"legal_search"`
 	Browser  Browser          `yaml:"browser"`
 	Net      NetConfig        `yaml:"net"`
 	Media    MediaConfig         `yaml:"media"`
@@ -768,6 +767,7 @@ type Backend struct {
 type Profiles struct {
 	Memory map[string]MemoryProfile `yaml:"memory"`
 	Shell  map[string]ShellProfile  `yaml:"shell"`
+	SSH    map[string]SSHProfile    `yaml:"ssh"`
 	Agent  map[string]SpawnProfile  `yaml:"agent"`
 	Safety map[string]SafetyProfile `yaml:"safety"`
 }
@@ -928,11 +928,9 @@ type Store struct {
 	LocalityOK bool `yaml:"locality_ok"`
 }
 
-// ShellProfile is what an agent's shell is: either one-off sandbox jobs on a
-// project (provider sandbox, the default) or a connection to a real remote
-// machine (provider ssh).
+// ShellProfile configures one-off sandbox jobs on the agent's project.
 type ShellProfile struct {
-	Provider string `yaml:"provider"` // sandbox (default) | ssh
+	Provider string `yaml:"provider"` // sandbox (default); "ssh" triggers migration error
 	// Environment names an entry of environments (sandbox).
 	Environment string `yaml:"environment"`
 	// Project is the files-store project jobs run in when a call names none
@@ -947,10 +945,16 @@ type ShellProfile struct {
 	MemLimit string            `yaml:"mem_limit"`
 	CPULimit float64           `yaml:"cpu_limit"`
 	Env      map[string]string `yaml:"env"`
+}
+
+// SSHProfile configures a connection to a remote machine (capability net.ssh).
+type SSHProfile struct {
 	Host     string            `yaml:"host"`
 	User     string            `yaml:"user"`
 	Password string            `yaml:"password"`
 	KeyFile  string            `yaml:"key_file"`
+	WorkDir  string            `yaml:"workdir"`
+	Env      map[string]string `yaml:"env"`
 }
 
 // SpawnProfile is a reusable template for an ephemeral child. It contains
@@ -963,6 +967,7 @@ type SpawnProfile struct {
 	HistoryBudget int             `yaml:"history_budget"`
 	Memory        string          `yaml:"memory"`
 	Shell         string          `yaml:"shell"`
+	SSH           string          `yaml:"ssh"`
 	Safety        string          `yaml:"safety"`
 	Skills        []string        `yaml:"skills"`
 	Capabilities  []string        `yaml:"capabilities"`
@@ -1214,17 +1219,6 @@ func (e SearchEngine) TimeoutD() time.Duration {
 	return d
 }
 
-// LegalSearch configures the builtin:legal_search / builtin:legal_read tools:
-// a set of named legal-database engines and the default used when a call omits
-// `engine`. Supported: hklii (Hong Kong Legal Information Institute) and npc
-// (China National Database of Laws and Regulations); neither needs a key. With
-// no engines configured the tools report honest-unavailable rather than
-// failing. Engine connection config reuses SearchEngine (base_url / timeout).
-type LegalSearch struct {
-	Default string                  `yaml:"default"` // engine used when a call omits `engine`
-	Engines map[string]SearchEngine `yaml:"engines"`
-}
-
 // Browser configures the builtin:browser tool: Cloudflare Browser Run
 // (formerly Browser Rendering) Quick Actions, which read a page through a real
 // headless browser so JavaScript-rendered content is present. With no account
@@ -1316,6 +1310,7 @@ type Agent struct {
 	Memory        MemoryAgentConfig `yaml:"memory"`
 	Safety        string            `yaml:"safety"`
 	Shell         string            `yaml:"shell"`
+	SSH           string            `yaml:"ssh"`
 	Skills        []string          `yaml:"skills"`
 	Capabilities  []string          `yaml:"capabilities"`
 	CanContact    []string          `yaml:"can_contact"`
@@ -2484,6 +2479,18 @@ func validate(path string, c *Config) error {
 				return err
 			}
 		}
+		if p.SSH != "" {
+			if c.Profiles.SSH == nil {
+				return fmt.Errorf("%s: spawn profile %q references unknown ssh profile %q", path, pname, p.SSH)
+			}
+			sp, ok := c.Profiles.SSH[p.SSH]
+			if !ok {
+				return fmt.Errorf("%s: spawn profile %q references unknown ssh profile %q", path, pname, p.SSH)
+			}
+			if err := validateSSHProfile(path, "spawn:"+pname, p.SSH, sp); err != nil {
+				return err
+			}
+		}
 		for _, target := range p.CanContact {
 			if _, ok := c.Agents[target]; ok {
 				continue
@@ -2563,28 +2570,6 @@ func validate(path string, c *Config) error {
 			}
 		} else if _, ok := c.Search.Engines[c.Search.Default]; !ok {
 			return fmt.Errorf("%s: search.default %q is not a configured engine", path, c.Search.Default)
-		}
-	}
-
-	// Legal-search engines are optional; none configured leaves legal_search /
-	// legal_read in honest-unavailable mode. hklii and npc need no key.
-	for ename := range c.Legal.Engines {
-		switch ename {
-		case "hklii", "npc":
-		default:
-			return fmt.Errorf("%s: unsupported legal_search engine %q (want hklii or npc)", path, ename)
-		}
-	}
-	if n := len(c.Legal.Engines); n > 0 {
-		if c.Legal.Default == "" {
-			if n > 1 {
-				return fmt.Errorf("%s: legal_search has %d engines; set legal_search.default to the one used when a call omits `engine`", path, n)
-			}
-			for ename := range c.Legal.Engines {
-				c.Legal.Default = ename
-			}
-		} else if _, ok := c.Legal.Engines[c.Legal.Default]; !ok {
-			return fmt.Errorf("%s: legal_search.default %q is not a configured engine", path, c.Legal.Default)
 		}
 	}
 
@@ -2817,6 +2802,7 @@ func (c *Config) allowedCapabilitySet() map[string]bool {
 			allowedCaps[cap] = true
 		}
 		allowedCaps["shell.exec"] = true
+		allowedCaps["net.ssh"] = true
 		allowedCaps["agent.spawn"] = true
 		allowedCaps["agent.request"] = true
 		allowedCaps["channel.push"] = true
@@ -2865,6 +2851,21 @@ func (c *Config) ValidateAgent(name string, a Agent, path string) error {
 			}
 		} else {
 			return fmt.Errorf("%s: agent %q references unknown shell profile %q", path, name, a.Shell)
+		}
+	}
+	if a.SSH != "" {
+		if !allowedCaps["net.ssh"] {
+			return fmt.Errorf("%s: agent %q uses ssh but lacks net.ssh capability", path, name)
+		}
+		if c.Profiles.SSH == nil {
+			return fmt.Errorf("%s: agent %q references unknown ssh profile %q", path, name, a.SSH)
+		}
+		sp, ok := c.Profiles.SSH[a.SSH]
+		if !ok {
+			return fmt.Errorf("%s: agent %q references unknown ssh profile %q", path, name, a.SSH)
+		}
+		if err := validateSSHProfile(path, name, a.SSH, sp); err != nil {
+			return err
 		}
 	}
 	if a.Memory.IsInline || a.Memory.Profile != "" {

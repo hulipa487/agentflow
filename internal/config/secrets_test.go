@@ -154,8 +154,8 @@ memory:
       provider: qdrant
       config: { url: "${QDRANT_URL}", api_key: "${QDRANT_KEY}" }
 profiles:
-  shell:
-    box: { provider: ssh, host: h, user: u, password: "${BOX_PW}" }
+  ssh:
+    box: { host: h, user: u, password: "${BOX_PW}" }
 gateway:
   listen: ":0"
 `,
@@ -209,8 +209,8 @@ triggers:
 	if got := cfg.Files.S3.SecretKey; got != "${FILES_SK}" {
 		t.Fatalf("files s3 secret_key must stay raw, got %q", got)
 	}
-	if got := cfg.Profiles.Shell["box"].Password; got != "${BOX_PW}" {
-		t.Fatalf("shell password must stay raw, got %q", got)
+	if got := cfg.Profiles.SSH["box"].Password; got != "${BOX_PW}" {
+		t.Fatalf("ssh password must stay raw, got %q", got)
 	}
 	if got := cfg.Gateway.Channels[0].Token; got != "${TG_TOKEN}" {
 		t.Fatalf("channel token must stay raw, got %q", got)

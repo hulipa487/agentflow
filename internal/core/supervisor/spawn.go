@@ -56,6 +56,7 @@ func (s *Supervisor) Spawn(ctx context.Context, parent session.Identity, profile
 	info.Name = agentName
 	info.Model = tmpl.Model
 	info.Shell = tmpl.Shell
+	info.SSH = tmpl.SSH
 	info.Skills = tmpl.Skills
 	info.Capabilities = keysOf(childCaps)
 

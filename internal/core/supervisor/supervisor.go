@@ -52,6 +52,7 @@ type SpawnTemplate struct {
 	Model        string
 	Instructions string
 	Shell        map[string]any
+	SSH          map[string]any
 	Memory       *session.Info // partial Info used as a template; cloned per spawn
 	CanContact   map[string]bool
 	Capabilities map[string]bool

@@ -2,6 +2,7 @@ package ext
 
 import (
 	"context"
+	"encoding/base64"
 	"io"
 	"log/slog"
 	"net/http"
@@ -379,5 +380,63 @@ actions:
 	exposed := toolReg.Expose(nil, config.ToolsPolicy{Default: "all"}, false).RequireCapabilities(map[string]bool{"apis": true})
 	if _, ok := exposed.ByName["api:ghwasm.repo"]; !ok {
 		t.Fatalf("expected api:ghwasm.repo exposed on tools.Registry")
+	}
+}
+
+func TestExternalAPIHTTPBase64BinaryResponse(t *testing.T) {
+	rawPayload := []byte{0xff, 0xfe, 0x00, 'P', 'K', 0x03, 0x04, 0x80, 0x81}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(rawPayload)
+	}))
+	defer srv.Close()
+
+	parsedURL, _ := url.Parse(srv.URL)
+	pkgDir := t.TempDir()
+	manifestYAML := `
+name: binapi
+runtime: script
+entry: ./index.ts
+capabilities:
+  http:
+    allowed_hosts: ["` + parsedURL.Hostname() + `"]
+actions:
+  fetch_b64:
+    description: "Fetch raw bytes as base64"
+`
+	indexTS := `
+export function fetch_b64(args: { url: string }, host: any): unknown {
+  const resp = host.http.request({
+    url: args.url,
+    response_encoding: "base64",
+  });
+  return { status: resp.status, body: resp.body, body_base64: resp.body_base64 };
+}
+`
+	if err := os.WriteFile(filepath.Join(pkgDir, "manifest.yaml"), []byte(manifestYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkgDir, "index.ts"), []byte(indexTS), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	httpClient := hosthttp.New(extLogger(), nil, netguard.Policy{AllowPrivate: true})
+	reg := NewRegistry(HostDeps{HTTP: httpClient, Log: extLogger()})
+	defer reg.Close(context.Background())
+
+	if err := reg.RegisterDir(pkgDir); err != nil {
+		t.Fatalf("RegisterDir binapi: %v", err)
+	}
+	res, err := reg.Call(context.Background(), "binapi", "fetch_b64", map[string]any{"url": srv.URL})
+	if err != nil {
+		t.Fatalf("Call fetch_b64: %v", err)
+	}
+	m := res.(map[string]any)
+	if m["status"] != float64(200) || m["body"] != "" {
+		t.Fatalf("unexpected response fields: %+v", m)
+	}
+	wantB64 := base64.StdEncoding.EncodeToString(rawPayload)
+	if gotB64, _ := m["body_base64"].(string); gotB64 != wantB64 {
+		t.Fatalf("body_base64 = %q, want %q", gotB64, wantB64)
 	}
 }

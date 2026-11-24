@@ -76,7 +76,6 @@ import (
 	"agentflow/internal/drivers/fetch"
 	"agentflow/internal/drivers/ghhook"
 	"agentflow/internal/drivers/httpd"
-	"agentflow/internal/drivers/legal"
 	"agentflow/internal/drivers/llm"
 	"agentflow/internal/drivers/logfile"
 	"agentflow/internal/drivers/mcp"
@@ -261,22 +260,22 @@ func main() {
 		log.Warn("net.http.allow_private is enabled: outbound HTTP may reach loopback, private, link-local and reserved addresses")
 	}
 
-	// Shell profile passwords may be lazy references; an unresolvable one is
-	// cleared with a warning (the profile itself stays — a sandbox profile has
-	// no password, and ssh may still authenticate by key).
-	for name, p := range cfg.Profiles.Shell {
+	// SSH profile passwords may be lazy references; an unresolvable one is
+	// cleared with a warning (the profile itself stays — ssh may still
+	// authenticate by key).
+	for name, p := range cfg.Profiles.SSH {
 		if p.Password == "" {
 			continue
 		}
 		v, ok := credResolver.Resolve(ctx, p.Password)
 		if !ok {
-			log.Warn("shell profile credential unresolved; password cleared",
+			log.Warn("ssh profile credential unresolved; password cleared",
 				"profile", name, "credential", config.CredentialName(p.Password))
 			p.Password = ""
 		} else {
 			p.Password = v
 		}
-		cfg.Profiles.Shell[name] = p
+		cfg.Profiles.SSH[name] = p
 	}
 
 	// Memory backends. Pre-resolve default profiles so builtin:conversational
@@ -787,18 +786,12 @@ func main() {
 		log.Error("search engines failed", "err", err)
 		os.Exit(1)
 	}
-	legalSet, err := legal.Build(cfg.Legal)
-	if err != nil {
-		log.Error("legal engines failed", "err", err)
-		os.Exit(1)
-	}
 	// The browser tool is opt-in and degrades rather than failing: no account
 	// means an empty client and honest-unavailable, and a token that will not
 	// resolve is skipped with a warning inside Build.
 	browserClient := browser.Build(cfg.Browser, credResolver, log)
 	toolReg := tools.NewRegistry()
 	tools.RegisterBuiltins(toolReg, searchSet)
-	tools.RegisterLegalBuiltins(toolReg, legalSet)
 	tools.RegisterBrowserBuiltins(toolReg, browserClient, filesMgr)
 	tools.RegisterFetchBuiltins(toolReg, fetch.New(netPolicy), log, filesMgr)
 	// Sandbox jobs: one command, one ephemeral sandbox (gVisor runsc or
@@ -855,6 +848,7 @@ func main() {
 		}
 	}
 	tools.RegisterShellBuiltins(toolReg, shellFront)
+	tools.RegisterSSHBuiltins(toolReg, shellFront)
 	// Declarative HTTP tools: config-declared REST integrations, no Go code per
 	// API. They share the same dialer guard and per-tenant credential store as
 	// http.request and builtin:fetch.
@@ -924,7 +918,7 @@ func main() {
 	extReg.RegisterTools(toolReg)
 
 	// Bake config-level tool spec overrides (tools.policy.overrides) into the
-	// registry — after every Register* call (builtins, legal, shell, MCP, APIs) and
+	// registry — after every Register* call (builtins, shell, MCP, APIs) and
 	// before any Expose. An override naming no registered tool is left for the
 	// Lua path (it may target a tool.def-declared tool, which does not exist
 	// until a chunk loads); a description referencing an unknown prompt key
@@ -1133,6 +1127,9 @@ func main() {
 		for k, h := range gateOps(enforce, name, effectiveCaps, "shell.exec", caps.ShellHandlers(shellFront, name, deliverJob), &withheld) {
 			handlers[k] = h
 		}
+		for k, h := range gateOps(enforce, name, effectiveCaps, "net.ssh", caps.SSHHandlers(shellFront, name), &withheld) {
+			handlers[k] = h
+		}
 		for k, h := range gateOps(enforce, name, effectiveCaps, "net.http", caps.HTTPHandlers(log, credStore, netPolicy, filesMgr), &withheld) {
 			handlers[k] = limitEgress(h)
 		}
@@ -1181,6 +1178,7 @@ func main() {
 				HistoryBudget: a.HistoryBudget,
 				Memory:        amPtr,
 				Shell:         shellProfileMap(cfg, a.Shell),
+				SSH:           sshProfileMap(cfg, a.SSH),
 				Skills:        a.Skills,
 				Capabilities:  a.Capabilities,
 
@@ -1312,6 +1310,9 @@ func main() {
 		for k, h := range gateOps(enforce, pname, profileCaps, "shell.exec", caps.ShellHandlers(shellFront, pname, deliverJob), &withheld) {
 			handlers[k] = h
 		}
+		for k, h := range gateOps(enforce, pname, profileCaps, "net.ssh", caps.SSHHandlers(shellFront, pname), &withheld) {
+			handlers[k] = h
+		}
 		for k, h := range gateOps(enforce, pname, profileCaps, "net.http", caps.HTTPHandlers(log, credStore, netPolicy, filesMgr), &withheld) {
 			handlers[k] = limitEgress(h)
 		}
@@ -1358,6 +1359,7 @@ func main() {
 			Model:         p.Model,
 			Instructions:  p.Instructions.File,
 			Shell:         shellProfileMap(cfg, p.Shell),
+			SSH:           sshProfileMap(cfg, p.SSH),
 			CanContact:    stringSet(p.CanContact),
 			Capabilities:  profileCaps,
 			Skills:        p.Skills,
@@ -2326,6 +2328,10 @@ func main() {
 					cat.ShellProfiles = append(cat.ShellProfiles, name)
 				}
 				sort.Strings(cat.ShellProfiles)
+				for name := range curCfg.Profiles.SSH {
+					cat.SSHProfiles = append(cat.SSHProfiles, name)
+				}
+				sort.Strings(cat.SSHProfiles)
 				for name := range curCfg.Environments {
 					cat.Environments = append(cat.Environments, name)
 				}
@@ -2816,21 +2822,23 @@ func triggerTarget(cfg *config.Config, profile string) (string, bool) {
 }
 
 // toolPolicyFor returns the tools policy for one agent or spawn profile. An
-// agent without the shell.exec capability must not see the registry shell
-// tools (builtin:shell.exec / shell.write / shell.destroy), even under a
-// permissive tools policy — the same gate as shell profile binding at config
-// load. The forbidden list is cloned before appending so the shared policy is
-// never mutated.
+// agent without shell.exec must not see the local sandbox shell/file tools, and
+// an agent without net.ssh must not see the remote SSH tools, even under a
+// permissive tools policy. The forbidden list is cloned before appending so the
+// shared policy is never mutated.
 func toolPolicyFor(policy config.ToolsPolicy, caps map[string]bool) config.ToolsPolicy {
-	if caps["shell.exec"] {
+	var extra []string
+	if !caps["shell.exec"] {
+		extra = append(extra, "builtin:shell.exec", "builtin:fs.read", "builtin:fs.write")
+	}
+	if !caps["net.ssh"] {
+		extra = append(extra, "builtin:ssh.exec", "builtin:ssh.read", "builtin:ssh.write", "builtin:ssh.close")
+	}
+	if len(extra) == 0 {
 		return policy
 	}
 	out := policy
-	// The file tools are forbidden with them: they read and write the same
-	// project the shell tools run commands in.
-	out.Forbidden = append(append([]string{}, policy.Forbidden...),
-		"builtin:shell.exec", "builtin:shell.write", "builtin:shell.destroy",
-		"builtin:fs.read", "builtin:fs.write")
+	out.Forbidden = append(append([]string{}, policy.Forbidden...), extra...)
 	return out
 }
 
@@ -2838,17 +2846,13 @@ func toolPolicyFor(policy config.ToolsPolicy, caps map[string]bool) config.Tools
 // sandbox shell profile, which is when it is worth finding out at boot
 // whether the sandbox works here.
 func sandboxInUse(cfg *config.Config) bool {
-	uses := func(name string) bool {
-		p, ok := cfg.Profiles.Shell[name]
-		return ok && p.Provider != "ssh"
-	}
 	for _, a := range cfg.Agents {
-		if uses(a.Shell) {
+		if a.Shell != "" {
 			return true
 		}
 	}
 	for _, p := range cfg.Profiles.Agent {
-		if uses(p.Shell) {
+		if p.Shell != "" {
 			return true
 		}
 	}
@@ -3124,10 +3128,24 @@ func shellProfileMap(cfg *config.Config, name string) map[string]any {
 		"memory_bytes": memory,
 		"cpu_limit":    p.CPULimit,
 		"env":          p.Env,
-		"host":         p.Host,
-		"user":         p.User,
-		"password":     p.Password,
-		"key_file":     p.KeyFile,
+	}
+}
+
+func sshProfileMap(cfg *config.Config, name string) map[string]any {
+	if name == "" || cfg.Profiles.SSH == nil {
+		return nil
+	}
+	p, ok := cfg.Profiles.SSH[name]
+	if !ok {
+		return nil
+	}
+	return map[string]any{
+		"host":     p.Host,
+		"user":     p.User,
+		"password": p.Password,
+		"key_file": p.KeyFile,
+		"workdir":  p.WorkDir,
+		"env":      p.Env,
 	}
 }
 

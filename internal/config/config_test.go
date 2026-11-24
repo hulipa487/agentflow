@@ -124,7 +124,8 @@ func TestValidateGhhookRequiresSecret(t *testing.T) {
 	}
 }
 
-// TestValidateShellProfile exercises the provider-specific validation rules.
+// TestValidateShellProfile exercises the sandbox-only shell profile validation rules
+// and the migration error for legacy provider: ssh.
 func TestValidateShellProfile(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -132,13 +133,9 @@ func TestValidateShellProfile(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name:    "ssh missing host",
-			profile: ShellProfile{Provider: "ssh", User: "root"},
-			wantErr: "missing required host",
-		},
-		{
-			name:    "ssh valid",
-			profile: ShellProfile{Provider: "ssh", Host: "1.2.3.4:22", User: "root"},
+			name:    "legacy ssh provider gets migration hint",
+			profile: ShellProfile{Provider: "ssh"},
+			wantErr: `profiles.ssh`,
 		},
 		{
 			name:    "sandbox by default",
@@ -193,6 +190,15 @@ func TestValidateShellProfile(t *testing.T) {
 				t.Fatalf("expected error containing %q, got %v", tt.wantErr, err)
 			}
 		})
+	}
+}
+
+func TestValidateSSHProfile(t *testing.T) {
+	if err := validateSSHProfile("cfg.yaml", "test-owner", "box", SSHProfile{User: "root"}); err == nil || !strings.Contains(err.Error(), "missing required host") {
+		t.Fatalf("expected missing host error, got %v", err)
+	}
+	if err := validateSSHProfile("cfg.yaml", "test-owner", "box", SSHProfile{Host: "1.2.3.4:22", User: "root"}); err != nil {
+		t.Fatalf("valid ssh profile refused: %v", err)
 	}
 }
 
@@ -489,72 +495,6 @@ func TestValidateUsers(t *testing.T) {
 	id.RequireRegistration = &no
 	if id.RegistrationRequired() {
 		t.Fatal("explicit require_registration=false must disable requirement")
-	}
-}
-
-// TestValidateLegalSearch exercises the legal-search engine rules: only hklii
-// is supported (no key), and default resolution.
-func TestValidateLegalSearch(t *testing.T) {
-	tests := []struct {
-		name    string
-		legal   LegalSearch
-		wantErr string
-		wantDef string
-	}{
-		{name: "none configured ok", legal: LegalSearch{}},
-		{
-			name:    "unknown engine",
-			legal:   LegalSearch{Engines: map[string]SearchEngine{"westlaw": {}}},
-			wantErr: "unsupported legal_search engine",
-		},
-		{
-			name:    "hklii needs no key, defaults to itself",
-			legal:   LegalSearch{Engines: map[string]SearchEngine{"hklii": {}}},
-			wantDef: "hklii",
-		},
-		{
-			name:    "default names unconfigured engine",
-			legal:   LegalSearch{Default: "lexis", Engines: map[string]SearchEngine{"hklii": {}}},
-			wantErr: "not a configured engine",
-		},
-		{
-			name:    "explicit default ok",
-			legal:   LegalSearch{Default: "hklii", Engines: map[string]SearchEngine{"hklii": {}}},
-			wantDef: "hklii",
-		},
-		{
-			name:    "npc supported, no key",
-			legal:   LegalSearch{Engines: map[string]SearchEngine{"npc": {}}},
-			wantDef: "npc",
-		},
-		{
-			name:    "two engines need an explicit default",
-			legal:   LegalSearch{Engines: map[string]SearchEngine{"hklii": {}, "npc": {}}},
-			wantErr: "set legal_search.default",
-		},
-		{
-			name:    "hklii + npc with default",
-			legal:   LegalSearch{Default: "npc", Engines: map[string]SearchEngine{"hklii": {}, "npc": {}}},
-			wantDef: "npc",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := &Config{Legal: tt.legal, Agents: map[string]Agent{"bot": {Loop: "./loop.lua"}}}
-			err := validate("cfg.yaml", c)
-			if tt.wantErr != "" {
-				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-					t.Fatalf("expected error containing %q, got: %v", tt.wantErr, err)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("expected no error, got: %v", err)
-			}
-			if tt.wantDef != "" && c.Legal.Default != tt.wantDef {
-				t.Fatalf("default = %q, want %q", c.Legal.Default, tt.wantDef)
-			}
-		})
 	}
 }
 

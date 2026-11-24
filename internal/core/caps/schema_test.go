@@ -34,8 +34,8 @@ func TestLLMChatDropsMangledRequired(t *testing.T) {
 		Type:     "llm.chat",
 		Messages: []session.ChatMessage{{Role: "user", Content: "hi"}},
 		Tools: []session.ToolSpec{{
-			Name:        "legal_read",
-			Description: "Read a judgment",
+			Name:        "mock_read",
+			Description: "Read a document",
 			// What a Go `"required": []string{}` becomes after a Lua round-trip.
 			Parameters: map[string]any{"type": "object", "required": map[string]any{}},
 		}},
@@ -91,8 +91,8 @@ func TestToolSchemaVMRoundTrip(t *testing.T) {
 
 	reg := tools.NewRegistry()
 	reg.Register(tools.ToolSpec{
-		Name:        "builtin:legal_read",
-		Description: "Read a judgment",
+		Name:        "builtin:mock_read",
+		Description: "Read a document",
 		Parameters: map[string]any{
 			"type":       "object",
 			"properties": map[string]any{"path": map[string]any{"type": "string"}},
@@ -100,7 +100,7 @@ func TestToolSchemaVMRoundTrip(t *testing.T) {
 		},
 		Invoke: func(ctx context.Context, args map[string]any) (any, error) { return nil, nil },
 	})
-	agentSet := reg.Expose([]string{"builtin:legal_read"}, config.ToolsPolicy{}, false)
+	agentSet := reg.Expose([]string{"builtin:mock_read"}, config.ToolsPolicy{}, false)
 
 	mgr := llm.NewManager(map[string]config.Model{
 		"default": {Provider: "openai", Model: "m", BaseURL: srv.URL},
@@ -163,7 +163,7 @@ function loop() {
 		t.Fatalf("loop failed: %s", sends[0])
 	}
 	body := bodies[0]
-	if !strings.Contains(string(body), "legal_read") {
+	if !strings.Contains(string(body), "mock_read") {
 		t.Fatalf("provider request missing the tool\n%s", body)
 	}
 	if strings.Contains(string(body), `"required":{}`) || strings.Contains(string(body), `"required": {}`) {

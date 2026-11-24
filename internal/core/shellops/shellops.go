@@ -88,9 +88,8 @@ func DecodeHandle(id string) (Options, error) {
 	return o, nil
 }
 
-// Profile reads an agent's bound shell profile from the op context: the
-// provider, and what a sandbox job takes from it. ok is false when the agent
-// has no profile.
+// Profile reads an agent's bound sandbox shell profile from the op context.
+// ok is false when the agent has no sandbox shell profile bound.
 func Profile(ctx context.Context) (provider string, p shelljobs.Profile, raw map[string]any, ok bool) {
 	raw = session.ShellFromCtx(ctx)
 	if raw == nil {
@@ -124,6 +123,28 @@ func Profile(ctx context.Context) (provider string, p shelljobs.Profile, raw map
 	return provider, p, raw, true
 }
 
+// SSHProfile reads an agent's bound SSH profile from the op context into
+// shell.SpawnOpts. ok is false when the agent has no SSH profile bound.
+func SSHProfile(ctx context.Context) (shell.SpawnOpts, bool) {
+	raw := session.SSHFromCtx(ctx)
+	if raw == nil {
+		return shell.SpawnOpts{}, false
+	}
+	str := func(key string) string {
+		s, _ := raw[key].(string)
+		return s
+	}
+	opts := shell.SpawnOpts{
+		WorkDir:  str("workdir"),
+		Host:     str("host"),
+		User:     str("user"),
+		Password: str("password"),
+		KeyFile:  str("key_file"),
+	}
+	opts.Env, _ = raw["env"].(map[string]string)
+	return opts, true
+}
+
 // Scope is the files-store scope a turn acts in: the user's when the turn has
 // one, otherwise the agent's own. A loop can never name it.
 func Scope(ctx context.Context, agent string) string {
@@ -154,12 +175,7 @@ func (f *Front) request(ctx context.Context, agent, command string, o Options, t
 	if owner == "" {
 		return shelljobs.Request{}, errors.New("shell: no owner in context")
 	}
-	provider, profile, _, ok := Profile(ctx)
-	if ok && provider == SSH {
-		// The agent is bound to a remote machine. A sandbox job would run
-		// somewhere else entirely, which is never what was meant.
-		return shelljobs.Request{}, errors.New("shell: this agent's shell profile is an SSH connection; use shell.spawn and shell.exec with its handle")
-	}
+	_, profile, _, _ := Profile(ctx)
 	return shelljobs.Request{
 		Scope:       Scope(ctx, agent),
 		Owner:       owner,

@@ -2,6 +2,7 @@ package ext
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,7 +30,8 @@ type httpInvokeReq struct {
 	Auth        *struct {
 		Service string `json:"service"`
 	} `json:"auth,omitempty"`
-	TimeoutMS int `json:"timeout_ms,omitempty"`
+	TimeoutMS        int    `json:"timeout_ms,omitempty"`
+	ResponseEncoding string `json:"response_encoding,omitempty"`
 }
 
 // executeHTTP mediates one outbound HTTP call on behalf of an External API,
@@ -76,6 +78,10 @@ func executeHTTP(ctx context.Context, m Manifest, deps HostDeps, rawJSON []byte)
 		"status":  resp.Status,
 		"headers": resp.Headers,
 		"body":    resp.Body,
+	}
+	if strings.EqualFold(strings.TrimSpace(req.ResponseEncoding), "base64") {
+		out["body"] = ""
+		out["body_base64"] = base64.StdEncoding.EncodeToString(resp.BodyBytes)
 	}
 	if resp.Truncated {
 		out["truncated"] = true

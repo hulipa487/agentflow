@@ -37,8 +37,8 @@ memory:
   backends:
     main_db: { provider: sqlite, config: { path: ./data/agentflow.db } }
 profiles:
-  shell:
-    box: { provider: ssh, host: 10.0.0.1, user: ops, key_file: ./keys/box.pem }
+  ssh:
+    box: { host: 10.0.0.1, user: ops, key_file: ./keys/box.pem }
 gateway:
   route: ./routes/route.lua
 `
@@ -189,8 +189,8 @@ loop: plugin:per_chat
 	if p != filepath.Join(dir, "data", "agentflow.db") {
 		t.Fatalf("sqlite backend path not rebased: %v", p)
 	}
-	if kf := cfg.Profiles.Shell["box"].KeyFile; kf != filepath.Join(dir, "keys", "box.pem") {
-		t.Fatalf("shell key_file not rebased: %q", kf)
+	if kf := cfg.Profiles.SSH["box"].KeyFile; kf != filepath.Join(dir, "keys", "box.pem") {
+		t.Fatalf("ssh key_file not rebased: %q", kf)
 	}
 	if cfg.Plugins.Dir != filepath.Join(dir, "plugins") {
 		t.Fatalf("plugins.dir not rebased: %q", cfg.Plugins.Dir)

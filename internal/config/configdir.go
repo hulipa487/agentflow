@@ -252,6 +252,7 @@ func (f *agentFile) spawnProfile() (SpawnProfile, error) {
 		HistoryBudget: a.HistoryBudget,
 		Memory:        a.Memory.Profile,
 		Shell:         a.Shell,
+		SSH:           a.SSH,
 		Safety:        a.Safety,
 		Skills:        a.Skills,
 		Capabilities:  a.Capabilities,
@@ -311,9 +312,9 @@ func rebaseConfigPaths(dir string, c *Config) {
 			c.Memory.Backends[name] = b
 		}
 	}
-	for name, p := range c.Profiles.Shell {
+	for name, p := range c.Profiles.SSH {
 		p.KeyFile = rebasePath(dir, p.KeyFile)
-		c.Profiles.Shell[name] = p
+		c.Profiles.SSH[name] = p
 	}
 }
 

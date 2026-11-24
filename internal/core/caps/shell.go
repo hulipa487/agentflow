@@ -5,49 +5,48 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"path"
 	"strings"
 	"time"
 
-	"agentflow/internal/core/files"
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/shelljobs"
 	"agentflow/internal/core/shellops"
 	"agentflow/internal/drivers/shell"
 )
 
+func opFail(err error) (string, bool) {
+	b, _ := json.Marshal(err.Error())
+	return string(b), false
+}
+
+func opOKJSON(v any) (string, bool) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return opFail(err)
+	}
+	return string(b), true
+}
+
+func opOwned(ctx context.Context, op string) (string, error) {
+	owner := session.OwnerFromCtx(ctx)
+	if owner == "" {
+		return "", fmt.Errorf("%s: no owner in context", op)
+	}
+	return owner, nil
+}
+
 // JobDeliverer hands a background job's result to the session that started
 // it, as a message in its inbox. The engine routes it like any other message,
 // so it reaches the session on whichever instance owns it by then.
 type JobDeliverer func(owner string, msg session.Message)
 
-// ShellHandlers returns the per-agent shell op handler map.
+// ShellHandlers returns the per-agent local sandbox shell op handler map.
 //
 // A sandbox shell is not a resource: shell.run is one job, and the handle
 // shell.spawn returns is only the options it was given, so that loops written
-// against the old spawn/exec/destroy calls keep working. An SSH shell is a
-// real connection and goes through the shell manager as before, including the
-// spawn-time copy of a project snapshot or the session's scratch files onto
-// the remote machine.
+// against the old spawn/exec/destroy calls keep working. Remote SSH sessions
+// live in SSHHandlers (ssh.*, gated behind net.ssh).
 func ShellHandlers(front *shellops.Front, agent string, deliver JobDeliverer) map[string]session.OpHandler {
-	fail := func(err error) (string, bool) {
-		b, _ := json.Marshal(err.Error())
-		return string(b), false
-	}
-	okJSON := func(v any) (string, bool) {
-		b, err := json.Marshal(v)
-		if err != nil {
-			return fail(err)
-		}
-		return string(b), true
-	}
-	owned := func(ctx context.Context, op string) (string, error) {
-		owner := session.OwnerFromCtx(ctx)
-		if owner == "" {
-			return "", fmt.Errorf("%s: no owner in context", op)
-		}
-		return owner, nil
-	}
 	seconds := func(v float64) time.Duration { return time.Duration(v * float64(time.Second)) }
 
 	// options reads a sandbox shell's settings from an op.
@@ -89,123 +88,100 @@ func ShellHandlers(front *shellops.Front, agent string, deliver JobDeliverer) ma
 
 	return map[string]session.OpHandler{
 		"shell.spawn": func(ctx context.Context, op session.Op) (string, bool) {
-			owner, err := owned(ctx, "shell.spawn")
-			if err != nil {
-				return fail(err)
+			if _, err := opOwned(ctx, "shell.spawn"); err != nil {
+				return opFail(err)
 			}
 			switch op.ShellProvider {
 			case shellops.SSH:
-				return spawnSSH(ctx, front, agent, owner, op, fail, okJSON)
+				return opFail(errors.New("shell.spawn: SSH moved to ssh.spawn (requires net.ssh capability)"))
 			case "", shellops.Sandbox, "docker":
 				// "docker" was the old default's name; a loop that spelled it
-				// out meant "the local shell", which is what this is.
+				// out meant "the local sandbox shell", which is what this is.
 			default:
-				return fail(fmt.Errorf("shell.spawn: unknown shell provider %q (use sandbox or ssh)", op.ShellProvider))
+				return opFail(fmt.Errorf("shell.spawn: unknown shell provider %q (use sandbox; SSH moved to ssh.spawn)", op.ShellProvider))
 			}
 			o, err := options("shell.spawn", op)
 			if err != nil {
-				return fail(err)
+				return opFail(err)
 			}
 			id, err := o.Encode()
 			if err != nil {
-				return fail(err)
+				return opFail(err)
 			}
-			return okJSON(map[string]any{"id": id, "provider": shellops.Sandbox, "state": int(shell.HandleRunning)})
+			return opOKJSON(map[string]any{"id": id, "provider": shellops.Sandbox, "state": int(shell.HandleRunning)})
 		},
 
 		"shell.exec": func(ctx context.Context, op session.Op) (string, bool) {
-			owner, err := owned(ctx, "shell.exec")
+			if _, err := opOwned(ctx, "shell.exec"); err != nil {
+				return opFail(err)
+			}
+			if !shellops.IsSandboxHandle(op.ShellHandle) {
+				return opFail(errors.New("shell.exec: expected a sandbox handle from shell.spawn (use ssh.exec for SSH handles)"))
+			}
+			o, err := shellops.DecodeHandle(op.ShellHandle)
 			if err != nil {
-				return fail(err)
+				return opFail(err)
 			}
-			if shellops.IsSandboxHandle(op.ShellHandle) {
-				o, err := shellops.DecodeHandle(op.ShellHandle)
-				if err != nil {
-					return fail(err)
-				}
-				res, err := front.Run(ctx, agent, op.Cmd, o, seconds(op.Timeout))
-				if err != nil {
-					return fail(err)
-				}
-				return okJSON(res)
-			}
-			if front.SSH == nil {
-				return fail(errors.New("shell.exec: no remote shell support in this engine"))
-			}
-			result, err := front.SSH.Exec(ctx, owner, op.ShellHandle, op.Cmd)
+			res, err := front.Run(ctx, agent, op.Cmd, o, seconds(op.Timeout))
 			if err != nil {
-				return fail(err)
+				return opFail(err)
 			}
-			return okJSON(result)
+			return opOKJSON(res)
 		},
 
 		"shell.write": func(ctx context.Context, op session.Op) (string, bool) {
-			owner, err := owned(ctx, "shell.write")
+			if _, err := opOwned(ctx, "shell.write"); err != nil {
+				return opFail(err)
+			}
+			if !shellops.IsSandboxHandle(op.ShellHandle) {
+				return opFail(errors.New("shell.write: expected a sandbox handle from shell.spawn (use ssh.write for SSH handles)"))
+			}
+			o, err := shellops.DecodeHandle(op.ShellHandle)
 			if err != nil {
-				return fail(err)
+				return opFail(err)
 			}
-			if shellops.IsSandboxHandle(op.ShellHandle) {
-				o, err := shellops.DecodeHandle(op.ShellHandle)
-				if err != nil {
-					return fail(err)
-				}
-				if _, err := front.Write(ctx, agent, o, op.Path, []byte(op.Content)); err != nil {
-					return fail(fmt.Errorf("shell.write: %w", err))
-				}
-				return "true", true
-			}
-			if front.SSH == nil {
-				return fail(errors.New("shell.write: no remote shell support in this engine"))
-			}
-			if err := front.SSH.Write(ctx, owner, op.ShellHandle, op.Path, []byte(op.Content)); err != nil {
-				return fail(err)
+			if _, err := front.Write(ctx, agent, o, op.Path, []byte(op.Content)); err != nil {
+				return opFail(fmt.Errorf("shell.write: %w", err))
 			}
 			return "true", true
 		},
 
 		"shell.destroy": func(ctx context.Context, op session.Op) (string, bool) {
-			owner, err := owned(ctx, "shell.destroy")
-			if err != nil {
-				return fail(err)
+			if _, err := opOwned(ctx, "shell.destroy"); err != nil {
+				return opFail(err)
 			}
-			if shellops.IsSandboxHandle(op.ShellHandle) {
-				return "true", true // there was never anything to destroy
+			if !shellops.IsSandboxHandle(op.ShellHandle) {
+				return opFail(errors.New("shell.destroy: expected a sandbox handle from shell.spawn (use ssh.close for SSH handles)"))
 			}
-			if front.SSH == nil {
-				return fail(errors.New("shell.destroy: no remote shell support in this engine"))
-			}
-			if err := front.SSH.Destroy(ctx, owner, op.ShellHandle); err != nil {
-				return fail(err)
-			}
-			return "true", true
+			return "true", true // there was never anything to destroy
 		},
 
 		// shell.run is one command as one sandbox job, with no handle.
 		"shell.run": func(ctx context.Context, op session.Op) (string, bool) {
-			if _, err := owned(ctx, "shell.run"); err != nil {
-				return fail(err)
+			if _, err := opOwned(ctx, "shell.run"); err != nil {
+				return opFail(err)
 			}
 			o, err := options("shell.run", op)
 			if err != nil {
-				return fail(err)
+				return opFail(err)
 			}
 			res, err := front.Run(ctx, agent, op.Cmd, o, seconds(op.Timeout))
 			if err != nil {
-				return fail(err)
+				return opFail(err)
 			}
-			return okJSON(res)
+			return opOKJSON(res)
 		},
 
 		// shell.start queues a job and returns at once; its result arrives in
 		// the session's inbox as a shell.result message.
 		"shell.start": func(ctx context.Context, op session.Op) (string, bool) {
-			owner, err := owned(ctx, "shell.start")
+			owner, err := opOwned(ctx, "shell.start")
 			if err != nil {
-				return fail(err)
+				return opFail(err)
 			}
 			o, err := options("shell.start", op)
 			if err != nil {
-				return fail(err)
+				return opFail(err)
 			}
 			// The result turn runs as whoever started the job: the identity is
 			// captured now, from the turn's core-stamped provenance, because
@@ -217,39 +193,39 @@ func ShellHandlers(front *shellops.Front, agent string, deliver JobDeliverer) ma
 				}
 			})
 			if err != nil {
-				return fail(err)
+				return opFail(err)
 			}
-			return okJSON(shellops.JobMap(job))
+			return opOKJSON(shellops.JobMap(job))
 		},
 
 		"shell.status": func(ctx context.Context, op session.Op) (string, bool) {
-			owner, err := owned(ctx, "shell.status")
+			owner, err := opOwned(ctx, "shell.status")
 			if err != nil {
-				return fail(err)
+				return opFail(err)
 			}
 			if front.Jobs == nil {
-				return fail(errors.New("shell.status: this engine was started without the sandbox"))
+				return opFail(errors.New("shell.status: this engine was started without the sandbox"))
 			}
 			job, err := front.Jobs.Status(ctx, owner, op.JobID)
 			if err != nil {
-				return fail(err)
+				return opFail(err)
 			}
-			return okJSON(shellops.JobMap(job))
+			return opOKJSON(shellops.JobMap(job))
 		},
 
 		"shell.cancel": func(ctx context.Context, op session.Op) (string, bool) {
-			owner, err := owned(ctx, "shell.cancel")
+			owner, err := opOwned(ctx, "shell.cancel")
 			if err != nil {
-				return fail(err)
+				return opFail(err)
 			}
 			if front.Jobs == nil {
-				return fail(errors.New("shell.cancel: this engine was started without the sandbox"))
+				return opFail(errors.New("shell.cancel: this engine was started without the sandbox"))
 			}
 			job, err := front.Jobs.Cancel(ctx, owner, op.JobID)
 			if err != nil {
-				return fail(err)
+				return opFail(err)
 			}
-			return okJSON(shellops.JobMap(job))
+			return opOKJSON(shellops.JobMap(job))
 		},
 	}
 }
@@ -278,105 +254,6 @@ func jobMessage(owner string, j shelljobs.Job, id session.ActingIdentity, hasIde
 		Payload:    shellops.JobMap(j),
 		Provenance: prov,
 	}
-}
-
-// spawnSSH opens a connection to a remote machine and, when asked, copies a
-// project snapshot or the session's scratch files onto it before the handle
-// reports ready.
-func spawnSSH(ctx context.Context, front *shellops.Front, agent, owner string, op session.Op,
-	fail func(error) (string, bool), okJSON func(any) (string, bool)) (string, bool) {
-	mgr, fm := front.SSH, front.Files
-	if mgr == nil {
-		return fail(errors.New("shell.spawn: no remote shell support in this engine"))
-	}
-	wantCheckout := op.Project != ""
-	wantScratch := op.ScratchMount != ""
-	if (wantCheckout || wantScratch) && fm == nil {
-		return fail(fmt.Errorf("shell.spawn: files store unavailable (disabled at boot)"))
-	}
-	if wantCheckout && len(op.Volumes) == 0 {
-		return fail(fmt.Errorf("shell.spawn: checkout requires a volume mount (volumes = {\"host:container\"})"))
-	}
-	h, err := mgr.Spawn(ctx, owner, shellops.SSH, shell.SpawnOpts{
-		WorkDir:   op.WorkDir,
-		Env:       op.ShellEnv,
-		Host:      op.Host,
-		User:      op.User,
-		Password:  op.Password,
-		KeyFile:   op.KeyFile,
-		ShellOpts: op.ShellOpts,
-	})
-	if err != nil {
-		return fail(err)
-	}
-	// Materialize BEFORE the handle reports ready: a caller that gets a handle
-	// back can exec immediately and see every file. A failure mid-copy closes
-	// the half-prepared connection rather than leaving it live and misleading.
-	if wantCheckout {
-		if err := checkoutInto(ctx, mgr, fm, h.ID, owner, shellops.Scope(ctx, agent), op.Project, op.Ref, op.Volumes[0]); err != nil {
-			_ = mgr.Destroy(ctx, owner, h.ID)
-			return fail(err)
-		}
-	}
-	if wantScratch {
-		if err := scratchInto(ctx, mgr, fm, h.ID, owner, op.Owner, op.ScratchMount); err != nil {
-			_ = mgr.Destroy(ctx, owner, h.ID)
-			return fail(err)
-		}
-	}
-	return okJSON(map[string]any{"id": h.ID, "provider": h.Provider, "state": int(h.State)})
-}
-
-// checkoutInto resolves the project's snapshot and writes every file into the
-// remote directory of the first volume mount. Remote paths are POSIX
-// regardless of the host OS.
-//
-// The word "checkout" in the error below is load-bearing beyond this engine: a
-// deployment's cold-start retry matches on it to tell "this project has nothing
-// to check out yet" from a broken shell, and falls back to a bare shell on
-// that basis. Reword it only together with a structured alternative — the test
-// TestShellSpawnCheckoutFailureNamesCheckout is what will stop you.
-func checkoutInto(ctx context.Context, mgr *shell.Manager, fm *files.Manager, handleID, owner, scope, project, ref, volume string) error {
-	if ref == "" {
-		ref = "main"
-	}
-	dest := volumeContainerDir(volume)
-	if dest == "" {
-		return fmt.Errorf("shell.spawn: volume %q has no container path", volume)
-	}
-	man, err := fm.Checkout(ctx, scope, project, ref)
-	if err != nil {
-		return fmt.Errorf("shell.spawn: checkout %s@%s: %w", project, ref, err)
-	}
-	for _, f := range man.Files {
-		b, err := fm.ReadBlob(ctx, f.Handle, fm.MaxFileBytes())
-		if err != nil {
-			return fmt.Errorf("shell.spawn: read %s: %w", f.Path, err)
-		}
-		if err := mgr.Write(ctx, owner, handleID, path.Join(dest, f.Path), b); err != nil {
-			return fmt.Errorf("shell.spawn: materialize %s: %w", f.Path, err)
-		}
-	}
-	return nil
-}
-
-// scratchInto copies every live scratch record of the owning session into the
-// given remote directory.
-func scratchInto(ctx context.Context, mgr *shell.Manager, fm *files.Manager, handleID, owner, sessionKey, dest string) error {
-	entries, err := fm.ScratchList(ctx, sessionKey)
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		b, err := fm.ReadBlob(ctx, e.Handle, fm.MaxFileBytes())
-		if err != nil {
-			return fmt.Errorf("shell.spawn: read scratch %s: %w", e.Path, err)
-		}
-		if err := mgr.Write(ctx, owner, handleID, path.Join(dest, e.Path), b); err != nil {
-			return fmt.Errorf("shell.spawn: materialize scratch %s: %w", e.Path, err)
-		}
-	}
-	return nil
 }
 
 // volumeContainerDir extracts the container path from a docker -v spec

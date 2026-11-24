@@ -13,6 +13,7 @@ type Catalog struct {
 	SafetyProfiles []string   `json:"safety_profiles"`
 	MemoryProfiles []string   `json:"memory_profiles"`
 	ShellProfiles  []string   `json:"shell_profiles,omitempty"`
+	SSHProfiles    []string   `json:"ssh_profiles,omitempty"`
 	Environments   []string   `json:"environments,omitempty"`
 	Packages       []string   `json:"packages,omitempty"`
 	PromptKeys     []string   `json:"prompt_keys"`
@@ -35,7 +36,7 @@ var NewLuaOps = []string{
 // ceiling still decides which are accepted.
 var CapabilityNames = []string{
 	"llm.chat", "memory", "tools", "apis", "agent.send", "agent.request", "agent.spawn",
-	"net.http", "net.mail", "shell.exec", "files", "session.state", "users",
+	"net.http", "net.mail", "net.ssh", "shell.exec", "files", "session.state", "users",
 	"channel.push",
 }
 

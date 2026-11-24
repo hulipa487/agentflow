@@ -750,6 +750,7 @@ func (d *Driver) handleUpdate(u update) {
 	}
 	info, hasInfo := d.BotInfo()
 	mentioned := hasMention(text, entities, info.BotID, info.Username)
+	mentionsOthers := hasMentionOfOthers(text, entities, info.BotID, info.Username)
 	isReplyToBot := isReplyFromBot(m.ReplyToMessage, info.BotID, info.Username)
 
 	payload := map[string]any{
@@ -761,6 +762,9 @@ func (d *Driver) handleUpdate(u update) {
 		"name":            m.From.FirstName,
 		"mentioned":       mentioned,
 		"is_reply_to_bot": isReplyToBot,
+	}
+	if mentionsOthers {
+		payload["mentions_others"] = true
 	}
 	if m.Chat.Title != "" {
 		payload["chat_title"] = m.Chat.Title
@@ -775,6 +779,13 @@ func (d *Driver) handleUpdate(u update) {
 	}
 	if m.ReplyToMessage != nil {
 		payload["reply_to_message_id"] = m.ReplyToMessage.MessageID
+		replyAuthor := strings.TrimSpace(m.ReplyToMessage.From.FirstName)
+		if replyAuthor == "" {
+			replyAuthor = strings.TrimSpace(m.ReplyToMessage.From.Username)
+		}
+		if replyAuthor != "" {
+			payload["reply_to_author"] = replyAuthor
+		}
 		replyText := m.ReplyToMessage.Text
 		if replyText == "" {
 			replyText = m.ReplyToMessage.Caption
@@ -868,6 +879,24 @@ func hasMention(text string, entities []tgEntity, botID int64, botUsername strin
 		return false
 	}
 	return fallbackMention(text, botUsername)
+}
+
+func hasMentionOfOthers(text string, entities []tgEntity, botID int64, botUsername string) bool {
+	botUsername = strings.TrimPrefix(strings.TrimSpace(botUsername), "@")
+	for _, e := range entities {
+		switch e.Type {
+		case "text_mention":
+			if e.User != nil && (botID == 0 || e.User.ID != botID) {
+				return true
+			}
+		case "mention":
+			sub := strings.TrimPrefix(sliceUTF16(text, e.Offset, e.Length), "@")
+			if sub != "" && (botUsername == "" || !strings.EqualFold(sub, botUsername)) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func fallbackMention(text, botUsername string) bool {

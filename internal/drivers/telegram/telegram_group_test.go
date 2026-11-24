@@ -115,7 +115,10 @@ func TestGroupPayloadEnrichmentUTF16AndOnDrop(t *testing.T) {
 	if p["mentioned"] != true || p["is_reply_to_bot"] != true {
 		t.Fatalf("expected mentioned=true and is_reply_to_bot=true, got %+v", p)
 	}
-	if p["reply_to_text"] != "previous bot answer" || p["bot_username"] != "helper_bot" {
+	if _, hasOthers := p["mentions_others"]; hasOthers {
+		t.Fatalf("did not expect mentions_others when only bot was mentioned: %+v", p)
+	}
+	if p["reply_to_text"] != "previous bot answer" || p["reply_to_author"] != "helper_bot" || p["bot_username"] != "helper_bot" {
 		t.Fatalf("reply/bot fields = %+v", p)
 	}
 
@@ -136,5 +139,65 @@ func TestGroupPayloadEnrichmentUTF16AndOnDrop(t *testing.T) {
 	p2 := sink.inbs[1].Message.Payload
 	if p2["mentioned"] != false || p2["is_reply_to_bot"] != false {
 		t.Fatalf("unrelated message must not trigger mention/reply flags, got %+v", p2)
+	}
+	if _, hasOthers := p2["mentions_others"]; hasOthers {
+		t.Fatalf("plain message without mention entity must not set mentions_others: %+v", p2)
+	}
+
+	// Mentioning another member (username @mention) and quoting a user with FirstName.
+	sdkMentionOther := &models.Update{
+		ID: 4,
+		Message: &models.Message{
+			ID:   24,
+			Text: "@bob can you check that?",
+			Entities: []models.MessageEntity{
+				{Type: models.MessageEntityTypeMention, Offset: 0, Length: 4},
+			},
+			From: &models.User{ID: 100, Username: "alice", FirstName: "Alice"},
+			Chat: models.Chat{ID: -10055, Type: models.ChatTypeSupergroup},
+			ReplyToMessage: &models.Message{
+				ID:   23,
+				Text: "original note",
+				From: &models.User{ID: 200, Username: "bob_u", FirstName: "Bob"},
+			},
+		},
+	}
+	d.handleUpdate(fromSDK(sdkMentionOther))
+	if len(sink.inbs) != 3 {
+		t.Fatalf("expected 3 routed messages, got %d", len(sink.inbs))
+	}
+	p3 := sink.inbs[2].Message.Payload
+	if p3["mentioned"] != false || p3["mentions_others"] != true || p3["is_reply_to_bot"] != false {
+		t.Fatalf("expected mentions_others=true without bot mention/reply, got %+v", p3)
+	}
+	if p3["reply_to_author"] != "Bob" {
+		t.Fatalf("expected reply_to_author=Bob from FirstName, got %+v", p3["reply_to_author"])
+	}
+
+	// Text-mentioning another user (without @username) must also set mentions_others=true.
+	sdkTextMentionOther := &models.Update{
+		ID: 5,
+		Message: &models.Message{
+			ID:   25,
+			Text: "Carol what do you think?",
+			Entities: []models.MessageEntity{
+				{
+					Type:   models.MessageEntityTypeTextMention,
+					Offset: 0,
+					Length: 5,
+					User:   &models.User{ID: 300, FirstName: "Carol"},
+				},
+			},
+			From: &models.User{ID: 100, Username: "alice", FirstName: "Alice"},
+			Chat: models.Chat{ID: -10055, Type: models.ChatTypeSupergroup},
+		},
+	}
+	d.handleUpdate(fromSDK(sdkTextMentionOther))
+	if len(sink.inbs) != 4 {
+		t.Fatalf("expected 4 routed messages, got %d", len(sink.inbs))
+	}
+	p4 := sink.inbs[3].Message.Payload
+	if p4["mentioned"] != false || p4["mentions_others"] != true {
+		t.Fatalf("expected mentions_others=true for text_mention of another user, got %+v", p4)
 	}
 }

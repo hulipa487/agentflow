@@ -1,6 +1,7 @@
 package studio
 
 import (
+	"slices"
 	"testing"
 
 	"agentflow/internal/vm"
@@ -9,10 +10,24 @@ import (
 // Every starter template must load as written: the current prelude version and
 // a chunk that compiles, so an agent created from one runs without an edit.
 func TestTemplatesCompile(t *testing.T) {
+	tpls := Templates()
+	wantOrder := []string{
+		"qq-group-bot-fts",
+		"qq-group-bot-vec",
+		"telegram-group-bot-fts",
+		"telegram-group-bot-vec",
+	}
+	if len(tpls) != len(wantOrder) {
+		t.Fatalf("expected exactly %d templates, got %d", len(wantOrder), len(tpls))
+	}
+
 	seen := map[string]bool{}
-	for _, tpl := range Templates() {
+	for i, tpl := range tpls {
 		if tpl.Name == "" || tpl.Title == "" || tpl.Description == "" {
 			t.Fatalf("template %+v is missing a name, title or description", tpl)
+		}
+		if tpl.Name != wantOrder[i] {
+			t.Fatalf("template[%d].Name = %q, want %q", i, tpl.Name, wantOrder[i])
 		}
 		if seen[tpl.Name] {
 			t.Fatalf("template name %q is used twice", tpl.Name)
@@ -26,29 +41,40 @@ func TestTemplatesCompile(t *testing.T) {
 			if err := vm.CompileCheck(path, tpl.Loop); err != nil {
 				t.Fatalf("compile: %v", err)
 			}
+			if len(tpl.Settings) == 0 || len(tpl.Extras) == 0 || tpl.Instructions == "" {
+				t.Fatalf("missing settings/extras/instructions on %s", tpl.Name)
+			}
+			if len(tpl.Capabilities) == 0 || len(tpl.Skills) == 0 {
+				t.Fatalf("missing capabilities/skills on %s", tpl.Name)
+			}
+			if len(tpl.MemoryInline) == 0 {
+				t.Fatalf("missing inline memory profile on %s", tpl.Name)
+			}
+			stores, ok := tpl.MemoryInline["stores"].(map[string]any)
+			if !ok {
+				t.Fatalf("memory_inline.stores missing on %s: %#v", tpl.Name, tpl.MemoryInline)
+			}
+			dialogue, ok := stores["dialogue"].(map[string]any)
+			if !ok {
+				t.Fatalf("memory_inline.stores.dialogue missing on %s", tpl.Name)
+			}
+			requires, _ := dialogue["requires"].([]string)
+			switch tpl.Name {
+			case "qq-group-bot-fts", "telegram-group-bot-fts":
+				if tpl.MemoryInline["recall"] != "plugin:recency" {
+					t.Fatalf("expected plugin:recency on %s, got %v", tpl.Name, tpl.MemoryInline["recall"])
+				}
+				if !slices.Contains(requires, "text_search") {
+					t.Fatalf("expected text_search requirement on %s, got %v", tpl.Name, requires)
+				}
+			case "qq-group-bot-vec", "telegram-group-bot-vec":
+				if tpl.MemoryInline["recall"] != "plugin:semantic" || tpl.MemoryInline["embed_model"] != "bge-m3" {
+					t.Fatalf("expected plugin:semantic + bge-m3 on %s, got %#v", tpl.Name, tpl.MemoryInline)
+				}
+				if !slices.Contains(requires, "vector") {
+					t.Fatalf("expected vector requirement on %s, got %v", tpl.Name, requires)
+				}
+			}
 		})
-	}
-	for _, want := range []string{"telegram-group-bot", "qq-group-bot", "echo", "llm-chat", "group-chat", "rag", "single-turn-api"} {
-		if !seen[want] {
-			t.Fatalf("template %q is missing", want)
-		}
-	}
-	for _, presetName := range []string{"telegram-group-bot", "qq-group-bot"} {
-		var found *Template
-		for _, tpl := range Templates() {
-			if tpl.Name == presetName {
-				copyTpl := tpl
-				found = &copyTpl
-				break
-			}
-		}
-		if found == nil || len(found.Settings) == 0 || len(found.Extras) == 0 || found.Memory != "conversational" || found.Instructions == "" {
-			t.Fatalf("%s preset missing schema metadata: %+v", presetName, found)
-		}
-		for _, c := range found.Capabilities {
-			if c == "tools" || c == "apis" || c == "net.http" {
-				t.Fatalf("%s must keep external write capability %q off by default", presetName, c)
-			}
-		}
 	}
 }

@@ -75,9 +75,13 @@ type JournalFilter struct {
 	UserUUID  string
 	SessionID string
 	Direction string // "in" | "out" | ""
-	Since     int64  // unix seconds, inclusive
-	Until     int64  // unix seconds, exclusive (0 = now)
-	Limit     int    // default 100, capped at 1000
+	Channel   string
+	Agent     string
+	Chat      string
+	Status    string
+	Since     int64 // unix seconds, inclusive
+	Until     int64 // unix seconds, exclusive (0 = now)
+	Limit     int   // default 100, capped at 1000
 }
 
 // ListMessages returns journal rows matching the filter, newest first. It is
@@ -104,6 +108,22 @@ func (s *sqliteStore) ListMessages(ctx context.Context, f JournalFilter) ([]Jour
 	if f.Direction != "" {
 		where = append(where, "direction = ?")
 		args = append(args, f.Direction)
+	}
+	if f.Channel != "" {
+		where = append(where, "channel = ?")
+		args = append(args, f.Channel)
+	}
+	if f.Agent != "" {
+		where = append(where, "agent = ?")
+		args = append(args, f.Agent)
+	}
+	if f.Chat != "" {
+		where = append(where, "chat = ?")
+		args = append(args, f.Chat)
+	}
+	if f.Status != "" {
+		where = append(where, "status = ?")
+		args = append(args, f.Status)
 	}
 	if f.Since > 0 {
 		where = append(where, "ts >= ?")

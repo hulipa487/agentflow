@@ -447,7 +447,72 @@ func (b *Broker) subscribeLive(sessionKey string) (<-chan session.TraceEvent, fu
 
 // TraceSnapshot returns the buffered events for a studio thread.
 func (b *Broker) TraceSnapshot(agent, thread string) []session.TraceEvent {
-	return b.ringFor(agent + "|" + ChannelName + ":" + thread).snapshot()
+	return b.SessionTraceSnapshot(agent + "|" + ChannelName + ":" + thread)
+}
+
+// SessionTraceSnapshot returns buffered trace events for any session key
+// without allocating a new ring when the session has not recorded traces yet.
+func (b *Broker) SessionTraceSnapshot(sessionKey string) []session.TraceEvent {
+	b.mu.Lock()
+	r := b.rings[sessionKey]
+	b.mu.Unlock()
+	if r == nil {
+		return []session.TraceEvent{}
+	}
+	return r.snapshot()
+}
+
+// HasTrace reports whether the session currently holds buffered trace events.
+func (b *Broker) HasTrace(sessionKey string) bool {
+	if sessionKey == "" {
+		return false
+	}
+	b.mu.Lock()
+	r := b.rings[sessionKey]
+	b.mu.Unlock()
+	return r != nil && r.len() > 0
+}
+
+// SessionSummary describes any observed session trace ring across all channels.
+type SessionSummary struct {
+	Session string    `json:"session"`
+	Agent   string    `json:"agent"`
+	Channel string    `json:"channel,omitempty"`
+	Chat    string    `json:"chat,omitempty"`
+	Last    time.Time `json:"last"`
+	Events  int       `json:"events"`
+}
+
+// Sessions lists all observed trace rings (Studio and external channels),
+// ordered most recently active first.
+func (b *Broker) Sessions() []SessionSummary {
+	b.mu.Lock()
+	type item struct {
+		key  string
+		at   time.Time
+		ring *ring
+	}
+	items := make([]item, 0, len(b.rings))
+	for k, r := range b.rings {
+		items = append(items, item{key: k, at: b.last[k], ring: r})
+	}
+	b.mu.Unlock()
+
+	out := make([]SessionSummary, 0, len(items))
+	for _, it := range items {
+		agent, rest, _ := strings.Cut(it.key, "|")
+		channel, chat, _ := strings.Cut(rest, ":")
+		out = append(out, SessionSummary{
+			Session: it.key,
+			Agent:   agent,
+			Channel: channel,
+			Chat:    chat,
+			Last:    it.at,
+			Events:  it.ring.len(),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Last.After(out[j].Last) })
+	return out
 }
 
 // Thread is one observed studio session.

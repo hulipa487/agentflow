@@ -192,3 +192,48 @@ function loop() {
 		t.Fatalf("expected failing result, got %+v", failRes)
 	}
 }
+
+func TestScenarioExtrasPayloadAndSessionSkip(t *testing.T) {
+	sc := &Scenario{
+		Agent:  "group-bot",
+		Extras: map[string]any{"trigger_phrase": "!bot"},
+		LoopSource: `// af-prelude-version: 2
+function loop() {
+  while (true) {
+    const msg = session.inbox();
+    const extras = ((agent.config() || {}).extras || {}) as Record<string, unknown>;
+    const p = (msg.payload || {}) as Record<string, unknown>;
+    const phrase = String(extras.trigger_phrase || "");
+    if (p.mentioned !== true && !(phrase && (msg.text || "").includes(phrase))) {
+      session.skip("not_mentioned");
+      continue;
+    }
+    session.send(msg.channel + ":" + msg.text);
+  }
+}
+`,
+		Messages: []Input{
+			{From: "alice", Channel: "telegram", Text: "random chatter", Payload: map[string]any{"chat_type": "supergroup", "mentioned": false}},
+			{From: "bob", Channel: "telegram", Text: "!bot status", Payload: map[string]any{"chat_type": "supergroup", "mentioned": false}},
+		},
+		Expect:    []string{"telegram:!bot status"},
+		ExpectOps: []string{"session.skip"},
+	}
+
+	res, err := RunWithResult(context.Background(), sc)
+	if err != nil {
+		t.Fatalf("RunWithResult: %v", err)
+	}
+	if !res.OK {
+		t.Fatalf("expected OK=true, got err=%q assertions=%+v", res.Error, res.Assertions)
+	}
+	var sawSkip bool
+	for _, ev := range res.Events {
+		if ev.Kind == "turn.skip" && ev.Text == "not_mentioned" {
+			sawSkip = true
+		}
+	}
+	if !sawSkip {
+		t.Fatalf("expected turn.skip event in trace, got %+v", res.Events)
+	}
+}

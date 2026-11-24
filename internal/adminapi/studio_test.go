@@ -12,11 +12,13 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"agentflow/internal/config"
 	"agentflow/internal/core/execguard"
 	"agentflow/internal/core/gateway"
 	"agentflow/internal/core/pool"
+	"agentflow/internal/core/runtime"
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/studio"
 	"agentflow/internal/core/supervisor"
@@ -516,5 +518,98 @@ func TestStudioApprovalsAPI(t *testing.T) {
 	res = do(t, f.ui.API(), "POST", "/admin/api/studio/approvals/no-such-id/decision", map[string]any{"approve": true})
 	if res.Code != http.StatusNotFound {
 		t.Fatalf("missing id code = %d, want 404: %s", res.Code, res.Body.String())
+	}
+}
+
+func TestStudioEventsAndSessionTrace(t *testing.T) {
+	f := newStudioFixture(t)
+	ctx := context.Background()
+	rt, err := runtime.OpenSQLite(filepath.Join(t.TempDir(), "runtime.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rt.Close() })
+	f.ui.deps.Journal = rt
+
+	now := time.Now().Unix()
+	entries := []runtime.JournalEntry{
+		{ID: "e1", Ts: now - 40, Direction: "in", Status: "routed", Channel: "telegram", Chat: "-1001", Sender: "alice", Agent: "support", SessionID: "support|telegram:-1001", Text: "hello group"},
+		{ID: "e2", Ts: now - 30, Direction: "out", Status: "ignored", Channel: "telegram", Chat: "-1001", Agent: "support", SessionID: "support|telegram:-1001", Text: "not_mentioned", Err: "not_mentioned"},
+		{ID: "e3", Ts: now - 20, Direction: "out", Status: "delivered", Channel: "telegram", Chat: "-1001", Agent: "support", SessionID: "support|telegram:-1001", Text: "hi @alice"},
+		{ID: "e4", Ts: now - 10, Direction: "in", Status: "dropped_allowlist", Channel: "telegram", Chat: "-1002", Sender: "mallory", Agent: "sales", Text: "blocked", Err: "allow_users"},
+		{ID: "e5", Ts: now - 5, Direction: "out", Status: "blocked_safety", Channel: "webhook", Chat: "w1", Agent: "support", SessionID: "support|webhook:w1", Text: "", Err: "pii"},
+	}
+	for _, e := range entries {
+		if err := rt.RecordMessage(ctx, e); err != nil {
+			t.Fatalf("record %s: %v", e.ID, err)
+		}
+	}
+
+	// Trace an external telegram session in the broker.
+	f.broker.Trace(session.TraceEvent{SessionID: "support|telegram:-1001", Agent: "support", Kind: "turn.skip", Text: "not_mentioned", OK: true})
+
+	// 1. Filter by chat and check has_trace + outcome mapping.
+	res := do(t, f.ui.API(), "GET", "/admin/api/studio/events?channel=telegram&chat=-1001", nil)
+	if res.Code != http.StatusOK {
+		t.Fatalf("events code = %d: %s", res.Code, res.Body.String())
+	}
+	var evResp struct {
+		OK     bool              `json:"ok"`
+		Events []studioEventView `json:"events"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &evResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(evResp.Events) != 3 {
+		t.Fatalf("events = %+v, want 3", evResp.Events)
+	}
+	if !evResp.Events[0].HasTrace || evResp.Events[0].Outcome != "answered" {
+		t.Fatalf("newest event = %+v", evResp.Events[0])
+	}
+	if evResp.Events[1].Outcome != "ignored" || evResp.Events[2].Outcome != "received" {
+		t.Fatalf("outcomes = %+v", evResp.Events)
+	}
+
+	// 2. status=dropped matches dropped_* and blocked_* across agents.
+	res = do(t, f.ui.API(), "GET", "/admin/api/studio/events?status=dropped", nil)
+	if res.Code != http.StatusOK {
+		t.Fatalf("dropped events code = %d: %s", res.Code, res.Body.String())
+	}
+	evResp.Events = nil
+	if err := json.Unmarshal(res.Body.Bytes(), &evResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(evResp.Events) != 2 || evResp.Events[0].ID != "e5" || evResp.Events[1].ID != "e4" {
+		t.Fatalf("dropped events = %+v", evResp.Events)
+	}
+
+	// 3. status=ignored&agent=support filters accurately.
+	res = do(t, f.ui.API(), "GET", "/admin/api/studio/events?status=ignored&agent=support", nil)
+	evResp.Events = nil
+	_ = json.Unmarshal(res.Body.Bytes(), &evResp)
+	if len(evResp.Events) != 1 || evResp.Events[0].ID != "e2" {
+		t.Fatalf("ignored support events = %+v", evResp.Events)
+	}
+
+	// 4. session-trace endpoint returns trace for external telegram session and error on missing param.
+	res = do(t, f.ui.API(), "GET", "/admin/api/studio/session-trace?session=support|telegram:-1001", nil)
+	if res.Code != http.StatusOK {
+		t.Fatalf("session-trace code = %d: %s", res.Code, res.Body.String())
+	}
+	var trResp struct {
+		OK      bool                 `json:"ok"`
+		Session string               `json:"session"`
+		Events  []session.TraceEvent `json:"events"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &trResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(trResp.Events) != 1 || trResp.Events[0].Kind != "turn.skip" {
+		t.Fatalf("trace events = %+v", trResp.Events)
+	}
+
+	res = do(t, f.ui.API(), "GET", "/admin/api/studio/session-trace", nil)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("missing session expected 400, got %d", res.Code)
 	}
 }

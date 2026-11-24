@@ -105,6 +105,19 @@ type ChannelList struct {
 	Note     string        `json:"note"`
 }
 
+// ChannelHooks connects persisted Studio channel edits to runtime drivers
+// that support hot reload (such as Telegram long polling).
+type ChannelHooks struct {
+	Apply  func(saved []config.Channel, changed *config.Channel, deletedName string) (bool, error)
+	IsLive func(ch config.Channel) (live bool, known bool)
+}
+
+// ChannelApplyResult reports whether a saved edit took effect without restart.
+type ChannelApplyResult struct {
+	Applied bool
+	Note    string
+}
+
 // Channels persists the deployment's gateway channels. Channels bind at boot,
 // so a save is durable but does not change the running listeners: the API
 // reports restart_required, and the desktop app says so.
@@ -115,6 +128,30 @@ type Channels struct {
 	configPath string
 	agentNames func() []string
 	log        *slog.Logger
+	hooks      ChannelHooks
+}
+
+// SetHooks installs runtime hooks for live-reloading supported channels.
+func (c *Channels) SetHooks(h ChannelHooks) {
+	c.mu.Lock()
+	c.hooks = h
+	c.mu.Unlock()
+}
+
+// RawToken returns the persisted token and optional API base for one channel
+// so an authenticated admin test endpoint can check a saved bot token without
+// returning the secret to the client.
+func (c *Channels) RawToken(index int) (token, apiBase string, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	raw, err := c.readRaw()
+	if err != nil {
+		return "", "", err
+	}
+	if index < 0 || index >= len(raw) {
+		return "", "", fmt.Errorf("channel #%d does not exist", index+1)
+	}
+	return raw[index].Token, raw[index].APIBase, nil
 }
 
 // NewChannels builds the store. agentNames should return the live agent names
@@ -206,6 +243,11 @@ func (c *Channels) view(i int, ch config.Channel) ChannelView {
 // persisted definition. Secrets cannot be compared (the boot config has them
 // resolved), so a secret-only edit is covered by the list's restart note.
 func (c *Channels) live(i int, raw config.Channel) bool {
+	if c.hooks.IsLive != nil {
+		if live, known := c.hooks.IsLive(raw); known {
+			return live
+		}
+	}
 	if c.cfg == nil || i >= len(c.cfg.Gateway.Channels) {
 		return false
 	}
@@ -279,66 +321,112 @@ func (c *Channels) Validate(index int, d ChannelDraft) []string {
 // Save replaces (index >= 0) or appends (index < 0) a channel and persists the
 // list. expectMTime guards against clobbering a hand edit.
 func (c *Channels) Save(index int, d ChannelDraft, expectMTime int64) (ChannelList, error) {
+	list, _, err := c.SaveLive(index, d, expectMTime)
+	return list, err
+}
+
+// SaveLive validates, writes, and notifies runtime channel hooks when supported.
+func (c *Channels) SaveLive(index int, d ChannelDraft, expectMTime int64) (ChannelList, ChannelApplyResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	path := c.sourcePath()
 	if path == "" {
-		return ChannelList{}, errors.New("this instance has no editable config file")
+		return ChannelList{}, ChannelApplyResult{}, errors.New("this instance has no editable config file")
 	}
 	if expectMTime > 0 {
 		if st, err := os.Stat(path); err == nil && st.ModTime().UnixNano() != expectMTime {
-			return ChannelList{}, ErrChannelConflict
+			return ChannelList{}, ChannelApplyResult{}, ErrChannelConflict
 		} else if err != nil && !os.IsNotExist(err) {
-			return ChannelList{}, err
+			return ChannelList{}, ChannelApplyResult{}, err
 		}
 	}
 	raw, err := c.readRaw()
 	if err != nil {
-		return ChannelList{}, err
+		return ChannelList{}, ChannelApplyResult{}, err
 	}
 	list, err := c.merged(raw, index, d)
 	if err != nil {
-		return ChannelList{}, err
+		return ChannelList{}, ChannelApplyResult{}, err
 	}
 	if err := config.ValidateStudioChannels(c.validationConfig(), list); err != nil {
-		return ChannelList{}, err
+		return ChannelList{}, ChannelApplyResult{}, err
 	}
 	if err := c.write(list); err != nil {
-		return ChannelList{}, err
+		return ChannelList{}, ChannelApplyResult{}, err
 	}
-	return c.listLocked()
+	var outcome ChannelApplyResult
+	if c.hooks.Apply != nil && len(list) > 0 {
+		pos := index
+		if pos < 0 || pos >= len(list) {
+			pos = len(list) - 1
+		}
+		changed := list[pos]
+		applied, applyErr := c.hooks.Apply(list, &changed, "")
+		if applyErr != nil {
+			c.log.Warn("channel live apply failed", "channel", changed.Name, "err", applyErr)
+			outcome.Note = "saved to config, but live activation failed: " + applyErr.Error()
+		} else if applied {
+			outcome.Applied = true
+			outcome.Note = "saved and active now"
+		}
+	}
+	outList, err := c.listLocked()
+	return outList, outcome, err
 }
 
 // Delete removes a channel by index and persists the remaining list.
 func (c *Channels) Delete(index int, expectMTime int64) (ChannelList, error) {
+	list, _, err := c.DeleteLive(index, expectMTime)
+	return list, err
+}
+
+// DeleteLive removes a channel by index, persists the list, and stops live
+// listeners for supported channels.
+func (c *Channels) DeleteLive(index int, expectMTime int64) (ChannelList, ChannelApplyResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	path := c.sourcePath()
 	if path == "" {
-		return ChannelList{}, errors.New("this instance has no editable config file")
+		return ChannelList{}, ChannelApplyResult{}, errors.New("this instance has no editable config file")
 	}
 	if expectMTime > 0 {
 		if st, err := os.Stat(path); err == nil && st.ModTime().UnixNano() != expectMTime {
-			return ChannelList{}, ErrChannelConflict
+			return ChannelList{}, ChannelApplyResult{}, ErrChannelConflict
 		} else if err != nil && !os.IsNotExist(err) {
-			return ChannelList{}, err
+			return ChannelList{}, ChannelApplyResult{}, err
 		}
 	}
 	raw, err := c.readRaw()
 	if err != nil {
-		return ChannelList{}, err
+		return ChannelList{}, ChannelApplyResult{}, err
 	}
 	if index < 0 || index >= len(raw) {
-		return ChannelList{}, fmt.Errorf("channel #%d does not exist", index+1)
+		return ChannelList{}, ChannelApplyResult{}, fmt.Errorf("channel #%d does not exist", index+1)
+	}
+	deletedName := raw[index].Name
+	if deletedName == "" {
+		deletedName = fmt.Sprintf("%s-%d", raw[index].Type, index)
 	}
 	list := append(append([]config.Channel(nil), raw[:index]...), raw[index+1:]...)
 	if err := config.ValidateStudioChannels(c.validationConfig(), list); err != nil {
-		return ChannelList{}, err
+		return ChannelList{}, ChannelApplyResult{}, err
 	}
 	if err := c.write(list); err != nil {
-		return ChannelList{}, err
+		return ChannelList{}, ChannelApplyResult{}, err
 	}
-	return c.listLocked()
+	var outcome ChannelApplyResult
+	if c.hooks.Apply != nil {
+		applied, applyErr := c.hooks.Apply(list, nil, deletedName)
+		if applyErr != nil {
+			c.log.Warn("channel live delete failed", "channel", deletedName, "err", applyErr)
+			outcome.Note = "deleted from config; live stop failed: " + applyErr.Error()
+		} else if applied {
+			outcome.Applied = true
+			outcome.Note = "stopped and deleted"
+		}
+	}
+	outList, err := c.listLocked()
+	return outList, outcome, err
 }
 
 // merged applies the draft to the raw list, preserving secrets that the draft

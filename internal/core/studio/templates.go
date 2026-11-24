@@ -6,13 +6,32 @@ import (
 	"agentflow/internal/vm"
 )
 
+// TemplateSetting describes one starter configuration field surfaced in
+// Studio's Builder UI and stored inside the agent's extras map.
+type TemplateSetting struct {
+	Key         string   `json:"key"`
+	Label       string   `json:"label"`
+	Description string   `json:"description,omitempty"`
+	Type        string   `json:"type"` // bool | number | string | select
+	Default     any      `json:"default"`
+	Min         *float64 `json:"min,omitempty"`
+	Max         *float64 `json:"max,omitempty"`
+	Placeholder string   `json:"placeholder,omitempty"`
+	Options     []string `json:"options,omitempty"`
+}
+
 // Template is a starter loop the builder offers. Every template carries the
 // current prelude version, so a loop created from one loads without an edit.
 type Template struct {
-	Name        string `json:"name"`
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	Loop        string `json:"loop"`
+	Name         string            `json:"name"`
+	Title        string            `json:"title"`
+	Description  string            `json:"description"`
+	Capabilities []string          `json:"capabilities,omitempty"`
+	Memory       string            `json:"memory,omitempty"`
+	Instructions string            `json:"instructions,omitempty"`
+	Extras       map[string]any    `json:"extras,omitempty"`
+	Settings     []TemplateSetting `json:"settings,omitempty"`
+	Loop         string            `json:"loop"`
 }
 
 // Templates returns the starter loops. They are deliberately small and use
@@ -20,7 +39,273 @@ type Template struct {
 // exercised before it is persisted.
 func Templates() []Template {
 	directive := fmt.Sprintf("// af-prelude-version: %d\n", vm.PreludeVersion)
+	f64 := func(v float64) *float64 { return &v }
 	return []Template{
+		{
+			Name:         "telegram-group-bot",
+			Title:        "Telegram group bot",
+			Description:  "Flagship group assistant: answers @-mentions, replies, or an optional trigger phrase, enforces cooldowns, keeps each group's context separate with explicit retention, and stays quiet otherwise.",
+			Capabilities: []string{"llm.chat", "memory", "session.state"},
+			Memory:       "conversational",
+			Instructions: "You are a concise, helpful member of a Telegram group chat. Answer clearly, match the user's language, and admit when you are unsure instead of guessing.",
+			Extras: map[string]any{
+				"respond_on_mention": true,
+				"respond_on_reply":   true,
+				"respond_in_dm":      true,
+				"trigger_phrase":     "",
+				"cooldown_sec":       15,
+				"store_all_messages": false,
+				"retention_turns":    20,
+			},
+			Settings: []TemplateSetting{
+				{
+					Key:         "respond_on_mention",
+					Label:       "Reply on @-mention",
+					Description: "Answer when a group member @-mentions the bot or invokes a bot command.",
+					Type:        "bool",
+					Default:     true,
+				},
+				{
+					Key:         "respond_on_reply",
+					Label:       "Reply when replied to",
+					Description: "Answer when a group member replies directly to one of the bot's messages.",
+					Type:        "bool",
+					Default:     true,
+				},
+				{
+					Key:         "respond_in_dm",
+					Label:       "Reply in direct messages",
+					Description: "Answer private 1-on-1 messages sent directly to the bot.",
+					Type:        "bool",
+					Default:     true,
+				},
+				{
+					Key:         "trigger_phrase",
+					Label:       "Trigger phrase",
+					Description: "Optional case-insensitive keyword or prefix (for example !bot or help:) that wakes the bot without an @-mention.",
+					Type:        "string",
+					Default:     "",
+					Placeholder: "!bot",
+				},
+				{
+					Key:         "cooldown_sec",
+					Label:       "Group cooldown (seconds)",
+					Description: "Minimum gap between bot replies in the same group. 0 disables cooldown.",
+					Type:        "number",
+					Default:     15,
+					Min:         f64(0),
+					Max:         f64(3600),
+				},
+				{
+					Key:         "store_all_messages",
+					Label:       "Remember ignored group messages",
+					Description: "When off, only turns where the bot replied enter group context and memory.",
+					Type:        "bool",
+					Default:     false,
+				},
+				{
+					Key:         "retention_turns",
+					Label:       "Context window (turns)",
+					Description: "How many recent turns per group stay in working context.",
+					Type:        "number",
+					Default:     20,
+					Min:         f64(1),
+					Max:         f64(200),
+				},
+			},
+			Loop: directive + `interface GroupTurn {
+  who: string;
+  text: string;
+  reply: string;
+}
+
+interface GroupSettings {
+  respond_on_mention: boolean;
+  respond_on_reply: boolean;
+  respond_in_dm: boolean;
+  trigger_phrase: string;
+  cooldown_sec: number;
+  store_all_messages: boolean;
+  retention_turns: number;
+}
+
+function readBoolSetting(extras: Record<string, unknown>, key: string, fallback: boolean): boolean {
+  return typeof extras[key] === "boolean" ? (extras[key] as boolean) : fallback;
+}
+
+function readNumSetting(extras: Record<string, unknown>, key: string, fallback: number, min: number): number {
+  const val = Number(extras[key]);
+  return Number.isFinite(val) && val >= min ? val : fallback;
+}
+
+function readSettings(): GroupSettings {
+  const extras = ((agent.config() || {}).extras || {}) as Record<string, unknown>;
+  return {
+    respond_on_mention: readBoolSetting(extras, "respond_on_mention", true),
+    respond_on_reply: readBoolSetting(extras, "respond_on_reply", true),
+    respond_in_dm: readBoolSetting(extras, "respond_in_dm", true),
+    trigger_phrase: typeof extras.trigger_phrase === "string" ? extras.trigger_phrase.trim() : "",
+    cooldown_sec: readNumSetting(extras, "cooldown_sec", 15, 0),
+    store_all_messages: readBoolSetting(extras, "store_all_messages", false),
+    retention_turns: Math.max(1, Math.floor(readNumSetting(extras, "retention_turns", 20, 1))),
+  };
+}
+
+function loadTurns(): GroupTurn[] {
+  try {
+    const v = session.state.get("turns");
+    if (Array.isArray(v)) return v as GroupTurn[];
+  } catch (_) {}
+  return [];
+}
+
+function saveTurns(turns: GroupTurn[], limit: number): void {
+  while (turns.length > limit) turns.shift();
+  try {
+    session.state.set("turns", turns);
+  } catch (_) {}
+}
+
+function loadLastReplyMs(): number {
+  try {
+    const v = Number(session.state.get("last_reply_ms"));
+    return Number.isFinite(v) ? v : 0;
+  } catch (_) {}
+  return 0;
+}
+
+function saveLastReplyMs(ts: number): void {
+  try {
+    session.state.set("last_reply_ms", ts);
+  } catch (_) {}
+}
+
+function rememberTurn(chat: string, who: string, text: string, reply: string): void {
+  try {
+    memory.write({ type: "turn", chat: chat, who: who, text: text, reply: reply });
+  } catch (_) {}
+}
+
+function matchesTrigger(text: string, phrase: string): boolean {
+  if (!phrase) return false;
+  return text.toLowerCase().indexOf(phrase.toLowerCase()) >= 0;
+}
+
+function shouldAnswer(
+  msg: { text?: string; channel?: string; payload?: Record<string, unknown> },
+  cfg: GroupSettings
+): { ok: true; reason: string } | { ok: false; reason: string } {
+  const p = (msg.payload || {}) as Record<string, unknown>;
+  const chatType = String(p.chat_type || "");
+  const isStudio = msg.channel === "studio";
+  const isPrivate = isStudio || chatType === "private" || chatType === "";
+
+  if (isPrivate) {
+    if (!isStudio && !cfg.respond_in_dm) {
+      return { ok: false, reason: "dm_disabled" };
+    }
+    return { ok: true, reason: isStudio ? "studio_test" : "private_chat" };
+  }
+
+  const text = msg.text || "";
+  const mentioned = p.mentioned === true;
+  const replyToBot = p.is_reply_to_bot === true;
+  const triggered = matchesTrigger(text, cfg.trigger_phrase);
+  const matched =
+    (cfg.respond_on_mention && mentioned) ||
+    (cfg.respond_on_reply && replyToBot) ||
+    triggered;
+
+  if (!matched) {
+    return { ok: false, reason: "not_mentioned" };
+  }
+  if (cfg.cooldown_sec > 0) {
+    const elapsed = Date.now() - loadLastReplyMs();
+    if (elapsed >= 0 && elapsed < cfg.cooldown_sec * 1000) {
+      return { ok: false, reason: "cooldown" };
+    }
+  }
+  return { ok: true, reason: triggered ? "trigger_phrase" : replyToBot ? "reply_to_bot" : "mentioned" };
+}
+
+function buildMessages(
+  msg: { text?: string; from?: string; payload?: Record<string, unknown> },
+  cfg: GroupSettings,
+  turns: GroupTurn[],
+  instructions: string,
+  historyBudget: number
+): Array<{ role: string; content: string }> {
+  const p = (msg.payload || {}) as Record<string, unknown>;
+  const who = String(p.name || p.username || msg.from || "member");
+  const chatTitle = String(p.chat_title || "");
+  const replyToText = String(p.reply_to_text || "");
+  const text = msg.text || "";
+
+  let sys = instructions || "You are a concise, helpful member of a Telegram group chat.";
+  if (chatTitle) {
+    sys += "\nGroup: " + chatTitle;
+  }
+
+  // Task 2 customization hook: route support questions to a group-specific knowledge base here.
+  // For example, match support keywords or p.chat_id and prepend memory.recall({ store: "knowledge", ... }) passages.
+
+  const messages: Array<{ role: string; content: string }> = [{ role: "system", content: sys }];
+  const start = Math.max(0, turns.length - cfg.retention_turns);
+  for (let i = start; i < turns.length; i++) {
+    const t = turns[i];
+    messages.push({ role: "user", content: t.who + ": " + t.text });
+    if (t.reply) {
+      messages.push({ role: "assistant", content: t.reply });
+    }
+  }
+  let userLine = who + ": " + text;
+  if (replyToText) {
+    userLine = "[Replying to: " + replyToText + "]\n" + userLine;
+  }
+  messages.push({ role: "user", content: userLine });
+  return token_budget(messages, historyBudget || 6000);
+}
+
+function loop(): void {
+  while (true) {
+    const msg = session.inbox();
+    const cfg = readSettings();
+    const p = (msg.payload || {}) as Record<string, unknown>;
+    const who = String(p.name || p.username || msg.from || "member");
+    const chat = String(p.chat_id || msg.reply_to || "chat");
+    const text = msg.text || "";
+    const turns = loadTurns();
+
+    if (!/\S/.test(text)) {
+      session.skip("empty_message");
+      continue;
+    }
+
+    const decision = shouldAnswer(msg, cfg);
+    if (!decision.ok) {
+      if (cfg.store_all_messages) {
+        turns.push({ who: who, text: text, reply: "" });
+        saveTurns(turns, cfg.retention_turns);
+        rememberTurn(chat, who, text, "");
+      }
+      session.skip(decision.reason);
+      continue;
+    }
+
+    const info = agent.info();
+    const messages = buildMessages(msg, cfg, turns, info.instructions, info.history_budget);
+    const reply = llm.chat(messages);
+    const answer = reply.text || "";
+
+    session.send(answer);
+    saveLastReplyMs(Date.now());
+    turns.push({ who: who, text: text, reply: answer });
+    saveTurns(turns, cfg.retention_turns);
+    rememberTurn(chat, who, text, answer);
+  }
+}
+`,
+		},
 		{
 			Name:        "echo",
 			Title:       "Echo",

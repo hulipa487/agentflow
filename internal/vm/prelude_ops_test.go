@@ -98,6 +98,7 @@ var builderTypes = []struct{ name, call, op string }{
 	{"session.send", `session.send("hi")`, "send"},
 	{"session.push", `session.push("telegram", "1", "hi")`, "session.push"},
 	{"session.push_user", `session.push_user("u_1", "hi")`, "session.push_user"},
+	{"session.skip", `session.skip("cooldown")`, "session.skip"},
 	{"session.exit", `session.exit()`, "session.exit"},
 	{"session.state.set", `session.state.set("k", 1)`, "session.state.set"},
 	{"session.state.get", `session.state.get("k")`, "session.state.get"},
@@ -194,6 +195,14 @@ func TestOpBuildersForwardTheirOptions(t *testing.T) {
 		expr string
 		want map[string]any
 	}{
+		{
+			name: "session.skip carries reason",
+			expr: `session.skip("cooldown")`,
+			want: map[string]any{
+				"type": "session.skip",
+				"text": "cooldown",
+			},
+		},
 		{
 			name: "http.request carries query_params and save_to",
 			expr: `http.request({ url: "https://x", query: { city: "Tokyo" }, save_to: "body.txt", timeout: 5 })`,

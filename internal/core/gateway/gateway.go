@@ -125,6 +125,17 @@ func (r *Registry) Register(d Driver) {
 	r.log.Info("channel registered", "channel", d.Name())
 }
 
+// Unregister removes a channel driver by name from the egress registry.
+func (r *Registry) Unregister(name string) {
+	r.mu.Lock()
+	_, existed := r.drivers[name]
+	delete(r.drivers, name)
+	r.mu.Unlock()
+	if existed {
+		r.log.Info("channel unregistered", "channel", name)
+	}
+}
+
 // Send delivers text to the message's origin channel. A reply to an unknown
 // channel is an error the session should hear about (op failure), not a
 // silent drop.

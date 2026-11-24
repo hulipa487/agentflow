@@ -19,6 +19,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -1705,6 +1706,7 @@ func main() {
 	// lookup serves every actor's egress, and the inbound callback below reads
 	// the same map. A channel with type: openai defaults to metadata, so its
 	// coding context is never written to the audit trail.
+	var journalModesMu sync.RWMutex
 	journalModes := make(map[string]session.JournalMode, len(cfg.Gateway.Channels))
 	for i, ch := range cfg.Gateway.Channels {
 		name := ch.Name
@@ -1713,12 +1715,16 @@ func main() {
 		}
 		journalModes[name] = session.ParseJournalMode(ch.JournalMode())
 	}
-	sup.SetJournalMode(func(channel string) session.JournalMode {
-		if m, ok := journalModes[channel]; ok {
+	journalModeFor := func(channel string) session.JournalMode {
+		journalModesMu.RLock()
+		m, ok := journalModes[channel]
+		journalModesMu.RUnlock()
+		if ok {
 			return m
 		}
 		return session.JournalFull
-	})
+	}
+	sup.SetJournalMode(journalModeFor)
 	if cfg.Audit.AuditEnabled() {
 		if days := cfg.Audit.AuditRetention(); days > 0 {
 			prune := func() {
@@ -1737,6 +1743,10 @@ func main() {
 		}
 		sup.EgressJournal = func(rec session.EgressRecord) {
 			errStr := rec.Err
+			entryType := "agent"
+			if rec.Status == "ignored" {
+				entryType = "skip"
+			}
 			entry := runtime.JournalEntry{
 				ID:              rec.InReplyTo,
 				Direction:       "out",
@@ -1747,7 +1757,7 @@ func main() {
 				UserUUID:        rec.UserUUID,
 				Agent:           rec.Agent,
 				SessionID:       rec.SessionID,
-				Type:            "agent",
+				Type:            entryType,
 				Text:            rec.Text,
 				Attachments:     rec.Attachments,
 				TextBytes:       rec.TextBytes,
@@ -1820,7 +1830,7 @@ func main() {
 			if msg.Provenance != nil && msg.Provenance.UserUUID != nil {
 				userUUID = *msg.Provenance.UserUUID
 			}
-			mode := journalModes[in.Channel]
+			mode := journalModeFor(in.Channel)
 			if mode == session.JournalOff {
 				return
 			}
@@ -1958,7 +1968,68 @@ func main() {
 			"linkable", identReg.LinkableChannels(),
 			"cors_origins", len(cfg.Runtime.Users.CORSOrigins))
 	}
-	var telegramDrivers []*telegram.Driver
+	type tgBootEntry struct {
+		name string
+		ch   config.Channel
+		d    *telegram.Driver
+	}
+	type liveTGEntry struct {
+		ch     config.Channel
+		cancel context.CancelFunc
+	}
+	isTGPolling := func(ch config.Channel) bool {
+		return ch.Type == "telegram" && (ch.Mode == "" || ch.Mode == "polling")
+	}
+	channelNameAt := func(i int, ch config.Channel) string {
+		if ch.Name != "" {
+			return ch.Name
+		}
+		return fmt.Sprintf("%s-%d", ch.Type, i)
+	}
+	buildTelegramDriver := func(name string, ch config.Channel) (*telegram.Driver, string, bool) {
+		token, ok := credResolver.Resolve(ctx, ch.Token)
+		if !ok {
+			return nil, "token", false
+		}
+		secretToken, ok := credResolver.Resolve(ctx, ch.SecretToken)
+		if !ok {
+			return nil, "secret_token", false
+		}
+		mpol, mok := mediaPol(ch)
+		var mstore media.Store
+		if mok {
+			mstore = mediaStore
+		}
+		d := telegram.New(name, token, ch.Agent, ch.Mode, ch.AllowUsers, ch.Path, cfg.Gateway.PublicURL, secretToken, sink, httpSrv, mstore, mpol, log)
+		d.SetMedia(mediaSvc)
+		if cfg.Audit.AuditEnabled() {
+			d.OnDrop = func(channel, agent, chatID, sender, text, reason string) {
+				mode := journalModeFor(channel)
+				if mode == session.JournalOff {
+					return
+				}
+				t := text
+				if !mode.AllowsText() {
+					t = ""
+				}
+				_ = journalSink.RecordMessage(ctx, runtime.JournalEntry{
+					ID:        uuid.NewString(),
+					Direction: "in",
+					Status:    "dropped_allowlist",
+					Channel:   channel,
+					Chat:      chatID,
+					Sender:    sender,
+					Agent:     agent,
+					Text:      t,
+					TextBytes: len(text),
+					Err:       reason,
+				})
+			}
+		}
+		return d, "", true
+	}
+
+	var telegramDrivers []tgBootEntry
 	var qqDrivers []*qqbot.Driver
 	var feishuDrivers []*feishu.Driver
 	var wecomDrivers []*wecom.Driver
@@ -1994,22 +2065,18 @@ func main() {
 			d := webhook.New(name, ch.Path, ch.Agent, sink, httpSrv, mstore, mpol, wopts, netPolicy, log)
 			gw.Register(d)
 		case "telegram":
-			token, ok := credResolver.Resolve(ctx, ch.Token)
+			d, missingField, ok := buildTelegramDriver(name, ch)
 			if !ok {
+				rawField := ch.Token
+				if missingField == "secret_token" {
+					rawField = ch.SecretToken
+				}
 				log.Warn("channel skipped: unresolved credential",
-					"channel", name, "field", "token", "credential", config.CredentialName(ch.Token))
+					"channel", name, "field", missingField, "credential", config.CredentialName(rawField))
 				continue
 			}
-			secretToken, ok := credResolver.Resolve(ctx, ch.SecretToken)
-			if !ok {
-				log.Warn("channel skipped: unresolved credential",
-					"channel", name, "field", "secret_token", "credential", config.CredentialName(ch.SecretToken))
-				continue
-			}
-			d := telegram.New(name, token, ch.Agent, ch.Mode, ch.AllowUsers, ch.Path, cfg.Gateway.PublicURL, secretToken, sink, httpSrv, mstore, mpol, log)
-			d.SetMedia(mediaSvc)
 			gw.Register(d)
-			telegramDrivers = append(telegramDrivers, d)
+			telegramDrivers = append(telegramDrivers, tgBootEntry{name: name, ch: ch, d: d})
 		case "qq":
 			if mediaSvc == nil || !mediaSvc.CanPresign() {
 				log.Warn("channel skipped: qq requires public media URLs — configure media.backend: s3 or media.temp_url.enabled: true (with gateway.public_url)",
@@ -2196,11 +2263,113 @@ func main() {
 		log.Error("httpd server failed to start", "listen", cfg.Gateway.Listen, "err", err)
 		exit(1)
 	}
-	for _, d := range telegramDrivers {
-		if err := d.Start(ctx); err != nil {
-			log.Error("channel start failed", "channel", d.Name(), "err", err)
+	var liveTGMu sync.Mutex
+	liveTG := map[string]liveTGEntry{}
+	for _, entry := range telegramDrivers {
+		if isTGPolling(entry.ch) {
+			tgCtx, tgCancel := context.WithCancel(ctx)
+			if err := entry.d.Start(tgCtx); err != nil {
+				tgCancel()
+				log.Error("channel start failed", "channel", entry.name, "err", err)
+				exit(1)
+			}
+			liveTG[entry.name] = liveTGEntry{ch: entry.ch, cancel: tgCancel}
+			continue
+		}
+		if err := entry.d.Start(ctx); err != nil {
+			log.Error("channel start failed", "channel", entry.name, "err", err)
 			exit(1)
 		}
+	}
+	if channelsStore != nil {
+		normTGMode := func(m string) string {
+			if m == "" {
+				return "polling"
+			}
+			return m
+		}
+		channelsStore.SetHooks(studio.ChannelHooks{
+			Apply: func(saved []config.Channel, changed *config.Channel, deletedName string) (bool, error) {
+				journalModesMu.Lock()
+				nextModes := make(map[string]session.JournalMode, len(saved))
+				for i, c := range saved {
+					nextModes[channelNameAt(i, c)] = session.ParseJournalMode(c.JournalMode())
+				}
+				journalModes = nextModes
+				journalModesMu.Unlock()
+
+				liveTGMu.Lock()
+				defer liveTGMu.Unlock()
+				desired := make(map[string]config.Channel)
+				changedName := ""
+				for i, c := range saved {
+					n := channelNameAt(i, c)
+					if isTGPolling(c) {
+						desired[n] = c
+					}
+					if changed != nil && changed.Name != "" && n == changed.Name {
+						changedName = n
+					}
+				}
+				if changedName == "" && changed != nil {
+					changedName = changed.Name
+				}
+				var stoppedDeleted bool
+				for name, cur := range liveTG {
+					if _, keep := desired[name]; !keep {
+						cur.cancel()
+						gw.Unregister(name)
+						delete(liveTG, name)
+						if deletedName != "" && name == deletedName {
+							stoppedDeleted = true
+						}
+					}
+				}
+				if changed == nil {
+					return stoppedDeleted, nil
+				}
+				if !isTGPolling(*changed) {
+					return false, nil
+				}
+				if cur, ok := liveTG[changedName]; ok {
+					cur.cancel()
+					gw.Unregister(changedName)
+					delete(liveTG, changedName)
+				}
+				d, missingField, ok := buildTelegramDriver(changedName, *changed)
+				if !ok {
+					return false, fmt.Errorf("unresolved %s credential for telegram channel %q", missingField, changedName)
+				}
+				tgCtx, tgCancel := context.WithCancel(ctx)
+				gw.Register(d)
+				if err := d.Start(tgCtx); err != nil {
+					tgCancel()
+					gw.Unregister(changedName)
+					return false, err
+				}
+				liveTG[changedName] = liveTGEntry{ch: *changed, cancel: tgCancel}
+				return true, nil
+			},
+			IsLive: func(ch config.Channel) (bool, bool) {
+				if !isTGPolling(ch) {
+					return false, false
+				}
+				liveTGMu.Lock()
+				cur, ok := liveTG[ch.Name]
+				liveTGMu.Unlock()
+				if !ok {
+					return false, true
+				}
+				match := cur.ch.Name == ch.Name &&
+					cur.ch.Agent == ch.Agent &&
+					normTGMode(cur.ch.Mode) == normTGMode(ch.Mode) &&
+					cur.ch.Journal == ch.Journal &&
+					slices.Equal(cur.ch.AllowUsers, ch.AllowUsers) &&
+					slices.Equal(cur.ch.Media.Allow, ch.Media.Allow) &&
+					cur.ch.Media.MaxBytes == ch.Media.MaxBytes
+				return match, true
+			},
+		})
 	}
 	for _, d := range qqDrivers {
 		if err := d.Start(ctx); err != nil {
@@ -2345,8 +2514,10 @@ func main() {
 			Safety:     safetyStore,
 			Memory:     memoryStore,
 			Plugins:    pluginsStore,
-			Media:      mediaSvc,
-			Guard:      execGuard,
+			Media:         mediaSvc,
+			Guard:         execGuard,
+			Journal:       journalSink,
+			ResolveSecret: credResolver.Resolve,
 			StudioCatalog: func() studio.Catalog {
 				curCfg := cfg
 				if loaded, err := cfgSource.Load(nil); err == nil && loaded != nil {

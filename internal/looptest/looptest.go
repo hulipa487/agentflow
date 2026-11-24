@@ -37,6 +37,7 @@ type Scenario struct {
 	Instructions string            `yaml:"instructions"`
 	Model        string            `yaml:"model"`
 	Safety       string            `yaml:"safety,omitempty"` // ""|"none" | "default"
+	Extras       map[string]any    `yaml:"extras,omitempty"`
 	Packages     map[string]string `yaml:"packages"`
 	Timeout      string            `yaml:"timeout"`
 	Messages     []Input           `yaml:"messages"`
@@ -59,8 +60,10 @@ type Scenario struct {
 }
 
 type Input struct {
-	From string `yaml:"from"`
-	Text string `yaml:"text"`
+	From    string         `yaml:"from"`
+	Text    string         `yaml:"text"`
+	Channel string         `yaml:"channel,omitempty"`
+	Payload map[string]any `yaml:"payload,omitempty"`
 }
 
 type LLMUsage struct {
@@ -194,12 +197,13 @@ func RunWithResult(ctx context.Context, sc *Scenario) (*Result, error) {
 
 	started := time.Now()
 	rec := &recorder{}
-	tc := &traceCollector{}
 	handlers, ops := scenarioHandlers(sc, rec)
+	tc := &traceCollector{ops: ops}
 	info := &session.Info{
 		Name:         first(sc.Agent, "scenario"),
 		Model:        first(sc.Model, "test-model"),
 		Instructions: &session.StringBox{},
+		Extras:       sc.Extras,
 	}
 	info.Instructions.Store(sc.Instructions)
 	identity := session.Identity{
@@ -234,8 +238,9 @@ func RunWithResult(ctx context.Context, sc *Scenario) (*Result, error) {
 			Type:    "user",
 			From:    "user:" + from,
 			Text:    in.Text,
-			Channel: "test",
+			Channel: first(in.Channel, "test"),
 			ReplyTo: "reply",
+			Payload: in.Payload,
 			Ts:      time.Now().Unix(),
 		}
 		if !waitForTurnOrError(runCtx, tc, turnID, errBefore, timeout) {
@@ -400,10 +405,14 @@ type traceCollector struct {
 	events []session.TraceEvent
 	ended  map[string]bool
 	errs   int
+	ops    *opLog
 }
 
 func (c *traceCollector) record(ev session.TraceEvent) {
 	ev.Seq = c.seq.Add(1)
+	if ev.Kind == "turn.skip" && c.ops != nil {
+		c.ops.add("session.skip")
+	}
 	c.mu.Lock()
 	if c.ended == nil {
 		c.ended = map[string]bool{}
@@ -578,7 +587,7 @@ func scenarioHandlers(sc *Scenario, rec *recorder) (map[string]session.OpHandler
 	}
 	// A few read-only ops are safe to answer generically; anything else is
 	// explicit in the scenario.
-	for _, kind := range []string{"store.query", "store.list", "store.scopes", "files.list", "files.projects"} {
+	for _, kind := range []string{"store.query", "store.list", "store.scopes", "memory.recall", "files.list", "files.projects"} {
 		if _, exists := handlers[kind]; !exists {
 			handlers[kind] = func(ctx context.Context, op session.Op) (string, bool) {
 				log.add(op.Type)
@@ -586,12 +595,56 @@ func scenarioHandlers(sc *Scenario, rec *recorder) (map[string]session.OpHandler
 			}
 		}
 	}
-	for _, kind := range []string{"store.put", "store.delete", "files.put", "files.delete", "files.commit", "files.checkout", "scheduler.every", "scheduler.after", "scheduler.cron", "scheduler.cancel"} {
+	for _, kind := range []string{"store.put", "store.delete", "memory.write", "files.put", "files.delete", "files.commit", "files.checkout", "scheduler.every", "scheduler.after", "scheduler.cron", "scheduler.cancel"} {
 		if _, exists := handlers[kind]; !exists {
 			handlers[kind] = func(ctx context.Context, op session.Op) (string, bool) {
 				log.add(op.Type)
 				return ok(map[string]any{"ok": true, "id": "scenario-timer"})
 			}
+		}
+	}
+	var stateMu sync.Mutex
+	sessionState := map[string]any{}
+	if _, exists := handlers["session.state.get"]; !exists {
+		handlers["session.state.get"] = func(ctx context.Context, op session.Op) (string, bool) {
+			log.add(op.Type)
+			stateMu.Lock()
+			val, found := sessionState[op.Key]
+			stateMu.Unlock()
+			if !found {
+				return "null", true
+			}
+			return ok(val)
+		}
+	}
+	if _, exists := handlers["session.state.set"]; !exists {
+		handlers["session.state.set"] = func(ctx context.Context, op session.Op) (string, bool) {
+			log.add(op.Type)
+			stateMu.Lock()
+			sessionState[op.Key] = op.Value
+			stateMu.Unlock()
+			return `{"ok":true}`, true
+		}
+	}
+	if _, exists := handlers["session.state.delete"]; !exists {
+		handlers["session.state.delete"] = func(ctx context.Context, op session.Op) (string, bool) {
+			log.add(op.Type)
+			stateMu.Lock()
+			delete(sessionState, op.Key)
+			stateMu.Unlock()
+			return `{"ok":true}`, true
+		}
+	}
+	if _, exists := handlers["session.state.list"]; !exists {
+		handlers["session.state.list"] = func(ctx context.Context, op session.Op) (string, bool) {
+			log.add(op.Type)
+			stateMu.Lock()
+			cp := make(map[string]any, len(sessionState))
+			for k, v := range sessionState {
+				cp[k] = v
+			}
+			stateMu.Unlock()
+			return ok(cp)
 		}
 	}
 	_ = rec

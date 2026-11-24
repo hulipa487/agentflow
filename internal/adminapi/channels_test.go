@@ -1,10 +1,12 @@
 package adminapi
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,6 +15,7 @@ import (
 
 	"agentflow/internal/config"
 	"agentflow/internal/core/studio"
+	"agentflow/internal/drivers/telegram"
 )
 
 func channelAPIFixture(t *testing.T) (*UI, string) {
@@ -142,5 +145,93 @@ func TestStudioChannelsAPI(t *testing.T) {
 	list = decodeChannels(t, rec.Body.Bytes())
 	if len(list.Channels) != 0 {
 		t.Fatalf("after delete = %+v", list.Channels)
+	}
+}
+
+func TestStudioTelegramTestEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/botsecret-tok-xyz/getMe":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok": true,
+				"result": map[string]any{
+					"id":                          9901,
+					"is_bot":                      true,
+					"first_name":                  "Group Helper",
+					"username":                    "group_helper_bot",
+					"can_join_groups":             true,
+					"can_read_all_group_messages": false,
+				},
+			})
+		case "/botbad-secret-tok/getMe":
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "description": "Unauthorized: bad-secret-tok"})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	ui, _ := channelAPIFixture(t)
+	ui.deps.ResolveSecret = func(_ context.Context, raw string) (string, bool) {
+		if raw == "credential:tg" {
+			return "secret-tok-xyz", true
+		}
+		return raw, true
+	}
+
+	// Save one telegram channel referencing credential:tg.
+	rec := do(t, ui.API(), http.MethodPost, "/admin/api/studio/channels", map[string]any{
+		"channel": map[string]any{
+			"name": "tg-group", "type": "telegram", "agent": "base", "mode": "polling",
+			"token": "credential:tg",
+		},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save telegram channel: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 1. Test using inline credential ref.
+	rec = do(t, ui.API(), http.MethodPost, "/admin/api/studio/channels/telegram/test", map[string]any{
+		"token":    "secret-tok-xyz",
+		"api_base": srv.URL,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("inline test: %d %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		OK  bool             `json:"ok"`
+		Bot telegram.BotInfo `json:"bot"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK || resp.Bot.Username != "group_helper_bot" || !resp.Bot.PrivacyModeEnabled || resp.Bot.BotID != 9901 {
+		t.Fatalf("unexpected bot info: %+v", resp)
+	}
+
+	// 2. Test using stored channel index (blank token resolved via ResolveSecret) without leaking token.
+	idx := 0
+	rec = do(t, ui.API(), http.MethodPost, "/admin/api/studio/channels/telegram/test", map[string]any{
+		"index":    idx,
+		"api_base": srv.URL,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("saved index test: %d %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "secret-tok-xyz") {
+		t.Fatalf("response leaked resolved token: %s", rec.Body.String())
+	}
+
+	// 3. Invalid token scrubs secret from error text.
+	rec = do(t, ui.API(), http.MethodPost, "/admin/api/studio/channels/telegram/test", map[string]any{
+		"token":    "bad-secret-tok",
+		"api_base": srv.URL,
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for bad token, got %d %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "bad-secret-tok") {
+		t.Fatalf("error leaked token: %s", rec.Body.String())
 	}
 }

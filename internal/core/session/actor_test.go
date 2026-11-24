@@ -329,3 +329,62 @@ function loop() {
 		t.Fatalf("expected approved api run=2, got %q", got)
 	}
 }
+
+func TestSessionSkipRecordsTraceAndIgnoredJournal(t *testing.T) {
+	gw := &fakeGW{}
+	a := New("main|skip",
+		Identity{SessionID: "main|skip", Agent: "main", Capabilities: map[string]bool{}},
+		&Info{Name: "main", HistoryBudget: 100},
+		gw, nil, nil, nil, nil, map[string]OpHandler{}, pool.New(1),
+		slog.New(slog.NewTextHandler(&logBuf{}, nil)))
+
+	var mu sync.Mutex
+	var traces []TraceEvent
+	var egress []EgressRecord
+	a.Tracer = func(ev TraceEvent) {
+		mu.Lock()
+		traces = append(traces, ev)
+		mu.Unlock()
+	}
+	a.Journal = func(rec EgressRecord) {
+		mu.Lock()
+		egress = append(egress, rec)
+		mu.Unlock()
+	}
+	a.LoopSrc = directive() + `
+function loop() {
+  const m = session.inbox();
+  if (m.text === "ignore-me") {
+    session.skip("not_mentioned");
+    return;
+  }
+  session.send("ok:" + m.text);
+}`
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go a.Run(ctx)
+
+	a.Mailbox <- Message{ID: "m1", Type: "user", From: "alice", Text: "ignore-me", Channel: "telegram", ReplyTo: "-1001"}
+	a.Mailbox <- Message{ID: "m2", Type: "user", From: "alice", Text: "hello", Channel: "telegram", ReplyTo: "-1001"}
+
+	waitFor(t, "second message reply", 5*time.Second, func() bool { return len(gw.snapshot()) == 1 })
+	if got := gw.snapshot()[0].text; got != "ok:hello" {
+		t.Fatalf("got send = %q, want ok:hello", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	var sawSkipTrace bool
+	for _, ev := range traces {
+		if ev.Kind == "turn.skip" && ev.Turn == "m1" && ev.Text == "not_mentioned" {
+			sawSkipTrace = true
+		}
+	}
+	if !sawSkipTrace {
+		t.Fatalf("missing turn.skip trace event: %+v", traces)
+	}
+	if len(egress) != 2 || egress[0].Status != "ignored" || egress[0].Err != "not_mentioned" || egress[0].InReplyTo != "m1" {
+		t.Fatalf("unexpected egress journal records: %+v", egress)
+	}
+}

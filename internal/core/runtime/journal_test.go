@@ -86,3 +86,38 @@ func TestJournalPrune(t *testing.T) {
 		t.Fatalf("remaining: %d %v", n, err)
 	}
 }
+
+func TestJournalFilterByChannelAgentChatStatus(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	now := time.Now().Unix()
+
+	rows := []JournalEntry{
+		{ID: "j1", Ts: now - 30, Direction: "in", Status: "routed", Channel: "telegram", Chat: "-1001", Agent: "support", Text: "hi"},
+		{ID: "j2", Ts: now - 20, Direction: "out", Status: "ignored", Channel: "telegram", Chat: "-1001", Agent: "support", Text: "cooldown", Err: "cooldown"},
+		{ID: "j3", Ts: now - 10, Direction: "in", Status: "dropped_allowlist", Channel: "telegram", Chat: "-1002", Agent: "sales", Text: "blocked", Err: "allow_users"},
+		{ID: "j4", Ts: now - 5, Direction: "in", Status: "routed", Channel: "webhook", Chat: "w1", Agent: "support", Text: "hook"},
+	}
+	for _, r := range rows {
+		if err := s.RecordMessage(ctx, r); err != nil {
+			t.Fatalf("record %s: %v", r.ID, err)
+		}
+	}
+
+	byChan, err := s.ListMessages(ctx, JournalFilter{Channel: "telegram"})
+	if err != nil || len(byChan) != 3 {
+		t.Fatalf("by Channel = %+v, err=%v", byChan, err)
+	}
+	byAgent, err := s.ListMessages(ctx, JournalFilter{Agent: "sales"})
+	if err != nil || len(byAgent) != 1 || byAgent[0].ID != "j3" {
+		t.Fatalf("by Agent = %+v, err=%v", byAgent, err)
+	}
+	byChat, err := s.ListMessages(ctx, JournalFilter{Chat: "-1001"})
+	if err != nil || len(byChat) != 2 {
+		t.Fatalf("by Chat = %+v, err=%v", byChat, err)
+	}
+	byStatus, err := s.ListMessages(ctx, JournalFilter{Status: "ignored"})
+	if err != nil || len(byStatus) != 1 || byStatus[0].ID != "j2" {
+		t.Fatalf("by Status = %+v, err=%v", byStatus, err)
+	}
+}

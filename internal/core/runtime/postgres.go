@@ -197,6 +197,18 @@ func (s *postgresStore) ListMessages(ctx context.Context, f JournalFilter) ([]Jo
 	if f.Direction != "" {
 		add("direction = $%d", f.Direction)
 	}
+	if f.Channel != "" {
+		add("channel = $%d", f.Channel)
+	}
+	if f.Agent != "" {
+		add("agent = $%d", f.Agent)
+	}
+	if f.Chat != "" {
+		add("chat = $%d", f.Chat)
+	}
+	if f.Status != "" {
+		add("status = $%d", f.Status)
+	}
 	if f.Since > 0 {
 		add("ts >= $%d", f.Since)
 	}

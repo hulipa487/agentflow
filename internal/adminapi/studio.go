@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,6 +24,8 @@ import (
 	"agentflow/internal/config"
 	"agentflow/internal/core/execguard"
 	"agentflow/internal/core/media"
+	"agentflow/internal/core/runtime"
+	"agentflow/internal/core/session"
 	"agentflow/internal/core/studio"
 	"agentflow/internal/core/supervisor"
 	"agentflow/internal/looptest"
@@ -1052,5 +1055,141 @@ func (u *UI) handleStudioApprovalDecision(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":       true,
 		"approval": rec,
+	})
+}
+
+type studioEventView struct {
+	runtime.JournalEntry
+	HasTrace bool   `json:"has_trace"`
+	Outcome  string `json:"outcome"`
+}
+
+func studioEventOutcome(e runtime.JournalEntry) string {
+	status := strings.ToLower(strings.TrimSpace(e.Status))
+	switch {
+	case strings.HasPrefix(status, "dropped"), strings.HasPrefix(status, "blocked"):
+		return "dropped"
+	case status == "ignored":
+		return "ignored"
+	case status == "failed", e.Err != "" && status != "ignored":
+		return "failed"
+	case status == "answered", status == "delivered", e.Direction == "out" && status == "":
+		return "answered"
+	default:
+		return "received"
+	}
+}
+
+// handleStudioEvents returns recent message journal entries annotated with
+// Event Center outcomes and trace-ring availability for live diagnostics.
+func (u *UI) handleStudioEvents(w http.ResponseWriter, r *http.Request) {
+	if u.deps.Journal == nil {
+		writeErr(w, http.StatusServiceUnavailable, "message journal is not enabled on this instance")
+		return
+	}
+	q := r.URL.Query()
+	limit := 100
+	if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n <= 0 {
+			writeErr(w, http.StatusBadRequest, "invalid limit")
+			return
+		}
+		if n > 500 {
+			n = 500
+		}
+		limit = n
+	}
+	var since, until int64
+	if raw := strings.TrimSpace(q.Get("since")); raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid since timestamp")
+			return
+		}
+		since = n
+	}
+	if raw := strings.TrimSpace(q.Get("until")); raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid until timestamp")
+			return
+		}
+		until = n
+	}
+
+	statusParam := strings.TrimSpace(q.Get("status"))
+	f := runtime.JournalFilter{
+		Channel:   strings.TrimSpace(q.Get("channel")),
+		Agent:     strings.TrimSpace(q.Get("agent")),
+		Chat:      strings.TrimSpace(q.Get("chat")),
+		SessionID: strings.TrimSpace(q.Get("session")),
+		Direction: strings.TrimSpace(q.Get("direction")),
+		Since:     since,
+		Until:     until,
+		Limit:     limit,
+	}
+	postFilterOutcome := ""
+	switch statusParam {
+	case "dropped", "answered", "failed", "received":
+		postFilterOutcome = statusParam
+		if fetchLimit := limit * 4; fetchLimit > f.Limit {
+			if fetchLimit > 1000 {
+				fetchLimit = 1000
+			}
+			f.Limit = fetchLimit
+		}
+	case "":
+	default:
+		f.Status = statusParam
+	}
+
+	entries, err := u.deps.Journal.ListMessages(r.Context(), f)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	out := make([]studioEventView, 0, len(entries))
+	for _, e := range entries {
+		outcome := studioEventOutcome(e)
+		if postFilterOutcome != "" && outcome != postFilterOutcome {
+			continue
+		}
+		hasTrace := u.deps.Studio != nil && e.SessionID != "" && u.deps.Studio.HasTrace(e.SessionID)
+		out = append(out, studioEventView{
+			JournalEntry: e,
+			HasTrace:     hasTrace,
+			Outcome:      outcome,
+		})
+		if len(out) >= limit {
+			break
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"events": out,
+	})
+}
+
+// handleStudioSessionTrace returns buffered execution trace events for any
+// runtime session key (Telegram, Webhook, Studio, etc.).
+func (u *UI) handleStudioSessionTrace(w http.ResponseWriter, r *http.Request) {
+	if u.deps.Studio == nil {
+		writeErr(w, http.StatusServiceUnavailable, "studio broker is not enabled on this instance")
+		return
+	}
+	sessionKey := strings.TrimSpace(r.URL.Query().Get("session"))
+	if sessionKey == "" {
+		writeErr(w, http.StatusBadRequest, "session query parameter is required")
+		return
+	}
+	events := u.deps.Studio.SessionTraceSnapshot(sessionKey)
+	if events == nil {
+		events = []session.TraceEvent{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"session": sessionKey,
+		"events":  events,
 	})
 }

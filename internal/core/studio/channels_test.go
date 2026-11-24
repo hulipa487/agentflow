@@ -341,3 +341,78 @@ channels:
 		t.Fatalf("encrypt_key lost on save: %+v", saved.Channels[1])
 	}
 }
+
+func TestChannelsSetHooksSaveLiveDeleteLiveAndRawToken(t *testing.T) {
+	t.Setenv("TG_TOK", "123456:real-token")
+	dir := writeFiles(t, map[string]string{
+		"system.yaml":           channelSystem,
+		"profiles/greeter.yaml": greeterProfile,
+		"channels.yaml":         "channels: []\n",
+	})
+	cfg, err := config.LoadDir(dir, testLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewChannels(cfg, dir, "", agentsFor("greeter"), testLog())
+
+	liveSet := map[string]config.Channel{}
+	var deletedSeen []string
+	store.SetHooks(ChannelHooks{
+		Apply: func(saved []config.Channel, changed *config.Channel, deletedName string) (bool, error) {
+			if deletedName != "" {
+				deletedSeen = append(deletedSeen, deletedName)
+				delete(liveSet, deletedName)
+				return true, nil
+			}
+			if changed != nil && changed.Type == "telegram" {
+				liveSet[changed.Name] = *changed
+				return true, nil
+			}
+			return false, nil
+		},
+		IsLive: func(ch config.Channel) (bool, bool) {
+			if ch.Type != "telegram" {
+				return false, false
+			}
+			_, ok := liveSet[ch.Name]
+			return ok, true
+		},
+	})
+
+	initList, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	saved, outcome, err := store.SaveLive(-1, ChannelDraft{
+		Name: "tg-main", Type: "telegram", Agent: "greeter", Mode: "polling", Token: "${TG_TOK}", APIBase: "https://api.example.test",
+	}, initList.MTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !outcome.Applied || outcome.Note == "" {
+		t.Fatalf("expected live apply outcome, got %+v", outcome)
+	}
+	if len(saved.Channels) != 1 || !saved.Channels[0].Live {
+		t.Fatalf("expected Live=true via IsLive hook, got %+v", saved.Channels)
+	}
+
+	tok, base, err := store.RawToken(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "${TG_TOK}" || base != "https://api.example.test" {
+		t.Fatalf("RawToken = (%q, %q)", tok, base)
+	}
+
+	afterDel, delOutcome, err := store.DeleteLive(0, saved.MTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !delOutcome.Applied || len(afterDel.Channels) != 0 {
+		t.Fatalf("unexpected DeleteLive result: outcome=%+v channels=%+v", delOutcome, afterDel.Channels)
+	}
+	if len(deletedSeen) != 1 || deletedSeen[0] != "tg-main" {
+		t.Fatalf("deletedSeen = %v; want [tg-main]", deletedSeen)
+	}
+}

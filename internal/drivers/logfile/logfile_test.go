@@ -83,6 +83,24 @@ func TestJournalRoundTripAndFiltering(t *testing.T) {
 	if n, err := l.JournalRowCount(ctx); err != nil || n != 3 {
 		t.Fatalf("row count = %d, err=%v", n, err)
 	}
+
+	if err := l.RecordMessage(ctx, runtime.JournalEntry{
+		ID: "m4", Ts: now.Add(-10 * time.Second).Unix(), Direction: "out", Status: "ignored",
+		Channel: "telegram", Chat: "-1009", Agent: "groupbot", UserUUID: "user:3", Text: "cooldown", Err: "cooldown",
+	}); err != nil {
+		t.Fatalf("record m4: %v", err)
+	}
+	for name, f := range map[string]runtime.JournalFilter{
+		"channel": {Channel: "telegram"},
+		"agent":   {Agent: "groupbot"},
+		"chat":    {Chat: "-1009"},
+		"status":  {Status: "ignored"},
+	} {
+		got, err := l.ListMessages(ctx, f)
+		if err != nil || len(got) != 1 || got[0].ID != "m4" {
+			t.Fatalf("filter %s = %v, err=%v", name, ids(got), err)
+		}
+	}
 }
 
 // A record belongs to the day it happened, not the day it was written: that is

@@ -1377,6 +1377,33 @@ func (a *Actor) dispatchInline(ctx context.Context, op Op, current *Message) (re
 		a.log.Log(ctx, levelOf(op.Level), op.Msg)
 		return "true", true, true
 
+	case "session.skip":
+		reason := strings.TrimSpace(op.Text)
+		if reason == "" {
+			reason = "skipped"
+		}
+		turnID := ""
+		if current != nil {
+			turnID = current.ID
+		}
+		a.trace(TraceEvent{Kind: "turn.skip", Op: "session.skip", Turn: turnID, Text: reason, OK: true})
+		if current != nil && current.Channel != "" {
+			turnCtx := a.opContext(ctx, current)
+			a.writeEgressJournal(EgressRecord{
+				SessionID: a.Identity.SessionID,
+				Agent:     a.Identity.Agent,
+				Channel:   current.Channel,
+				ReplyTo:   current.ReplyTo,
+				UserUUID:  PersonalUUIDFromCtx(turnCtx),
+				Text:      reason,
+				InReplyTo: current.ID,
+				Status:    "ignored",
+				Err:       reason,
+			})
+		}
+		a.closeTurn(ctx, current, nil)
+		return "true", true, true
+
 	case "session.exit":
 		// The coroutine is never resumed; Run sees the flag and lets the
 		// actor terminate instead of restarting the loop. A turn in progress is

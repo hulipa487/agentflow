@@ -15,14 +15,16 @@
 
 ## What is AgentFlow
 
-> TL;DR - A LLM Runtime with TypeScript/JS programmable, hot reloadable loops & Wasm External APIs
+> TL;DR - A programmable runtime for custom LLM bots and workflows (TypeScript/JS loops + Wasm external APIs)
 
-AgentFlow is an open-source, pure-Go single-binary runtime for LLM agents.
+AgentFlow is an open-source, pure-Go single-binary runtime for custom LLM bots and workflows.
 
-Configure all the routines - API keys, LLM Upstreams, Tools, Channels, Memory - with simple YAML, while you enjoy the fun of coding agentic loops in TypeScript/JS and Wasm extensions, without sacrificing control! You name it, we've got it.
+When you only need a fixed hosted bot template, turnkey tools get you started quickly; AgentFlow earns its keep as soon as a bot or workflow needs custom logic those alternatives make awkward — while still keeping configuration, keys, channels, memory, and safety cleanly out of your way:
+- **Start in minutes, customize in code**: configure models, channels, memory, and starter settings in Studio with zero TypeScript (including the flagship [Telegram group bot starter](https://github.com/hulipa487/agentflow-studio/tree/main/examples/telegram-group-bot)), then edit its clean TypeScript loop when your team needs bespoke routing, approvals, or tool orchestration.
+- **Built-in observability**: test bot tokens and Privacy Mode live, keep external write tools off by default, and inspect every `answered`, `ignored`, `dropped`, or `failed` message in Studio's Event Center.
 - [x] Direct r/w control over vectordb?
 - [x] User prompts accessible to scripts?
-- [x] Custom ReAct loops?
+- [x] Custom ReAct loops and per-group filtering (`session.skip`)?
 - [x] Per-user credentials your script can use but never see?
 - [x] Hot reload without dropping a conversation?
 - [ ] Flying pigs? (working on it)
@@ -197,7 +199,7 @@ agentflow run -config mybot      # go
 
 ## AgentFlow Studio & Documentation
 
-AgentFlow itself is strictly a headless runtime; all UI, full documentation, and runnable examples live in [**AgentFlow Studio**](https://github.com/hulipa487/agentflow-studio). Connect Studio (desktop or web) to any deployment's `/admin/api/` endpoint to get an overview of sessions and instances, an agent builder with a TypeScript/JS editor and analyzer, a playground with execution traces, and screens for models, channels, safety, users, credentials, usage, and logs. The complete guides (getting started, architecture, configuration reference, Script API reference, deployment guides) ship inside Studio offline, and full runnable scenarios & single-pattern loops live under Studio's [`examples/`](https://github.com/hulipa487/agentflow-studio/tree/main/examples).
+AgentFlow itself is strictly a headless runtime; all UI, full documentation, and runnable examples live in [**AgentFlow Studio**](https://github.com/hulipa487/agentflow-studio). Connect Studio (desktop or web) to any deployment's `/admin/api/` endpoint to configure starter agents without touching code, inspect live sessions and **Event Center** outcomes (why a channel message was answered, ignored, dropped, or failed), write TypeScript/JS loops with inline diagnostics, replay execution traces in the playground, and manage models, channels (with live Telegram polling and token/Privacy Mode checks), safety, users, credentials, usage, and logs. The complete guides ship offline inside Studio, and full runnable starters live under Studio's [`examples/`](https://github.com/hulipa487/agentflow-studio/tree/main/examples) (starting with [`telegram-group-bot`](https://github.com/hulipa487/agentflow-studio/tree/main/examples/telegram-group-bot)).
 
 ## For developers
 

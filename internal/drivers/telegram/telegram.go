@@ -45,6 +45,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -81,6 +83,85 @@ const (
 	defaultMaxMediaBytes = 8 << 20
 )
 
+// BotInfo holds the bot identity and group Privacy Mode status reported by
+// Telegram's getMe endpoint.
+type BotInfo struct {
+	BotID                   int64  `json:"bot_id"`
+	Username                string `json:"username"`
+	FirstName               string `json:"first_name,omitempty"`
+	CanJoinGroups           bool   `json:"can_join_groups"`
+	CanReadAllGroupMessages bool   `json:"can_read_all_group_messages"`
+	PrivacyModeEnabled      bool   `json:"privacy_mode_enabled"`
+}
+
+// TestToken queries Telegram's getMe endpoint to verify token validity and
+// report bot identity and Privacy Mode status. Token values are scrubbed from errors.
+func TestToken(ctx context.Context, token, apiBase string, client *http.Client) (BotInfo, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return BotInfo{}, errors.New("telegram token is required")
+	}
+	base := strings.TrimRight(strings.TrimSpace(apiBase), "/")
+	if base == "" {
+		base = "https://api.telegram.org"
+	}
+	if client == nil {
+		client = &http.Client{Timeout: callTimeout}
+	}
+	scrub := func(err error) error {
+		if err == nil {
+			return nil
+		}
+		return errors.New(strings.ReplaceAll(err.Error(), token, "***"))
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
+	endpoint := base + "/bot" + token + "/getMe"
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return BotInfo{}, scrub(err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return BotInfo{}, scrub(err)
+	}
+	defer resp.Body.Close()
+
+	var body struct {
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
+		Result      struct {
+			ID                      int64  `json:"id"`
+			Username                string `json:"username"`
+			FirstName               string `json:"first_name"`
+			CanJoinGroups           bool   `json:"can_join_groups"`
+			CanReadAllGroupMessages bool   `json:"can_read_all_group_messages"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); err != nil {
+		if resp.StatusCode != http.StatusOK {
+			return BotInfo{}, fmt.Errorf("telegram getMe returned HTTP %d", resp.StatusCode)
+		}
+		return BotInfo{}, scrub(fmt.Errorf("decode telegram getMe response: %w", err))
+	}
+	if !body.OK || resp.StatusCode != http.StatusOK {
+		desc := strings.TrimSpace(body.Description)
+		if desc == "" {
+			desc = fmt.Sprintf("HTTP %d", resp.StatusCode)
+		}
+		return BotInfo{}, scrub(fmt.Errorf("telegram getMe failed: %s", desc))
+	}
+	return BotInfo{
+		BotID:                   body.Result.ID,
+		Username:                body.Result.Username,
+		FirstName:               body.Result.FirstName,
+		CanJoinGroups:           body.Result.CanJoinGroups,
+		CanReadAllGroupMessages: body.Result.CanReadAllGroupMessages,
+		PrivacyModeEnabled:      !body.Result.CanReadAllGroupMessages,
+	}, nil
+}
+
 // Driver is the Telegram channel driver. It implements gateway.Driver for
 // replies (sendMessage / sendPhoto / ...) and either polls or serves a
 // webhook for inbound.
@@ -101,6 +182,14 @@ type Driver struct {
 	log         *slog.Logger
 	client      *http.Client
 
+	// OnDrop is invoked when the driver discards an update before routing
+	// (e.g. allow_users rejection) so operators can audit why a message stayed silent.
+	OnDrop func(channel, agent, chatID, sender, text, reason string)
+
+	botMu      sync.RWMutex
+	botInfo    BotInfo
+	hasBotInfo bool
+
 	// The SDK client is built on first use rather than in New: New must stay
 	// infallible (it installs the webhook handler and mints the secret), and
 	// tests construct a Driver literal with only the fields they need — so the
@@ -108,6 +197,36 @@ type Driver struct {
 	botOnce sync.Once
 	bot     *bot.Bot
 	botErr  error
+}
+
+// SetBotInfo seeds the driver's known bot identity (used at startup or in tests).
+func (d *Driver) SetBotInfo(info BotInfo) {
+	d.botMu.Lock()
+	d.botInfo = info
+	d.hasBotInfo = true
+	d.botMu.Unlock()
+}
+
+// BotInfo returns the cached bot identity and whether it has been populated.
+func (d *Driver) BotInfo() (BotInfo, bool) {
+	d.botMu.RLock()
+	defer d.botMu.RUnlock()
+	return d.botInfo, d.hasBotInfo
+}
+
+func (d *Driver) refreshBotInfo(ctx context.Context) {
+	info, err := TestToken(ctx, d.token, d.apiBase, d.httpClient())
+	if err != nil {
+		d.log.Debug("telegram getMe refresh skipped", "err", err)
+		return
+	}
+	d.SetBotInfo(info)
+	if info.PrivacyModeEnabled {
+		d.log.Warn("telegram bot Privacy Mode is ON: non-mention group messages will not reach the runtime unless changed in BotFather",
+			"bot_username", info.Username, "bot_id", info.BotID)
+		return
+	}
+	d.log.Info("telegram bot identity resolved", "bot_username", info.Username, "bot_id", info.BotID)
 }
 
 func New(name, token, agent, mode string, allowUsers []int64, path, publicURL, secretToken string, sink router.Sink, srv *httpd.Server, store media.Store, pol media.Policy, log *slog.Logger) *Driver {
@@ -169,6 +288,7 @@ func (d *Driver) Name() string { return d.name }
 // <public_url>/health — which round-trips through the public proxy back to that
 // listener — and a probe before bind would always fail.
 func (d *Driver) Start(ctx context.Context) error {
+	go d.refreshBotInfo(ctx)
 	switch d.mode {
 	case "polling":
 		d.ensureNoWebhook("polling mode")
@@ -387,25 +507,57 @@ type update struct {
 	Message  *tgMessage `json:"message"`
 }
 
-// tgMessage is the message portion of a Telegram update, including media.
+// tgMessage is the message portion of a Telegram update, including media,
+// group/topic metadata, entities, and reply context.
 type tgMessage struct {
+	MessageID       int64  `json:"message_id"`
+	MessageThreadID int64  `json:"message_thread_id"`
+	Text            string `json:"text"`
+	Caption         string `json:"caption"`
+	From            struct {
+		ID        int64  `json:"id"`
+		IsBot     bool   `json:"is_bot"`
+		Username  string `json:"username"`
+		FirstName string `json:"first_name"`
+	} `json:"from"`
+	Chat struct {
+		ID    int64  `json:"id"`
+		Type  string `json:"type"`
+		Title string `json:"title"`
+	} `json:"chat"`
+	Entities        []tgEntity      `json:"entities"`
+	CaptionEntities []tgEntity      `json:"caption_entities"`
+	ReplyToMessage  *tgReplyMessage `json:"reply_to_message"`
+	Photo           []photoSize     `json:"photo"`
+	Doc             *document       `json:"document"`
+	Voice           *voice          `json:"voice"`
+	Audio           *audio          `json:"audio"`
+	Video           *video          `json:"video"`
+}
+
+type tgEntityUser struct {
+	ID       int64  `json:"id"`
+	IsBot    bool   `json:"is_bot"`
+	Username string `json:"username"`
+}
+
+type tgEntity struct {
+	Type   string        `json:"type"`
+	Offset int           `json:"offset"`
+	Length int           `json:"length"`
+	User   *tgEntityUser `json:"user"`
+}
+
+type tgReplyMessage struct {
 	MessageID int64  `json:"message_id"`
 	Text      string `json:"text"`
 	Caption   string `json:"caption"`
 	From      struct {
 		ID        int64  `json:"id"`
+		IsBot     bool   `json:"is_bot"`
 		Username  string `json:"username"`
 		FirstName string `json:"first_name"`
 	} `json:"from"`
-	Chat struct {
-		ID   int64  `json:"id"`
-		Type string `json:"type"`
-	} `json:"chat"`
-	Photo []photoSize `json:"photo"`
-	Doc   *document   `json:"document"`
-	Voice *voice      `json:"voice"`
-	Audio *audio      `json:"audio"`
-	Video *video      `json:"video"`
 }
 
 // The attachment shapes are named types rather than inline structs because both
@@ -457,18 +609,37 @@ func fromSDK(u *models.Update) update {
 		return out
 	}
 	msg := &tgMessage{
-		MessageID: int64(m.ID),
-		Text:      m.Text,
-		Caption:   m.Caption,
+		MessageID:       int64(m.ID),
+		MessageThreadID: int64(m.MessageThreadID),
+		Text:            m.Text,
+		Caption:         m.Caption,
 	}
 	out.Message = msg
 	if m.From != nil {
 		msg.From.ID = m.From.ID
+		msg.From.IsBot = m.From.IsBot
 		msg.From.Username = m.From.Username
 		msg.From.FirstName = m.From.FirstName
 	}
 	msg.Chat.ID = m.Chat.ID
 	msg.Chat.Type = string(m.Chat.Type)
+	msg.Chat.Title = m.Chat.Title
+	msg.Entities = mapSDKEntities(m.Entities)
+	msg.CaptionEntities = mapSDKEntities(m.CaptionEntities)
+	if m.ReplyToMessage != nil {
+		rep := &tgReplyMessage{
+			MessageID: int64(m.ReplyToMessage.ID),
+			Text:      m.ReplyToMessage.Text,
+			Caption:   m.ReplyToMessage.Caption,
+		}
+		if m.ReplyToMessage.From != nil {
+			rep.From.ID = m.ReplyToMessage.From.ID
+			rep.From.IsBot = m.ReplyToMessage.From.IsBot
+			rep.From.Username = m.ReplyToMessage.From.Username
+			rep.From.FirstName = m.ReplyToMessage.From.FirstName
+		}
+		msg.ReplyToMessage = rep
+	}
 	for _, p := range m.Photo {
 		msg.Photo = append(msg.Photo, photoSize{
 			FileID:   p.FileID,
@@ -556,42 +727,198 @@ func (d *Driver) handleUpdate(u update) {
 		return
 	}
 	text := m.Text
+	entities := m.Entities
 	if text == "" {
 		text = m.Caption
+		entities = m.CaptionEntities
 	}
+	chatID := strconv.FormatInt(m.Chat.ID, 10)
+	sender := "user:telegram:" + strconv.FormatInt(m.From.ID, 10)
 	// The allow-list is checked before media is ingested. ingestMedia downloads
 	// the file from Telegram and writes it to the blob store, so checking the
 	// sender afterwards let a non-allowed user make the runtime do both.
 	if len(d.allow) > 0 && !d.allow[m.From.ID] {
 		d.log.Warn("dropping message from non-allowed user", "user_id", m.From.ID)
+		if d.OnDrop != nil {
+			d.OnDrop(d.name, d.agent, chatID, sender, text, "allow_users")
+		}
 		return
 	}
 	atts := d.ingestMedia(m)
 	if text == "" && len(atts) == 0 {
 		return
 	}
-	d.log.Debug("telegram update received", "update_id", u.UpdateID, "chat_id", m.Chat.ID, "user_id", m.From.ID, "text_len", len(text), "media", len(atts))
-	chatID := strconv.FormatInt(m.Chat.ID, 10)
+	info, hasInfo := d.BotInfo()
+	mentioned := hasMention(text, entities, info.BotID, info.Username)
+	isReplyToBot := isReplyFromBot(m.ReplyToMessage, info.BotID, info.Username)
+
+	payload := map[string]any{
+		"chat_id":         chatID,
+		"chat_type":       m.Chat.Type,
+		"message_id":      m.MessageID,
+		"user_id":         m.From.ID,
+		"username":        m.From.Username,
+		"name":            m.From.FirstName,
+		"mentioned":       mentioned,
+		"is_reply_to_bot": isReplyToBot,
+	}
+	if m.Chat.Title != "" {
+		payload["chat_title"] = m.Chat.Title
+	}
+	if m.MessageThreadID > 0 {
+		payload["message_thread_id"] = m.MessageThreadID
+	}
+	if hasInfo {
+		payload["bot_id"] = info.BotID
+		payload["bot_username"] = info.Username
+		payload["can_read_all_group_messages"] = info.CanReadAllGroupMessages
+	}
+	if m.ReplyToMessage != nil {
+		payload["reply_to_message_id"] = m.ReplyToMessage.MessageID
+		replyText := m.ReplyToMessage.Text
+		if replyText == "" {
+			replyText = m.ReplyToMessage.Caption
+		}
+		if replyText != "" {
+			payload["reply_to_text"] = clipRunes(replyText, 240)
+		}
+	}
+
+	d.log.Debug("telegram update received", "update_id", u.UpdateID, "chat_id", m.Chat.ID, "chat_type", m.Chat.Type, "user_id", m.From.ID, "text_len", len(text), "media", len(atts))
 	d.sink.Submit(router.Inbound{
 		Channel: d.name,
 		Agent:   d.agent,
 		Message: session.Message{
 			ID:          fmt.Sprintf("tg-%d", u.UpdateID),
 			Type:        "user",
-			From:        "user:telegram:" + strconv.FormatInt(m.From.ID, 10),
+			From:        sender,
 			Text:        text,
 			Channel:     d.name,
 			ReplyTo:     chatID,
 			Attachments: atts,
 			Ts:          time.Now().Unix(),
-			Payload: map[string]any{
-				"chat_id":  chatID,
-				"user_id":  m.From.ID,
-				"username": m.From.Username,
-				"name":     m.From.FirstName,
-			},
+			Payload:     payload,
 		},
 	})
+}
+
+func mapSDKEntities(src []models.MessageEntity) []tgEntity {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]tgEntity, 0, len(src))
+	for _, e := range src {
+		ent := tgEntity{
+			Type:   string(e.Type),
+			Offset: e.Offset,
+			Length: e.Length,
+		}
+		if e.User != nil {
+			ent.User = &tgEntityUser{
+				ID:       e.User.ID,
+				IsBot:    e.User.IsBot,
+				Username: e.User.Username,
+			}
+		}
+		out = append(out, ent)
+	}
+	return out
+}
+
+func sliceUTF16(s string, offset, length int) string {
+	if s == "" || offset < 0 || length <= 0 {
+		return ""
+	}
+	units := utf16.Encode([]rune(s))
+	if offset >= len(units) {
+		return ""
+	}
+	end := offset + length
+	if end > len(units) {
+		end = len(units)
+	}
+	return string(utf16.Decode(units[offset:end]))
+}
+
+func hasMention(text string, entities []tgEntity, botID int64, botUsername string) bool {
+	botUsername = strings.TrimPrefix(strings.TrimSpace(botUsername), "@")
+	for _, e := range entities {
+		switch e.Type {
+		case "text_mention":
+			if botID > 0 && e.User != nil && e.User.ID == botID {
+				return true
+			}
+		case "mention":
+			if botUsername != "" {
+				sub := strings.TrimPrefix(sliceUTF16(text, e.Offset, e.Length), "@")
+				if strings.EqualFold(sub, botUsername) {
+					return true
+				}
+			}
+		case "bot_command":
+			if botUsername != "" {
+				cmd := sliceUTF16(text, e.Offset, e.Length)
+				if _, after, ok := strings.Cut(cmd, "@"); ok && strings.EqualFold(after, botUsername) {
+					return true
+				}
+			}
+		}
+	}
+	if botUsername == "" || text == "" {
+		return false
+	}
+	return fallbackMention(text, botUsername)
+}
+
+func fallbackMention(text, botUsername string) bool {
+	lowerText := strings.ToLower(text)
+	needle := "@" + strings.ToLower(botUsername)
+	isWordByte := func(b byte) bool {
+		return (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '_'
+	}
+	start := 0
+	for {
+		idx := strings.Index(lowerText[start:], needle)
+		if idx < 0 {
+			return false
+		}
+		pos := start + idx
+		end := pos + len(needle)
+		beforeOK := pos == 0 || !isWordByte(lowerText[pos-1])
+		afterOK := end == len(lowerText) || !isWordByte(lowerText[end])
+		if beforeOK && afterOK {
+			return true
+		}
+		start = pos + 1
+	}
+}
+
+func isReplyFromBot(rep *tgReplyMessage, botID int64, botUsername string) bool {
+	if rep == nil {
+		return false
+	}
+	if botID > 0 && rep.From.ID == botID {
+		return true
+	}
+	botUsername = strings.TrimPrefix(strings.TrimSpace(botUsername), "@")
+	if botUsername != "" && rep.From.IsBot && strings.EqualFold(rep.From.Username, botUsername) {
+		return true
+	}
+	return false
+}
+
+func clipRunes(s string, maxRunes int) string {
+	if maxRunes <= 0 || utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	n := 0
+	for i := range s {
+		if n == maxRunes {
+			return s[:i] + "…"
+		}
+		n++
+	}
+	return s
 }
 
 // ingestMedia downloads the update's media (photo/document/voice/audio/video)

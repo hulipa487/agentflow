@@ -444,6 +444,18 @@ func journalMatches(e runtime.JournalEntry, f runtime.JournalFilter) bool {
 	if f.Direction != "" && e.Direction != f.Direction {
 		return false
 	}
+	if f.Channel != "" && e.Channel != f.Channel {
+		return false
+	}
+	if f.Agent != "" && e.Agent != f.Agent {
+		return false
+	}
+	if f.Chat != "" && e.Chat != f.Chat {
+		return false
+	}
+	if f.Status != "" && e.Status != f.Status {
+		return false
+	}
 	if f.Since > 0 && e.Ts < f.Since {
 		return false
 	}

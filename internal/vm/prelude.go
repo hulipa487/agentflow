@@ -125,6 +125,12 @@ af.version = 2;
     push_user: function(uuid, text) {
       return callOp({ type: "session.push_user", address: "user:" + uuid, text: text });
     },
+    skip: function(reason) {
+      return callOp({
+        type: "session.skip",
+        text: reason !== undefined && reason !== null ? String(reason) : "",
+      });
+    },
     exit: function() {
       callOp({ type: "session.exit" });
     },

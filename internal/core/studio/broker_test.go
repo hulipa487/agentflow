@@ -370,3 +370,37 @@ func TestChatStreamsApprovalPromptWhileWaiting(t *testing.T) {
 		t.Fatalf("replies = %+v", res.Replies)
 	}
 }
+
+func TestBrokerSessionTraceAndSessions(t *testing.T) {
+	b := NewBroker(&fakeRouter{live: true}, nil, Config{}, discard())
+
+	if b.HasTrace("bot|telegram:-1001") {
+		t.Fatal("expected HasTrace false before events")
+	}
+	if got := b.SessionTraceSnapshot("bot|telegram:-1001"); len(got) != 0 {
+		t.Fatalf("expected empty snapshot without creating ring, got %+v", got)
+	}
+	if got := b.Sessions(); len(got) != 0 {
+		t.Fatalf("expected zero sessions before tracing, got %+v", got)
+	}
+
+	b.Trace(session.TraceEvent{SessionID: "bot|telegram:-1001", Agent: "bot", Kind: "turn.skip", Text: "not_mentioned", OK: true})
+	time.Sleep(10 * time.Millisecond)
+	b.Trace(session.TraceEvent{SessionID: "bot|studio:t1", Agent: "bot", Kind: "turn.start"})
+
+	if !b.HasTrace("bot|telegram:-1001") {
+		t.Fatal("expected HasTrace true for traced telegram session")
+	}
+	tgSnap := b.SessionTraceSnapshot("bot|telegram:-1001")
+	if len(tgSnap) != 1 || tgSnap[0].Kind != "turn.skip" || tgSnap[0].Text != "not_mentioned" {
+		t.Fatalf("unexpected telegram trace snapshot: %+v", tgSnap)
+	}
+
+	sessions := b.Sessions()
+	if len(sessions) != 2 {
+		t.Fatalf("sessions = %+v, want 2", sessions)
+	}
+	if sessions[0].Session != "bot|studio:t1" || sessions[1].Channel != "telegram" || sessions[1].Chat != "-1001" {
+		t.Fatalf("unexpected session summaries order/fields: %+v", sessions)
+	}
+}

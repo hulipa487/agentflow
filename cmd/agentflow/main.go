@@ -35,6 +35,7 @@ import (
 	"agentflow/internal/core/caps"
 	"agentflow/internal/core/chatreq"
 	"agentflow/internal/core/credentials"
+	"agentflow/internal/core/execguard"
 	"agentflow/internal/core/ext"
 	"agentflow/internal/core/files"
 	"agentflow/internal/core/fleet"
@@ -381,6 +382,7 @@ func main() {
 	// scope layer enforces what it records, so it must exist wherever the
 	// engine does (§8: pools + ACL, groups).
 	tenReg := tenancy.New(rtStore, log)
+	execGuard := execguard.NewStore(rtStore)
 	memReg.SetPoolResolver(func(name string) (string, error) {
 		return tenReg.PoolUUIDByName(context.Background(), name)
 	}) // Per-call token detail in the ledger (the daily rollup is always written).
@@ -887,6 +889,10 @@ func main() {
 			}
 			c, err = mcp.NewHTTPClientWithPolicy(sname, s.URL, token, policy, log)
 		default:
+			if cfg.HostedMode() {
+				log.Error("mcp stdio server refused in hosted mode", "server", sname)
+				os.Exit(1)
+			}
 			c, err = mcp.NewClient(sname, s.Command, s.Args, log)
 		}
 		if err != nil {
@@ -947,9 +953,6 @@ func main() {
 	// serializes those writes against the reads agent.config() performs.
 	promptReg := session.NewPromptRegistry(cfg.PromptTexts())
 	promptFiles := cfg.PromptFiles()
-	// Every agent's tool handlers share one LuaOverrides instance, so an
-	// override is reported as unclaimed only when no loaded loop declares it.
-	toolWiring := caps.ToolWiring{LuaOverrides: luaOverrides, Prompts: promptReg, Log: log}
 	agentMemories := []memory.AgentMemory{}
 	// Per-tenant egress rate limit (E18): netguard restricts where an agent
 	// may connect, this restricts how often. Keyed on the personal uuid — the
@@ -1118,10 +1121,30 @@ func main() {
 		for k, h := range gateOps(enforce, name, effectiveCaps, "memory", caps.StoreHandlers(amPtr, memMgr, tenReg), &withheld) {
 			handlers[k] = h
 		}
-		for k, h := range gateOps(enforce, name, effectiveCaps, "tools", caps.ToolHandlers(agentSet, toolWiring), &withheld) {
+		var grantedToolCaps map[string]bool
+		if enforce || cfg.HostedMode() {
+			grantedToolCaps = effectiveCaps
+		}
+		agentToolWiring := caps.ToolWiring{
+			LuaOverrides: luaOverrides,
+			Prompts:      promptReg,
+			Log:          log,
+			Guard:        execGuard,
+			HostedMode:   cfg.HostedMode(),
+			GrantedCaps:  grantedToolCaps,
+			Agent:        name,
+		}
+		for k, h := range gateOps(enforce, name, effectiveCaps, "tools", caps.ToolHandlers(agentSet, agentToolWiring), &withheld) {
 			handlers[k] = h
 		}
-		for k, h := range gateOps(enforce, name, effectiveCaps, "apis", caps.APIHandlers(extReg), &withheld) {
+		apiWiring := caps.APIWiring{
+			Guard:       execGuard,
+			HostedMode:  cfg.HostedMode(),
+			GrantedCaps: grantedToolCaps,
+			ToolsPolicy: cfg.Tools.Policy,
+			Agent:       name,
+		}
+		for k, h := range gateOps(enforce, name, effectiveCaps, "apis", caps.APIHandlersWithWiring(extReg, apiWiring), &withheld) {
 			handlers[k] = h
 		}
 		for k, h := range gateOps(enforce, name, effectiveCaps, "shell.exec", caps.ShellHandlers(shellFront, name, deliverJob), &withheld) {
@@ -1301,10 +1324,30 @@ func main() {
 		for k, h := range gateOps(enforce, pname, profileCaps, "memory", caps.StoreHandlers(amPtr, memMgr, tenReg), &withheld) {
 			handlers[k] = h
 		}
-		for k, h := range gateOps(enforce, pname, profileCaps, "tools", caps.ToolHandlers(agentSet, toolWiring), &withheld) {
+		var grantedProfileCaps map[string]bool
+		if enforce || cfg.HostedMode() {
+			grantedProfileCaps = profileCaps
+		}
+		profileToolWiring := caps.ToolWiring{
+			LuaOverrides: luaOverrides,
+			Prompts:      promptReg,
+			Log:          log,
+			Guard:        execGuard,
+			HostedMode:   cfg.HostedMode(),
+			GrantedCaps:  grantedProfileCaps,
+			Agent:        pname,
+		}
+		for k, h := range gateOps(enforce, pname, profileCaps, "tools", caps.ToolHandlers(agentSet, profileToolWiring), &withheld) {
 			handlers[k] = h
 		}
-		for k, h := range gateOps(enforce, pname, profileCaps, "apis", caps.APIHandlers(extReg), &withheld) {
+		profileAPIWiring := caps.APIWiring{
+			Guard:       execGuard,
+			HostedMode:  cfg.HostedMode(),
+			GrantedCaps: grantedProfileCaps,
+			ToolsPolicy: cfg.Tools.Policy,
+			Agent:       pname,
+		}
+		for k, h := range gateOps(enforce, pname, profileCaps, "apis", caps.APIHandlersWithWiring(extReg, profileAPIWiring), &withheld) {
 			handlers[k] = h
 		}
 		for k, h := range gateOps(enforce, pname, profileCaps, "shell.exec", caps.ShellHandlers(shellFront, pname, deliverJob), &withheld) {
@@ -1409,6 +1452,7 @@ func main() {
 
 	exit := os.Exit
 	sup := supervisor.New(defs, gw, opPool, shellMgr, log)
+	sup.SetExecGuard(execGuard)
 	sup.SetShellJobs(shellJobs)
 	sup.SetMedia(mediaSvc)
 	deliverJobResult := caps.JobDeliverer(func(owner string, msg session.Message) {
@@ -2302,6 +2346,7 @@ func main() {
 			Memory:     memoryStore,
 			Plugins:    pluginsStore,
 			Media:      mediaSvc,
+			Guard:      execGuard,
 			StudioCatalog: func() studio.Catalog {
 				curCfg := cfg
 				if loaded, err := cfgSource.Load(nil); err == nil && loaded != nil {

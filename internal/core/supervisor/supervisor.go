@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"agentflow/internal/core/execguard"
 	"agentflow/internal/core/gateway"
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/metrics"
@@ -86,6 +87,9 @@ type Supervisor struct {
 
 	// media is the centralized media service attached to every spawned actor.
 	media *media.Service
+
+	// guard backs runtime-owned action approvals and write idempotency.
+	guard *execguard.Store
 
 	// hub, when set, decides whether a delivered message is this instance's to
 	// handle or belongs to the instance that owns the session. Nil — the
@@ -201,6 +205,10 @@ func (s *Supervisor) SetProfileSettings(p session.ProfileSettings) { s.profileSe
 // SetMedia installs the centralized media service used by session actors to
 // normalize inbound/outbound attachments and enforce per-scope handle grants.
 func (s *Supervisor) SetMedia(svc *media.Service) { s.media = svc }
+
+// SetExecGuard installs the runtime-owned approval and idempotency store used by
+// every spawned session actor.
+func (s *Supervisor) SetExecGuard(g *execguard.Store) { s.guard = g }
 
 // SetSessionCap sets the per-tenant bound on live sessions (E18): a tenant
 // whose sessions are all busy with it cannot spawn actors without bound. 0
@@ -627,6 +635,7 @@ func (s *Supervisor) ensureSession(agent, skey string, def *AgentDef, tenant str
 	a.Tracer = s.tracer
 	a.TracePayloads = s.tracePayloads
 	a.Media = s.media
+	a.Guard = s.guard
 	actorCtx, cancel := context.WithCancel(s.ctx)
 
 	s.mu.Lock()

@@ -53,6 +53,7 @@ func registerConfiguredAPIs(reg *ext.Registry, apis map[string]config.APIConfig,
 				Description:        act.Description,
 				ExposeAsTool:       act.ExposeAsTool,
 				NeedsConfirm:       act.NeedsConfirm,
+				Kind:               act.Kind,
 				RequiresCapability: act.RequiresCapability,
 				Parameters:         act.Parameters,
 			}

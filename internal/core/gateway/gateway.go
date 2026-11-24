@@ -3,10 +3,12 @@
 package gateway
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/metrics"
@@ -68,6 +70,25 @@ type DeltaDriver interface {
 	DeliverDelta(replyTo string, text string) error
 }
 
+// ApprovalPrompt carries the redacted details of a pending action approval
+// for channels or Studio to display and approve/deny via structured callbacks.
+type ApprovalPrompt struct {
+	ID          string         `json:"id"`
+	SessionKey  string         `json:"session_key,omitempty"`
+	Agent       string         `json:"agent,omitempty"`
+	Action      string         `json:"action"`
+	Destination string         `json:"destination,omitempty"`
+	Description string         `json:"description,omitempty"`
+	ArgsPreview map[string]any `json:"args_preview,omitempty"`
+	ExpiresAt   int64          `json:"expires_at,omitempty"`
+}
+
+// ApprovalDriver is implemented by channels that handle interactive structured
+// approvals natively (e.g., Studio UI, interactive button channels).
+type ApprovalDriver interface {
+	DeliverApproval(replyTo string, p ApprovalPrompt) error
+}
+
 // TurnDriver is the optional end-of-turn signal. EndTurn is called exactly once
 // per turn: success, error, crash or cancellation. A channel that does not
 // implement it needs nothing from it (the fallbacks above finish on Deliver).
@@ -127,6 +148,34 @@ func (r *Registry) Send(channel, replyTo, text string, attachments []media.Part)
 		return err
 	}
 	return nil
+}
+
+// SendApproval delivers a runtime-owned approval prompt to channel. Channels
+// implementing ApprovalDriver receive the structured ApprovalPrompt; plain text
+// channels receive a redacted summary showing action, destination, and args.
+func (r *Registry) SendApproval(channel, replyTo string, p ApprovalPrompt) error {
+	d, err := r.driver(channel)
+	if err != nil {
+		return err
+	}
+	if ad, ok := d.(ApprovalDriver); ok {
+		return ad.DeliverApproval(replyTo, p)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Confirmation required: %s", p.Action)
+	if p.Destination != "" {
+		fmt.Fprintf(&b, "\nTarget: %s", p.Destination)
+	}
+	if len(p.ArgsPreview) > 0 {
+		if raw, err := json.Marshal(p.ArgsPreview); err == nil {
+			fmt.Fprintf(&b, "\nArgs: %s", string(raw))
+		}
+	}
+	if p.ExpiresAt > 0 {
+		fmt.Fprintf(&b, "\nExpires: %s", time.Unix(p.ExpiresAt, 0).UTC().Format(time.RFC3339))
+	}
+	fmt.Fprintf(&b, "\nReply \"YES [ref:%s]\" to approve or \"NO [ref:%s]\" to deny.", p.ID, p.ID)
+	return r.Send(channel, replyTo, b.String(), nil)
 }
 
 // driver resolves a registered driver, counting the failure the way Send does.

@@ -1062,3 +1062,100 @@ func TestValidateTimezoneOffset(t *testing.T) {
 		t.Fatalf("unset offset = %v; want 0", got)
 	}
 }
+
+func TestValidateHostedModeAndActionKind(t *testing.T) {
+	validKind := "read"
+	badKind := "admin"
+	enforceFalse := false
+	tests := []struct {
+		name    string
+		cfg     *Config
+		wantErr string
+	}{
+		{
+			name: "hosted rejects stdio mcp",
+			cfg: &Config{
+				Runtime: Runtime{Mode: "hosted"},
+				MCP:     MCP{Servers: map[string]MCPServer{"local": {Command: "npx", Args: []string{"foo"}}}},
+			},
+			wantErr: "disabled when runtime.mode is hosted",
+		},
+		{
+			name: "hosted allows http mcp",
+			cfg: &Config{
+				Runtime: Runtime{Mode: "hosted"},
+				MCP:     MCP{Servers: map[string]MCPServer{"remote": {URL: "https://mcp.example.com"}}},
+			},
+		},
+		{
+			name: "hosted rejects enforce_capabilities=false",
+			cfg: &Config{
+				Runtime: Runtime{Mode: "hosted"},
+				Plugins: Plugins{EnforceCapabilities: &enforceFalse},
+			},
+			wantErr: "requires plugins.enforce_capabilities=true",
+		},
+		{
+			name:    "invalid runtime.mode",
+			cfg:     &Config{Runtime: Runtime{Mode: "cloud"}},
+			wantErr: "runtime.mode must be self_hosted or hosted",
+		},
+		{
+			name: "invalid tool override kind",
+			cfg: &Config{
+				Tools: Tools{Policy: ToolsPolicy{Overrides: map[string]ToolSpecOverride{
+					"builtin:web_search": {Kind: &badKind},
+				}}},
+			},
+			wantErr: "kind must be read, write or destructive",
+		},
+		{
+			name: "valid tool override and api action kind",
+			cfg: &Config{
+				Runtime: Runtime{Mode: "self_hosted"},
+				Tools: Tools{Policy: ToolsPolicy{Overrides: map[string]ToolSpecOverride{
+					"builtin:web_search": {Kind: &validKind},
+				}}},
+				APIs: map[string]APIConfig{
+					"svc": {
+						Runtime: "script",
+						Entry:   "./index.ts",
+						Actions: map[string]APIActionConfig{
+							"list": {Kind: "read"},
+							"send": {Kind: "write", NeedsConfirm: true},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "invalid api action kind",
+			cfg: &Config{
+				APIs: map[string]APIConfig{
+					"svc": {
+						Runtime: "script",
+						Entry:   "./index.ts",
+						Actions: map[string]APIActionConfig{
+							"bad": {Kind: "superuser"},
+						},
+					},
+				},
+			},
+			wantErr: "kind must be read, write or destructive",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validate("cfg.yaml", tt.cfg)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("expected error containing %q, got %v", tt.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}

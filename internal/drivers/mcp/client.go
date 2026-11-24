@@ -20,13 +20,17 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os/exec"
+	"strings"
 	"sync/atomic"
 	"time"
 
+	"agentflow/internal/core/execguard"
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/netguard"
 	"agentflow/internal/core/session"
@@ -96,13 +100,39 @@ func NewHTTPClient(name, endpoint, token string, log *slog.Logger) (*Client, err
 // same rule http.request and builtin:fetch follow.
 func NewHTTPClientWithPolicy(name, endpoint, token string, policy netguard.Policy, log *slog.Logger) (*Client, error) {
 	l := log.With("mcp_server", name)
+	parsed, err := url.Parse(endpoint)
+	if err != nil || (strings.ToLower(parsed.Scheme) != "http" && strings.ToLower(parsed.Scheme) != "https") || parsed.Host == "" {
+		return nil, fmt.Errorf("mcp connect %s: endpoint must be an http or https URL (got %q)", name, endpoint)
+	}
+	expScheme := strings.ToLower(parsed.Scheme)
+	expHost := strings.ToLower(parsed.Host)
+
 	base := policy.Transport()
-	httpClient := &http.Client{Transport: base}
+	httpClient := &http.Client{
+		Transport: base,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+			if req.URL == nil || (strings.ToLower(req.URL.Scheme) != "http" && strings.ToLower(req.URL.Scheme) != "https") {
+				return errors.New("mcp redirect scheme must be http or https")
+			}
+			if !strings.EqualFold(req.URL.Scheme, expScheme) || !strings.EqualFold(req.URL.Host, expHost) {
+				return fmt.Errorf("mcp cross-origin redirect to %s://%s refused", req.URL.Scheme, req.URL.Host)
+			}
+			return nil
+		},
+	}
 	if token != "" {
 		// StreamableClientTransport has no header field, so the credential
 		// rides on the transport. Requests are cloned rather than mutated:
 		// Go's client may retry, and a mutated shared request is a data race.
-		httpClient.Transport = &bearerTransport{token: token, base: base}
+		httpClient.Transport = &bearerTransport{
+			token:          token,
+			expectedScheme: expScheme,
+			expectedHost:   expHost,
+			base:           base,
+		}
 	}
 	c, err := connect(l, name, &mcpsdk.StreamableClientTransport{
 		Endpoint:   endpoint,
@@ -142,14 +172,18 @@ func connect(l *slog.Logger, name string, transport mcpsdk.Transport) (*Client, 
 	return c, nil
 }
 
-// bearerTransport adds an Authorization header to every request, for the HTTP
-// transport's per-server token.
+// bearerTransport adds an Authorization header only for the configured origin.
 type bearerTransport struct {
-	token string
-	base  http.RoundTripper
+	token          string
+	expectedScheme string
+	expectedHost   string
+	base           http.RoundTripper
 }
 
 func (t *bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.URL == nil || !strings.EqualFold(r.URL.Scheme, t.expectedScheme) || !strings.EqualFold(r.URL.Host, t.expectedHost) {
+		return nil, fmt.Errorf("mcp bearer credential refused for off-origin target %v", r.URL)
+	}
 	r = r.Clone(r.Context())
 	r.Header.Set("Authorization", "Bearer "+t.token)
 	return t.base.RoundTrip(r)
@@ -177,6 +211,8 @@ func (c *Client) ListTools(ctx context.Context) ([]tools.ToolSpec, error) {
 			Description:        t.Description,
 			Parameters:         schema,
 			Autonomous:         false,
+			Kind:               execguard.ActionUnclassified,
+			DestinationFn:      func(context.Context, map[string]any) string { return "mcp:" + c.name },
 			RequiresCapability: c.requiresCapability,
 			Invoke:             c.makeInvoker(t.Name),
 		})

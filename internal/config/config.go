@@ -392,6 +392,15 @@ type Runtime struct {
 	// finish; single defaults to 0, preserving the immediate shutdown it always
 	// had. "0" explicitly disables the wait.
 	ShutdownGrace string `yaml:"shutdown_grace"`
+	// Mode selects deployment security posture: "" / "self_hosted" (default)
+	// or "hosted" (strict boundary defaults: denies unclassified actions and
+	// forbids host-launched stdio MCP servers).
+	Mode string `yaml:"mode"`
+}
+
+// HostedMode reports whether strict hosted security posture is enabled.
+func (c *Config) HostedMode() bool {
+	return c != nil && strings.EqualFold(strings.TrimSpace(c.Runtime.Mode), "hosted")
 }
 
 // TimezoneOffset is the cron matching offset as a duration. It is a fixed
@@ -1105,6 +1114,8 @@ type ToolSpecOverride struct {
 
 	NeedsConfirm *bool   `yaml:"needs_confirm"`
 	Permission   *string `yaml:"permission"`
+	// Kind classifies the action's side-effect profile: read | write | destructive.
+	Kind *string `yaml:"kind"`
 }
 
 // ToolParamOverride overrides the presentation of one parameter. Only the
@@ -2729,9 +2740,21 @@ func validate(path string, c *Config) error {
 		}
 	}
 
+	switch strings.ToLower(strings.TrimSpace(c.Runtime.Mode)) {
+	case "", "self_hosted", "hosted":
+	default:
+		return fmt.Errorf("%s: runtime.mode must be self_hosted or hosted (got %q)", path, c.Runtime.Mode)
+	}
+	if c.HostedMode() && c.Plugins.EnforceCapabilities != nil && !*c.Plugins.EnforceCapabilities {
+		return fmt.Errorf("%s: runtime.mode=hosted requires plugins.enforce_capabilities=true", path)
+	}
+
 	for sname, s := range c.MCP.Servers {
 		if s.Command == "" && s.URL == "" {
 			return fmt.Errorf("%s: mcp server %q has neither command nor url", path, sname)
+		}
+		if c.HostedMode() && strings.TrimSpace(s.Command) != "" {
+			return fmt.Errorf("%s: mcp.servers.%s: host-launched stdio MCP (command) is disabled when runtime.mode is hosted; use a Streamable HTTP endpoint (url)", path, sname)
 		}
 	}
 
@@ -2934,6 +2957,13 @@ func validatePromptRefs(path string, c *Config) error {
 		}
 	}
 	for tname, o := range c.Tools.Policy.Overrides {
+		if o.Kind != nil {
+			switch strings.ToLower(strings.TrimSpace(*o.Kind)) {
+			case "", "read", "write", "destructive":
+			default:
+				return fmt.Errorf("%s: tool override %q kind must be read, write or destructive (got %q)", path, tname, *o.Kind)
+			}
+		}
 		if o.Description != nil && o.Description.IsRef && !has(o.Description.Value) {
 			return fmt.Errorf("%s: tool override %q description references unknown prompt %q", path, tname, o.Description.Value)
 		}

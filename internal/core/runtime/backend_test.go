@@ -161,6 +161,41 @@ func TestStoreContract(t *testing.T) {
 			t.Fatal("delete did not remove the row")
 		}
 
+		// Atomic CAS operations for approvals and execution intents.
+		casStore, ok := s.(interface {
+			PutRowIfAbsent(ctx context.Context, key, value string, expiresAt time.Time) (bool, error)
+			CompareAndSwapRow(ctx context.Context, key, oldValue, newValue string, expiresAt time.Time) (bool, error)
+		})
+		if !ok {
+			t.Fatal("store must implement PutRowIfAbsent and CompareAndSwapRow")
+		}
+		casKey := "approval|" + user + "|c1"
+		inserted, err := casStore.PutRowIfAbsent(ctx, casKey, `{"status":"pending"}`, time.Now().Add(time.Minute))
+		if err != nil || !inserted {
+			t.Fatalf("first PutRowIfAbsent: inserted=%v err=%v", inserted, err)
+		}
+		inserted, err = casStore.PutRowIfAbsent(ctx, casKey, `{"status":"other"}`, time.Now().Add(time.Minute))
+		if err != nil || inserted {
+			t.Fatalf("second PutRowIfAbsent should lose race: inserted=%v err=%v", inserted, err)
+		}
+		swapped, err := casStore.CompareAndSwapRow(ctx, casKey, `{"status":"wrong"}`, `{"status":"claimed"}`, time.Now().Add(time.Minute))
+		if err != nil || swapped {
+			t.Fatalf("mismatched CAS must fail: swapped=%v err=%v", swapped, err)
+		}
+		swapped, err = casStore.CompareAndSwapRow(ctx, casKey, `{"status":"pending"}`, `{"status":"approved"}`, time.Now().Add(time.Minute))
+		if err != nil || !swapped {
+			t.Fatalf("matching CAS must succeed: swapped=%v err=%v", swapped, err)
+		}
+		// Expired row can be replaced by PutRowIfAbsent.
+		expKey := "approval|" + user + "|expired"
+		if err := s.PutRow(ctx, expKey, `{"status":"pending"}`, time.Now().Add(-time.Second)); err != nil {
+			t.Fatalf("put expired cas row: %v", err)
+		}
+		inserted, err = casStore.PutRowIfAbsent(ctx, expKey, `{"status":"fresh"}`, time.Now().Add(time.Minute))
+		if err != nil || !inserted {
+			t.Fatalf("expired PutRowIfAbsent should replace expired row: inserted=%v err=%v", inserted, err)
+		}
+
 		// --- usage ledger ----------------------------------------------------
 		day := DayKey(time.Now())
 		at := time.Now()

@@ -193,3 +193,39 @@ func TestHTTPClientAfterCloseFails(t *testing.T) {
 		t.Fatal("a call after Close must fail rather than block or panic")
 	}
 }
+
+func TestHTTPClientRejectsCrossOriginRedirectsAndOffOriginBearer(t *testing.T) {
+	var leakedBearer string
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leakedBearer = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/steal", http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	if _, err := NewHTTPClient("redir", redirector.URL, "s3cret", discardLog()); err == nil || !strings.Contains(err.Error(), "cross-origin redirect") {
+		t.Fatalf("expected cross-origin redirect refusal, got %v", err)
+	}
+	if leakedBearer != "" {
+		t.Fatalf("bearer token leaked across redirect: %q", leakedBearer)
+	}
+
+	// Direct bearerTransport check against mismatched scheme or host.
+	tr := &bearerTransport{
+		token:          "s3cret",
+		expectedScheme: "https",
+		expectedHost:   "mcp.example.com",
+		base:           http.DefaultTransport,
+	}
+	req, _ := http.NewRequest(http.MethodPost, target.URL, nil)
+	if _, err := tr.RoundTrip(req); err == nil || !strings.Contains(err.Error(), "off-origin") {
+		t.Fatalf("expected off-origin bearer refusal, got %v", err)
+	}
+	if leakedBearer != "" {
+		t.Fatalf("bearer token reached off-origin server: %q", leakedBearer)
+	}
+}

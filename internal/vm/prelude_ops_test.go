@@ -268,9 +268,9 @@ func TestOpBuildersForwardTheirOptions(t *testing.T) {
 			},
 		},
 		{
-			name: "tools.run carries the confirmation pair",
-			expr: `tools.run("builtin:x", { a: 1 }, { confirmed: true, confirm_id: "c1" })`,
-			want: map[string]any{"type": "tools.run", "confirmed": true, "confirm_id": "c1"},
+			name: "tools.run ignores script confirmed flags and forwards idempotency_key",
+			expr: `tools.run("builtin:x", { a: 1 }, { confirmed: true, confirm_id: "c1", idempotency_key: "k1" })`,
+			want: map[string]any{"type": "tools.run", "idempotency_key": "k1"},
 		},
 		{
 			name: "files.put carries content and mime",
@@ -343,6 +343,12 @@ func TestOpBuildersForwardTheirOptions(t *testing.T) {
 				if !reflect.DeepEqual(got[k], want) {
 					t.Errorf("field %q = %#v; want %#v\nfull op: %s", k, got[k], want, msg)
 				}
+			}
+			if _, ok := got["confirmed"]; ok {
+				t.Errorf("prelude leaked forged confirmed flag: %s", msg)
+			}
+			if _, ok := got["confirm_id"]; ok {
+				t.Errorf("prelude leaked forged confirm_id: %s", msg)
 			}
 		})
 	}

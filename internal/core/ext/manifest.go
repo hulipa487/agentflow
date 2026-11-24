@@ -56,6 +56,7 @@ type ActionSpec struct {
 	Description        string         `yaml:"description,omitempty" json:"description,omitempty"`
 	ExposeAsTool       bool           `yaml:"expose_as_tool,omitempty" json:"expose_as_tool,omitempty"`
 	NeedsConfirm       bool           `yaml:"needs_confirm,omitempty" json:"needs_confirm,omitempty"`
+	Kind               string         `yaml:"kind,omitempty" json:"kind,omitempty"`
 	RequiresCapability string         `yaml:"requires_capability,omitempty" json:"requires_capability,omitempty"`
 	Parameters         map[string]any `yaml:"parameters,omitempty" json:"parameters,omitempty"`
 }
@@ -120,9 +121,14 @@ func ValidateManifest(m Manifest) error {
 	if len(m.Actions) == 0 {
 		return fmt.Errorf("api %q: actions must declare at least one action", m.Name)
 	}
-	for actName := range m.Actions {
+	for actName, spec := range m.Actions {
 		if !validNameRe.MatchString(actName) {
 			return fmt.Errorf("api %q: invalid action name %q", m.Name, actName)
+		}
+		switch strings.ToLower(strings.TrimSpace(spec.Kind)) {
+		case "", "read", "write", "destructive":
+		default:
+			return fmt.Errorf("api %q action %q: kind must be read, write or destructive (got %q)", m.Name, actName, spec.Kind)
 		}
 	}
 	return nil

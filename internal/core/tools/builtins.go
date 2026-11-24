@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"agentflow/internal/core/execguard"
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/shellops"
 	"agentflow/internal/drivers/sandbox"
@@ -38,6 +39,14 @@ func RegisterBuiltins(r *Registry, searcher *search.Set) {
 	r.Register(ToolSpec{
 		Name:        "builtin:web_search",
 		Description: desc,
+		Kind:        execguard.ActionRead,
+		DestinationFn: func(_ context.Context, args map[string]any) string {
+			eng, _ := args["engine"].(string)
+			if eng == "" {
+				return "search:default"
+			}
+			return "search:" + eng
+		},
 		Parameters: map[string]any{
 			"type":       "object",
 			"properties": props,
@@ -243,10 +252,22 @@ func RegisterSSHBuiltins(r *Registry, front *shellops.Front) {
 		return owner, h.ID, true, nil
 	}
 
+	sshDest := func(ctx context.Context, args map[string]any) string {
+		if opts, ok := shellops.SSHProfile(ctx); ok && opts.Host != "" {
+			return "ssh:" + opts.Host
+		}
+		if hid, _ := args["handle_id"].(string); hid != "" {
+			return "ssh-handle:" + hid
+		}
+		return "ssh"
+	}
+
 	r.Register(ToolSpec{
 		Name:               "builtin:ssh.exec",
 		Description:        "Run a command over SSH on this agent's bound remote host (opening and reusing a per-session connection), or on an explicit SSH handle_id. Returns handle_id, stdout, stderr, exit_code and duration_ms.",
 		RequiresCapability: "net.ssh",
+		Kind:               execguard.ActionWrite,
+		DestinationFn:      sshDest,
 		Parameters: objectSchema(map[string]any{
 			"command":   map[string]any{"type": "string", "description": "Command to run"},
 			"handle_id": map[string]any{"type": "string", "description": "Optional: SSH handle_id from ssh.spawn instead of the bound SSH profile"},
@@ -280,6 +301,8 @@ func RegisterSSHBuiltins(r *Registry, front *shellops.Front) {
 		Name:               "builtin:ssh.read",
 		Description:        "Read a text file over SSH from this agent's bound remote host (or an explicit SSH handle_id).",
 		RequiresCapability: "net.ssh",
+		Kind:               execguard.ActionRead,
+		DestinationFn:      sshDest,
 		Parameters: objectSchema(map[string]any{
 			"path":      map[string]any{"type": "string", "description": "Remote file path"},
 			"handle_id": map[string]any{"type": "string", "description": "Optional: SSH handle_id from ssh.spawn instead of the bound SSH profile"},
@@ -308,6 +331,8 @@ func RegisterSSHBuiltins(r *Registry, front *shellops.Front) {
 		Name:               "builtin:ssh.write",
 		Description:        "Write a text file over SSH on this agent's bound remote host (or an explicit SSH handle_id).",
 		RequiresCapability: "net.ssh",
+		Kind:               execguard.ActionWrite,
+		DestinationFn:      sshDest,
 		Parameters: objectSchema(map[string]any{
 			"path":      map[string]any{"type": "string", "description": "Remote file path"},
 			"content":   map[string]any{"type": "string", "description": "File content"},
@@ -338,6 +363,8 @@ func RegisterSSHBuiltins(r *Registry, front *shellops.Front) {
 		Name:               "builtin:ssh.close",
 		Description:        "Close this agent's active remote SSH connection (or a specific SSH handle_id); a later ssh call opens a fresh one.",
 		RequiresCapability: "net.ssh",
+		Kind:               execguard.ActionWrite,
+		DestinationFn:      sshDest,
 		Parameters: objectSchema(map[string]any{
 			"handle_id": map[string]any{"type": "string", "description": "Optional: SSH handle_id to close; defaults to the session's bound SSH connection"},
 		}, nil),
@@ -395,10 +422,18 @@ func failed(tool string, err error) map[string]any {
 }
 
 func registerShellProfileBuiltins(r *Registry, front *shellops.Front) {
+	localDest := func(ctx context.Context, _ map[string]any) string {
+		if _, p, _, ok := shellops.Profile(ctx); ok && p.Project != "" {
+			return "sandbox:" + p.Project
+		}
+		return "sandbox:workspace"
+	}
 	r.Register(ToolSpec{
 		Name:               "builtin:shell.exec",
 		Description:        "Run a shell command in this agent's project. Each call starts fresh in the project directory: files the command writes there are kept, but nothing else carries over between calls — no background processes, no shell variables, no files outside the project. Returns stdout, stderr, exit_code, duration_ms, timed_out and the project files it changed.",
 		RequiresCapability: "shell.exec",
+		Kind:               execguard.ActionWrite,
+		DestinationFn:      localDest,
 		Parameters: objectSchema(map[string]any{
 			"command": map[string]any{"type": "string", "description": "Command to run"},
 		}, []string{"command"}),
@@ -449,10 +484,18 @@ func registerFSBuiltins(r *Registry, front *shellops.Front) {
 		return b.agent, opts, nil
 	}
 
+	localDest := func(ctx context.Context, _ map[string]any) string {
+		if _, p, _, ok := shellops.Profile(ctx); ok && p.Project != "" {
+			return "sandbox:" + p.Project
+		}
+		return "sandbox:workspace"
+	}
 	r.Register(ToolSpec{
 		Name:               "builtin:fs.read",
 		Description:        "Read a text file from this agent's project.",
 		RequiresCapability: "shell.exec",
+		Kind:               execguard.ActionRead,
+		DestinationFn:      localDest,
 		Parameters: objectSchema(map[string]any{
 			"path":      map[string]any{"type": "string", "description": "File path, relative to the project"},
 			"handle_id": map[string]any{"type": "string", "description": "Optional: a sandbox handle from shell.spawn whose mount and workdir options apply"},
@@ -478,6 +521,8 @@ func registerFSBuiltins(r *Registry, front *shellops.Front) {
 		Name:               "builtin:fs.write",
 		Description:        "Write a text file in this agent's project.",
 		RequiresCapability: "shell.exec",
+		Kind:               execguard.ActionWrite,
+		DestinationFn:      localDest,
 		Parameters: objectSchema(map[string]any{
 			"path":      map[string]any{"type": "string", "description": "File path, relative to the project"},
 			"content":   map[string]any{"type": "string", "description": "File content"},

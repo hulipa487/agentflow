@@ -113,6 +113,7 @@ func (s *Supervisor) Spawn(ctx context.Context, parent session.Identity, profile
 	a.Journal = s.EgressJournal
 	a.MemBudget = s.vmMemory
 	a.Media = s.media
+	a.Guard = s.guard
 
 	actorCtx, cancel := context.WithCancel(s.ctx)
 

@@ -19,6 +19,7 @@ import (
 
 	"agentflow/internal/config"
 	"agentflow/internal/core/address"
+	"agentflow/internal/core/execguard"
 	"agentflow/internal/core/gateway"
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/memory"
@@ -335,9 +336,10 @@ type Op struct {
 	Environment string `json:"environment,omitempty"`
 	JobID       string `json:"job_id,omitempty"`
 
-	// Confirm bypass.
-	Confirmed bool   `json:"confirmed,omitempty"`
-	ConfirmID string `json:"confirm_id,omitempty"`
+	// Confirm bypass (Go-only; never deserialized from script payloads).
+	Confirmed      bool   `json:"-"`
+	ConfirmID      string `json:"-"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 
 	// External APIs (api.call, api.batch).
 	API      string        `json:"api,omitempty"`
@@ -347,9 +349,10 @@ type Op struct {
 
 // APICallSpec is one request in an api.batch op.
 type APICallSpec struct {
-	API    string         `json:"api"`
-	Action string         `json:"action"`
-	Args   map[string]any `json:"args,omitempty"`
+	API            string         `json:"api"`
+	Action         string         `json:"action"`
+	Args           map[string]any `json:"args,omitempty"`
+	IdempotencyKey string         `json:"idempotency_key,omitempty"`
 }
 
 // CredentialRef names a stored credential to resolve at op-handler time. It
@@ -834,6 +837,9 @@ type Actor struct {
 	// are normalized and scope-authorized at the Lua→Go border.
 	Media *media.Service
 
+	// Guard backs runtime-owned action approvals and write idempotency.
+	Guard *execguard.Store
+
 	gw     Gateway
 	agents AgentService
 	sched  SchedulerService
@@ -1246,11 +1252,11 @@ func (a *Actor) runOnce(ctx context.Context) (crashed bool) {
 			return false // shutdown or reload
 		}
 
-		// Confirm interception: when tools.run returns needs_confirm, park the
-		// coroutine, send a confirm prompt, block for the user's confirm reply,
-		// then re-dispatch with Confirmed=true. The Lua coroutine stays suspended
-		// throughout — it yields once, resumes once.
-		if op.Type == "tools.run" && ok && isConfirmRequest(resp) {
+		// Confirm interception: when tools.run or api.call returns needs_confirm,
+		// park the coroutine, deliver a runtime-owned approval prompt, wait for an
+		// authorized decision (channel reply or out-of-band Studio decision), then
+		// re-dispatch carrying only a Go-context approval token.
+		if (op.Type == "tools.run" || op.Type == "api.call") && ok && isConfirmRequest(resp) {
 			resp, ok, proceed = a.doConfirm(ctx, op, &current, resp)
 			if !proceed {
 				return false
@@ -2720,73 +2726,236 @@ func isConfirmRequest(respJSON string) bool {
 	return ok && b
 }
 
-// doConfirm sends a confirm prompt to the user, blocks for a confirm reply,
-// then re-dispatches the tools.run op with Confirmed=true if approved.
+// ApproverPrincipalForMessage returns the authenticated principal identifier
+// eligible to decide an interactive action approval triggered by m. System,
+// scheduler, and inter-agent messages cannot self-approve interactive prompts.
+func ApproverPrincipalForMessage(m *Message) string {
+	if m == nil {
+		return ""
+	}
+	switch provenanceKindOf(m) {
+	case "agent", "scheduler", "system":
+		return ""
+	}
+	if id, ok := actingIdentityOf(m, false); ok && id.Personal != "" {
+		return "user:" + id.Personal
+	}
+	if m.Channel != "" && m.From != "" {
+		return "chan:" + m.Channel + ":" + m.From
+	}
+	return ""
+}
+
+// ApproverPrincipalFromCtx extracts the eligible approver principal from ctx's
+// stamped turn message.
+func ApproverPrincipalFromCtx(ctx context.Context) string {
+	return ApproverPrincipalForMessage(TurnMessageFromCtx(ctx))
+}
+
+func parseApprovalReply(msg Message, approvalID string) (decided, approve bool) {
+	if msg.Type == "confirm.decision" {
+		ref, _ := msg.Payload["approval_id"].(string)
+		if ref == "" {
+			ref, _ = msg.Payload["confirm_id"].(string)
+		}
+		if ref != approvalID {
+			return false, false
+		}
+		if b, ok := msg.Payload["approved"].(bool); ok {
+			return true, b
+		}
+		if dec, ok := msg.Payload["decision"].(string); ok {
+			switch strings.ToLower(strings.TrimSpace(dec)) {
+			case "approve", "approved", "yes":
+				return true, true
+			case "deny", "denied", "no", "reject":
+				return true, false
+			}
+		}
+		return false, false
+	}
+	if strings.TrimSpace(msg.Text) == "" {
+		return false, false
+	}
+	ref := fmt.Sprintf("[ref:%s]", approvalID)
+	if !strings.Contains(msg.Text, ref) {
+		return false, false
+	}
+	cleaned := strings.ReplaceAll(msg.Text, ref, "")
+	cleaned = strings.TrimSpace(cleaned)
+	cleaned = strings.TrimRight(cleaned, ".!")
+	switch strings.ToUpper(strings.TrimSpace(cleaned)) {
+	case "YES", "APPROVE":
+		return true, true
+	case "NO", "DENY":
+		return true, false
+	default:
+		return false, false
+	}
+}
+
+// doConfirm sends a runtime-owned approval prompt to the user, blocks for an
+// authorized decision (verified channel reply or out-of-band Studio decision),
+// then re-dispatches with a Go-context approval token if approved.
 func (a *Actor) doConfirm(ctx context.Context, op Op, current *Message, respJSON string) (resp string, ok, proceed bool) {
 	var ci struct {
-		ConfirmID string `json:"confirm_id"`
-		Tool      string `json:"tool"`
+		ApprovalID  string         `json:"approval_id"`
+		ConfirmID   string         `json:"confirm_id"`
+		Tool        string         `json:"tool"`
+		Destination string         `json:"destination"`
+		Description string         `json:"description"`
+		ArgsPreview map[string]any `json:"args_preview"`
 	}
 	if err := json.Unmarshal([]byte(respJSON), &ci); err != nil {
 		return `"confirm parse error"`, false, true
 	}
-
-	prompt := fmt.Sprintf(
-		"⚠️ Confirm: run tool %q? Reply YES to proceed or NO to cancel [ref:%s]",
-		ci.Tool, ci.ConfirmID,
-	)
-	if a.gw != nil && current != nil && current.Channel != "" {
-		if err := a.gw.Send(current.Channel, current.ReplyTo, prompt, nil); err != nil {
-			a.log.Warn("confirm prompt send failed", "err", err)
-		}
+	approvalID := ci.ApprovalID
+	if approvalID == "" {
+		approvalID = ci.ConfirmID
 	}
-	a.log.Info("confirm prompt sent", "tool", ci.Tool, "confirm_id", ci.ConfirmID)
+	if approvalID == "" {
+		return `"confirm validation error: missing approval_id"`, false, true
+	}
 
-	// A prompt nobody answers must not park the session forever. Ten minutes is
-	// long enough for a person to notice and short enough that a turn with no
-	// one to answer it recovers on its own.
-	const confirmWait = 10 * time.Minute
+	prompt := gateway.ApprovalPrompt{
+		ID:          approvalID,
+		SessionKey:  a.Identity.SessionID,
+		Agent:       a.Identity.Agent,
+		Action:      ci.Tool,
+		Destination: ci.Destination,
+		Description: ci.Description,
+		ArgsPreview: ci.ArgsPreview,
+	}
 
-	var confirmed bool
-	for {
-		msg, goOn, expired := a.waitInboxOrTimeout(ctx, confirmWait)
-		if expired {
-			a.log.Warn("confirmation timed out; treating it as denied",
-				"tool", ci.Tool, "confirm_id", ci.ConfirmID, "waited", confirmWait)
-			r, _ := jsonString("tool invocation denied: no confirmation within " + confirmWait.String())
+	const defaultConfirmWait = 10 * time.Minute
+	confirmWait := defaultConfirmWait
+	if a.Guard != nil {
+		rec, found, err := a.Guard.GetApproval(ctx, approvalID)
+		if err != nil || !found || rec.SessionKey != a.Identity.SessionID {
+			r, _ := jsonString("tool invocation denied: unknown approval record")
+			a.log.Warn("confirm rejected unknown approval", "tool", ci.Tool, "approval_id", approvalID, "err", err)
 			return r, false, true
 		}
-		if !goOn {
-			return "", false, false
+		prompt.Action = rec.CanonicalAction
+		prompt.Destination = rec.Destination
+		prompt.Description = rec.Description
+		prompt.ArgsPreview = rec.RedactedArgs
+		prompt.ExpiresAt = rec.ExpiresAt
+		if left := time.Until(time.Unix(rec.ExpiresAt, 0)); left > 0 && left < confirmWait {
+			confirmWait = left
 		}
-		if msg.Text == "" {
-			continue
-		}
-		ref := fmt.Sprintf("[ref:%s]", ci.ConfirmID)
-		if !strings.Contains(msg.Text, ref) {
-			continue
-		}
-		upper := strings.ToUpper(msg.Text)
-		confirmed = strings.Contains(upper, "YES")
-		break
+	} else {
+		prompt.ExpiresAt = time.Now().Add(confirmWait).Unix()
 	}
 
-	if !confirmed {
+	type approvalGateway interface {
+		SendApproval(channel, replyTo string, p gateway.ApprovalPrompt) error
+	}
+	if a.gw != nil && current != nil && current.Channel != "" {
+		if ag, ok := a.gw.(approvalGateway); ok {
+			if err := ag.SendApproval(current.Channel, current.ReplyTo, prompt); err != nil {
+				a.log.Warn("confirm prompt send failed", "err", err)
+			}
+		} else {
+			fallback := fmt.Sprintf(
+				"Confirmation required: %s\nReply \"YES [ref:%s]\" to approve or \"NO [ref:%s]\" to deny.",
+				prompt.Action, prompt.ID, prompt.ID,
+			)
+			if err := a.gw.Send(current.Channel, current.ReplyTo, fallback, nil); err != nil {
+				a.log.Warn("confirm prompt send failed", "err", err)
+			}
+		}
+	}
+	a.log.Info("confirm prompt sent", "tool", prompt.Action, "approval_id", approvalID)
+
+	timer := time.NewTimer(confirmWait)
+	defer timer.Stop()
+
+	var guardCh chan execguard.ApprovalRecord
+	waitCtx, waitCancel := context.WithTimeout(ctx, confirmWait)
+	defer waitCancel()
+	if a.Guard != nil {
+		guardCh = make(chan execguard.ApprovalRecord, 1)
+		go func() {
+			rec, decided, _ := a.Guard.WaitDecision(waitCtx, approvalID, confirmWait)
+			if decided {
+				guardCh <- rec
+			}
+		}()
+	}
+
+	expectedChannel := ""
+	expectedApprover := ApproverPrincipalForMessage(current)
+	if current != nil {
+		expectedChannel = current.Channel
+	}
+
+	var approved bool
+	for {
+		a.busy.Store(false)
+		select {
+		case rec := <-guardCh:
+			a.busy.Store(true)
+			a.touch()
+			approved = rec.Status == execguard.ApprovalApproved
+			goto decided
+		case msg := <-a.Mailbox:
+			a.busy.Store(true)
+			a.touch()
+			decided, wantApprove := parseApprovalReply(msg, approvalID)
+			if !decided {
+				continue
+			}
+			actorPrincipal := ApproverPrincipalForMessage(&msg)
+			if a.Guard != nil {
+				rec, err := a.Guard.Decide(ctx, approvalID, wantApprove, actorPrincipal, msg.Channel)
+				if err != nil {
+					a.log.Warn("ignoring unauthorized or invalid confirmation reply",
+						"approval_id", approvalID, "channel", msg.Channel, "principal", actorPrincipal, "err", err)
+					continue
+				}
+				approved = rec.Status == execguard.ApprovalApproved
+				goto decided
+			}
+			if expectedChannel != "" && msg.Channel != expectedChannel {
+				a.log.Warn("ignoring confirmation reply from mismatched channel", "got", msg.Channel, "want", expectedChannel)
+				continue
+			}
+			if expectedApprover == "" || actorPrincipal != expectedApprover {
+				a.log.Warn("ignoring confirmation reply from unauthorized sender", "got", actorPrincipal, "want", expectedApprover)
+				continue
+			}
+			approved = wantApprove
+			goto decided
+		case <-timer.C:
+			a.log.Warn("confirmation timed out; treating it as denied",
+				"tool", prompt.Action, "approval_id", approvalID, "waited", confirmWait)
+			r, _ := jsonString("tool invocation denied: no confirmation within " + confirmWait.String())
+			return r, false, true
+		case <-a.reload:
+			return "", false, false
+		case <-ctx.Done():
+			return "", false, false
+		}
+	}
+
+decided:
+	waitCancel()
+	if !approved {
 		r, _ := jsonString("tool invocation denied by user")
-		a.log.Info("confirm denied", "tool", ci.Tool, "confirm_id", ci.ConfirmID)
+		a.log.Info("confirm denied", "tool", prompt.Action, "approval_id", approvalID)
 		return r, false, true
 	}
 
-	a.log.Info("confirm approved; re-dispatching", "tool", ci.Tool)
-	op.Confirmed = true
-	op.ConfirmID = ci.ConfirmID
+	a.log.Info("confirm approved; re-dispatching", "tool", prompt.Action, "approval_id", approvalID)
+	approvedCtx := execguard.WithApprovedID(ctx, approvalID)
 
 	type result struct {
 		resp string
 		ok   bool
 	}
 	resCh := pool.CallKeyed(a.pool, a.fairnessKey(current), func() result {
-		r, o := a.execBlocking(ctx, op, current)
+		r, o := a.execBlocking(approvedCtx, op, current)
 		return result{r, o}
 	})
 	select {

@@ -108,3 +108,46 @@ func (s *sqliteStore) SweepExpired(ctx context.Context) (int, error) {
 	n, err := res.RowsAffected()
 	return int(n), err
 }
+
+// PutRowIfAbsent inserts key with value only if no non-expired row exists for
+// key. An already-expired row for key is reclaimed first so it can be replaced.
+func (s *sqliteStore) PutRowIfAbsent(ctx context.Context, key, value string, expiresAt time.Time) (bool, error) {
+	now := time.Now().UnixNano()
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM files_meta WHERE key = ? AND expires_at != 0 AND expires_at <= ?`, key, now); err != nil {
+		return false, err
+	}
+	var exp int64
+	if !expiresAt.IsZero() {
+		exp = expiresAt.UnixNano()
+	}
+	res, err := s.db.ExecContext(ctx, `
+		INSERT INTO files_meta (key, value, updated_at, expires_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(key) DO NOTHING`,
+		key, value, now, exp)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+// CompareAndSwapRow atomically replaces oldValue with newValue when key exists,
+// matches oldValue, and has not expired.
+func (s *sqliteStore) CompareAndSwapRow(ctx context.Context, key, oldValue, newValue string, expiresAt time.Time) (bool, error) {
+	now := time.Now().UnixNano()
+	var exp int64
+	if !expiresAt.IsZero() {
+		exp = expiresAt.UnixNano()
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE files_meta
+		SET value = ?, updated_at = ?, expires_at = ?
+		WHERE key = ? AND value = ? AND (expires_at = 0 OR expires_at > ?)`,
+		newValue, now, exp, key, oldValue, now)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}

@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/url"
+	"strings"
 	"time"
 
+	"agentflow/internal/core/execguard"
 	"agentflow/internal/core/files"
 	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/netguard"
@@ -70,6 +73,10 @@ func RegisterFetchBuiltins(r *Registry, c *fetch.Client, log *slog.Logger, fm *f
 		}, []string{"url"}),
 		Autonomous:         true,
 		RequiresCapability: "net.http",
+		Kind:               execguard.ActionRead,
+		DestinationFn: func(_ context.Context, args map[string]any) string {
+			return urlOriginDestination(argString(args["url"]))
+		},
 		Invoke: func(ctx context.Context, args map[string]any) (any, error) {
 			if c == nil {
 				return ResultUnavailable("builtin:fetch", "The fetch client is not configured."), nil
@@ -175,6 +182,18 @@ func argStringMap(v any) map[string]string {
 // argBoolOr reads a boolean arg, falling back when it is absent. It cannot use
 // the zero value as "unset" the way the numeric helpers do, because false is a
 // meaningful choice — follow:false must not become follow:true.
+func urlOriginDestination(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return raw
+	}
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host)
+}
+
 func argBoolOr(v any, fallback bool) bool {
 	if b, ok := v.(bool); ok {
 		return b

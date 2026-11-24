@@ -346,6 +346,48 @@ func (s *postgresStore) SweepExpired(ctx context.Context) (int, error) {
 	return int(n), err
 }
 
+// PutRowIfAbsent inserts key with value only if no non-expired row exists for key.
+func (s *postgresStore) PutRowIfAbsent(ctx context.Context, key, value string, expiresAt time.Time) (bool, error) {
+	now := time.Now().UnixNano()
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM files_meta WHERE key = $1 AND expires_at != 0 AND expires_at <= $2`, key, now); err != nil {
+		return false, err
+	}
+	var exp int64
+	if !expiresAt.IsZero() {
+		exp = expiresAt.UnixNano()
+	}
+	res, err := s.db.ExecContext(ctx, `
+		INSERT INTO files_meta (key, value, updated_at, expires_at)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (key) DO NOTHING`,
+		key, value, now, exp)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+// CompareAndSwapRow atomically updates value from oldValue to newValue when unexpired.
+func (s *postgresStore) CompareAndSwapRow(ctx context.Context, key, oldValue, newValue string, expiresAt time.Time) (bool, error) {
+	now := time.Now().UnixNano()
+	var exp int64
+	if !expiresAt.IsZero() {
+		exp = expiresAt.UnixNano()
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE files_meta
+		SET value = $1, updated_at = $2, expires_at = $3
+		WHERE key = $4 AND value = $5 AND (expires_at = 0 OR expires_at > $6)`,
+		newValue, now, exp, key, oldValue, now)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
 // --- usage ledger -----------------------------------------------------------
 
 func (s *postgresStore) RecordUsage(rec UsageRecord, withEvent bool) error {

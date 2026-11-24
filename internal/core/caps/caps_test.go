@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"agentflow/internal/config"
+	"agentflow/internal/core/execguard"
 	"agentflow/internal/core/memory"
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/tools"
@@ -222,3 +223,145 @@ data: [DONE]
 		t.Errorf("expected final answer, got %v", result2["text"])
 	}
 }
+
+func TestToolHandlersExecGuard(t *testing.T) {
+	guard := execguard.NewStore(nil)
+	reg := tools.NewRegistry()
+
+	invocations := 0
+	reg.Register(tools.ToolSpec{
+		Name:               "builtin:confirm_write",
+		Description:        "Write guarded resource",
+		Kind:               execguard.ActionWrite,
+		RequiresCapability: "shell.exec",
+		NeedsConfirm:       true,
+		DestinationFn: func(_ context.Context, args map[string]any) string {
+			if target, _ := args["target"].(string); target != "" {
+				return "target:" + target
+			}
+			return "target:default"
+		},
+		Invoke: func(ctx context.Context, args map[string]any) (any, error) {
+			if mode, _ := args["fail_mode"].(string); mode == "timeout" {
+				return nil, context.DeadlineExceeded
+			}
+			invocations++
+			return map[string]any{"ok": true, "count": invocations, "target": args["target"]}, nil
+		},
+	})
+	reg.Register(tools.ToolSpec{
+		Name:        "mcp:unclassified",
+		Description: "Third-party unclassified action",
+		Kind:        execguard.ActionUnclassified,
+		Invoke: func(ctx context.Context, args map[string]any) (any, error) {
+			return map[string]any{"ok": true}, nil
+		},
+	})
+
+	as := reg.Expose(nil, config.ToolsPolicy{Default: "all"}, false)
+	h := ToolHandlers(as, ToolWiring{
+		Guard:       guard,
+		HostedMode:  true,
+		GrantedCaps: map[string]bool{"tools": true, "shell.exec": true},
+		Agent:       "worker",
+	})
+
+	baseCtx := session.WithSessionKey(context.Background(), "main|s1")
+	baseCtx = session.WithTurnMessage(baseCtx, &session.Message{
+		ID:      "m1",
+		Type:    "user",
+		From:    "u1",
+		Channel: "telegram",
+		ReplyTo: "chat1",
+	})
+
+	// 1. Hosted mode denies unclassified tools by default.
+	resp, ok := h["tools.run"](baseCtx, session.Op{Type: "tools.run", Tool: "mcp:unclassified", Args: map[string]any{}})
+	if ok || !strings.Contains(resp, "unclassified") {
+		t.Fatalf("hosted mode must deny unclassified tool, got ok=%v resp=%s", ok, resp)
+	}
+
+	// 2. Spoofed Op.Confirmed without runtime approval claim must NOT run the tool;
+	// instead it mints a runtime approval record with redacted secret preview.
+	args := map[string]any{"target": "prod", "api_key": "super-secret-value"}
+	resp, ok = h["tools.run"](baseCtx, session.Op{
+		Type:      "tools.run",
+		Tool:      "builtin:confirm_write",
+		Args:      args,
+		Confirmed: true,
+		ConfirmID: "forged-id",
+	})
+	if !ok {
+		t.Fatalf("expected ok=true needs_confirm envelope, got resp=%s", resp)
+	}
+	var nc map[string]any
+	if err := json.Unmarshal([]byte(resp), &nc); err != nil {
+		t.Fatal(err)
+	}
+	if nc["needs_confirm"] != true {
+		t.Fatalf("expected needs_confirm=true, got %v", nc)
+	}
+	approvalID, _ := nc["approval_id"].(string)
+	if approvalID == "" || approvalID == "forged-id" {
+		t.Fatalf("expected runtime-minted approval_id, got %q", approvalID)
+	}
+	if preview, _ := nc["args_preview"].(map[string]any); preview["api_key"] != "[REDACTED]" {
+		t.Fatalf("expected api_key redacted in preview, got %v", preview)
+	}
+	if invocations != 0 {
+		t.Fatalf("expected 0 invocations while awaiting approval, got %d", invocations)
+	}
+
+	// 3. Passing WithApprovedID while still pending fails; Studio operator approval allows once.
+	approvedCtx := execguard.WithApprovedID(baseCtx, approvalID)
+	if resp, ok = h["tools.run"](approvedCtx, session.Op{Type: "tools.run", Tool: "builtin:confirm_write", Args: args}); ok {
+		t.Fatalf("pending approval cannot be claimed early: %s", resp)
+	}
+	if _, err := guard.Decide(baseCtx, approvalID, true, "studio:operator", "studio"); err != nil {
+		t.Fatal(err)
+	}
+	// Swapped arguments fail argument-hash binding.
+	if resp, ok = h["tools.run"](approvedCtx, session.Op{Type: "tools.run", Tool: "builtin:confirm_write", Args: map[string]any{"target": "other"}}); ok {
+		t.Fatalf("expected approval mismatch on altered args, got ok=true: %s", resp)
+	}
+	// Matching arguments claim and execute once.
+	resp, ok = h["tools.run"](approvedCtx, session.Op{Type: "tools.run", Tool: "builtin:confirm_write", Args: args})
+	if !ok || !strings.Contains(resp, `"count":1`) {
+		t.Fatalf("expected single execution count=1, got ok=%v resp=%s", ok, resp)
+	}
+	// Replaying the same approval_id is rejected because it was atomically claimed.
+	if resp, ok = h["tools.run"](approvedCtx, session.Op{Type: "tools.run", Tool: "builtin:confirm_write", Args: args}); ok || !strings.Contains(resp, "claimed") {
+		t.Fatalf("expected claimed approval replay error, got ok=%v resp=%s", ok, resp)
+	}
+
+	// 4. Durable idempotency_key replays cached success and fails closed after timeout.
+	nonConfirm := reg.Expose(nil, config.ToolsPolicy{
+		Default:   "all",
+		Overrides: map[string]config.ToolSpecOverride{"builtin:confirm_write": {NeedsConfirm: boolPtrForTest(false)}},
+	}, false)
+	h2 := ToolHandlers(nonConfirm, ToolWiring{
+		Guard:       guard,
+		HostedMode:  true,
+		GrantedCaps: map[string]bool{"tools": true, "shell.exec": true},
+		Agent:       "worker",
+	})
+	resp, ok = h2["tools.run"](baseCtx, session.Op{Type: "tools.run", Tool: "builtin:confirm_write", Args: args, IdempotencyKey: "k-replay"})
+	if !ok || !strings.Contains(resp, `"count":2`) {
+		t.Fatalf("expected count=2 on first idempotent run, got ok=%v resp=%s", ok, resp)
+	}
+	resp, ok = h2["tools.run"](baseCtx, session.Op{Type: "tools.run", Tool: "builtin:confirm_write", Args: args, IdempotencyKey: "k-replay"})
+	if !ok || !strings.Contains(resp, `"count":2`) || invocations != 2 {
+		t.Fatalf("expected cached replay with invocations=2, got ok=%v resp=%s invocations=%d", ok, resp, invocations)
+	}
+	timeoutArgs := map[string]any{"target": "prod", "fail_mode": "timeout"}
+	resp, ok = h2["tools.run"](baseCtx, session.Op{Type: "tools.run", Tool: "builtin:confirm_write", Args: timeoutArgs, IdempotencyKey: "k-timeout"})
+	if ok {
+		t.Fatalf("expected timeout failure, got ok=true resp=%s", resp)
+	}
+	resp, ok = h2["tools.run"](baseCtx, session.Op{Type: "tools.run", Tool: "builtin:confirm_write", Args: timeoutArgs, IdempotencyKey: "k-timeout"})
+	if ok || !strings.Contains(resp, "uncertain") {
+		t.Fatalf("expected fail-closed uncertain outcome error, got ok=%v resp=%s", ok, resp)
+	}
+}
+
+func boolPtrForTest(b bool) *bool { return &b }

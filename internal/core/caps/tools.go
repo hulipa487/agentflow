@@ -4,9 +4,13 @@ package caps
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 
+	"github.com/google/uuid"
+
+	"agentflow/internal/core/execguard"
 	"agentflow/internal/core/session"
 	"agentflow/internal/core/tools"
 )
@@ -19,6 +23,10 @@ type ToolWiring struct {
 	LuaOverrides *tools.LuaOverrides
 	Prompts      *session.PromptRegistry
 	Log          *slog.Logger
+	Guard        *execguard.Store
+	HostedMode   bool
+	GrantedCaps  map[string]bool
+	Agent        string
 }
 
 // ToolHandlers returns handlers for tools.list and tools.run bound to one
@@ -85,37 +93,154 @@ func ToolHandlers(agentSet *tools.AgentSet, w ToolWiring) map[string]session.OpH
 				return string(b), false
 			}
 
-			// Confirmed re-invocation: skip NeedsConfirm check.
-			if op.Confirmed {
-				t, ok := agentSet.ByName[name]
-				if !ok {
-					b, _ := json.Marshal(map[string]any{"ok": false, "error": fmt.Sprintf("tool %q not available", name)})
+			t, ok := agentSet.ByName[name]
+			if !ok {
+				b, _ := json.Marshal(map[string]any{"ok": false, "error": fmt.Sprintf("tool %q not available", name)})
+				return string(b), false
+			}
+
+			var dest string
+			if t.DestinationFn != nil {
+				dest = t.DestinationFn(ctx, args)
+			}
+			_, argsHash := execguard.CanonicalJSON(args)
+			rev := execguard.ActionRevision(
+				t.Name,
+				string(t.Kind),
+				t.RequiresCapability,
+				fmt.Sprintf("%v", t.NeedsConfirm),
+				t.Description,
+			)
+
+			caller := execguard.Caller{
+				Agent:             w.Agent,
+				SessionKey:        session.SessionKeyFromCtx(ctx),
+				WorkspaceScope:    session.ScopePrefixFromCtx(ctx),
+				PersonalUUID:      session.PersonalUUIDFromCtx(ctx),
+				ApproverPrincipal: session.ApproverPrincipalFromCtx(ctx),
+				ProvenanceKind:    session.ProvenanceKindFromCtx(ctx),
+				GrantedCaps:       w.GrantedCaps,
+				HostedMode:        w.HostedMode,
+			}
+			if tm := session.TurnMessageFromCtx(ctx); tm != nil {
+				caller.Channel = tm.Channel
+				caller.ReplyTo = tm.ReplyTo
+			}
+
+			reqCap := ""
+			if w.GrantedCaps != nil || w.HostedMode {
+				reqCap = t.RequiresCapability
+			}
+			approvalID := execguard.ApprovedIDFromCtx(ctx)
+			req := execguard.ActionRequest{
+				CanonicalID:        name,
+				Revision:           rev,
+				Kind:               t.Kind,
+				Destination:        dest,
+				Description:        t.Description,
+				RequiredCapability: reqCap,
+				NeedsConfirm:       t.NeedsConfirm,
+				Args:               args,
+				ArgsHash:           argsHash,
+				Caller:             caller,
+				ApprovalID:         approvalID,
+				IdempotencyKey:     op.IdempotencyKey,
+			}
+
+			decision, reason := execguard.Evaluate(req)
+			switch decision {
+			case execguard.DecisionDeny:
+				b, _ := json.Marshal(map[string]any{"ok": false, "error": reason})
+				return string(b), false
+			case execguard.DecisionRequireApproval:
+				if approvalID == "" {
+					if w.Guard != nil {
+						rec, err := w.Guard.CreateApproval(ctx, req)
+						if err != nil {
+							b, _ := json.Marshal(map[string]any{"ok": false, "error": err.Error()})
+							return string(b), false
+						}
+						b, _ := json.Marshal(map[string]any{
+							"ok":            false,
+							"needs_confirm": true,
+							"approval_id":   rec.ID,
+							"confirm_id":    rec.ID,
+							"tool":          name,
+							"destination":   rec.Destination,
+							"description":   rec.Description,
+							"args_preview":  rec.RedactedArgs,
+						})
+						// Return ok:true so prelude passes the structured needs_confirm
+						// response back to runOnce for actor.doConfirm interception.
+						return string(b), true
+					}
+					if w.HostedMode {
+						b, _ := json.Marshal(map[string]any{"ok": false, "error": "approval store is not configured"})
+						return string(b), false
+					}
+					fallbackID := uuid.New().String()
+					b, _ := json.Marshal(map[string]any{
+						"ok":            false,
+						"needs_confirm": true,
+						"approval_id":   fallbackID,
+						"confirm_id":    fallbackID,
+						"tool":          name,
+						"destination":   dest,
+						"description":   t.Description,
+						"args_preview":  execguard.RedactArgs(args),
+					})
+					return string(b), true
+				}
+				if w.Guard != nil {
+					if _, err := w.Guard.ClaimForExecution(ctx, approvalID, req); err != nil {
+						b, _ := json.Marshal(map[string]any{"ok": false, "error": err.Error()})
+						return string(b), false
+					}
+				} else if w.HostedMode {
+					b, _ := json.Marshal(map[string]any{"ok": false, "error": "approval store is not configured"})
 					return string(b), false
 				}
-				res, err := t.Invoke(ctx, args)
+			}
+
+			idemKey := op.IdempotencyKey
+			if idemKey == "" && approvalID != "" {
+				idemKey = "approval:" + approvalID
+			}
+			scope := caller.WorkspaceScope
+			if scope == "" {
+				scope = caller.SessionKey
+			}
+			if w.Guard != nil && idemKey != "" {
+				rec, replayed, err := w.Guard.BeginExecution(ctx, scope, idemKey, name, argsHash, dest)
 				if err != nil {
 					b, _ := json.Marshal(map[string]any{"ok": false, "error": err.Error()})
 					return string(b), false
 				}
-				b, err := json.Marshal(res)
-				if err != nil {
-					return fmt.Sprintf("%q", err.Error()), false
+				if replayed {
+					return rec.ResultJSON, true
 				}
-				return string(b), true
 			}
 
-			// Normal path: goes through Invoke which checks NeedsConfirm.
-			res, err := agentSet.Invoke(ctx, name, args)
+			invokeCtx := execguard.WithPreAuthorized(execguard.WithIdempotencyKey(ctx, op.IdempotencyKey), name)
+			res, err := t.Invoke(invokeCtx, args)
 			if err != nil {
+				if w.Guard != nil && idemKey != "" {
+					uncertain := errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+					_ = w.Guard.CompleteExecution(context.WithoutCancel(ctx), scope, idemKey, "", err, uncertain, approvalID)
+				}
 				b, _ := json.Marshal(map[string]any{"ok": false, "error": err.Error()})
 				return string(b), false
 			}
 			b, err := json.Marshal(res)
 			if err != nil {
+				if w.Guard != nil && idemKey != "" {
+					_ = w.Guard.CompleteExecution(context.WithoutCancel(ctx), scope, idemKey, "", err, false, approvalID)
+				}
 				return fmt.Sprintf("%q", err.Error()), false
 			}
-			// Return ok:true even if needs_confirm — the prelude does not
-			// unwrap it as an error, and runOnce intercepts the flag.
+			if w.Guard != nil && idemKey != "" {
+				_ = w.Guard.CompleteExecution(context.WithoutCancel(ctx), scope, idemKey, string(b), nil, false, approvalID)
+			}
 			return string(b), true
 		},
 	}

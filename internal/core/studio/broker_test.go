@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"agentflow/internal/core/gateway"
 	"agentflow/internal/core/session"
 )
 
@@ -325,5 +326,47 @@ func TestStopThreadUsesTheStudioSessionKey(t *testing.T) {
 	b.StopThread("echo", "t1")
 	if len(r.stopped) != 1 || r.stopped[0] != "echo|studio:t1" {
 		t.Fatalf("stopped = %v", r.stopped)
+	}
+}
+
+func TestChatStreamsApprovalPromptWhileWaiting(t *testing.T) {
+	r := &fakeRouter{live: true, busy: false}
+	b := NewBroker(r, nil, Config{ChatTimeout: 5 * time.Second}, discard())
+	r.onDeliver = func(agent, key string, msg session.Message) {
+		sk := agent + "|" + key
+		b.Trace(session.TraceEvent{SessionID: sk, Kind: "turn.start", Turn: msg.ID})
+		_ = b.DeliverApproval(msg.ReplyTo, gateway.ApprovalPrompt{
+			ID:          "appr-1",
+			SessionKey:  sk,
+			Agent:       agent,
+			Action:      "builtin:fs.write",
+			Destination: "sandbox:app",
+			Description: "Write file",
+			ArgsPreview: map[string]any{"path": "a.txt", "token": "[REDACTED]"},
+			ExpiresAt:   time.Now().Add(time.Minute).Unix(),
+		})
+		go func() {
+			time.Sleep(250 * time.Millisecond)
+			_ = b.Deliver(msg.ReplyTo, "written after approval", nil)
+			b.Trace(session.TraceEvent{SessionID: sk, Kind: "turn.end", Turn: msg.ID})
+		}()
+	}
+
+	var types []string
+	var gotApproval *gateway.ApprovalPrompt
+	res, err := b.Chat(context.Background(), ChatRequest{Agent: "echo", Thread: "t-appr", Text: "write it"}, func(ev ChatEvent) {
+		types = append(types, ev.Type)
+		if ev.Type == "approval" {
+			gotApproval = ev.Approval
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotApproval == nil || gotApproval.ID != "appr-1" || gotApproval.ArgsPreview["token"] != "[REDACTED]" {
+		t.Fatalf("expected approval prompt event, got %+v (events=%v)", gotApproval, types)
+	}
+	if len(res.Replies) != 1 || res.Replies[0].Text != "written after approval" {
+		t.Fatalf("replies = %+v", res.Replies)
 	}
 }

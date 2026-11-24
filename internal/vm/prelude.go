@@ -273,9 +273,8 @@ af.version = 2;
   }
   function goToolsRun(name, args, opts) {
     const req = { type: "tools.run", tool: name, args: args || {} };
-    if (opts && opts.confirmed) {
-      req.confirmed = true;
-      req.confirm_id = opts.confirm_id;
+    if (opts && opts.idempotency_key) {
+      req.idempotency_key = String(opts.idempotency_key);
     }
     return callOp(req);
   }
@@ -488,6 +487,7 @@ af.version = 2;
         timeout: opts.timeout,
         auth: opts.auth,
         save_to: opts.save_to,
+        idempotency_key: opts.idempotency_key,
       });
     },
     get: function(url, opts) {
@@ -798,13 +798,17 @@ af.version = 2;
     list: function() {
       return callOp({ type: "api.list" });
     },
-    call: function(pkg, action, args) {
-      return callOp({
+    call: function(pkg, action, args, opts) {
+      const req = {
         type: "api.call",
         api: String(pkg),
         action: String(action),
         args: args || {},
-      });
+      };
+      if (opts && opts.idempotency_key) {
+        req.idempotency_key = String(opts.idempotency_key);
+      }
+      return callOp(req);
     },
     batch: function(calls) {
       const list = Array.isArray(calls) ? calls : [];
@@ -815,6 +819,7 @@ af.version = 2;
           api: String(c.api || ""),
           action: String(c.action || ""),
           args: c.args || {},
+          idempotency_key: c.idempotency_key ? String(c.idempotency_key) : undefined,
         });
       }
       return callOp({ type: "api.batch", calls: norm });

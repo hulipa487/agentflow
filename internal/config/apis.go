@@ -40,6 +40,7 @@ type APIActionConfig struct {
 	Description        string         `yaml:"description,omitempty"`
 	ExposeAsTool       bool           `yaml:"expose_as_tool,omitempty"`
 	NeedsConfirm       bool           `yaml:"needs_confirm,omitempty"`
+	Kind               string         `yaml:"kind,omitempty"` // read | write | destructive
 	RequiresCapability string         `yaml:"requires_capability,omitempty"`
 	Parameters         map[string]any `yaml:"parameters,omitempty"`
 }
@@ -87,9 +88,14 @@ func validateAPIs(path string, c *Config) error {
 				}
 			}
 		}
-		for act := range a.Actions {
+		for act, actCfg := range a.Actions {
 			if !validAPINameRe.MatchString(act) {
 				return fmt.Errorf("%s: apis.%s: invalid action name %q", path, name, act)
+			}
+			switch strings.ToLower(strings.TrimSpace(actCfg.Kind)) {
+			case "", "read", "write", "destructive":
+			default:
+				return fmt.Errorf("%s: apis.%s.actions.%s: kind must be read, write or destructive (got %q)", path, name, act, actCfg.Kind)
 			}
 		}
 	}

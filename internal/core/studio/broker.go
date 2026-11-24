@@ -18,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"agentflow/internal/core/gateway"
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/metrics"
 	"agentflow/internal/core/runtime"
@@ -72,6 +73,7 @@ type Broker struct {
 type pendingChat struct {
 	sessionKey string
 	replies    chan Reply
+	approvals  chan gateway.ApprovalPrompt
 }
 
 // Reply is one outbound message captured from a playground turn.
@@ -129,6 +131,22 @@ func (b *Broker) Deliver(replyTo, text string, attachments []media.Part) error {
 	return nil
 }
 
+// DeliverApproval implements gateway.ApprovalDriver: it pushes a redacted
+// interactive approval prompt onto the active playground turn's SSE stream.
+func (b *Broker) DeliverApproval(replyTo string, p gateway.ApprovalPrompt) error {
+	b.mu.Lock()
+	pc := b.pending[replyTo]
+	b.mu.Unlock()
+	if pc == nil {
+		return nil
+	}
+	select {
+	case pc.approvals <- p:
+	default:
+	}
+	return nil
+}
+
 // ChatRequest is one playground turn.
 type ChatRequest struct {
 	Agent       string
@@ -150,11 +168,12 @@ type ChatResult struct {
 
 // ChatEvent is what the HTTP handler streams.
 type ChatEvent struct {
-	Type  string              `json:"type"` // trace | reply | done | error
-	Trace *session.TraceEvent `json:"trace,omitempty"`
-	Reply *Reply              `json:"reply,omitempty"`
-	Done  *ChatResult         `json:"done,omitempty"`
-	Err   string              `json:"error,omitempty"`
+	Type     string                  `json:"type"` // trace | reply | approval | done | error
+	Trace    *session.TraceEvent     `json:"trace,omitempty"`
+	Reply    *Reply                  `json:"reply,omitempty"`
+	Approval *gateway.ApprovalPrompt `json:"approval,omitempty"`
+	Done     *ChatResult             `json:"done,omitempty"`
+	Err      string                  `json:"error,omitempty"`
 }
 
 // ErrEmptyText is refused before a turn is delivered.
@@ -213,7 +232,11 @@ func (b *Broker) Chat(ctx context.Context, req ChatRequest, emit func(ChatEvent)
 	defer unsub()
 
 	requestID := uuid.NewString()
-	pending := &pendingChat{sessionKey: sessionKey, replies: make(chan Reply, 16)}
+	pending := &pendingChat{
+		sessionKey: sessionKey,
+		replies:    make(chan Reply, 16),
+		approvals:  make(chan gateway.ApprovalPrompt, 16),
+	}
 	b.mu.Lock()
 	b.pending[requestID] = pending
 	b.mu.Unlock()
@@ -253,8 +276,8 @@ func (b *Broker) Chat(ctx context.Context, req ChatRequest, emit func(ChatEvent)
 	tick := time.NewTicker(100 * time.Millisecond)
 	defer tick.Stop()
 
-	// Replies and trace events travel on separate channels; drain any reply
-	// that raced with the turn boundary before closing the turn.
+	// Replies, approvals, and trace events travel on separate channels; drain
+	// any buffered items that raced with the turn boundary before closing.
 	drain := func() {
 		for {
 			select {
@@ -262,6 +285,9 @@ func (b *Broker) Chat(ctx context.Context, req ChatRequest, emit func(ChatEvent)
 				result.Replies = append(result.Replies, rep)
 				repCopy := rep
 				emit(ChatEvent{Type: "reply", Reply: &repCopy})
+			case ap := <-pending.approvals:
+				apCopy := ap
+				emit(ChatEvent{Type: "approval", Approval: &apCopy})
 			default:
 				return
 			}
@@ -274,6 +300,7 @@ func (b *Broker) Chat(ctx context.Context, req ChatRequest, emit func(ChatEvent)
 	}
 
 	sawTurn := false
+	awaitingApproval := false
 	// refused is set when safety ingress turned this message away. A
 	// classifier block skips the turn outright (no turn.start, no turn.end),
 	// so the only sign that it is over is the session going idle again.
@@ -307,7 +334,12 @@ func (b *Broker) Chat(ctx context.Context, req ChatRequest, emit func(ChatEvent)
 				emit(ChatEvent{Type: "error", Err: err.Error()})
 				return result, err
 			}
+		case ap := <-pending.approvals:
+			awaitingApproval = true
+			apCopy := ap
+			emit(ChatEvent{Type: "approval", Approval: &apCopy})
 		case rep := <-pending.replies:
+			awaitingApproval = false
 			result.Replies = append(result.Replies, rep)
 			repCopy := rep
 			emit(ChatEvent{Type: "reply", Reply: &repCopy})
@@ -318,7 +350,7 @@ func (b *Broker) Chat(ctx context.Context, req ChatRequest, emit func(ChatEvent)
 			if !live {
 				return finish()
 			}
-			if sawTurn && !busy && len(result.Replies) > 0 {
+			if sawTurn && !busy && !awaitingApproval && len(result.Replies) > 0 {
 				return finish()
 			}
 			// Safety skipped the turn and the session is parked on its inbox

@@ -2,11 +2,19 @@ package ext
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 
+	"github.com/google/uuid"
+
+	"agentflow/internal/config"
+	"agentflow/internal/core/execguard"
+	"agentflow/internal/core/session"
 	"agentflow/internal/core/tools"
 )
 
@@ -31,9 +39,20 @@ type APIView struct {
 
 // BatchCall identifies one External API invocation inside CallBatch.
 type BatchCall struct {
-	API    string         `json:"api"`
-	Action string         `json:"action"`
-	Args   map[string]any `json:"args,omitempty"`
+	API            string         `json:"api"`
+	Action         string         `json:"action"`
+	Args           map[string]any `json:"args,omitempty"`
+	IdempotencyKey string         `json:"idempotency_key,omitempty"`
+}
+
+// CallPolicy configures execution-boundary authorization for External API calls.
+type CallPolicy struct {
+	Guard          *execguard.Store
+	HostedMode     bool
+	GrantedCaps    map[string]bool
+	ToolsPolicy    config.ToolsPolicy
+	Agent          string
+	IdempotencyKey string
 }
 
 // BatchResult holds the outcome of one entry in CallBatch (ordered 1-to-1 with requests).
@@ -142,6 +161,9 @@ func (r *Registry) Call(ctx context.Context, apiName, action string, args map[st
 	if !ok {
 		return nil, fmt.Errorf("unknown external api %q", apiName)
 	}
+	if _, ok := entry.manifest.Actions[action]; !ok {
+		return nil, fmt.Errorf("unknown action %q on api %q", action, apiName)
+	}
 
 	select {
 	case r.sem <- struct{}{}:
@@ -150,6 +172,235 @@ func (r *Registry) Call(ctx context.Context, apiName, action string, args map[st
 		return nil, ctx.Err()
 	}
 	return entry.runner.Invoke(ctx, action, args)
+}
+
+func extDestination(m Manifest) string {
+	base := "api:" + m.Name
+	if m.Capabilities.HTTP != nil && len(m.Capabilities.HTTP.AllowedHosts) > 0 {
+		return fmt.Sprintf("%s (%s)", base, strings.Join(m.Capabilities.HTTP.AllowedHosts, ","))
+	}
+	return base
+}
+
+func isToolPolicyForbidden(canonical string, policy config.ToolsPolicy) bool {
+	for _, f := range policy.Forbidden {
+		if f == canonical {
+			return true
+		}
+	}
+	if override, ok := policy.Overrides[canonical]; ok {
+		if override.Permission != nil && *override.Permission == "forbidden" {
+			return true
+		}
+	}
+	return false
+}
+
+// AuthorizeAndCall evaluates capability, policy, hosted-mode, approval, and
+// idempotency constraints for one External API action invocation before
+// running it.
+func (r *Registry) AuthorizeAndCall(ctx context.Context, apiName, action string, args map[string]any, pol CallPolicy) (any, map[string]any, error) {
+	if r == nil {
+		return nil, nil, fmt.Errorf("external api registry is not configured")
+	}
+	r.mu.RLock()
+	entry, ok := r.apis[apiName]
+	r.mu.RUnlock()
+	if !ok {
+		return nil, nil, fmt.Errorf("unknown external api %q", apiName)
+	}
+	spec, ok := entry.manifest.Actions[action]
+	if !ok {
+		return nil, nil, fmt.Errorf("unknown action %q on api %q", action, apiName)
+	}
+
+	canonical := fmt.Sprintf("api:%s.%s", apiName, action)
+	if execguard.IsPreAuthorized(ctx, canonical) {
+		data, err := r.Call(ctx, apiName, action, args)
+		return data, nil, err
+	}
+
+	forbidden := isToolPolicyForbidden(canonical, pol.ToolsPolicy)
+	needsConfirm := spec.NeedsConfirm
+	kind, _ := execguard.ParseActionKind(spec.Kind)
+	if override, ok := pol.ToolsPolicy.Overrides[canonical]; ok {
+		if override.NeedsConfirm != nil {
+			needsConfirm = *override.NeedsConfirm
+		}
+		if override.Kind != nil {
+			if k, ok := execguard.ParseActionKind(*override.Kind); ok {
+				kind = k
+			}
+		}
+	}
+
+	reqCap := spec.RequiresCapability
+	if reqCap == "" {
+		reqCap = "apis"
+	}
+	if pol.GrantedCaps == nil && !pol.HostedMode {
+		reqCap = ""
+	}
+
+	dest := extDestination(entry.manifest)
+	_, argsHash := execguard.CanonicalJSON(args)
+	rev := execguard.ActionRevision(
+		canonical,
+		entry.manifest.Version,
+		string(kind),
+		reqCap,
+		fmt.Sprintf("%v", needsConfirm),
+		dest,
+	)
+
+	caller := execguard.Caller{
+		Agent:             pol.Agent,
+		SessionKey:        session.SessionKeyFromCtx(ctx),
+		WorkspaceScope:    session.ScopePrefixFromCtx(ctx),
+		PersonalUUID:      session.PersonalUUIDFromCtx(ctx),
+		ApproverPrincipal: session.ApproverPrincipalFromCtx(ctx),
+		ProvenanceKind:    session.ProvenanceKindFromCtx(ctx),
+		GrantedCaps:       pol.GrantedCaps,
+		HostedMode:        pol.HostedMode,
+	}
+	if tm := session.TurnMessageFromCtx(ctx); tm != nil {
+		caller.Channel = tm.Channel
+		caller.ReplyTo = tm.ReplyTo
+	}
+
+	approvalID := execguard.ApprovedIDFromCtx(ctx)
+	req := execguard.ActionRequest{
+		CanonicalID:        canonical,
+		Revision:           rev,
+		Kind:               kind,
+		Destination:        dest,
+		Description:        spec.Description,
+		RequiredCapability: reqCap,
+		NeedsConfirm:       needsConfirm,
+		PolicyForbidden:    forbidden,
+		Args:               args,
+		ArgsHash:           argsHash,
+		Caller:             caller,
+		ApprovalID:         approvalID,
+		IdempotencyKey:     pol.IdempotencyKey,
+	}
+
+	decision, reason := execguard.Evaluate(req)
+	switch decision {
+	case execguard.DecisionDeny:
+		return nil, nil, errors.New(reason)
+	case execguard.DecisionRequireApproval:
+		if approvalID == "" {
+			if pol.Guard != nil {
+				rec, err := pol.Guard.CreateApproval(ctx, req)
+				if err != nil {
+					return nil, nil, err
+				}
+				return nil, map[string]any{
+					"ok":            false,
+					"needs_confirm": true,
+					"approval_id":   rec.ID,
+					"confirm_id":    rec.ID,
+					"tool":          canonical,
+					"destination":   rec.Destination,
+					"description":   rec.Description,
+					"args_preview":  rec.RedactedArgs,
+				}, nil
+			}
+			if pol.HostedMode {
+				return nil, nil, errors.New("approval store is not configured")
+			}
+			fallbackID := uuid.New().String()
+			return nil, map[string]any{
+				"ok":            false,
+				"needs_confirm": true,
+				"approval_id":   fallbackID,
+				"confirm_id":    fallbackID,
+				"tool":          canonical,
+				"destination":   dest,
+				"description":   spec.Description,
+				"args_preview":  execguard.RedactArgs(args),
+			}, nil
+		}
+		if pol.Guard != nil {
+			if _, err := pol.Guard.ClaimForExecution(ctx, approvalID, req); err != nil {
+				return nil, nil, err
+			}
+		} else if pol.HostedMode {
+			return nil, nil, errors.New("approval store is not configured")
+		}
+	}
+
+	idemKey := pol.IdempotencyKey
+	if idemKey == "" && approvalID != "" {
+		idemKey = "approval:" + approvalID
+	}
+	scope := caller.WorkspaceScope
+	if scope == "" {
+		scope = caller.SessionKey
+	}
+	if pol.Guard != nil && idemKey != "" {
+		rec, replayed, err := pol.Guard.BeginExecution(ctx, scope, idemKey, canonical, argsHash, dest)
+		if err != nil {
+			return nil, nil, err
+		}
+		if replayed {
+			var cached any
+			if rec.ResultJSON != "" {
+				_ = json.Unmarshal([]byte(rec.ResultJSON), &cached)
+			}
+			return cached, nil, nil
+		}
+	}
+
+	data, err := r.Call(execguard.WithIdempotencyKey(ctx, pol.IdempotencyKey), apiName, action, args)
+	if err != nil {
+		if pol.Guard != nil && idemKey != "" {
+			uncertain := errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+			_ = pol.Guard.CompleteExecution(context.WithoutCancel(ctx), scope, idemKey, "", err, uncertain, approvalID)
+		}
+		return nil, nil, err
+	}
+	if pol.Guard != nil && idemKey != "" {
+		raw, mErr := json.Marshal(data)
+		if mErr != nil {
+			_ = pol.Guard.CompleteExecution(context.WithoutCancel(ctx), scope, idemKey, "", mErr, false, approvalID)
+		} else {
+			_ = pol.Guard.CompleteExecution(context.WithoutCancel(ctx), scope, idemKey, string(raw), nil, false, approvalID)
+		}
+	}
+	return data, nil, nil
+}
+
+// AuthorizeAndCallBatch authorizes and executes each batch item independently.
+func (r *Registry) AuthorizeAndCallBatch(ctx context.Context, calls []BatchCall, pol CallPolicy) []BatchResult {
+	out := make([]BatchResult, len(calls))
+	var wg sync.WaitGroup
+	for i, call := range calls {
+		wg.Add(1)
+		go func(idx int, c BatchCall) {
+			defer wg.Done()
+			itemPol := pol
+			itemPol.IdempotencyKey = c.IdempotencyKey
+			// Clear per-call approval ID unless explicitly scoped (batch cannot multiplex approvals).
+			itemCtx := ctx
+			data, needsConfirm, err := r.AuthorizeAndCall(itemCtx, c.API, c.Action, c.Args, itemPol)
+			if err != nil {
+				out[idx] = BatchResult{OK: false, Error: err.Error()}
+				return
+			}
+			if needsConfirm != nil {
+				out[idx] = BatchResult{
+					OK:    false,
+					Error: fmt.Sprintf("approval required for api:%s.%s; invoke individually via api.call", c.API, c.Action),
+				}
+				return
+			}
+			out[idx] = BatchResult{OK: true, Data: data}
+		}(i, call)
+	}
+	wg.Wait()
+	return out
 }
 
 // CallBatch fans out multiple External API calls concurrently and returns results
@@ -206,12 +457,18 @@ func (r *Registry) RegisterTools(toolReg *tools.Registry) {
 			if reqCap == "" {
 				reqCap = "apis"
 			}
+			kind, _ := execguard.ParseActionKind(spec.Kind)
+			dest := extDestination(m)
 			toolReg.Register(tools.ToolSpec{
 				Name:               fmt.Sprintf("api:%s.%s", pkg, act),
 				Description:        spec.Description,
 				Parameters:         spec.Parameters,
 				NeedsConfirm:       spec.NeedsConfirm,
 				RequiresCapability: reqCap,
+				Kind:               kind,
+				DestinationFn: func(context.Context, map[string]any) string {
+					return dest
+				},
 				Invoke: func(ctx context.Context, args map[string]any) (any, error) {
 					return r.Call(ctx, pkg, act, args)
 				},

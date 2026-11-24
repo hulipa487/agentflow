@@ -9,9 +9,10 @@ import (
 	"strings"
 	"sync"
 
-	"agentflow/internal/config"
-
 	"github.com/google/uuid"
+
+	"agentflow/internal/config"
+	"agentflow/internal/core/execguard"
 )
 
 // ToolSpec describes a tool that can be exposed to the agent.
@@ -31,6 +32,12 @@ type ToolSpec struct {
 	// hold that capability. It is how builtin:fetch and declarative HTTP tools
 	// stay behind net.http rather than being reachable through `tools` alone.
 	RequiresCapability string
+
+	// Kind classifies the side-effect profile ("read" | "write" | "destructive" | "").
+	Kind execguard.ActionKind
+	// DestinationFn extracts a redacted target descriptor (host, project, etc.)
+	// from call arguments for approval previews and binding.
+	DestinationFn func(ctx context.Context, args map[string]any) string
 
 	// Invoke runs the tool. It should return a table that serializes to JSON.
 	Invoke func(ctx context.Context, args map[string]any) (any, error)
@@ -207,6 +214,11 @@ func (r *Registry) ApplyOverrides(overrides map[string]config.ToolSpecOverride, 
 		}
 		if o.Permission != nil {
 			t.Permission = *o.Permission
+		}
+		if o.Kind != nil {
+			if k, ok := execguard.ParseActionKind(*o.Kind); ok {
+				t.Kind = k
+			}
 		}
 		r.tools[name] = t
 	}
@@ -397,6 +409,11 @@ func (r *Registry) Expose(skills []string, policy config.ToolsPolicy, autonomous
 		if override, ok := policy.Overrides[name]; ok {
 			if override.NeedsConfirm != nil {
 				t.NeedsConfirm = *override.NeedsConfirm
+			}
+			if override.Kind != nil {
+				if k, ok := execguard.ParseActionKind(*override.Kind); ok {
+					t.Kind = k
+				}
 			}
 			if override.Permission != nil && *override.Permission == "forbidden" {
 				continue

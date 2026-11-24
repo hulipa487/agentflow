@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"agentflow/internal/config"
+	"agentflow/internal/core/execguard"
 	"agentflow/internal/core/gateway"
 	"agentflow/internal/core/pool"
 	"agentflow/internal/core/session"
@@ -31,6 +32,7 @@ type studioFixture struct {
 	broker *studio.Broker
 	router *testRouter
 	ws     *studio.Workspace
+	guard  *execguard.Store
 }
 
 type testRouter struct {
@@ -87,6 +89,7 @@ func newStudioFixture(t *testing.T) *studioFixture {
 		t.Fatal(err)
 	}
 
+	guard := execguard.NewStore(nil)
 	ws := studio.NewWorkspace(dir, "", "", cfg, log)
 	ui := New(Deps{
 		ConfigDir: dir,
@@ -102,11 +105,12 @@ func newStudioFixture(t *testing.T) *studioFixture {
 		},
 		Studio:    b,
 		Workspace: ws,
+		Guard:     guard,
 		StudioCatalog: func() studio.Catalog {
 			return studio.NewCatalog([]string{"default"}, []string{"builtin:fetch"}, []string{"default", "none"}, nil, nil, []string{"tools"})
 		},
 	})
-	return &studioFixture{ui: ui, dir: dir, sup: sup, broker: b, router: r, ws: ws}
+	return &studioFixture{ui: ui, dir: dir, sup: sup, broker: b, router: r, ws: ws, guard: guard}
 }
 
 func testLoopBody() string {
@@ -432,5 +436,85 @@ expect:
 	_ = json.Unmarshal(rec.Body.Bytes(), &out2)
 	if !out2.OK || !out2.Result.OK || len(out2.Result.Sends) != 1 || out2.Result.Sends[0] != "hello replay" {
 		t.Fatalf("unexpected agent lookup result: %+v (%s)", out2, rec.Body.String())
+	}
+}
+
+func TestStudioApprovalsAPI(t *testing.T) {
+	f := newStudioFixture(t)
+	ctx := context.Background()
+
+	rec1, err := f.guard.CreateApproval(ctx, execguard.ActionRequest{
+		CanonicalID:  "builtin:fs.write",
+		Revision:     "r1",
+		Kind:         execguard.ActionWrite,
+		Destination:  "sandbox:app",
+		Description:  "Write config file",
+		NeedsConfirm: true,
+		Args:         map[string]any{"path": "cfg.yaml", "api_key": "topsecret"},
+		Caller: execguard.Caller{
+			Agent:             "echo",
+			SessionKey:        "echo|studio:t1",
+			ApproverPrincipal: "studio:operator",
+			Channel:           "studio",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec2, err := f.guard.CreateApproval(ctx, execguard.ActionRequest{
+		CanonicalID:  "builtin:shell.exec",
+		Revision:     "r2",
+		Kind:         execguard.ActionWrite,
+		Destination:  "sandbox:other",
+		NeedsConfirm: true,
+		Caller: execguard.Caller{
+			Agent:      "echo",
+			SessionKey: "echo|studio:t2",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// List filtered by session_key returns only the redacted matching approval.
+	res := do(t, f.ui.API(), "GET", "/admin/api/studio/approvals?session_key=echo|studio:t1", nil)
+	if res.Code != http.StatusOK {
+		t.Fatalf("list approvals code = %d: %s", res.Code, res.Body.String())
+	}
+	var listResp struct {
+		OK        bool                       `json:"ok"`
+		Approvals []execguard.ApprovalRecord `json:"approvals"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &listResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(listResp.Approvals) != 1 || listResp.Approvals[0].ID != rec1.ID {
+		t.Fatalf("unexpected filtered approvals: %+v", listResp.Approvals)
+	}
+	if listResp.Approvals[0].RedactedArgs["api_key"] != "[REDACTED]" {
+		t.Fatalf("expected api_key redacted, got %v", listResp.Approvals[0].RedactedArgs)
+	}
+
+	// Approve rec1 via POST decision -> 200.
+	res = do(t, f.ui.API(), "POST", "/admin/api/studio/approvals/"+rec1.ID+"/decision", map[string]any{"approve": true})
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"approved"`) {
+		t.Fatalf("approve code = %d: %s", res.Code, res.Body.String())
+	}
+	// Repeating decision -> 409 Conflict.
+	res = do(t, f.ui.API(), "POST", "/admin/api/studio/approvals/"+rec1.ID+"/decision", map[string]any{"approve": false})
+	if res.Code != http.StatusConflict {
+		t.Fatalf("double decide code = %d, want 409: %s", res.Code, res.Body.String())
+	}
+
+	// Deny rec2 using string decision -> 200.
+	res = do(t, f.ui.API(), "POST", "/admin/api/studio/approvals/"+rec2.ID+"/decision", map[string]any{"decision": "deny"})
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"denied"`) {
+		t.Fatalf("deny code = %d: %s", res.Code, res.Body.String())
+	}
+
+	// Missing approval id -> 404.
+	res = do(t, f.ui.API(), "POST", "/admin/api/studio/approvals/no-such-id/decision", map[string]any{"approve": true})
+	if res.Code != http.StatusNotFound {
+		t.Fatalf("missing id code = %d, want 404: %s", res.Code, res.Body.String())
 	}
 }

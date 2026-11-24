@@ -19,6 +19,7 @@ import (
 	"agentflow/internal/config"
 	"agentflow/internal/core/bundle"
 	"agentflow/internal/core/credentials"
+	"agentflow/internal/core/execguard"
 	"agentflow/internal/core/fleet"
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/metrics"
@@ -102,6 +103,7 @@ type Deps struct {
 	Memory        *studio.Memory
 	Plugins       *studio.Plugins
 	Media         *media.Service
+	Guard         *execguard.Store
 	StudioCatalog func() studio.Catalog
 }
 
@@ -214,6 +216,8 @@ func (u *UI) API() http.Handler {
 	mux.HandleFunc("DELETE /admin/api/studio/plugins/packages/{name}", u.handleStudioPackageDelete)
 	mux.HandleFunc("PUT /admin/api/studio/plugins/packages/{name}/files/{file}", u.handleStudioPackageFilePut)
 	mux.HandleFunc("DELETE /admin/api/studio/plugins/packages/{name}/files/{file}", u.handleStudioPackageFileDelete)
+	mux.HandleFunc("GET /admin/api/studio/approvals", u.handleStudioApprovals)
+	mux.HandleFunc("POST /admin/api/studio/approvals/{id}/decision", u.handleStudioApprovalDecision)
 	return mux
 }
 

@@ -144,3 +144,46 @@ func TestClientRefusesPrivateWithoutAllowPrivate(t *testing.T) {
 		t.Fatalf("expected netguard block, got %v", err)
 	}
 }
+
+func TestClientStripsSecretsAcrossHostRedirectsAndForwardsIdempotencyKey(t *testing.T) {
+	var leakedAuth, leakedCookie, leakedAPIKey, gotIdem string
+	finalSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leakedAuth = r.Header.Get("Authorization")
+		leakedCookie = r.Header.Get("Cookie")
+		leakedAPIKey = r.Header.Get("X-Api-Key")
+		_, _ = io.WriteString(w, "1234567890")
+	}))
+	defer finalSrv.Close()
+
+	// Cross-host hop using localhost while initial request uses 127.0.0.1.
+	finalLocalhost := strings.Replace(finalSrv.URL, "127.0.0.1", "localhost", 1)
+	startSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotIdem = r.Header.Get("Idempotency-Key")
+		http.Redirect(w, r, finalLocalhost+"/next", http.StatusFound)
+	}))
+	defer startSrv.Close()
+
+	c := New(testLogger(), nil, netguard.Policy{AllowPrivate: true})
+	resp, err := c.Do(context.Background(), Request{
+		URL: startSrv.URL,
+		Headers: map[string]string{
+			"Authorization": "Bearer secret",
+			"Cookie":        "sid=abc",
+			"X-Api-Key":     "topsecret",
+		},
+		IdempotencyKey: "idem-http-1",
+		MaxBodyBytes:   4,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotIdem != "idem-http-1" {
+		t.Fatalf("Idempotency-Key = %q, want %q", gotIdem, "idem-http-1")
+	}
+	if leakedAuth != "" || leakedCookie != "" || leakedAPIKey != "" {
+		t.Fatalf("secret headers leaked on cross-host redirect: auth=%q cookie=%q key=%q", leakedAuth, leakedCookie, leakedAPIKey)
+	}
+	if !resp.Truncated || resp.Body != "1234" {
+		t.Fatalf("expected truncated body \"1234\", got truncated=%v body=%q", resp.Truncated, resp.Body)
+	}
+}

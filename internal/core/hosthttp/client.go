@@ -69,6 +69,8 @@ type Request struct {
 	JSON               any
 	AuthService        string
 	Timeout            time.Duration
+	MaxBodyBytes       int64
+	IdempotencyKey     string
 	AllowedHosts       []string
 	AllowedCredentials []string
 	// RequireCredentialAllowlist refuses any AuthService when AllowedCredentials is empty.
@@ -154,9 +156,12 @@ func (c *Client) Do(ctx context.Context, reqSpec Request) (*Response, error) {
 		method = http.MethodGet
 	}
 
-	headers := make(map[string]string, len(reqSpec.Headers)+2)
+	headers := make(map[string]string, len(reqSpec.Headers)+3)
 	for k, v := range reqSpec.Headers {
 		headers[k] = v
+	}
+	if reqSpec.IdempotencyKey != "" && !hasHeaderFold(headers, "Idempotency-Key") {
+		headers["Idempotency-Key"] = reqSpec.IdempotencyKey
 	}
 
 	var credHeader string
@@ -227,24 +232,32 @@ func (c *Client) Do(ctx context.Context, reqSpec Request) (*Response, error) {
 	req = req.WithContext(callCtx)
 
 	httpClient := *c.base
-	if len(reqSpec.AllowedHosts) > 0 || credHeader != "" {
-		initialHost := strings.ToLower(parsed.Host)
-		allowed := reqSpec.AllowedHosts
-		httpClient.CheckRedirect = func(r *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return errors.New("stopped after 10 redirects")
-			}
-			if r.URL.Scheme != "http" && r.URL.Scheme != "https" {
-				return fmt.Errorf("redirect scheme must be http or https (got %q)", r.URL.Scheme)
-			}
-			if !HostAllowed(r.URL.Hostname(), allowed) {
-				return fmt.Errorf("redirect host %q is not in allowed_hosts", r.URL.Hostname())
-			}
-			if credHeader != "" && strings.ToLower(r.URL.Host) != initialHost {
+	initialHost := strings.ToLower(parsed.Host)
+	allowed := reqSpec.AllowedHosts
+	httpClient.CheckRedirect = func(r *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		if r.URL.Scheme != "http" && r.URL.Scheme != "https" {
+			return fmt.Errorf("redirect scheme must be http or https (got %q)", r.URL.Scheme)
+		}
+		if !HostAllowed(r.URL.Hostname(), allowed) {
+			return fmt.Errorf("redirect host %q is not in allowed_hosts", r.URL.Hostname())
+		}
+		if strings.ToLower(r.URL.Host) != initialHost {
+			if credHeader != "" {
 				r.Header.Del(credHeader)
 			}
-			return nil
+			r.Header.Del("Authorization")
+			r.Header.Del("Proxy-Authorization")
+			r.Header.Del("Cookie")
+			for k := range r.Header {
+				if secretHeaderRe.MatchString(k) {
+					r.Header.Del(k)
+				}
+			}
 		}
+		return nil
 	}
 
 	resp, err := httpClient.Do(req)
@@ -258,16 +271,20 @@ func (c *Client) Do(ctx context.Context, reqSpec Request) (*Response, error) {
 	}
 	defer resp.Body.Close()
 
-	lr := io.LimitReader(resp.Body, MaxBodyBytes+1)
+	maxBytes := int64(MaxBodyBytes)
+	if reqSpec.MaxBodyBytes > 0 && reqSpec.MaxBodyBytes < maxBytes {
+		maxBytes = reqSpec.MaxBodyBytes
+	}
+	lr := io.LimitReader(resp.Body, maxBytes+1)
 	bodyBytes, err := io.ReadAll(lr)
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
 	}
 	truncated := false
-	if len(bodyBytes) > MaxBodyBytes {
-		bodyBytes = bodyBytes[:MaxBodyBytes]
+	if int64(len(bodyBytes)) > maxBytes {
+		bodyBytes = bodyBytes[:maxBytes]
 		truncated = true
-		c.log.Warn("http.response truncated", "url", rawURL, "cap", MaxBodyBytes)
+		c.log.Warn("http.response truncated", "url", rawURL, "cap", maxBytes)
 	}
 
 	respHeaders := make(map[string]string, len(resp.Header))

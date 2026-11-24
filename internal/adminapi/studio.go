@@ -21,6 +21,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"agentflow/internal/config"
+	"agentflow/internal/core/execguard"
 	"agentflow/internal/core/media"
 	"agentflow/internal/core/studio"
 	"agentflow/internal/core/supervisor"
@@ -969,5 +970,87 @@ func (u *UI) handleStudioLoopTest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":     true,
 		"result": res,
+	})
+}
+
+// handleStudioApprovals returns pending execution approvals visible to Studio,
+// optionally filtered by session_key.
+func (u *UI) handleStudioApprovals(w http.ResponseWriter, r *http.Request) {
+	if u.deps.Guard == nil {
+		writeErr(w, http.StatusServiceUnavailable, "execution approval store is not enabled on this instance")
+		return
+	}
+	sessionKey := strings.TrimSpace(r.URL.Query().Get("session_key"))
+	items, err := u.deps.Guard.ListPending(r.Context(), sessionKey)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if items == nil {
+		items = []execguard.ApprovalRecord{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"approvals": items,
+	})
+}
+
+// handleStudioApprovalDecision records an authenticated Studio operator's
+// approve or deny decision on one pending runtime approval record.
+func (u *UI) handleStudioApprovalDecision(w http.ResponseWriter, r *http.Request) {
+	if u.deps.Guard == nil {
+		writeErr(w, http.StatusServiceUnavailable, "execution approval store is not enabled on this instance")
+		return
+	}
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		writeErr(w, http.StatusBadRequest, "missing approval id")
+		return
+	}
+	var body struct {
+		Approve  *bool  `json:"approve"`
+		Decision string `json:"decision"`
+	}
+	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	if err := dec.Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	var approve bool
+	switch {
+	case body.Approve != nil:
+		approve = *body.Approve
+	case body.Decision != "":
+		switch strings.ToLower(strings.TrimSpace(body.Decision)) {
+		case "approve", "approved", "yes":
+			approve = true
+		case "deny", "denied", "no", "reject":
+			approve = false
+		default:
+			writeErr(w, http.StatusBadRequest, "decision must be approve or deny")
+			return
+		}
+	default:
+		writeErr(w, http.StatusBadRequest, "approve or decision field is required")
+		return
+	}
+
+	rec, err := u.deps.Guard.Decide(r.Context(), id, approve, "studio:operator", studio.ChannelName)
+	if err != nil {
+		switch {
+		case errors.Is(err, execguard.ErrApprovalNotFound):
+			writeErr(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, execguard.ErrApprovalExpired), errors.Is(err, execguard.ErrApprovalNotPending):
+			writeErr(w, http.StatusConflict, err.Error())
+		case errors.Is(err, execguard.ErrUnauthorizedApprover):
+			writeErr(w, http.StatusForbidden, err.Error())
+		default:
+			writeErr(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"approval": rec,
 	})
 }

@@ -7,11 +7,9 @@ package tools
 // builtin:<...> or an MCP server's <server>/<tool>.
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -21,8 +19,9 @@ import (
 
 	"agentflow/internal/config"
 	"agentflow/internal/core/credentials"
+	"agentflow/internal/core/execguard"
+	"agentflow/internal/core/hosthttp"
 	"agentflow/internal/core/netguard"
-	"agentflow/internal/core/session"
 )
 
 const (
@@ -45,9 +44,9 @@ func RegisterHTTPTools(r *Registry, defs []config.HTTPTool, creds *credentials.S
 	if log == nil {
 		log = slog.Default()
 	}
-	client := &http.Client{Timeout: 0, Transport: policy.Transport()}
+	client := hosthttp.New(log, creds, policy)
 	for _, def := range defs {
-		spec, err := buildHTTPTool(def, client, creds, log)
+		spec, err := buildHTTPTool(def, client, log)
 		if err != nil {
 			log.Warn("tools.http skipped", "tool", def.Name, "err", err)
 			continue
@@ -56,7 +55,7 @@ func RegisterHTTPTools(r *Registry, defs []config.HTTPTool, creds *credentials.S
 	}
 }
 
-func buildHTTPTool(def config.HTTPTool, client *http.Client, creds *credentials.Store, log *slog.Logger) (ToolSpec, error) {
+func buildHTTPTool(def config.HTTPTool, client *hosthttp.Client, log *slog.Logger) (ToolSpec, error) {
 	name := "http:" + def.Name
 	params := def.Params
 	if params == nil {
@@ -86,6 +85,10 @@ func buildHTTPTool(def config.HTTPTool, client *http.Client, creds *credentials.
 	}
 	logger := log.With("module", "tools.http", "tool", name)
 	readOnly := method == http.MethodGet || method == http.MethodHead
+	kind := execguard.ActionWrite
+	if readOnly {
+		kind = execguard.ActionRead
+	}
 
 	spec := ToolSpec{
 		Name:               name,
@@ -93,8 +96,15 @@ func buildHTTPTool(def config.HTTPTool, client *http.Client, creds *credentials.
 		Parameters:         params,
 		Autonomous:         readOnly,
 		RequiresCapability: "net.http",
+		Kind:               kind,
+		DestinationFn: func(_ context.Context, args map[string]any) string {
+			if rendered, err := renderTemplate(def.URL, args, url.PathEscape, false); err == nil && rendered != "" {
+				return urlOriginDestination(rendered)
+			}
+			return urlOriginDestination(def.URL)
+		},
 		Invoke: func(ctx context.Context, args map[string]any) (any, error) {
-			return invokeHTTPTool(ctx, def, method, timeout, maxBytes, client, creds, logger, args)
+			return invokeHTTPTool(ctx, def, method, timeout, maxBytes, client, logger, args)
 		},
 	}
 	if def.NeedsConfirm != nil {
@@ -107,7 +117,10 @@ func buildHTTPTool(def config.HTTPTool, client *http.Client, creds *credentials.
 }
 
 func invokeHTTPTool(ctx context.Context, def config.HTTPTool, method string, timeout time.Duration,
-	maxBytes int64, client *http.Client, creds *credentials.Store, log *slog.Logger, args map[string]any) (any, error) {
+	maxBytes int64, client *hosthttp.Client, _ *slog.Logger, args map[string]any) (any, error) {
+	if client == nil {
+		return nil, fmt.Errorf("%s: http client is not configured", def.Name)
+	}
 	rawURL, err := renderTemplate(def.URL, args, url.PathEscape, true)
 	if err != nil {
 		return nil, fmt.Errorf("%s: url: %w", def.Name, err)
@@ -140,33 +153,12 @@ func invokeHTTPTool(ctx context.Context, def config.HTTPTool, method string, tim
 	for k, v := range def.Headers {
 		headers[k] = v
 	}
-	if def.Auth != nil && def.Auth.Service != "" {
-		if creds == nil {
-			return nil, fmt.Errorf("%s: auth=%q but credentials are not enabled", def.Name, def.Auth.Service)
-		}
-		uuid := session.CredentialUUIDFromCtx(ctx)
-		if uuid == "" {
-			return nil, fmt.Errorf("%s: auth=%q but no user in context", def.Name, def.Auth.Service)
-		}
-		cred, ok, err := creds.Get(ctx, uuid, def.Auth.Service)
-		if err != nil {
-			return nil, fmt.Errorf("%s: resolve auth %q: %w", def.Name, def.Auth.Service, err)
-		}
-		if !ok {
-			return nil, fmt.Errorf("%s: no credential for service %q", def.Name, def.Auth.Service)
-		}
-		header := cred.Header
-		if header == "" {
-			header = "Authorization"
-		}
-		scheme := cred.Scheme
-		if scheme == "" {
-			scheme = "Bearer"
-		}
-		headers[header] = scheme + " " + cred.Value
+	authService := ""
+	if def.Auth != nil {
+		authService = def.Auth.Service
 	}
 
-	var body io.Reader
+	var bodyStr string
 	if method != http.MethodGet && method != http.MethodHead {
 		var payload any
 		if def.Body != nil {
@@ -181,40 +173,29 @@ func invokeHTTPTool(ctx context.Context, def config.HTTPTool, method string, tim
 		if err != nil {
 			return nil, fmt.Errorf("%s: marshal body: %w", def.Name, err)
 		}
-		body = bytes.NewReader(b)
+		bodyStr = string(b)
 		if _, ok := headers["Content-Type"]; !ok {
 			headers["Content-Type"] = "application/json"
 		}
 	}
 
-	callCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(callCtx, method, parsed.String(), body)
+	resp, err := client.Do(ctx, hosthttp.Request{
+		Method:         method,
+		URL:            parsed.String(),
+		Headers:        headers,
+		Body:           bodyStr,
+		AuthService:    authService,
+		Timeout:        timeout,
+		MaxBodyBytes:   maxBytes,
+		IdempotencyKey: execguard.IdempotencyKeyFromCtx(ctx),
+		AllowedHosts:   def.Hosts,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("%s: build request: %w", def.Name, err)
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		if netguard.IsBlocked(err) {
-			log.Warn("declarative HTTP tool refused by the address guard", "url", parsed.Redacted())
-		}
 		return nil, fmt.Errorf("%s: %w", def.Name, err)
 	}
-	defer resp.Body.Close()
-
-	b, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("%s: read response: %w", def.Name, err)
-	}
-	truncated := int64(len(b)) > maxBytes
-	if truncated {
-		b = b[:maxBytes]
-	}
-	text := string(b)
-	if def.Response != "" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	b := resp.BodyBytes
+	text := resp.Body
+	if def.Response != "" && resp.Status >= 200 && resp.Status < 300 {
 		var parsedBody any
 		if err := json.Unmarshal(b, &parsedBody); err == nil {
 			if selected, ok := selectJSONPath(parsedBody, def.Response); ok {
@@ -222,7 +203,7 @@ func invokeHTTPTool(ctx context.Context, def config.HTTPTool, method string, tim
 			}
 			return map[string]any{
 				"ok":            true,
-				"status":        resp.StatusCode,
+				"status":        resp.Status,
 				"body":          text,
 				"select_missed": def.Response,
 			}, nil
@@ -231,10 +212,10 @@ func invokeHTTPTool(ctx context.Context, def config.HTTPTool, method string, tim
 		// pretending the call failed.
 	}
 	return map[string]any{
-		"ok":        resp.StatusCode >= 200 && resp.StatusCode < 300,
-		"status":    resp.StatusCode,
+		"ok":        resp.Status >= 200 && resp.Status < 300,
+		"status":    resp.Status,
 		"body":      text,
-		"truncated": truncated,
+		"truncated": resp.Truncated,
 	}, nil
 }
 

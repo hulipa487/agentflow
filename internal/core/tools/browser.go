@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"agentflow/internal/core/execguard"
 	"agentflow/internal/core/files"
 	"agentflow/internal/drivers/browser"
 )
@@ -85,6 +86,13 @@ func RegisterBrowserBuiltins(r *Registry, b *browser.Client, fm *files.Manager) 
 			},
 		}, []string{"action"}),
 		Autonomous: true,
+		Kind:       execguard.ActionRead,
+		DestinationFn: func(_ context.Context, args map[string]any) string {
+			if u := argString(args["url"]); u != "" {
+				return urlOriginDestination(u)
+			}
+			return "html:inline"
+		},
 		Invoke: func(ctx context.Context, args map[string]any) (any, error) {
 			if b.Empty() {
 				return ResultUnavailable("builtin:browser", "No Browser Run account is configured."), nil

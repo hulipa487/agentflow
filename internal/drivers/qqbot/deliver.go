@@ -252,26 +252,75 @@ func splitMarkdown(text string, n int) []string {
 	return chunks
 }
 
+type sendResp struct {
+	ID      string `json:"id"`
+	ExtInfo struct {
+		RefIdx string `json:"ref_idx"`
+	} `json:"ext_info"`
+}
+
+func bodyText(body map[string]any) string {
+	if s, _ := body["content"].(string); s != "" {
+		return strings.TrimSpace(s)
+	}
+	if md, _ := body["markdown"].(map[string]string); md != nil {
+		if s := md["content"]; s != "" {
+			return strings.TrimSpace(s)
+		}
+	}
+	if md, _ := body["markdown"].(map[string]any); md != nil {
+		if s, _ := md["content"].(string); s != "" {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
+}
+
+func (d *Driver) recordSent(out sendResp, body map[string]any) {
+	if out.ID == "" && out.ExtInfo.RefIdx == "" {
+		return
+	}
+	d.gwMu.Lock()
+	botName := d.botName
+	d.gwMu.Unlock()
+	d.rememberMsg([]string{out.ID, out.ExtInfo.RefIdx}, indexedMsg{
+		author: botName,
+		text:   bodyText(body),
+		isBot:  true,
+		at:     time.Now(),
+	})
+}
+
 // send posts one message, passive when the conversation allows it. A passive
 // reply refused as expired goes again as a proactive one.
 func (d *Driver) send(scene, id, target string, body map[string]any) error {
 	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
 	defer cancel()
+	var out sendResp
 	if msgID, seq, ok := d.claimRef(scene, target); ok {
 		body["msg_id"] = msgID
 		if scene == SceneC2C || scene == SceneGroup {
 			body["msg_seq"] = seq
 		}
-		err := d.call(ctx, "POST", messagesPath(scene, id), body, nil)
-		if err == nil || !isCode(err, passiveExpired...) {
+		err := d.call(ctx, "POST", messagesPath(scene, id), body, &out)
+		if err == nil {
+			d.recordSent(out, body)
+			return nil
+		}
+		if !isCode(err, passiveExpired...) {
 			return err
 		}
 		d.log.Info("qq passive reply window closed; sending proactively", "scene", scene, "err", err)
 		d.dropRef(target)
 		delete(body, "msg_id")
 		delete(body, "msg_seq")
+		out = sendResp{}
 	}
-	return d.call(ctx, "POST", messagesPath(scene, id), body, nil)
+	err := d.call(ctx, "POST", messagesPath(scene, id), body, &out)
+	if err == nil {
+		d.recordSent(out, body)
+	}
+	return err
 }
 
 // sendMedia sends one attachment by URL: uploaded as rich media for private

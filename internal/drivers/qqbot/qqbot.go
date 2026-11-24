@@ -157,6 +157,7 @@ type Driver struct {
 	refsMu sync.Mutex
 	refs   map[string]*replyRef
 
+	msgs *msgIndex
 	seen *dedup
 
 	// gateway session, for resuming after a dropped connection.
@@ -164,6 +165,7 @@ type Driver struct {
 	sessionID string
 	seq       int64
 	botID     string
+	botName   string
 	// wsURL overrides the gateway lookup (tests).
 	wsURL string
 	// retryBase is the first reconnect delay (tests shorten it).
@@ -215,6 +217,7 @@ func New(name, agent string, opts Options, sink router.Sink, srv *httpd.Server, 
 		priv:       priv,
 		pub:        priv.Public().(ed25519.PublicKey),
 		refs:       map[string]*replyRef{},
+		msgs:       newMsgIndex(4096, 24*time.Hour),
 		seen:       newDedup(4096, 30*time.Minute),
 		retryBase:  time.Second,
 	}
@@ -228,6 +231,98 @@ func New(name, agent string, opts Options, sink router.Sink, srv *httpd.Server, 
 }
 
 func (d *Driver) Name() string { return d.name }
+
+type indexedMsg struct {
+	author string
+	text   string
+	isBot  bool
+	at     time.Time
+}
+
+// msgIndex keeps a bounded, expiring index of sent and received messages by
+// message ID and QQ REFIDX so quote-replies can resolve what was replied to.
+type msgIndex struct {
+	mu      sync.Mutex
+	cap     int
+	ttl     time.Duration
+	entries map[string]indexedMsg
+	order   []string
+}
+
+func newMsgIndex(capacity int, ttl time.Duration) *msgIndex {
+	return &msgIndex{
+		cap:     capacity,
+		ttl:     ttl,
+		entries: make(map[string]indexedMsg, capacity),
+	}
+}
+
+func (m *msgIndex) remember(keys []string, entry indexedMsg) {
+	if r := []rune(entry.text); len(r) > 500 {
+		entry.text = string(r[:500])
+	}
+	if entry.at.IsZero() {
+		entry.at = time.Now()
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, raw := range keys {
+		k := strings.TrimSpace(raw)
+		if k == "" {
+			continue
+		}
+		if _, exists := m.entries[k]; !exists {
+			for m.cap > 0 && len(m.order) >= m.cap {
+				old := m.order[0]
+				m.order = m.order[1:]
+				delete(m.entries, old)
+			}
+			if m.cap > 0 && cap(m.order) > m.cap*2 && len(m.order) <= m.cap {
+				shrunk := make([]string, len(m.order), m.cap)
+				copy(shrunk, m.order)
+				m.order = shrunk
+			}
+			m.order = append(m.order, k)
+		}
+		m.entries[k] = entry
+	}
+}
+
+func (m *msgIndex) lookup(keys ...string) (indexedMsg, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	for _, raw := range keys {
+		k := strings.TrimSpace(raw)
+		if k == "" {
+			continue
+		}
+		e, ok := m.entries[k]
+		if !ok {
+			continue
+		}
+		if m.ttl > 0 && now.Sub(e.at) > m.ttl {
+			delete(m.entries, k)
+			continue
+		}
+		return e, true
+	}
+	return indexedMsg{}, false
+}
+
+func (d *Driver) rememberMsg(keys []string, entry indexedMsg) {
+	if d.msgs == nil {
+		return
+	}
+	d.msgs.remember(keys, entry)
+}
+
+func (d *Driver) lookupMsg(keys ...string) (indexedMsg, bool) {
+	if d.msgs == nil {
+		return indexedMsg{}, false
+	}
+	return d.msgs.lookup(keys...)
+}
 
 // Start opens the gateway connection in websocket mode. In webhook mode the
 // route is already mounted and the callback URL is set in the console, so

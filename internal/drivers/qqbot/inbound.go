@@ -50,7 +50,31 @@ type message struct {
 	Attachments []attachment `json:"attachments"`
 	// Mentions lists who the message @s. A group message's content keeps each
 	// of them as an opaque <@id> marker.
-	Mentions []mentionee `json:"mentions"`
+	Mentions         []mentionee `json:"mentions"`
+	MessageReference *struct {
+		MessageID             string `json:"message_id"`
+		IgnoreGetMessageError bool   `json:"ignore_get_message_error"`
+	} `json:"message_reference"`
+	MessageScene *struct {
+		Source string   `json:"source"`
+		Ext    []string `json:"ext"`
+	} `json:"message_scene"`
+}
+
+func parseSceneExt(ext []string) (msgIdx, refMsgIdx string) {
+	for _, item := range ext {
+		k, v, ok := strings.Cut(item, "=")
+		if !ok || v == "" {
+			continue
+		}
+		switch k {
+		case "msg_idx":
+			msgIdx = v
+		case "ref_msg_idx":
+			refMsgIdx = v
+		}
+	}
+	return msgIdx, refMsgIdx
 }
 
 // mentionee is one @ in a message. IsYou marks the bot itself.
@@ -67,24 +91,29 @@ type mentionee struct {
 // resolveMentions rewrites the <@id> markers of a group message. The bot's
 // own marker is dropped, anyone else's becomes @name when the platform gave a
 // name. It reports whether the bot was @ed and whether anyone else was.
-func resolveMentions(text string, list []mentionee) (out string, self, others bool) {
+func resolveMentions(text string, list []mentionee, botID string) (out string, self, others bool) {
 	for _, m := range list {
 		name := m.Nickname
 		if name == "" {
 			name = m.Username
 		}
-		if m.IsYou {
+		isSelf := m.IsYou || (botID != "" && (m.ID == botID || m.UserOpenID == botID || m.MemberOpenID == botID))
+		if isSelf {
 			self = true
 		} else {
 			others = true
 		}
-		for _, id := range []string{m.ID, m.MemberOpenID, m.UserOpenID} {
+		ids := []string{m.ID, m.MemberOpenID, m.UserOpenID}
+		if isSelf && botID != "" {
+			ids = append(ids, botID)
+		}
+		for _, id := range ids {
 			if id == "" {
 				continue
 			}
 			for _, mark := range []string{"<@" + id + ">", "<@!" + id + ">"} {
 				switch {
-				case m.IsYou:
+				case isSelf:
 					text = strings.ReplaceAll(text, mark, "")
 				case name != "":
 					text = strings.ReplaceAll(text, mark, "@"+name)
@@ -133,15 +162,17 @@ func (d *Driver) handleEvent(t, eventID string, raw json.RawMessage) {
 		return
 	}
 	switch {
-	case t == evGroupAll:
-		if !d.scenes[SceneGroupAll] {
-			return
-		}
-	case t == evGroup:
+	case t == evGroupAll || t == evGroup:
 		if !d.scenes[SceneGroup] && !d.scenes[SceneGroupAll] {
+			if _, seen := d.unknown.LoadOrStore("scene:"+t, true); !seen {
+				d.log.Info("qq event ignored because its scene is not enabled", "type", t)
+			}
 			return
 		}
 	case !d.scenes[scene]:
+		if _, seen := d.unknown.LoadOrStore("scene:"+t, true); !seen {
+			d.log.Info("qq event ignored because its scene is not enabled", "type", t)
+		}
 		return
 	}
 	var m message
@@ -152,19 +183,23 @@ func (d *Driver) handleEvent(t, eventID string, raw json.RawMessage) {
 	if m.ID == "" || m.Author.Bot {
 		return
 	}
-	// The platform may push one message more than once; a webhook retry and a
-	// gateway replay after resume both look like this.
-	if !d.seen.add(m.ID) {
-		return
+
+	var msgIdx, refMsgIdx, refMsgID string
+	if m.MessageScene != nil {
+		msgIdx, refMsgIdx = parseSceneExt(m.MessageScene.Ext)
 	}
+	if m.MessageReference != nil {
+		refMsgID = strings.TrimSpace(m.MessageReference.MessageID)
+	}
+	refEntry, hasRef := d.lookupMsg(refMsgIdx, refMsgID)
+	isReplyToBot := hasRef && refEntry.isBot
+
+	d.gwMu.Lock()
+	botID, botName := d.botID, d.botName
+	d.gwMu.Unlock()
 
 	var target, from string
 	payload := map[string]any{"scene": scene, "message_id": m.ID}
-	if scene == SceneGroup {
-		// Whether the bot was addressed with an @. A loop that listens to a
-		// whole group uses it to tell a message for it from one it overheard.
-		payload["mentioned"] = mentioned
-	}
 	if eventID != "" {
 		payload["event_id"] = eventID
 	}
@@ -174,15 +209,53 @@ func (d *Driver) handleEvent(t, eventID string, raw json.RawMessage) {
 	text := strings.TrimSpace(m.Content)
 	if scene == SceneGroup {
 		// With full group access the platform pushes an @ of the bot as a
-		// plain group message too; the mentions list is what tells it apart.
+		// GROUP_MESSAGE_CREATE event too; the mentions list tells it apart
+		// from an ordinary group message.
 		var self, others bool
-		text, self, others = resolveMentions(text, m.Mentions)
+		text, self, others = resolveMentions(text, m.Mentions, botID)
 		if self {
-			payload["mentioned"] = true
+			mentioned = true
 		}
+		if t == evGroupAll && !d.scenes[SceneGroupAll] && !mentioned && !isReplyToBot {
+			if _, seen := d.unknown.LoadOrStore("drop:"+t, true); !seen {
+				d.log.Info("qq group message without @-mention ignored; add scene group_all to receive all group messages", "type", t)
+			}
+			return
+		}
+		// Whether the bot was addressed with an @. A loop that listens to a
+		// whole group uses it to tell a message for it from one it overheard.
+		payload["mentioned"] = mentioned
 		if others || strings.Contains(text, "<@") {
 			payload["mentions_others"] = true
 		}
+		if botName != "" {
+			payload["bot_username"] = botName
+		}
+	}
+	refID := refMsgIdx
+	if refID == "" {
+		refID = refMsgID
+	}
+	if refID != "" {
+		payload["reply_to_message_id"] = refID
+	}
+	if hasRef {
+		if refEntry.text != "" {
+			payload["reply_to_text"] = refEntry.text
+		}
+		if refEntry.author != "" {
+			payload["reply_to_author"] = refEntry.author
+		}
+		if refEntry.isBot {
+			payload["is_reply_to_bot"] = true
+		}
+	}
+	// The platform may push one message more than once; a webhook retry and a
+	// gateway replay after resume both look like this. Check after the scene
+	// and mention gate so a dropped event does not suppress a companion event
+	// carrying the same message id.
+	if !d.seen.add(m.ID) {
+		return
 	}
 	switch scene {
 	case SceneC2C:
@@ -192,8 +265,11 @@ func (d *Driver) handleEvent(t, eventID string, raw json.RawMessage) {
 	case SceneGroup:
 		target = SceneGroup + ":" + m.GroupID
 		from = m.Author.MemberOpenID
+		if from == "" {
+			from = m.Author.ID
+		}
 		payload["group_openid"] = m.GroupID
-		payload["member_openid"] = m.Author.MemberOpenID
+		payload["member_openid"] = from
 		if m.Author.Nickname != "" {
 			payload["name"] = m.Author.Nickname
 		}
@@ -203,6 +279,9 @@ func (d *Driver) handleEvent(t, eventID string, raw json.RawMessage) {
 		payload["guild_id"] = m.GuildID
 		payload["channel_id"] = m.ChannelID
 		text = strings.TrimSpace(mention.ReplaceAllString(m.Content, ""))
+		if botName != "" {
+			payload["bot_username"] = botName
+		}
 	case SceneDM:
 		target = SceneDM + ":" + m.GuildID
 		from = m.Author.ID
@@ -234,6 +313,16 @@ func (d *Driver) handleEvent(t, eventID string, raw json.RawMessage) {
 	if text == "" && len(atts) == 0 {
 		return
 	}
+	who, _ := payload["name"].(string)
+	if who == "" {
+		who = from
+	}
+	d.rememberMsg([]string{m.ID, msgIdx}, indexedMsg{
+		author: who,
+		text:   text,
+		isBot:  false,
+		at:     time.Now(),
+	})
 	d.rememberRef(target, m.ID)
 	d.log.Debug("qq message received", "scene", scene, "message_id", m.ID, "text_len", len(text), "media", len(atts))
 	d.sink.Submit(router.Inbound{

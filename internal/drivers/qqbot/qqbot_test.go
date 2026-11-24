@@ -987,3 +987,149 @@ func TestTestCredentialsAndSecretScrubbing(t *testing.T) {
 		t.Fatalf("gateway error must scrub secret and token, got: %v", err)
 	}
 }
+
+func TestGroupMessageCreateMentionHandling(t *testing.T) {
+	// 1. scenes: ["group"] (without group_all) accepts GROUP_MESSAGE_CREATE when
+	// mentions has is_you: true, strips <@id>, and marks payload["mentioned"] = true.
+	d, sink, _ := newDriver(t, nil, Options{Scenes: []string{SceneGroup}})
+	d.botID = "BOT_ID"
+
+	// Non-mentioned GROUP_MESSAGE_CREATE is dropped and must not poison seen.
+	d.handleEvent(evGroupAll, "e-drop", json.RawMessage(`{"id":"m-unmentioned","content":"chatter","group_openid":"G1","author":{"member_openid":"U1"}}`))
+	if got := sink.all(); len(got) != 0 {
+		t.Fatalf("expected non-mentioned GROUP_MESSAGE_CREATE to be dropped, got %+v", got)
+	}
+
+	// Companion GROUP_AT_MESSAGE_CREATE with same id must still be accepted.
+	d.handleEvent(evGroup, "e-at-companion", json.RawMessage(`{"id":"m-unmentioned","content":"companion ping","group_openid":"G1","author":{"member_openid":"U1"}}`))
+	got := sink.all()
+	if len(got) != 1 || got[0].Message.Text != "companion ping" || got[0].Message.Payload["mentioned"] != true {
+		t.Fatalf("companion GROUP_AT_MESSAGE_CREATE dropped or malformed after ignored GROUP_MESSAGE_CREATE: %+v", got)
+	}
+
+	// Mentions with is_you: true under scenes: ["group"].
+	d.handleEvent(evGroupAll, "e-isyou", json.RawMessage(`{"id":"m-isyou","content":"<@!BOT_OPEN> hello group","group_openid":"G1","author":{"member_openid":"U2"},"mentions":[{"id":"BOT_OPEN","is_you":true,"bot":true}]}`))
+	got = sink.all()
+	if len(got) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(got))
+	}
+	if m := got[1].Message; m.Text != "hello group" || m.Payload["mentioned"] != true {
+		t.Fatalf("is_you mention message = %+v", m)
+	}
+
+	// Mentions matching d.botID even when is_you is omitted, and author.id fallback
+	// when author.member_openid is empty.
+	d.handleEvent(evGroupAll, "e-botid", json.RawMessage(`{"id":"m-botid","content":"<@BOT_ID> status","group_openid":"G1","author":{"id":"ALT_U3"},"mentions":[{"id":"BOT_ID","bot":true}]}`))
+	got = sink.all()
+	if len(got) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(got))
+	}
+	if m := got[2].Message; m.Text != "status" || m.Payload["mentioned"] != true || m.From != "user:qq:ALT_U3" || m.Payload["member_openid"] != "ALT_U3" {
+		t.Fatalf("botID fallback message = %+v", m)
+	}
+
+	// 2. scenes: ["group_all"] accepts non-mentioned GROUP_MESSAGE_CREATE with
+	// payload["mentioned"] == false.
+	dAll, sinkAll, _ := newDriver(t, nil, Options{Scenes: []string{SceneGroupAll}})
+	dAll.handleEvent(evGroupAll, "e-all", json.RawMessage(`{"id":"m-all","content":"overheard message","group_openid":"G2","author":{"member_openid":"U4"}}`))
+	gotAll := sinkAll.all()
+	if len(gotAll) != 1 || gotAll[0].Message.Text != "overheard message" || gotAll[0].Message.Payload["mentioned"] != false {
+		t.Fatalf("group_all message = %+v", gotAll)
+	}
+}
+
+func TestQuoteReplyTrackingAndBotUsername(t *testing.T) {
+	// Mock API that returns id and ext_info.ref_idx on send.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/app/getAppAccessToken":
+			_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "tok", "expires_in": 7200})
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":        "bot-msg-1",
+				"timestamp": time.Now().Format(time.RFC3339),
+				"ext_info":  map[string]any{"ref_idx": "REFIDX_BOT_1"},
+			})
+		}
+	}))
+	defer srv.Close()
+
+	d, sink, _ := newDriver(t, nil, Options{APIBase: srv.URL, Scenes: []string{SceneGroup}})
+	// Simulate READY setting botID and botName.
+	d.gwMu.Lock()
+	d.botID = "BOT_1"
+	d.botName = "MisakaBot"
+	d.gwMu.Unlock()
+
+	// Deliver a group message from the bot so bot-msg-1 + REFIDX_BOT_1 are indexed.
+	if err := d.Deliver("group:G1", "Try toggling the dark theme.", nil); err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+
+	// 1. Quote-reply via message_scene.ext ref_msg_idx=<ref_idx> without @,
+	// under scenes: ["group"] (without group_all).
+	d.handleEvent(evGroupAll, "e-q1", json.RawMessage(`{
+		"id":"m-q1",
+		"content":"which menu is that in?",
+		"group_openid":"G1",
+		"author":{"member_openid":"U1","member_nickname":"Alice"},
+		"message_scene":{"source":"default","ext":["msg_idx=REFIDX_USER_1","ref_msg_idx=REFIDX_BOT_1"]}
+	}`))
+	got := sink.all()
+	if len(got) != 1 {
+		t.Fatalf("expected quote-reply via ref_msg_idx to reach sink even without group_all, got %d", len(got))
+	}
+	m1 := got[0].Message
+	if m1.Payload["is_reply_to_bot"] != true || m1.Payload["reply_to_text"] != "Try toggling the dark theme." || m1.Payload["reply_to_message_id"] != "REFIDX_BOT_1" {
+		t.Fatalf("ref_msg_idx quote payload mismatch: %+v", m1.Payload)
+	}
+	if m1.Payload["bot_username"] != "MisakaBot" || m1.Payload["mentioned"] != false {
+		t.Fatalf("expected bot_username=MisakaBot and mentioned=false: %+v", m1.Payload)
+	}
+
+	// 2. Quote-reply via message_reference.message_id matching sent message id.
+	d.handleEvent(evGroupAll, "e-q2", json.RawMessage(`{
+		"id":"m-q2",
+		"content":"got it",
+		"group_openid":"G1",
+		"author":{"member_openid":"U2"},
+		"message_reference":{"message_id":"bot-msg-1"}
+	}`))
+	got = sink.all()
+	if len(got) != 2 {
+		t.Fatalf("expected quote-reply via message_reference.message_id, got %d", len(got))
+	}
+	m2 := got[1].Message
+	if m2.Payload["is_reply_to_bot"] != true || m2.Payload["reply_to_text"] != "Try toggling the dark theme." || m2.Payload["reply_to_message_id"] != "bot-msg-1" {
+		t.Fatalf("message_reference payload mismatch: %+v", m2.Payload)
+	}
+
+	// 3. Quoting a previous group member's message under group_all populates
+	// reply_to_text and reply_to_author without setting is_reply_to_bot.
+	dAll, sinkAll, _ := newDriver(t, nil, Options{APIBase: srv.URL, Scenes: []string{SceneGroup, SceneGroupAll}})
+	dAll.handleEvent(evGroupAll, "e-u1", json.RawMessage(`{
+		"id":"m-u1",
+		"content":"anyone free for lunch?",
+		"group_openid":"G2",
+		"author":{"member_openid":"U10","member_nickname":"Bob"},
+		"message_scene":{"source":"default","ext":["msg_idx=REFIDX_BOB_1"]}
+	}`))
+	dAll.handleEvent(evGroupAll, "e-u2", json.RawMessage(`{
+		"id":"m-u2",
+		"content":"count me in",
+		"group_openid":"G2",
+		"author":{"member_openid":"U11","member_nickname":"Carol"},
+		"message_scene":{"source":"default","ext":["msg_idx=REFIDX_CAROL_1","ref_msg_idx=REFIDX_BOB_1"]}
+	}`))
+	gotAll := sinkAll.all()
+	if len(gotAll) != 2 {
+		t.Fatalf("expected 2 group_all messages, got %d", len(gotAll))
+	}
+	m3 := gotAll[1].Message
+	if m3.Payload["is_reply_to_bot"] != nil {
+		t.Fatalf("member quote must not set is_reply_to_bot: %+v", m3.Payload)
+	}
+	if m3.Payload["reply_to_text"] != "anyone free for lunch?" || m3.Payload["reply_to_author"] != "Bob" || m3.Payload["reply_to_message_id"] != "REFIDX_BOB_1" {
+		t.Fatalf("member quote metadata mismatch: %+v", m3.Payload)
+	}
+}

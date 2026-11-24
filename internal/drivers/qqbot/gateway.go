@@ -270,7 +270,7 @@ func (d *Driver) connect(ctx context.Context) error {
 				}
 				_ = json.Unmarshal(p.D, &r)
 				d.gwMu.Lock()
-				d.sessionID, d.botID = r.SessionID, r.User.ID
+				d.sessionID, d.botID, d.botName = r.SessionID, r.User.ID, r.User.Username
 				d.gwMu.Unlock()
 				d.log.Info("qq gateway ready", "bot", r.User.Username, "intents", d.intents())
 			case "RESUMED":

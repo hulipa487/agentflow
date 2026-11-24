@@ -161,13 +161,7 @@ agentflow user export u_abc -pubkey eu-move.pub -out u_abc.zip   # move one user
 
 ## Getting Started
 
-Run the following auto-install script:
-
-```bash
-curl -fsSL agentflow.hulipa.my | sh
-```
-
-OR build from source — AgentFlow is 100% pure Go (`CGO_ENABLED=0`), so only Go 1.26+ is needed on Windows, macOS, or Linux (no C/C++ toolchain, no git submodules):
+Build from source — AgentFlow is 100% pure Go (`CGO_ENABLED=0`), so only Go 1.26+ is needed on Windows, macOS, or Linux (no C/C++ toolchain, no git submodules):
 
 ```bash
 git clone https://github.com/hulipa487/agentflow.git

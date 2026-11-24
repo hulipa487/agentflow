@@ -45,5 +45,5 @@ jobs:
           tmp=$(mktemp -d)
           "$BIN" init "$tmp/starter"
           "$BIN" validate -config "$tmp/starter"
-          "$BIN" loop check "$tmp/starter/loops/echo.lua"
+          "$BIN" loop check "$tmp/starter/loops/echo.ts"
           rm -rf "$tmp"

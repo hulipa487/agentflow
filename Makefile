@@ -52,7 +52,7 @@ CONFIG ?= $(if $(wildcard agentflow.yaml),agentflow.yaml,config.yaml)
 
 # ---- Go binary -------------------------------------------------------------
 GOSRC := $(shell git ls-files -co --exclude-standard -- "*.go") \
-	$(shell git ls-files -co --exclude-standard -- "internal/builtins/lua") \
+	$(shell git ls-files -co --exclude-standard -- "internal/builtins/ts") \
 	go.mod go.sum
 
 $(BIN): $(GOSRC)

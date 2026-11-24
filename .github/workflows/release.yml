@@ -24,9 +24,6 @@ jobs:
             goarch: arm64
             artifact: agentflow-linux-arm64
           - goos: darwin
-            goarch: amd64
-            artifact: agentflow-darwin-amd64
-          - goos: darwin
             goarch: arm64
             artifact: agentflow-darwin-arm64
           - goos: windows

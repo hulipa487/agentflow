@@ -307,6 +307,269 @@ function loop(): void {
 `,
 		},
 		{
+			Name:         "qq-group-bot",
+			Title:        "QQ group bot",
+			Description:  "Flagship QQ group assistant: answers @-mentions or optional trigger phrases, enforces per-group cooldowns, keeps each group's context separate with explicit retention, and stays quiet otherwise.",
+			Capabilities: []string{"llm.chat", "memory", "session.state"},
+			Memory:       "conversational",
+			Instructions: "You are a concise, helpful member of a QQ group chat. Match the user's language, address speakers clearly, and admit when you are unsure instead of guessing.",
+			Extras: map[string]any{
+				"respond_on_mention": true,
+				"respond_in_c2c":     true,
+				"respond_in_guild":   false,
+				"trigger_phrase":     "",
+				"cooldown_sec":       15,
+				"store_all_messages": false,
+				"retention_turns":    20,
+			},
+			Settings: []TemplateSetting{
+				{
+					Key:         "respond_on_mention",
+					Label:       "Reply on @-mention",
+					Description: "Answer when a QQ group member @-mentions the bot.",
+					Type:        "bool",
+					Default:     true,
+				},
+				{
+					Key:         "respond_in_c2c",
+					Label:       "Reply in C2C private chats",
+					Description: "Answer 1-on-1 private QQ messages sent directly to the bot.",
+					Type:        "bool",
+					Default:     true,
+				},
+				{
+					Key:         "respond_in_guild",
+					Label:       "Reply in QQ Guild / channel DMs",
+					Description: "Answer @-mentions in QQ Guild channels and guild DMs.",
+					Type:        "bool",
+					Default:     false,
+				},
+				{
+					Key:         "trigger_phrase",
+					Label:       "Trigger phrase",
+					Description: "Optional case-insensitive keyword or prefix (for example !bot) that wakes the bot without an @-mention when group_all scene is granted.",
+					Type:        "string",
+					Default:     "",
+					Placeholder: "!bot",
+				},
+				{
+					Key:         "cooldown_sec",
+					Label:       "Group cooldown (seconds)",
+					Description: "Minimum gap between bot replies in the same QQ group. 0 disables cooldown.",
+					Type:        "number",
+					Default:     15,
+					Min:         f64(0),
+					Max:         f64(3600),
+				},
+				{
+					Key:         "store_all_messages",
+					Label:       "Remember ignored group messages",
+					Description: "When off (or when using the default group scene), only turns where the bot replied enter group context and memory.",
+					Type:        "bool",
+					Default:     false,
+				},
+				{
+					Key:         "retention_turns",
+					Label:       "Context window (turns)",
+					Description: "How many recent turns per QQ group stay in working context.",
+					Type:        "number",
+					Default:     20,
+					Min:         f64(1),
+					Max:         f64(200),
+				},
+			},
+			Loop: directive + `interface QQGroupTurn {
+  who: string;
+  text: string;
+  reply: string;
+}
+
+interface QQGroupSettings {
+  respond_on_mention: boolean;
+  respond_in_c2c: boolean;
+  respond_in_guild: boolean;
+  trigger_phrase: string;
+  cooldown_sec: number;
+  store_all_messages: boolean;
+  retention_turns: number;
+}
+
+function readQQBoolSetting(extras: Record<string, unknown>, key: string, fallback: boolean): boolean {
+  return typeof extras[key] === "boolean" ? (extras[key] as boolean) : fallback;
+}
+
+function readQQNumSetting(extras: Record<string, unknown>, key: string, fallback: number, min: number): number {
+  const val = Number(extras[key]);
+  return Number.isFinite(val) && val >= min ? val : fallback;
+}
+
+function readQQSettings(): QQGroupSettings {
+  const extras = ((agent.config() || {}).extras || {}) as Record<string, unknown>;
+  return {
+    respond_on_mention: readQQBoolSetting(extras, "respond_on_mention", true),
+    respond_in_c2c: readQQBoolSetting(extras, "respond_in_c2c", true),
+    respond_in_guild: readQQBoolSetting(extras, "respond_in_guild", false),
+    trigger_phrase: typeof extras.trigger_phrase === "string" ? extras.trigger_phrase.trim() : "",
+    cooldown_sec: readQQNumSetting(extras, "cooldown_sec", 15, 0),
+    store_all_messages: readQQBoolSetting(extras, "store_all_messages", false),
+    retention_turns: Math.max(1, Math.floor(readQQNumSetting(extras, "retention_turns", 20, 1))),
+  };
+}
+
+function loadQQTurns(): QQGroupTurn[] {
+  try {
+    const v = session.state.get("turns");
+    if (Array.isArray(v)) return v as QQGroupTurn[];
+  } catch (_) {}
+  return [];
+}
+
+function saveQQTurns(turns: QQGroupTurn[], limit: number): void {
+  while (turns.length > limit) turns.shift();
+  try {
+    session.state.set("turns", turns);
+  } catch (_) {}
+}
+
+function loadQQLastReplyMs(): number {
+  try {
+    const v = Number(session.state.get("last_reply_ms"));
+    return Number.isFinite(v) ? v : 0;
+  } catch (_) {}
+  return 0;
+}
+
+function saveQQLastReplyMs(ts: number): void {
+  try {
+    session.state.set("last_reply_ms", ts);
+  } catch (_) {}
+}
+
+function rememberQQTurn(chat: string, who: string, text: string, reply: string): void {
+  try {
+    memory.write({ type: "turn", chat: chat, who: who, text: text, reply: reply });
+  } catch (_) {}
+}
+
+function matchesQQTrigger(text: string, phrase: string): boolean {
+  if (!phrase) return false;
+  return text.toLowerCase().indexOf(phrase.toLowerCase()) >= 0;
+}
+
+function shouldAnswerQQ(
+  msg: { text?: string; channel?: string; payload?: Record<string, unknown> },
+  cfg: QQGroupSettings
+): { ok: true; reason: string } | { ok: false; reason: string } {
+  if (msg.channel === "studio") {
+    return { ok: true, reason: "studio_test" };
+  }
+  const p = (msg.payload || {}) as Record<string, unknown>;
+  const scene = String(p.scene || "group");
+
+  if (scene === "c2c") {
+    if (!cfg.respond_in_c2c) {
+      return { ok: false, reason: "c2c_disabled" };
+    }
+    return { ok: true, reason: "c2c_chat" };
+  }
+  if (scene === "guild" || scene === "dm") {
+    if (!cfg.respond_in_guild) {
+      return { ok: false, reason: "guild_disabled" };
+    }
+    return { ok: true, reason: scene };
+  }
+
+  const text = msg.text || "";
+  const mentioned = p.mentioned === true;
+  const triggered = matchesQQTrigger(text, cfg.trigger_phrase);
+  const matched = (cfg.respond_on_mention && mentioned) || triggered;
+
+  if (!matched) {
+    return { ok: false, reason: "not_mentioned" };
+  }
+  if (cfg.cooldown_sec > 0) {
+    const elapsed = Date.now() - loadQQLastReplyMs();
+    if (elapsed >= 0 && elapsed < cfg.cooldown_sec * 1000) {
+      return { ok: false, reason: "cooldown" };
+    }
+  }
+  return { ok: true, reason: triggered ? "trigger_phrase" : "mentioned" };
+}
+
+function buildQQMessages(
+  msg: { text?: string; from?: string; payload?: Record<string, unknown> },
+  cfg: QQGroupSettings,
+  turns: QQGroupTurn[],
+  instructions: string,
+  historyBudget: number
+): Array<{ role: string; content: string }> {
+  const p = (msg.payload || {}) as Record<string, unknown>;
+  const who = String(p.name || p.username || p.member_openid || p.user_openid || msg.from || "member");
+  const scene = String(p.scene || "group");
+  const text = msg.text || "";
+
+  let sys = instructions || "You are a concise, helpful member of a QQ group chat.";
+  if (scene === "group" || scene === "guild") {
+    sys += "\nConversation scene: " + scene + ".";
+  }
+
+  // Task 2 customization hook: route support questions to a group-specific knowledge base here.
+  // For example, match support keywords or p.chat_id and prepend memory.recall({ store: "knowledge", ... }) passages.
+
+  const messages: Array<{ role: string; content: string }> = [{ role: "system", content: sys }];
+  const start = Math.max(0, turns.length - cfg.retention_turns);
+  for (let i = start; i < turns.length; i++) {
+    const t = turns[i];
+    messages.push({ role: "user", content: t.who + ": " + t.text });
+    if (t.reply) {
+      messages.push({ role: "assistant", content: t.reply });
+    }
+  }
+  messages.push({ role: "user", content: who + ": " + text });
+  return token_budget(messages, historyBudget || 6000);
+}
+
+function loop(): void {
+  while (true) {
+    const msg = session.inbox();
+    const cfg = readQQSettings();
+    const p = (msg.payload || {}) as Record<string, unknown>;
+    const who = String(p.name || p.username || p.member_openid || p.user_openid || msg.from || "member");
+    const chat = String(p.chat_id || msg.reply_to || "chat");
+    const text = msg.text || "";
+    const turns = loadQQTurns();
+
+    if (!/\S/.test(text)) {
+      session.skip("empty_message");
+      continue;
+    }
+
+    const decision = shouldAnswerQQ(msg, cfg);
+    if (!decision.ok) {
+      if (cfg.store_all_messages) {
+        turns.push({ who: who, text: text, reply: "" });
+        saveQQTurns(turns, cfg.retention_turns);
+        rememberQQTurn(chat, who, text, "");
+      }
+      session.skip(decision.reason);
+      continue;
+    }
+
+    const info = agent.info();
+    const messages = buildQQMessages(msg, cfg, turns, info.instructions, info.history_budget);
+    const reply = llm.chat(messages);
+    const answer = reply.text || "";
+
+    session.send(answer);
+    saveQQLastReplyMs(Date.now());
+    turns.push({ who: who, text: text, reply: answer });
+    saveQQTurns(turns, cfg.retention_turns);
+    rememberQQTurn(chat, who, text, answer);
+  }
+}
+`,
+		},
+		{
 			Name:        "echo",
 			Title:       "Echo",
 			Description: "No model needed: replies with the text it received. The smallest runnable agent.",

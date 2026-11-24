@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"agentflow/internal/core/studio"
+	"agentflow/internal/drivers/qqbot"
 	"agentflow/internal/drivers/telegram"
 )
 
@@ -196,6 +197,70 @@ func (u *UI) handleStudioTelegramTest(w http.ResponseWriter, r *http.Request) {
 		tok = strings.TrimSpace(resolved)
 	}
 	info, err := telegram.TestToken(r.Context(), tok, apiBase, nil)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":  true,
+		"bot": info,
+	})
+}
+
+// handleStudioQQTest verifies QQ Bot AppID + AppSecret by exchanging for an
+// access token and checking /gateway/bot without storing or echoing secrets.
+func (u *UI) handleStudioQQTest(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Index   *int   `json:"index,omitempty"`
+		AppID   string `json:"app_id,omitempty"`
+		Secret  string `json:"secret,omitempty"`
+		APIBase string `json:"api_base,omitempty"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	appID := strings.TrimSpace(req.AppID)
+	rawSecret := strings.TrimSpace(req.Secret)
+	apiBase := strings.TrimSpace(req.APIBase)
+	if (appID == "" || rawSecret == "") && req.Index != nil && *req.Index >= 0 {
+		ch, ok := u.channelsReady(w)
+		if !ok {
+			return
+		}
+		storedAppID, storedSecret, storedBase, err := ch.RawQQCredentials(*req.Index)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if appID == "" {
+			appID = strings.TrimSpace(storedAppID)
+		}
+		if rawSecret == "" {
+			rawSecret = strings.TrimSpace(storedSecret)
+		}
+		if apiBase == "" {
+			apiBase = strings.TrimSpace(storedBase)
+		}
+	}
+	if appID == "" {
+		writeErr(w, http.StatusBadRequest, "enter a QQ AppID first")
+		return
+	}
+	if rawSecret == "" {
+		writeErr(w, http.StatusBadRequest, "enter a QQ AppSecret first")
+		return
+	}
+	secret := rawSecret
+	if u.deps.ResolveSecret != nil {
+		resolved, ok := u.deps.ResolveSecret(r.Context(), rawSecret)
+		if !ok || strings.TrimSpace(resolved) == "" {
+			writeErr(w, http.StatusBadRequest, "app secret credential could not be resolved")
+			return
+		}
+		secret = strings.TrimSpace(resolved)
+	}
+	info, err := qqbot.TestCredentials(r.Context(), appID, secret, apiBase, nil)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return

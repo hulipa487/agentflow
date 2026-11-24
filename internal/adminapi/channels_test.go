@@ -15,6 +15,7 @@ import (
 
 	"agentflow/internal/config"
 	"agentflow/internal/core/studio"
+	"agentflow/internal/drivers/qqbot"
 	"agentflow/internal/drivers/telegram"
 )
 
@@ -233,5 +234,85 @@ func TestStudioTelegramTestEndpoint(t *testing.T) {
 	}
 	if strings.Contains(rec.Body.String(), "bad-secret-tok") {
 		t.Fatalf("error leaked token: %s", rec.Body.String())
+	}
+}
+
+func TestStudioQQTestEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/app/getAppAccessToken":
+			var in map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&in)
+			if in["appId"] == "102999" && in["clientSecret"] == "qq-secret-xyz" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "qq-tok-1", "expires_in": "7200"})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 100016, "message": "invalid secret " + in["clientSecret"]})
+		case "/gateway/bot":
+			_ = json.NewEncoder(w).Encode(map[string]any{"url": "wss://api.bot.qq.com/websocket", "shards": 1})
+		case "/users/@me":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "qq-bot-1", "username": "QQGroupStarter"})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	ui, _ := channelAPIFixture(t)
+	ui.deps.ResolveSecret = func(_ context.Context, raw string) (string, bool) {
+		if raw == "credential:qq" {
+			return "qq-secret-xyz", true
+		}
+		return raw, true
+	}
+
+	rec := do(t, ui.API(), http.MethodPost, "/admin/api/studio/channels", map[string]any{
+		"channel": map[string]any{
+			"name": "qq-group", "type": "qq", "agent": "base", "mode": "websocket",
+			"app_id": "102999", "secret": "credential:qq", "scenes": []string{"group", "c2c"},
+		},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save qq channel: %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = do(t, ui.API(), http.MethodPost, "/admin/api/studio/channels/qq/test", map[string]any{
+		"app_id":   "102999",
+		"secret":   "qq-secret-xyz",
+		"api_base": srv.URL,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("inline qq test: %d %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		OK  bool          `json:"ok"`
+		Bot qqbot.BotInfo `json:"bot"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK || resp.Bot.Username != "QQGroupStarter" || resp.Bot.Shards != 1 {
+		t.Fatalf("unexpected qq bot info: %+v", resp)
+	}
+
+	idx := 0
+	rec = do(t, ui.API(), http.MethodPost, "/admin/api/studio/channels/qq/test", map[string]any{
+		"index":    idx,
+		"api_base": srv.URL,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("saved index qq test: %d %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "qq-secret-xyz") {
+		t.Fatalf("response leaked resolved qq secret: %s", rec.Body.String())
+	}
+
+	rec = do(t, ui.API(), http.MethodPost, "/admin/api/studio/channels/qq/test", map[string]any{
+		"app_id":   "102999",
+		"secret":   "bad-qq-secret",
+		"api_base": srv.URL,
+	})
+	if rec.Code != http.StatusBadRequest || strings.Contains(rec.Body.String(), "bad-qq-secret") {
+		t.Fatalf("expected 400 scrubbed error, got %d %s", rec.Code, rec.Body.String())
 	}
 }

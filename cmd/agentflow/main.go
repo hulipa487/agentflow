@@ -1973,12 +1973,20 @@ func main() {
 		ch   config.Channel
 		d    *telegram.Driver
 	}
-	type liveTGEntry struct {
+	type qqBootEntry struct {
+		name string
+		ch   config.Channel
+		d    *qqbot.Driver
+	}
+	type liveDriverEntry struct {
 		ch     config.Channel
 		cancel context.CancelFunc
 	}
 	isTGPolling := func(ch config.Channel) bool {
 		return ch.Type == "telegram" && (ch.Mode == "" || ch.Mode == "polling")
+	}
+	isQQWebsocket := func(ch config.Channel) bool {
+		return ch.Type == "qq" && (ch.Mode == "" || ch.Mode == "websocket")
 	}
 	channelNameAt := func(i int, ch config.Channel) string {
 		if ch.Name != "" {
@@ -2028,9 +2036,40 @@ func main() {
 		}
 		return d, "", true
 	}
+	buildQQDriver := func(name string, ch config.Channel) (*qqbot.Driver, bool) {
+		secret, ok := credResolver.Resolve(ctx, ch.Secret)
+		if !ok {
+			return nil, false
+		}
+		mpol, mok := mediaPol(ch)
+		var mstore media.Store
+		if mok {
+			mstore = mediaStore
+		}
+		var qqMedia *media.Service
+		if mediaSvc != nil && mediaSvc.CanPresign() {
+			qqMedia = mediaSvc
+		} else {
+			log.Warn("qq channel starting without public media URLs; outbound media attachments require media.backend: s3 or media.temp_url.enabled: true",
+				"channel", name)
+		}
+		d := qqbot.New(name, ch.Agent, qqbot.Options{
+			AppID:      ch.AppID,
+			Secret:     secret,
+			Mode:       ch.Mode,
+			Path:       ch.QQPath(),
+			PublicURL:  cfg.Gateway.PublicURL,
+			Scenes:     ch.Scenes,
+			APIBase:    ch.APIBase,
+			Markdown:   ch.Markdown,
+			Media:      qqMedia,
+			PresignTTL: cfg.Media.TempURL.MediaTempURLTTL(),
+		}, sink, httpSrv, mstore, mpol, log)
+		return d, true
+	}
 
 	var telegramDrivers []tgBootEntry
-	var qqDrivers []*qqbot.Driver
+	var qqDrivers []qqBootEntry
 	var feishuDrivers []*feishu.Driver
 	var wecomDrivers []*wecom.Driver
 	for i, ch := range cfg.Gateway.Channels {
@@ -2078,31 +2117,14 @@ func main() {
 			gw.Register(d)
 			telegramDrivers = append(telegramDrivers, tgBootEntry{name: name, ch: ch, d: d})
 		case "qq":
-			if mediaSvc == nil || !mediaSvc.CanPresign() {
-				log.Warn("channel skipped: qq requires public media URLs — configure media.backend: s3 or media.temp_url.enabled: true (with gateway.public_url)",
-					"channel", name)
-				continue
-			}
-			secret, ok := credResolver.Resolve(ctx, ch.Secret)
+			d, ok := buildQQDriver(name, ch)
 			if !ok {
 				log.Warn("channel skipped: unresolved credential",
 					"channel", name, "field", "secret", "credential", config.CredentialName(ch.Secret))
 				continue
 			}
-			d := qqbot.New(name, ch.Agent, qqbot.Options{
-				AppID:      ch.AppID,
-				Secret:     secret,
-				Mode:       ch.Mode,
-				Path:       ch.QQPath(),
-				PublicURL:  cfg.Gateway.PublicURL,
-				Scenes:     ch.Scenes,
-				APIBase:    ch.APIBase,
-				Markdown:   ch.Markdown,
-				Media:      mediaSvc,
-				PresignTTL: cfg.Media.TempURL.MediaTempURLTTL(),
-			}, sink, httpSrv, mediaStore, mpol, log)
 			gw.Register(d)
-			qqDrivers = append(qqDrivers, d)
+			qqDrivers = append(qqDrivers, qqBootEntry{name: name, ch: ch, d: d})
 		case "feishu":
 			secret, ok := resolveField("secret", ch.Secret, true)
 			if !ok {
@@ -2263,8 +2285,9 @@ func main() {
 		log.Error("httpd server failed to start", "listen", cfg.Gateway.Listen, "err", err)
 		exit(1)
 	}
-	var liveTGMu sync.Mutex
-	liveTG := map[string]liveTGEntry{}
+	var liveMu sync.Mutex
+	liveTG := map[string]liveDriverEntry{}
+	liveQQ := map[string]liveDriverEntry{}
 	for _, entry := range telegramDrivers {
 		if isTGPolling(entry.ch) {
 			tgCtx, tgCancel := context.WithCancel(ctx)
@@ -2273,7 +2296,23 @@ func main() {
 				log.Error("channel start failed", "channel", entry.name, "err", err)
 				exit(1)
 			}
-			liveTG[entry.name] = liveTGEntry{ch: entry.ch, cancel: tgCancel}
+			liveTG[entry.name] = liveDriverEntry{ch: entry.ch, cancel: tgCancel}
+			continue
+		}
+		if err := entry.d.Start(ctx); err != nil {
+			log.Error("channel start failed", "channel", entry.name, "err", err)
+			exit(1)
+		}
+	}
+	for _, entry := range qqDrivers {
+		if isQQWebsocket(entry.ch) {
+			qqCtx, qqCancel := context.WithCancel(ctx)
+			if err := entry.d.Start(qqCtx); err != nil {
+				qqCancel()
+				log.Error("channel start failed", "channel", entry.name, "err", err)
+				exit(1)
+			}
+			liveQQ[entry.name] = liveDriverEntry{ch: entry.ch, cancel: qqCancel}
 			continue
 		}
 		if err := entry.d.Start(ctx); err != nil {
@@ -2288,6 +2327,12 @@ func main() {
 			}
 			return m
 		}
+		normQQMode := func(m string) string {
+			if m == "" {
+				return "websocket"
+			}
+			return m
+		}
 		channelsStore.SetHooks(studio.ChannelHooks{
 			Apply: func(saved []config.Channel, changed *config.Channel, deletedName string) (bool, error) {
 				journalModesMu.Lock()
@@ -2298,14 +2343,18 @@ func main() {
 				journalModes = nextModes
 				journalModesMu.Unlock()
 
-				liveTGMu.Lock()
-				defer liveTGMu.Unlock()
-				desired := make(map[string]config.Channel)
+				liveMu.Lock()
+				defer liveMu.Unlock()
+				desiredTG := make(map[string]config.Channel)
+				desiredQQ := make(map[string]config.Channel)
 				changedName := ""
 				for i, c := range saved {
 					n := channelNameAt(i, c)
 					if isTGPolling(c) {
-						desired[n] = c
+						desiredTG[n] = c
+					}
+					if isQQWebsocket(c) {
+						desiredQQ[n] = c
 					}
 					if changed != nil && changed.Name != "" && n == changed.Name {
 						changedName = n
@@ -2316,7 +2365,7 @@ func main() {
 				}
 				var stoppedDeleted bool
 				for name, cur := range liveTG {
-					if _, keep := desired[name]; !keep {
+					if _, keep := desiredTG[name]; !keep {
 						cur.cancel()
 						gw.Unregister(name)
 						delete(liveTG, name)
@@ -2325,57 +2374,101 @@ func main() {
 						}
 					}
 				}
+				for name, cur := range liveQQ {
+					if _, keep := desiredQQ[name]; !keep {
+						cur.cancel()
+						gw.Unregister(name)
+						delete(liveQQ, name)
+						if deletedName != "" && name == deletedName {
+							stoppedDeleted = true
+						}
+					}
+				}
 				if changed == nil {
 					return stoppedDeleted, nil
 				}
-				if !isTGPolling(*changed) {
+				switch {
+				case isTGPolling(*changed):
+					if cur, ok := liveTG[changedName]; ok {
+						cur.cancel()
+						gw.Unregister(changedName)
+						delete(liveTG, changedName)
+					}
+					d, missingField, ok := buildTelegramDriver(changedName, *changed)
+					if !ok {
+						return false, fmt.Errorf("unresolved %s credential for telegram channel %q", missingField, changedName)
+					}
+					tgCtx, tgCancel := context.WithCancel(ctx)
+					gw.Register(d)
+					if err := d.Start(tgCtx); err != nil {
+						tgCancel()
+						gw.Unregister(changedName)
+						return false, err
+					}
+					liveTG[changedName] = liveDriverEntry{ch: *changed, cancel: tgCancel}
+					return true, nil
+				case isQQWebsocket(*changed):
+					if cur, ok := liveQQ[changedName]; ok {
+						cur.cancel()
+						gw.Unregister(changedName)
+						delete(liveQQ, changedName)
+					}
+					d, ok := buildQQDriver(changedName, *changed)
+					if !ok {
+						return false, fmt.Errorf("unresolved secret credential for qq channel %q", changedName)
+					}
+					qqCtx, qqCancel := context.WithCancel(ctx)
+					gw.Register(d)
+					if err := d.Start(qqCtx); err != nil {
+						qqCancel()
+						gw.Unregister(changedName)
+						return false, err
+					}
+					liveQQ[changedName] = liveDriverEntry{ch: *changed, cancel: qqCancel}
+					return true, nil
+				default:
 					return false, nil
 				}
-				if cur, ok := liveTG[changedName]; ok {
-					cur.cancel()
-					gw.Unregister(changedName)
-					delete(liveTG, changedName)
-				}
-				d, missingField, ok := buildTelegramDriver(changedName, *changed)
-				if !ok {
-					return false, fmt.Errorf("unresolved %s credential for telegram channel %q", missingField, changedName)
-				}
-				tgCtx, tgCancel := context.WithCancel(ctx)
-				gw.Register(d)
-				if err := d.Start(tgCtx); err != nil {
-					tgCancel()
-					gw.Unregister(changedName)
-					return false, err
-				}
-				liveTG[changedName] = liveTGEntry{ch: *changed, cancel: tgCancel}
-				return true, nil
 			},
 			IsLive: func(ch config.Channel) (bool, bool) {
-				if !isTGPolling(ch) {
-					return false, false
+				if isTGPolling(ch) {
+					liveMu.Lock()
+					cur, ok := liveTG[ch.Name]
+					liveMu.Unlock()
+					if !ok {
+						return false, true
+					}
+					match := cur.ch.Name == ch.Name &&
+						cur.ch.Agent == ch.Agent &&
+						normTGMode(cur.ch.Mode) == normTGMode(ch.Mode) &&
+						cur.ch.Journal == ch.Journal &&
+						slices.Equal(cur.ch.AllowUsers, ch.AllowUsers) &&
+						slices.Equal(cur.ch.Media.Allow, ch.Media.Allow) &&
+						cur.ch.Media.MaxBytes == ch.Media.MaxBytes
+					return match, true
 				}
-				liveTGMu.Lock()
-				cur, ok := liveTG[ch.Name]
-				liveTGMu.Unlock()
-				if !ok {
-					return false, true
+				if isQQWebsocket(ch) {
+					liveMu.Lock()
+					cur, ok := liveQQ[ch.Name]
+					liveMu.Unlock()
+					if !ok {
+						return false, true
+					}
+					match := cur.ch.Name == ch.Name &&
+						cur.ch.Agent == ch.Agent &&
+						normQQMode(cur.ch.Mode) == normQQMode(ch.Mode) &&
+						cur.ch.AppID == ch.AppID &&
+						cur.ch.APIBase == ch.APIBase &&
+						cur.ch.Markdown == ch.Markdown &&
+						cur.ch.Journal == ch.Journal &&
+						slices.Equal(cur.ch.Scenes, ch.Scenes) &&
+						slices.Equal(cur.ch.Media.Allow, ch.Media.Allow) &&
+						cur.ch.Media.MaxBytes == ch.Media.MaxBytes
+					return match, true
 				}
-				match := cur.ch.Name == ch.Name &&
-					cur.ch.Agent == ch.Agent &&
-					normTGMode(cur.ch.Mode) == normTGMode(ch.Mode) &&
-					cur.ch.Journal == ch.Journal &&
-					slices.Equal(cur.ch.AllowUsers, ch.AllowUsers) &&
-					slices.Equal(cur.ch.Media.Allow, ch.Media.Allow) &&
-					cur.ch.Media.MaxBytes == ch.Media.MaxBytes
-				return match, true
+				return false, false
 			},
 		})
-	}
-	for _, d := range qqDrivers {
-		if err := d.Start(ctx); err != nil {
-			log.Error("channel start failed", "channel", d.Name(), "err", err)
-			exit(1)
-		}
 	}
 	for _, d := range feishuDrivers {
 		if err := d.Start(ctx); err != nil {

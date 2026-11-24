@@ -924,3 +924,66 @@ func TestSplitMarkdownKeepsCodeFencesClosed(t *testing.T) {
 		}
 	}
 }
+
+func TestTestCredentialsAndSecretScrubbing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/app/getAppAccessToken":
+			var in map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&in)
+			if in["appId"] == "1024" && in["clientSecret"] == "secret-xyz" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "tok-live-123", "expires_in": "7200"})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code":    100016,
+				"message": "bad secret " + in["clientSecret"],
+			})
+		case "/gateway/bot":
+			if r.Header.Get("Authorization") != "QQBot tok-live-123" || r.Header.Get("X-Union-Appid") != "1024" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]any{"code": 11244, "message": "ip not allowed tok-live-123"})
+				return
+			}
+			if r.Header.Get("X-Fail-Gateway") != "" {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"url": "wss://api.bot.qq.com/websocket", "shards": 2})
+		case "/users/@me":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "bot-99", "username": "GroupHelperQQ"})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	info, err := TestCredentials(context.Background(), "1024", "secret-xyz", srv.URL, srv.Client())
+	if err != nil {
+		t.Fatalf("TestCredentials valid: %v", err)
+	}
+	if info.AppID != "1024" || info.BotID != "bot-99" || info.Username != "GroupHelperQQ" || info.Shards != 2 || info.GatewayURL != "wss://api.bot.qq.com/websocket" {
+		t.Fatalf("unexpected BotInfo: %+v", info)
+	}
+
+	_, err = TestCredentials(context.Background(), "1024", "wrong-secret-leak", srv.URL, srv.Client())
+	if err == nil || strings.Contains(err.Error(), "wrong-secret-leak") {
+		t.Fatalf("expected scrubbed error, got: %v", err)
+	}
+
+	gwFail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/app/getAppAccessToken":
+			_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "tok-leak-check", "expires_in": 7200})
+		case "/gateway/bot":
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 40301, "message": "gateway forbidden with secret-xyz and tok-leak-check"})
+		}
+	}))
+	defer gwFail.Close()
+
+	_, err = TestCredentials(context.Background(), "1024", "secret-xyz", gwFail.URL, gwFail.Client())
+	if err == nil || strings.Contains(err.Error(), "secret-xyz") || strings.Contains(err.Error(), "tok-leak-check") {
+		t.Fatalf("gateway error must scrub secret and token, got: %v", err)
+	}
+}

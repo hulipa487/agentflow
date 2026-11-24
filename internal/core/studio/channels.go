@@ -154,6 +154,22 @@ func (c *Channels) RawToken(index int) (token, apiBase string, err error) {
 	return raw[index].Token, raw[index].APIBase, nil
 }
 
+// RawQQCredentials returns the persisted AppID, Secret, and optional APIBase
+// for one QQ channel so an authenticated admin test endpoint can verify stored
+// credentials without returning secrets to the client.
+func (c *Channels) RawQQCredentials(index int) (appID, secret, apiBase string, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	raw, err := c.readRaw()
+	if err != nil {
+		return "", "", "", err
+	}
+	if index < 0 || index >= len(raw) {
+		return "", "", "", fmt.Errorf("channel #%d does not exist", index+1)
+	}
+	return raw[index].AppID, raw[index].Secret, raw[index].APIBase, nil
+}
+
 // NewChannels builds the store. agentNames should return the live agent names
 // (not spawn templates), so a channel can target an agent created in Studio
 // since boot; nil falls back to the boot config's agents.

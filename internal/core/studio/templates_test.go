@@ -28,25 +28,27 @@ func TestTemplatesCompile(t *testing.T) {
 			}
 		})
 	}
-	for _, want := range []string{"telegram-group-bot", "echo", "llm-chat", "group-chat", "rag", "single-turn-api"} {
+	for _, want := range []string{"telegram-group-bot", "qq-group-bot", "echo", "llm-chat", "group-chat", "rag", "single-turn-api"} {
 		if !seen[want] {
 			t.Fatalf("template %q is missing", want)
 		}
 	}
-	var tg *Template
-	for _, tpl := range Templates() {
-		if tpl.Name == "telegram-group-bot" {
-			copyTpl := tpl
-			tg = &copyTpl
-			break
+	for _, presetName := range []string{"telegram-group-bot", "qq-group-bot"} {
+		var found *Template
+		for _, tpl := range Templates() {
+			if tpl.Name == presetName {
+				copyTpl := tpl
+				found = &copyTpl
+				break
+			}
 		}
-	}
-	if tg == nil || len(tg.Settings) == 0 || len(tg.Extras) == 0 || tg.Memory != "conversational" || tg.Instructions == "" {
-		t.Fatalf("telegram-group-bot preset missing schema metadata: %+v", tg)
-	}
-	for _, c := range tg.Capabilities {
-		if c == "tools" || c == "apis" || c == "net.http" {
-			t.Fatalf("telegram-group-bot must keep external write capability %q off by default", c)
+		if found == nil || len(found.Settings) == 0 || len(found.Extras) == 0 || found.Memory != "conversational" || found.Instructions == "" {
+			t.Fatalf("%s preset missing schema metadata: %+v", presetName, found)
+		}
+		for _, c := range found.Capabilities {
+			if c == "tools" || c == "apis" || c == "net.http" {
+				t.Fatalf("%s must keep external write capability %q off by default", presetName, c)
+			}
 		}
 	}
 }

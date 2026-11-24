@@ -429,6 +429,109 @@ func (d *Driver) call(ctx context.Context, method, path string, in, out any) err
 	}
 }
 
+// BotInfo describes a verified QQ Bot application and its gateway metadata.
+type BotInfo struct {
+	AppID      string `json:"app_id"`
+	BotID      string `json:"bot_id,omitempty"`
+	Username   string `json:"username,omitempty"`
+	GatewayURL string `json:"gateway_url,omitempty"`
+	Shards     int    `json:"shards,omitempty"`
+	APIBase    string `json:"api_base,omitempty"`
+}
+
+// TestCredentials exchanges AppID + AppSecret for an access token, verifies
+// OpenAPI access via GET /gateway/bot, and best-effort fetches bot profile
+// metadata from GET /users/@me. Secrets and tokens are scrubbed from errors.
+func TestCredentials(ctx context.Context, appID, secret, apiBase string, client *http.Client) (BotInfo, error) {
+	appID = strings.TrimSpace(appID)
+	secret = strings.TrimSpace(secret)
+	if appID == "" {
+		return BotInfo{}, errors.New("qq app_id is required")
+	}
+	if secret == "" {
+		return BotInfo{}, errors.New("qq app secret is required")
+	}
+	base := strings.TrimRight(strings.TrimSpace(apiBase), "/")
+	if base == "" {
+		base = DefaultAPIBase
+	}
+	if client == nil {
+		client = &http.Client{Timeout: callTimeout}
+	}
+	var tok string
+	scrub := func(err error) error {
+		if err == nil {
+			return nil
+		}
+		msg := strings.ReplaceAll(err.Error(), secret, "***")
+		if tok != "" {
+			msg = strings.ReplaceAll(msg, tok, "***")
+		}
+		return errors.New(msg)
+	}
+
+	ts := newTokenSource(appID, secret, base+"/app/getAppAccessToken", client)
+	var err error
+	tok, err = ts.Token(ctx)
+	if err != nil {
+		return BotInfo{}, scrub(err)
+	}
+
+	doGET := func(path string, out any) error {
+		reqCtx, cancel := context.WithTimeout(ctx, callTimeout)
+		defer cancel()
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, base+path, nil)
+		if err != nil {
+			return scrub(err)
+		}
+		req.Header.Set("Authorization", "QQBot "+tok)
+		req.Header.Set("X-Union-Appid", appID)
+		resp, err := client.Do(req)
+		if err != nil {
+			return scrub(err)
+		}
+		defer resp.Body.Close()
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			e := &apiError{Status: resp.StatusCode}
+			_ = json.Unmarshal(data, e)
+			if e.Message == "" {
+				e.Message = strings.TrimSpace(string(data))
+			}
+			return scrub(e)
+		}
+		if out != nil && len(data) > 0 {
+			if err := json.Unmarshal(data, out); err != nil {
+				return scrub(fmt.Errorf("qq api: GET %s: bad response: %w", path, err))
+			}
+		}
+		return nil
+	}
+
+	var gw struct {
+		URL    string `json:"url"`
+		Shards int    `json:"shards"`
+	}
+	if err := doGET("/gateway/bot", &gw); err != nil {
+		return BotInfo{}, err
+	}
+	info := BotInfo{
+		AppID:      appID,
+		GatewayURL: gw.URL,
+		Shards:     gw.Shards,
+		APIBase:    base,
+	}
+	var me struct {
+		ID       string `json:"id"`
+		Username string `json:"username"`
+	}
+	if err := doGET("/users/@me", &me); err == nil {
+		info.BotID = me.ID
+		info.Username = me.Username
+	}
+	return info, nil
+}
+
 // isCode reports whether err is an API error with one of codes.
 func isCode(err error, codes ...int) bool {
 	var e *apiError

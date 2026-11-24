@@ -66,7 +66,7 @@ func TestStudioPluginsAPI(t *testing.T) {
 
 	// Validate invalid source returns ok:false with errors.
 	rec = do(t, ui.API(), http.MethodPost, "/admin/api/studio/plugins/validate", map[string]any{
-		"kind": "builtin", "name": "token_budget", "source": "local x =",
+		"kind": "builtin", "name": "token_budget", "source": "const x =",
 	})
 	var v struct {
 		OK     bool     `json:"ok"`
@@ -77,7 +77,7 @@ func TestStudioPluginsAPI(t *testing.T) {
 	}
 
 	// PUT builtin saves shadow file and triggers reload.
-	custom := "-- af-prelude-version: 1\nfunction token_budget(m, b) return m end\n"
+	custom := "// af-prelude-version: 2\nfunction token_budget(m, b) { return m; }\n"
 	rec = do(t, ui.API(), http.MethodPut, "/admin/api/studio/plugins/builtins/token_budget", map[string]any{
 		"source": custom, "mtime": 0,
 	})
@@ -110,20 +110,20 @@ func TestStudioPluginsAPI(t *testing.T) {
 	}
 
 	// Package create -> save file -> delete file -> delete package.
-	pkgSrc := "-- af-prelude-version: 1\nlocal M = {}\nreturn M\n"
+	pkgSrc := "// af-prelude-version: 2\nvar M = {};\n"
 	rec = do(t, ui.API(), http.MethodPost, "/admin/api/studio/plugins/packages", map[string]any{
-		"name": "helpers", "file": "init.lua", "source": pkgSrc,
+		"name": "helpers", "file": "init.ts", "source": pkgSrc,
 	})
 	if rec.Code != http.StatusOK || packageCalls != 1 {
 		t.Fatalf("POST package: %d %s", rec.Code, rec.Body.String())
 	}
-	rec = do(t, ui.API(), http.MethodPut, "/admin/api/studio/plugins/packages/helpers/files/extra.lua", map[string]any{
+	rec = do(t, ui.API(), http.MethodPut, "/admin/api/studio/plugins/packages/helpers/files/extra.ts", map[string]any{
 		"source": pkgSrc, "mtime": 0,
 	})
 	if rec.Code != http.StatusOK || packageCalls != 2 {
 		t.Fatalf("PUT package file: %d %s", rec.Code, rec.Body.String())
 	}
-	rec = do(t, ui.API(), http.MethodDelete, "/admin/api/studio/plugins/packages/helpers/files/extra.lua?mtime=0", nil)
+	rec = do(t, ui.API(), http.MethodDelete, "/admin/api/studio/plugins/packages/helpers/files/extra.ts?mtime=0", nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("DELETE package file: %d %s", rec.Code, rec.Body.String())
 	}

@@ -412,10 +412,10 @@ func (u *UI) validateStudioAgent(name string, a config.Agent, loop string) []str
 	if strings.TrimSpace(loop) == "" {
 		errs = append(errs, "loop source is empty")
 	} else {
-		if err := vm.CheckChunkVersion(name+".lua", loop); err != nil {
+		if err := vm.CheckChunkVersion(name+".ts", loop); err != nil {
 			errs = append(errs, err.Error())
 		}
-		if err := vm.CompileCheck(name+".lua", loop); err != nil {
+		if err := vm.CompileCheck(name+".ts", loop); err != nil {
 			errs = append(errs, err.Error())
 		}
 	}
@@ -432,7 +432,7 @@ func (u *UI) handleStudioValidate(w http.ResponseWriter, r *http.Request) {
 	}
 	errs := u.validateStudioAgent(req.Name, a, req.Loop)
 	warnings := []string{}
-	if !strings.Contains(req.Loop, "function loop") {
+	if !strings.Contains(req.Loop, "function loop") && !strings.Contains(req.Loop, "loop =") {
 		warnings = append(warnings, "the loop source does not define function loop()")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": len(errs) == 0, "errors": errs, "warnings": warnings})
@@ -937,7 +937,7 @@ func (u *UI) handleStudioLoopTest(w http.ResponseWriter, r *http.Request) {
 				if loaded.agent.Loop != "" {
 					sc.Loop = loaded.agent.Loop
 				} else {
-					sc.Loop = sc.Agent + ".lua"
+					sc.Loop = sc.Agent + ".ts"
 				}
 			}
 			if strings.TrimSpace(sc.Instructions) == "" {

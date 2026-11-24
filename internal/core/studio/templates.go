@@ -19,220 +19,226 @@ type Template struct {
 // only documented prelude calls; the playground is where a new agent is
 // exercised before it is persisted.
 func Templates() []Template {
-	directive := fmt.Sprintf("-- af-prelude-version: %d\n", vm.PreludeVersion)
+	directive := fmt.Sprintf("// af-prelude-version: %d\n", vm.PreludeVersion)
 	return []Template{
 		{
 			Name:        "echo",
 			Title:       "Echo",
 			Description: "No model needed: replies with the text it received. The smallest runnable agent.",
-			Loop: directive + `function loop()
-  while true do
-    local msg = session.inbox()
-    session.send("echo: " .. (msg.text or ""))
-  end
-end
+			Loop: directive + `function loop(): void {
+  while (true) {
+    const msg = session.inbox();
+    session.send("echo: " + (msg.text || ""));
+  }
+}
 `,
 		},
 		{
 			Name:        "llm-chat",
 			Title:       "LLM chat",
 			Description: "One model call per message with a system prompt. Needs a configured model.",
-			Loop: directive + `function loop()
-  while true do
-    local msg = session.inbox()
-    local reply = llm.chat({
-      { role = "system", content = "You are a helpful assistant." },
-      { role = "user", content = msg.text or "" },
-    })
-    session.send(reply.text or "")
-  end
-end
+			Loop: directive + `function loop(): void {
+  while (true) {
+    const msg = session.inbox();
+    const reply = llm.chat([
+      { role: "system", content: "You are a helpful assistant." },
+      { role: "user", content: msg.text || "" },
+    ]);
+    session.send(reply.text || "");
+  }
+}
 `,
 		},
 		{
 			Name:        "tool-loop",
 			Title:       "Tool loop",
 			Description: "Offers the agent's enabled tools to the model and runs the first requested one.",
-			Loop: directive + `function loop()
-  while true do
-    local msg = session.inbox()
-    local reply = llm.chat({
-      { role = "system", content = "Use the available tools when they help." },
-      { role = "user", content = msg.text or "" },
-    }, { tools = tools.list() })
+			Loop: directive + `function loop(): void {
+  while (true) {
+    const msg = session.inbox();
+    const reply = llm.chat([
+      { role: "system", content: "Use the available tools when they help." },
+      { role: "user", content: msg.text || "" },
+    ], { tools: tools.list() });
 
-    local calls = reply.tool_calls or {}
-    if #calls > 0 then
-      local call = calls[1]
-      local result = tools.run(call.name, call.args or {})
-      session.send("tool " .. call.name .. " -> " .. tostring(result))
-    else
-      session.send(reply.text or "")
-    end
-  end
-end
+    const calls = reply.tool_calls || [];
+    if (calls.length > 0) {
+      const call = calls[0];
+      const result = tools.run(call.name, call.args || {});
+      session.send("tool " + call.name + " -> " + JSON.stringify(result));
+    } else {
+      session.send(reply.text || "");
+    }
+  }
+}
 `,
 		},
 		{
 			Name:        "stateless",
 			Title:       "One-shot",
 			Description: "Answers one message and exits. Useful for testing session lifecycle behaviour.",
-			Loop: directive + `function loop()
-  local msg = session.inbox()
-  session.send("handled: " .. (msg.text or ""))
-  session.exit()
-end
+			Loop: directive + `function loop(): void {
+  const msg = session.inbox();
+  session.send("handled: " + (msg.text || ""));
+  session.exit();
+}
 `,
 		},
 		{
 			Name:        "group-chat",
 			Title:       "Group chat with memory",
-			Description: "For QQ or Telegram groups: names each speaker, keeps the chat's recent exchanges (session.state capability) and recalls older ones (a memory profile with a dialogue store). Full scenario: agentflow-studio/examples/qq-group-chat.",
-			Loop: directive + `local CONTEXT_TURNS = 10
+			Description: "For QQ or Telegram groups: names each speaker, keeps the chat's recent exchanges (session.state capability) and recalls older ones (a memory profile with a dialogue store).",
+			Loop: directive + `const CONTEXT_TURNS = 10;
 
--- Recent context lives in session.state, which needs the session.state
--- capability; without it the bot still answers, just without context.
-local function load_context()
-  local ok, ctx = pcall(session.state.get, "context")
-  if ok and type(ctx) == "table" then return ctx end
-  return {}
-end
+interface ContextTurn {
+  who: string;
+  text: string;
+  reply: string;
+}
 
-local function save_context(ctx)
-  while #ctx > CONTEXT_TURNS do table.remove(ctx, 1) end
-  pcall(session.state.set, "context", ctx)
-end
+// Recent context lives in session.state, which needs the session.state
+// capability; without it the bot still answers, just without context.
+function loadContext(): ContextTurn[] {
+  try {
+    const ctx = session.state.get("context");
+    if (Array.isArray(ctx)) return ctx as ContextTurn[];
+  } catch (_) {}
+  return [];
+}
 
-function loop()
-  while true do
-    local msg = session.inbox()
-    local p = msg.payload or {}
-    local who = tostring(p.name or p.username or msg.from or "member")
-    local chat = tostring(p.chat_id or msg.reply_to or "chat")
-    local text = msg.text or ""
-    if text:match("%S") then
-      local info = agent.info()
-      local ctx = load_context()
-      local messages = {
-        { role = "system", content = info.instructions or "You are a friendly member of this group chat. Each message starts with the speaker's name." },
+function saveContext(ctx: ContextTurn[]): void {
+  while (ctx.length > CONTEXT_TURNS) ctx.shift();
+  try {
+    session.state.set("context", ctx);
+  } catch (_) {}
+}
+
+function loop(): void {
+  while (true) {
+    const msg = session.inbox();
+    const p = (msg.payload || {}) as Record<string, unknown>;
+    const who = String(p.name || p.username || msg.from || "member");
+    const chat = String(p.chat_id || msg.reply_to || "chat");
+    const text = msg.text || "";
+    if (/\S/.test(text)) {
+      const info = agent.info();
+      const ctx = loadContext();
+      const messages: Array<{ role: string; content: string }> = [
+        { role: "system", content: info.instructions || "You are a friendly member of this group chat. Each message starts with the speaker's name." },
+      ];
+      // Older exchanges from this chat that match the message (memory profile).
+      const older: string[] = [];
+      for (const hit of memory.recall({ store: "dialogue", kind: "text", text: text, k: 8 }) || []) {
+        const v = hit && (hit as { value?: Record<string, unknown> }).value;
+        if (v && typeof v === "object" && v.chat === chat && older.length < 4) {
+          older.push("- " + String(v.who) + ": " + String(v.text) + "\n  you: " + String(v.reply));
+        }
       }
-      -- Older exchanges from this chat that match the message (memory profile).
-      local older = {}
-      for _, hit in ipairs(memory.recall({ store = "dialogue", kind = "text", text = text, k = 8 }) or {}) do
-        local v = hit.value
-        if type(v) == "table" and v.chat == chat and #older < 4 then
-          table.insert(older, "- " .. tostring(v.who) .. ": " .. tostring(v.text) .. "\n  you: " .. tostring(v.reply))
-        end
-      end
-      if #older > 0 then
-        table.insert(messages, { role = "system", content = "Earlier in this chat:\n" .. table.concat(older, "\n") })
-      end
-      for _, e in ipairs(ctx) do
-        table.insert(messages, { role = "user", content = e.who .. ": " .. e.text })
-        table.insert(messages, { role = "assistant", content = e.reply })
-      end
-      table.insert(messages, { role = "user", content = who .. ": " .. text })
-      local reply = llm.chat(token_budget(messages, info.history_budget or 6000))
-      local answer = reply.text or ""
-      session.send(answer)
-      memory.write({ type = "turn", id = msg.id, chat = chat, who = who, text = text, reply = answer })
-      table.insert(ctx, { who = who, text = text, reply = answer })
-      save_context(ctx)
-    end
-  end
-end
+      if (older.length > 0) {
+        messages.push({ role: "system", content: "Earlier in this chat:\n" + older.join("\n") });
+      }
+      for (const e of ctx) {
+        messages.push({ role: "user", content: e.who + ": " + e.text });
+        messages.push({ role: "assistant", content: e.reply });
+      }
+      messages.push({ role: "user", content: who + ": " + text });
+      const reply = llm.chat(token_budget(messages, info.history_budget || 6000));
+      const answer = reply.text || "";
+      session.send(answer);
+      memory.write({ type: "turn", id: msg.id, chat: chat, who: who, text: text, reply: answer });
+      ctx.push({ who: who, text: text, reply: answer });
+      saveContext(ctx);
+    }
+  }
+}
 `,
 		},
 		{
 			Name:        "rag",
 			Title:       "Knowledge base (RAG)",
-			Description: "Answers from passages recalled by meaning and cites them; /learn adds passages for editors. Needs a memory profile with a vector store named knowledge, embed_model and recall: plugin:semantic. Full scenario: agentflow-studio/examples/telegram-rag.",
-			Loop: directive + `local TOP_K = 4
+			Description: "Answers from passages recalled by meaning and cites them; /learn adds passages for editors. Needs a memory profile with a vector store named knowledge, embed_model and recall: plugin:semantic.",
+			Loop: directive + `const TOP_K = 4;
 
-local function passages_for(question)
-  local out = {}
-  for _, hit in ipairs(memory.recall({ store = "knowledge", text = question, k = TOP_K }) or {}) do
-    if type(hit.value) == "table" and hit.value.text then
-      table.insert(out, hit.value)
-    end
-  end
-  return out
-end
+function passagesFor(question: string): Array<{ text: string }> {
+  const out: Array<{ text: string }> = [];
+  for (const hit of memory.recall({ store: "knowledge", text: question, k: TOP_K }) || []) {
+    const v = hit && (hit as { value?: { text?: string } }).value;
+    if (v && typeof v === "object" && v.text) {
+      out.push({ text: v.text });
+    }
+  }
+  return out;
+}
 
-function loop()
-  while true do
-    local msg = session.inbox()
-    local text = msg.text or ""
-    local doc = text:match("^%s*/learn%s+(.+)$")
-    if doc then
-      -- Who may teach the bot is policy: here, senders listed in the agent's
-      -- extras.editors.
-      local editors = ((agent.config() or {}).extras or {}).editors or {}
-      local allowed = false
-      for _, who in ipairs(editors) do
-        if who == msg.from then allowed = true end
-      end
-      if allowed then
-        local n = 0
-        for para in (doc .. "\n\n"):gmatch("(.-)\n%s*\n") do
-          if para:match("%S") then
-            n = n + 1
-            memory.write({ targets = { { store = "knowledge", key = "doc:" .. os.time() .. ":" .. n, value = { text = para } } } })
-          end
-        end
-        session.send("Learned " .. n .. " passage(s).")
-      else
-        session.send("Only editors can teach me.")
-      end
-    elseif text:match("%S") then
-      local passages = passages_for(text)
-      if #passages == 0 then
-        session.send("I don't have anything on that in my knowledge base yet.")
-      else
-        local numbered = {}
-        for i, p in ipairs(passages) do
-          table.insert(numbered, "[" .. i .. "] " .. p.text)
-        end
-        local reply = llm.chat({
-          { role = "system", content = "Answer only from the numbered passages and cite them like [1]. If they do not contain the answer, say you don't know." },
-          { role = "system", content = "Passages:\n\n" .. table.concat(numbered, "\n\n") },
-          { role = "user", content = text },
-        })
-        session.send(reply.text or "")
-      end
-    end
-  end
-end
+function loop(): void {
+  while (true) {
+    const msg = session.inbox();
+    const text = msg.text || "";
+    const learnMatch = /^\s*\/learn\s+([\s\S]+)$/.exec(text);
+    if (learnMatch) {
+      const cfg = agent.config() || {};
+      const editors = (((cfg.extras || {}) as Record<string, unknown>).editors || []) as string[];
+      if (editors.includes(msg.from)) {
+        let n = 0;
+        for (const rawPara of learnMatch[1].split(/\n\s*\n/)) {
+          const para = rawPara.trim();
+          if (para) {
+            n++;
+            memory.write({
+              targets: [{ store: "knowledge", key: "doc:" + os.time() + ":" + n, value: { text: para } }],
+            });
+          }
+        }
+        session.send("Learned " + n + " passage(s).");
+      } else {
+        session.send("Only editors can teach me.");
+      }
+    } else if (/\S/.test(text)) {
+      const passages = passagesFor(text);
+      if (passages.length === 0) {
+        session.send("I don't have anything on that in my knowledge base yet.");
+      } else {
+        const numbered = passages.map((p, i) => "[" + (i + 1) + "] " + p.text);
+        const reply = llm.chat([
+          { role: "system", content: "Answer only from the numbered passages and cite them like [1]. If they do not contain the answer, say you don't know." },
+          { role: "system", content: "Passages:\n\n" + numbered.join("\n\n") },
+          { role: "user", content: text },
+        ]);
+        session.send(reply.text || "");
+      }
+    }
+  }
+}
 `,
 		},
 		{
 			Name:        "single-turn-api",
 			Title:       "Single-turn API",
-			Description: "For the openai channel: answers each chat/completions request's last message with the agent's own instructions. Full scenario: agentflow-studio/examples/chat-completions.",
-			Loop: directive + `function loop()
-  while true do
-    local msg = session.inbox()
-    local info = agent.info()
-    local reply = llm.chat({
-      { role = "system", content = info.instructions or "You are a helpful assistant." },
-      { role = "user", content = msg.text or "" },
-    })
-    session.reply({ text = reply.text or "", finish_reason = reply.finish_reason, usage = reply.usage })
-  end
-end
+			Description: "For the openai channel: answers each chat/completions request's last message with the agent's own instructions.",
+			Loop: directive + `function loop(): void {
+  while (true) {
+    const msg = session.inbox();
+    const info = agent.info();
+    const reply = llm.chat([
+      { role: "system", content: info.instructions || "You are a helpful assistant." },
+      { role: "user", content: msg.text || "" },
+    ]);
+    session.reply({ text: reply.text || "", finish_reason: reply.finish_reason, usage: reply.usage });
+  }
+}
 `,
 		},
 		{
 			Name:        "openai-passthrough",
 			Title:       "OpenAI pass-through",
-			Description: "For the openai channel: forwards the client's messages, tools and sampling parameters to the agent's model unchanged. Reference copy: agentflow-studio/examples/loops/openai_passthrough.lua.",
-			Loop: directive + `function loop()
-  while true do
-    local msg = session.inbox()
-    local reply = llm.forward()
-    session.reply(reply)
-  end
-end
+			Description: "For the openai channel: forwards the client's messages, tools and sampling parameters to the agent's model unchanged.",
+			Loop: directive + `function loop(): void {
+  while (true) {
+    session.inbox();
+    const reply = llm.forward();
+    session.reply(reply);
+  }
+}
 `,
 		},
 	}

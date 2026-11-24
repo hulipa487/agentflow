@@ -166,14 +166,21 @@ func PackagePaths() []string {
 	return out
 }
 
-// packageManifest is optional; a package without one loads its *.lua files in
-// lexical order. prelude_api pins the package to this core's Lua API.
+// packageManifest is optional; a package without one loads its *.ts/*.js files
+// in lexical order. prelude_api pins the package to this core's prelude API.
 type packageManifest struct {
 	Name        string   `yaml:"name"`
 	Description string   `yaml:"description"`
 	Version     string   `yaml:"version"`
 	PreludeAPI  int      `yaml:"prelude_api"`
 	Files       []string `yaml:"files"`
+}
+
+func isScriptFile(name string) bool {
+	if strings.HasSuffix(name, ".d.ts") {
+		return false
+	}
+	return strings.HasSuffix(name, ".ts") || strings.HasSuffix(name, ".js")
 }
 
 // packageSource loads one package, recursively expanding its own imports.
@@ -211,14 +218,14 @@ func packageSourceLocked(name string, stack []string) (string, string, error) {
 			return "", "", fmt.Errorf("package %q: %w", name, err)
 		}
 		for _, e := range entries {
-			if !e.IsDir() && strings.HasSuffix(e.Name(), ".lua") {
+			if !e.IsDir() && isScriptFile(e.Name()) {
 				files = append(files, e.Name())
 			}
 		}
 		sort.Strings(files)
 	}
 	if len(files) == 0 {
-		return "", "", fmt.Errorf("package %q: no .lua files", name)
+		return "", "", fmt.Errorf("package %q: no .ts or .js files", name)
 	}
 	var parts []string
 	for _, f := range files {
@@ -242,14 +249,14 @@ func packageSourceLocked(name string, stack []string) (string, string, error) {
 	return strings.Join(parts, "\n"), dir, nil
 }
 
-// expandImportsLocked replaces "-- af-import: <name>" lines with the package's
+// expandImportsLocked replaces "// af-import: <name>" lines with the package's
 // source. Caller must hold mu.RLock.
 func expandImportsLocked(src string, stack []string) (string, error) {
 	lines := strings.Split(src, "\n")
 	out := make([]string, 0, len(lines)+8)
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if rest, ok := strings.CutPrefix(trimmed, "-- af-import:"); ok {
+		if rest, ok := strings.CutPrefix(trimmed, "// af-import:"); ok {
 			name := strings.TrimSpace(rest)
 			if name == "" {
 				return "", fmt.Errorf("af-import: missing package name")
@@ -277,7 +284,7 @@ func stripPreludeDirective(src string) string {
 	out := lines[:0]
 	for _, line := range lines {
 		t := strings.TrimSpace(line)
-		if strings.HasPrefix(t, "--") && strings.Contains(t, "af-prelude-version") {
+		if strings.HasPrefix(t, "//") && strings.Contains(t, "af-prelude-version") {
 			continue
 		}
 		out = append(out, line)
@@ -286,17 +293,18 @@ func stripPreludeDirective(src string) string {
 }
 
 // shadowLocked returns the deployment's override for a builtin name, if one exists.
-// Caller must hold mu.RLock.
+// Prefers <name>.ts over <name>.js. Caller must hold mu.RLock.
 func shadowLocked(name string) (src, path string, ok bool) {
 	if pluginDir == "" {
 		return "", "", false
 	}
-	p := filepath.Join(pluginDir, name+".lua")
-	b, err := os.ReadFile(p)
-	if err != nil {
-		return "", "", false
+	for _, ext := range []string{".ts", ".js"} {
+		p := filepath.Join(pluginDir, name+ext)
+		if b, err := os.ReadFile(p); err == nil {
+			return string(b), p, true
+		}
 	}
-	return string(b), p, true
+	return "", "", false
 }
 
 // SupportChunkPaths returns the file backing each support chunk that
@@ -398,7 +406,7 @@ func Resolve(ref string) (src string, watchPath string, err error) {
 		}
 		return expanded, ref, nil
 	}
-	// Directory loop: concatenate all *.lua files (sorted) with a newline
+	// Directory loop: concatenate all *.ts / *.js files (sorted) with a newline
 	// between, so a multi-module loop can be authored as separate files.
 	entries, err := os.ReadDir(ref)
 	if err != nil {
@@ -406,7 +414,7 @@ func Resolve(ref string) (src string, watchPath string, err error) {
 	}
 	var parts []string
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".lua") {
+		if e.IsDir() || !isScriptFile(e.Name()) {
 			continue
 		}
 		member := filepath.Join(ref, e.Name())
@@ -420,7 +428,7 @@ func Resolve(ref string) (src string, watchPath string, err error) {
 		parts = append(parts, string(b))
 	}
 	if len(parts) == 0 {
-		return "", "", fmt.Errorf("loop dir %s has no .lua files", ref)
+		return "", "", fmt.Errorf("loop dir %s has no .ts or .js files", ref)
 	}
 	expanded, err := expandImportsLocked(strings.Join(parts, "\n"), nil)
 	if err != nil {

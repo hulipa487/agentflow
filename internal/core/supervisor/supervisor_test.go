@@ -22,7 +22,7 @@ import (
 // directive is the leading comment line every chunk has to declare. The loop
 // fixtures in this package are chunks: vm.State.Start refuses one that declares
 // nothing, so they go through this the way a shipped loop does.
-func directive() string { return fmt.Sprintf("-- af-prelude-version: %d\n", vm.PreludeVersion) }
+func directive() string { return fmt.Sprintf("// af-prelude-version: %d\n", vm.PreludeVersion) }
 
 // This file tests the multi-agent authority layer: ACL enforcement, request
 // correlation, spawn attenuation, and lifecycle cleanup. It uses lightweight
@@ -39,14 +39,14 @@ func newTestSupervisor(t *testing.T) *Supervisor {
 			CanContact:   map[string]bool{"worker": true},
 			Capabilities: map[string]bool{"llm.chat": true, "agent.send": true, "agent.request": true, "agent.spawn": true},
 			Handlers:     map[string]session.OpHandler{},
-			LoopSrc:      directive() + "function loop() while true do session.inbox() end end",
+			LoopSrc:      directive() + "function loop() { while (true) { session.inbox(); } }",
 		},
 		"worker": {
 			Info:         &session.Info{Name: "worker", HistoryBudget: 100},
 			CanContact:   map[string]bool{"planner": true},
 			Capabilities: map[string]bool{"llm.chat": true, "agent.reply": true},
 			Handlers:     map[string]session.OpHandler{},
-			LoopSrc:      directive() + "function loop() while true do session.inbox() end end",
+			LoopSrc:      directive() + "function loop() { while (true) { session.inbox(); } }",
 		},
 	}
 	sup := New(defs, gw, p, nil, log)
@@ -72,7 +72,7 @@ func newTestSupervisor(t *testing.T) *Supervisor {
 // carries the refusal.
 func TestUngatedSupportShadowRefusesTheSession(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "token_budget.lua"), []byte("SUPPORT = 1\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "token_budget.ts"), []byte("var SUPPORT = 1;\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	luacode.SetPluginDir(dir)
@@ -136,7 +136,7 @@ func TestSpawnAttenuation(t *testing.T) {
 	sup := newTestSupervisor(t)
 	sup.templates["coder"] = &SpawnTemplate{
 		Name:         "coder",
-		LoopSrc:      directive() + "function loop() while true do session.inbox() end end",
+		LoopSrc:      directive() + "function loop() { while (true) { session.inbox(); } }",
 		Capabilities: map[string]bool{"llm.chat": true, "agent.send": true, "shell.exec": true},
 		CanContact:   map[string]bool{"worker": true},
 		Handlers:     map[string]session.OpHandler{},
@@ -179,7 +179,7 @@ func TestSpawnRequiresCapability(t *testing.T) {
 	sup := newTestSupervisor(t)
 	sup.templates["coder"] = &SpawnTemplate{
 		Name:         "coder",
-		LoopSrc:      directive() + "function loop() end",
+		LoopSrc:      directive() + "function loop() {}",
 		Capabilities: map[string]bool{"llm.chat": true},
 		Handlers:     map[string]session.OpHandler{},
 	}
@@ -200,7 +200,7 @@ func TestSendToSpawnedChildSession(t *testing.T) {
 	sup := newTestSupervisor(t)
 	sup.templates["coder"] = &SpawnTemplate{
 		Name:         "coder",
-		LoopSrc:      directive() + "function loop() while true do session.inbox() end end",
+		LoopSrc:      directive() + "function loop() { while (true) { session.inbox(); } }",
 		Capabilities: map[string]bool{"llm.chat": true, "agent.send": true},
 		Handlers:     map[string]session.OpHandler{},
 		Memory:       &session.Info{Name: "coder"},
@@ -212,7 +212,7 @@ func TestSendToSpawnedChildSession(t *testing.T) {
 		CanContact:   map[string]bool{"planner": true},
 		Capabilities: map[string]bool{"llm.chat": true, "agent.send": true},
 		Handlers:     map[string]session.OpHandler{},
-		LoopSrc:      directive() + "function loop() while true do session.inbox() end end",
+		LoopSrc:      directive() + "function loop() { while (true) { session.inbox(); } }",
 	}
 	parent := session.Identity{
 		SessionID:    "planner|x",
@@ -256,7 +256,7 @@ func TestSendFindOrCreatesRoutedSession(t *testing.T) {
 		CanContact:   map[string]bool{"planner": true},
 		Capabilities: map[string]bool{"llm.chat": true},
 		Handlers:     map[string]session.OpHandler{},
-		LoopSrc:      directive() + "function loop() while true do session.inbox() end end",
+		LoopSrc:      directive() + "function loop() { while (true) { session.inbox(); } }",
 	}
 	parent := session.Identity{
 		SessionID:    "planner|x",
@@ -291,7 +291,7 @@ func TestSendFindOrCreateEnforcesACL(t *testing.T) {
 		Info:         &session.Info{Name: "pm", HistoryBudget: 100},
 		Capabilities: map[string]bool{"llm.chat": true},
 		Handlers:     map[string]session.OpHandler{},
-		LoopSrc:      directive() + "function loop() while true do session.inbox() end end",
+		LoopSrc:      directive() + "function loop() { while (true) { session.inbox(); } }",
 	}
 	parent := session.Identity{
 		SessionID:    "planner|x",
@@ -334,7 +334,7 @@ func TestSendToExitedSessionFails(t *testing.T) {
 		Capabilities: map[string]bool{"llm.chat": true},
 		Handlers:     map[string]session.OpHandler{},
 		// A loop that returns immediately so the session exits right away.
-		LoopSrc: directive() + "function loop() end",
+		LoopSrc: directive() + "function loop() {}",
 	}
 	parent := session.Identity{
 		SessionID:    "planner|x",
@@ -387,7 +387,7 @@ func TestSpawnPreservesProfileExtras(t *testing.T) {
 	}
 	sup.templates["pm"] = &SpawnTemplate{
 		Name:         "pm",
-		LoopSrc:      directive() + "function loop() while true do session.inbox() end end",
+		LoopSrc:      directive() + "function loop() { while (true) { session.inbox(); } }",
 		Capabilities: map[string]bool{"llm.chat": true},
 		Handlers:     map[string]session.OpHandler{},
 		Memory: &session.Info{

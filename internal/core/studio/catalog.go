@@ -34,7 +34,7 @@ var NewLuaOps = []string{
 // builder offers these as checkboxes; a deployment's plugins.allow_capabilities
 // ceiling still decides which are accepted.
 var CapabilityNames = []string{
-	"llm.chat", "memory", "tools", "agent.send", "agent.request", "agent.spawn",
+	"llm.chat", "memory", "tools", "apis", "agent.send", "agent.request", "agent.spawn",
 	"net.http", "net.mail", "shell.exec", "files", "session.state", "users",
 	"channel.push",
 }

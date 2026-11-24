@@ -84,11 +84,15 @@ func TestGatedOpDeniesInsideALoop(t *testing.T) {
 		&session.Info{Name: "writer", HistoryBudget: 100},
 		gw, nil, nil, nil, nil, handlers, pool.New(1), discardLogger())
 	a.LoopSrc = directive() + `
-function loop()
-  local msg = session.inbox()
-  local ok, res = pcall(http.get, "https://example.com")
-  if ok then session.send("reached: " .. tostring(res.status)) else session.send("denied: " .. tostring(res)) end
-end
+function loop() {
+  session.inbox();
+  try {
+    const res = http.get("https://example.com");
+    session.send("reached: " + String(res.status));
+  } catch (e) {
+    session.send("denied: " + (e instanceof Error ? e.message : String(e)));
+  }
+}
 `
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -96,14 +96,14 @@ func TestIdleSessionIsUnloadedAndComesBack(t *testing.T) {
 	t.Cleanup(func() { _ = store.Close() })
 	handlers := caps.SessionStateHandlers{Store: store}.Handlers()
 	sup, drv := idleSupervisor(t, `
-function loop()
-  while true do
-    local m = session.inbox()
-    local n = session.state.get("count") or 0
-    session.state.set("count", n + 1)
-    session.send(tostring(n + 1))
-  end
-end`, handlers, nil, nil)
+function loop() {
+  while (true) {
+    const m = session.inbox();
+    const n = session.state.get("count") || 0;
+    session.state.set("count", n + 1);
+    session.send(String(n + 1));
+  }
+}`, handlers, nil, nil)
 
 	unloadsBefore := metric(t, "agentflow_sessions_unloaded")
 	if got := deliverAndWait(t, sup, drv, "chat", "hi"); got != "1" {
@@ -136,12 +136,12 @@ func TestLiveResourcesBlockUnload(t *testing.T) {
 		sched := scheduler.New(nil)
 		t.Cleanup(func() { sched.CancelOwner("echo|chat") })
 		sup, drv := idleSupervisor(t, `
-function loop()
-  local m = session.inbox()
-  scheduler.after(300)
-  session.send(m.text)
-  while true do session.inbox() end
-end`, map[string]session.OpHandler{}, sched, nil)
+function loop() {
+  const m = session.inbox();
+  scheduler.after(300);
+  session.send(m.text);
+  while (true) { session.inbox(); }
+}`, map[string]session.OpHandler{}, sched, nil)
 		deliverAndWait(t, sup, drv, "chat", "hi")
 		time.Sleep(40 * time.Millisecond)
 		sup.SweepIdle()

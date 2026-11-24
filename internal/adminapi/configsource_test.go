@@ -177,7 +177,7 @@ models:
     api_key: ${AGENTFLOW_TEST_KEY}
 agents:
   bot:
-    loop: ./loop.lua
+    loop: ./loop.ts
 `
 	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
 		t.Fatal(err)
@@ -282,7 +282,7 @@ models:
     model: gpt-4o-mini
 agents:
   bot:
-    loop: ./loop.lua
+    loop: ./loop.ts
 `
 	if err := validateRawConfig(raw, dir); err != nil {
 		t.Fatalf("validating from the config's own directory: %v", err)

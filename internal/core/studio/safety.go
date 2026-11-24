@@ -74,12 +74,12 @@ type SafetyProfileView struct {
 	Agents        []string `json:"agents"`
 	SpawnProfiles []string `json:"spawn_profiles"`
 	Classifiers   []string `json:"classifiers"`
-	LuaFilters    []string `json:"lua_filters"`
+	ScriptFilters []string `json:"script_filters"`
 	Live          bool     `json:"live"`
 }
 
-// LuaFilterDraft is the editable shape of one custom Lua safety filter.
-type LuaFilterDraft struct {
+// ScriptFilterDraft is the editable shape of one custom TypeScript/JS safety filter.
+type ScriptFilterDraft struct {
 	Name        string   `json:"name"`
 	Source      string   `json:"source,omitempty"`
 	File        string   `json:"file,omitempty"`
@@ -92,8 +92,8 @@ type LuaFilterDraft struct {
 	Fallback    string   `json:"fallback,omitempty"`
 }
 
-// LuaFilterView is one custom Lua safety filter plus its references and live status.
-type LuaFilterView struct {
+// ScriptFilterView is one custom script safety filter plus its references and live status.
+type ScriptFilterView struct {
 	Name        string   `json:"name"`
 	Source      string   `json:"source,omitempty"`
 	File        string   `json:"file,omitempty"`
@@ -135,7 +135,7 @@ type ClassifierView struct {
 }
 
 // SafetyList is the whole editable safety surface: profiles, classifiers,
-// custom Lua filters, and the names an editor may reference.
+// custom script filters, and the names an editor may reference.
 type SafetyList struct {
 	Mode           string              `json:"mode"` // configdir | file
 	Path           string              `json:"path,omitempty"`
@@ -144,7 +144,7 @@ type SafetyList struct {
 	BuiltinFilters []string            `json:"builtin_filters"`
 	Profiles       []SafetyProfileView `json:"profiles"`
 	Classifiers    []ClassifierView    `json:"classifiers"`
-	LuaFilters     []LuaFilterView     `json:"lua_filters"`
+	ScriptFilters  []ScriptFilterView  `json:"script_filters"`
 	Models         []string            `json:"models"`
 	Prompts        []string            `json:"prompts"`
 	Note           string              `json:"note"`
@@ -177,16 +177,16 @@ func NewSafety(cfg *config.Config, configDir, configPath string, log *slog.Logge
 
 // safetySections is the subset of the config this editor owns.
 type safetySections struct {
-	profiles    map[string]config.SafetyProfile
-	classifiers map[string]config.ClassifierProfile
-	luaFilters  map[string]config.LuaFilterProfile
+	profiles      map[string]config.SafetyProfile
+	classifiers   map[string]config.ClassifierProfile
+	scriptFilters map[string]config.ScriptFilterProfile
 }
 
 func (s safetySections) clone() safetySections {
 	out := safetySections{
-		profiles:    make(map[string]config.SafetyProfile, len(s.profiles)),
-		classifiers: make(map[string]config.ClassifierProfile, len(s.classifiers)),
-		luaFilters:  make(map[string]config.LuaFilterProfile, len(s.luaFilters)),
+		profiles:      make(map[string]config.SafetyProfile, len(s.profiles)),
+		classifiers:   make(map[string]config.ClassifierProfile, len(s.classifiers)),
+		scriptFilters: make(map[string]config.ScriptFilterProfile, len(s.scriptFilters)),
 	}
 	for k, v := range s.profiles {
 		out.profiles[k] = v
@@ -194,8 +194,8 @@ func (s safetySections) clone() safetySections {
 	for k, v := range s.classifiers {
 		out.classifiers[k] = v
 	}
-	for k, v := range s.luaFilters {
-		out.luaFilters[k] = v
+	for k, v := range s.scriptFilters {
+		out.scriptFilters[k] = v
 	}
 	return out
 }
@@ -231,7 +231,7 @@ func (s *Safety) listLocked() (SafetyList, error) {
 		BuiltinFilters: safety.FilterNames(),
 		Profiles:       []SafetyProfileView{},
 		Classifiers:    []ClassifierView{},
-		LuaFilters:     []LuaFilterView{},
+		ScriptFilters:  []ScriptFilterView{},
 		Models:         classifierModels(lists),
 		Prompts:        promptNames(lists),
 		Note:           "Safety profiles are core-owned and bind when agentflow starts; saved changes take effect after a restart.",
@@ -268,15 +268,15 @@ func (s *Safety) listLocked() (SafetyList, error) {
 		}
 	}
 	classifierUse := map[string][]string{}
-	luaUse := map[string][]string{}
+	scriptUse := map[string][]string{}
 	for pname, p := range sec.profiles {
 		for _, f := range p.Filters {
 			if strings.HasPrefix(f, "classifier:") {
 				cname := strings.TrimPrefix(f, "classifier:")
 				classifierUse[cname] = append(classifierUse[cname], pname)
-			} else if strings.HasPrefix(f, "lua:") {
-				lname := strings.TrimPrefix(f, "lua:")
-				luaUse[lname] = append(luaUse[lname], pname)
+			} else if strings.HasPrefix(f, "script:") {
+				sname := strings.TrimPrefix(f, "script:")
+				scriptUse[sname] = append(scriptUse[sname], pname)
 			}
 		}
 	}
@@ -289,7 +289,7 @@ func (s *Safety) listLocked() (SafetyList, error) {
 			Agents:        sorted(agentUse[name]),
 			SpawnProfiles: sorted(spawnUse[name]),
 			Classifiers:   classifierRefs(p.Filters),
-			LuaFilters:    luaFilterRefs(p.Filters),
+			ScriptFilters: scriptFilterRefs(p.Filters),
 			Live:          profileLive(s.boot(), name, p),
 		}
 		out.Profiles = append(out.Profiles, v)
@@ -301,12 +301,12 @@ func (s *Safety) listLocked() (SafetyList, error) {
 		v.Live = classifierLive(s.boot(), name, c)
 		out.Classifiers = append(out.Classifiers, v)
 	}
-	for _, name := range sortedKeys(sec.luaFilters) {
-		lf := sec.luaFilters[name]
-		v := luaFilterView(name, lf)
-		v.UsedBy = sorted(luaUse[name])
-		v.Live = luaFilterLive(s.boot(), name, lf)
-		out.LuaFilters = append(out.LuaFilters, v)
+	for _, name := range sortedKeys(sec.scriptFilters) {
+		sf := sec.scriptFilters[name]
+		v := scriptFilterView(name, sf)
+		v.UsedBy = sorted(scriptUse[name])
+		v.Live = scriptFilterLive(s.boot(), name, sf)
+		out.ScriptFilters = append(out.ScriptFilters, v)
 	}
 	return out, nil
 }
@@ -442,23 +442,23 @@ func (s *Safety) DeleteClassifier(name string, expectMTime int64) (SafetyList, e
 	return s.listLocked()
 }
 
-// ValidateLuaFilter dry-runs a custom Lua filter draft against the deployment.
-func (s *Safety) ValidateLuaFilter(d LuaFilterDraft, creating bool) []string {
+// ValidateScriptFilter dry-runs a custom script filter draft against the deployment.
+func (s *Safety) ValidateScriptFilter(d ScriptFilterDraft, creating bool) []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sec, err := s.readSections()
 	if err != nil {
 		return []string{err.Error()}
 	}
-	next, errs := mergeLuaFilter(sec, d, creating)
+	next, errs := mergeScriptFilter(sec, d, creating)
 	if len(errs) > 0 {
 		return errs
 	}
 	return s.validateSections(next)
 }
 
-// SaveLuaFilter creates or updates one custom Lua safety filter.
-func (s *Safety) SaveLuaFilter(d LuaFilterDraft, creating bool, expectMTime int64) (SafetyList, error) {
+// SaveScriptFilter creates or updates one custom script safety filter.
+func (s *Safety) SaveScriptFilter(d ScriptFilterDraft, creating bool, expectMTime int64) (SafetyList, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.checkMTime(expectMTime); err != nil {
@@ -468,7 +468,7 @@ func (s *Safety) SaveLuaFilter(d LuaFilterDraft, creating bool, expectMTime int6
 	if err != nil {
 		return SafetyList{}, err
 	}
-	next, errs := mergeLuaFilter(sec, d, creating)
+	next, errs := mergeScriptFilter(sec, d, creating)
 	if len(errs) > 0 {
 		return SafetyList{}, errors.New(strings.Join(errs, "; "))
 	}
@@ -481,9 +481,9 @@ func (s *Safety) SaveLuaFilter(d LuaFilterDraft, creating bool, expectMTime int6
 	return s.listLocked()
 }
 
-// DeleteLuaFilter removes one custom Lua safety filter and refuses while a
-// profile still references lua:<name>.
-func (s *Safety) DeleteLuaFilter(name string, expectMTime int64) (SafetyList, error) {
+// DeleteScriptFilter removes one custom script safety filter and refuses while a
+// profile still references script:<name>.
+func (s *Safety) DeleteScriptFilter(name string, expectMTime int64) (SafetyList, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.checkMTime(expectMTime); err != nil {
@@ -493,11 +493,11 @@ func (s *Safety) DeleteLuaFilter(name string, expectMTime int64) (SafetyList, er
 	if err != nil {
 		return SafetyList{}, err
 	}
-	if _, ok := sec.luaFilters[name]; !ok {
-		return SafetyList{}, fmt.Errorf("lua safety filter %q does not exist", name)
+	if _, ok := sec.scriptFilters[name]; !ok {
+		return SafetyList{}, fmt.Errorf("script safety filter %q does not exist", name)
 	}
 	next := sec.clone()
-	delete(next.luaFilters, name)
+	delete(next.scriptFilters, name)
 	if errs := s.validateSections(next); len(errs) > 0 {
 		return SafetyList{}, errors.New(strings.Join(errs, "; "))
 	}
@@ -597,30 +597,30 @@ func mergeClassifier(sec safetySections, d ClassifierDraft, creating bool) (safe
 	return next, nil
 }
 
-func mergeLuaFilter(sec safetySections, d LuaFilterDraft, creating bool) (safetySections, []string) {
+func mergeScriptFilter(sec safetySections, d ScriptFilterDraft, creating bool) (safetySections, []string) {
 	name := strings.TrimSpace(d.Name)
 	var errs []string
 	switch {
 	case name == "":
-		errs = append(errs, "a lua filter name is required")
+		errs = append(errs, "a script filter name is required")
 	case strings.ContainsAny(name, " \t/:|"):
-		errs = append(errs, "lua filter name may not contain spaces or : / |")
+		errs = append(errs, "script filter name may not contain spaces or : / |")
 	case len(name) > 64:
-		errs = append(errs, "lua filter name must be at most 64 characters")
+		errs = append(errs, "script filter name must be at most 64 characters")
 	}
-	if _, exists := sec.luaFilters[name]; exists && creating {
-		errs = append(errs, fmt.Sprintf("lua safety filter %q already exists", name))
+	if _, exists := sec.scriptFilters[name]; exists && creating {
+		errs = append(errs, fmt.Sprintf("script safety filter %q already exists", name))
 	}
 	if !creating {
-		if _, exists := sec.luaFilters[name]; !exists {
-			errs = append(errs, fmt.Sprintf("lua safety filter %q does not exist", name))
+		if _, exists := sec.scriptFilters[name]; !exists {
+			errs = append(errs, fmt.Sprintf("script safety filter %q does not exist", name))
 		}
 	}
 	if len(errs) > 0 {
 		return safetySections{}, errs
 	}
 	next := sec.clone()
-	next.luaFilters[name] = config.LuaFilterProfile{
+	next.scriptFilters[name] = config.ScriptFilterProfile{
 		Source:      strings.ReplaceAll(d.Source, "\r\n", "\n"),
 		File:        strings.TrimSpace(d.File),
 		Directions:  trimList(d.Directions),
@@ -639,7 +639,7 @@ func (s *Safety) validateSections(next safetySections) []string {
 	if err != nil {
 		return []string{"the current config does not load: " + err.Error()}
 	}
-	if err := config.ValidateSafetySections(s.sourcePath(), base, next.profiles, next.classifiers, next.luaFilters); err != nil {
+	if err := config.ValidateSafetySections(s.sourcePath(), base, next.profiles, next.classifiers, next.scriptFilters); err != nil {
 		return []string{err.Error()}
 	}
 	return nil
@@ -696,9 +696,9 @@ func promptNames(cfg *config.Config) []string {
 
 func (s *Safety) readSections() (safetySections, error) {
 	empty := safetySections{
-		profiles:    map[string]config.SafetyProfile{},
-		classifiers: map[string]config.ClassifierProfile{},
-		luaFilters:  map[string]config.LuaFilterProfile{},
+		profiles:      map[string]config.SafetyProfile{},
+		classifiers:   map[string]config.ClassifierProfile{},
+		scriptFilters: map[string]config.ScriptFilterProfile{},
 	}
 	path := s.sourcePath()
 	if path == "" {
@@ -726,8 +726,8 @@ func (s *Safety) readSections() (safetySections, error) {
 	if frag.Safety.Classifiers != nil {
 		empty.classifiers = frag.Safety.Classifiers
 	}
-	if frag.Safety.LuaFilters != nil {
-		empty.luaFilters = frag.Safety.LuaFilters
+	if frag.Safety.ScriptFilters != nil {
+		empty.scriptFilters = frag.Safety.ScriptFilters
 	}
 	for name, p := range empty.profiles {
 		if p.Filters == nil {
@@ -756,7 +756,7 @@ func (s *Safety) checkMTime(expect int64) error {
 	return nil
 }
 
-// writeSections replaces only profiles.safety and safety.classifiers, leaving
+// writeSections replaces only profiles.safety and safety, leaving
 // every other key and comment in place.
 func (s *Safety) writeSections(sec safetySections) error {
 	path := s.sourcePath()
@@ -789,11 +789,11 @@ func (s *Safety) writeSections(sec safetySections) error {
 }
 
 func applySafety(root *yaml.Node, sec safetySections) error {
-	if len(sec.classifiers) == 0 && len(sec.luaFilters) == 0 {
+	if len(sec.classifiers) == 0 && len(sec.scriptFilters) == 0 {
 		config.DeleteMapKey(root, "safety")
 	} else {
 		var v yaml.Node
-		if err := v.Encode(config.SafetyConfig{Classifiers: sec.classifiers, LuaFilters: sec.luaFilters}); err != nil {
+		if err := v.Encode(config.SafetyConfig{Classifiers: sec.classifiers, ScriptFilters: sec.scriptFilters}); err != nil {
 			return err
 		}
 		config.SetMapKey(root, "safety", &v)
@@ -977,28 +977,28 @@ func classifierRefs(filters []string) []string {
 	return out
 }
 
-func luaFilterRefs(filters []string) []string {
+func scriptFilterRefs(filters []string) []string {
 	out := []string{}
 	for _, f := range filters {
-		if strings.HasPrefix(f, "lua:") {
-			out = append(out, strings.TrimPrefix(f, "lua:"))
+		if strings.HasPrefix(f, "script:") {
+			out = append(out, strings.TrimPrefix(f, "script:"))
 		}
 	}
 	return out
 }
 
-func luaFilterLive(cfg *config.Config, name string, p config.LuaFilterProfile) bool {
+func scriptFilterLive(cfg *config.Config, name string, p config.ScriptFilterProfile) bool {
 	if cfg == nil {
 		return false
 	}
-	live, ok := cfg.Safety.LuaFilters[name]
+	live, ok := cfg.Safety.ScriptFilters[name]
 	if !ok {
 		return false
 	}
-	return reflect.DeepEqual(normalizeLuaFilter(live), normalizeLuaFilter(p))
+	return reflect.DeepEqual(normalizeScriptFilter(live), normalizeScriptFilter(p))
 }
 
-func normalizeLuaFilter(p config.LuaFilterProfile) config.LuaFilterProfile {
+func normalizeScriptFilter(p config.ScriptFilterProfile) config.ScriptFilterProfile {
 	p.Resolved = ""
 	if len(p.Directions) == 0 {
 		p.Directions = nil
@@ -1009,8 +1009,8 @@ func normalizeLuaFilter(p config.LuaFilterProfile) config.LuaFilterProfile {
 	return p
 }
 
-func luaFilterView(name string, f config.LuaFilterProfile) LuaFilterView {
-	return LuaFilterView{
+func scriptFilterView(name string, f config.ScriptFilterProfile) ScriptFilterView {
+	return ScriptFilterView{
 		Name:        name,
 		Source:      f.Source,
 		File:        f.File,

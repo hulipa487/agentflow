@@ -11,14 +11,14 @@ import (
 	"agentflow/internal/vm"
 )
 
-// TestPluginDirShadowsBuiltin: a file <plugins.dir>/<name>.lua wins over the
-// embedded builtin — for Resolve (loop/route refs, with a watch path for hot
-// reload) and for SupportChunks. Unshadowed builtins fall back to embedded.
+// TestPluginDirShadowsBuiltin: a file <plugins.dir>/<name>.ts (or .js) wins
+// over the embedded builtin — for Resolve (loop/route refs, with a watch path
+// for hot reload) and for SupportChunks. Unshadowed builtins fall back to embedded.
 func TestPluginDirShadowsBuiltin(t *testing.T) {
 	Register()
 	dir := t.TempDir()
-	shadowSrc := directive() + "memory_recall_handler = function(q, o) return {} end\n"
-	if err := os.WriteFile(filepath.Join(dir, "recency.lua"), []byte(shadowSrc), 0o600); err != nil {
+	shadowSrc := directive() + "function memory_recall_handler(_q: unknown, _o: unknown) { return []; }\n"
+	if err := os.WriteFile(filepath.Join(dir, "recency.ts"), []byte(shadowSrc), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	luacode.SetPluginDir(dir)
@@ -31,7 +31,7 @@ func TestPluginDirShadowsBuiltin(t *testing.T) {
 	if src != shadowSrc {
 		t.Fatalf("shadow not used:\n%s", src)
 	}
-	if watch != filepath.Join(dir, "recency.lua") {
+	if watch != filepath.Join(dir, "recency.ts") {
 		t.Fatalf("shadow watch path = %q", watch)
 	}
 
@@ -57,8 +57,8 @@ func TestPluginDirShadowsBuiltin(t *testing.T) {
 	}
 }
 
-// TestNoPluginDirKeepsEmbedded: with no plugins.dir set, behavior is exactly
-// the pre-shadowing loader.
+// TestNoPluginDirKeepsEmbedded: with no plugins.dir set, embedded builtins
+// resolve unwatched.
 func TestNoPluginDirKeepsEmbedded(t *testing.T) {
 	Register()
 	luacode.SetPluginDir("")
@@ -79,13 +79,11 @@ func TestNoPluginDirKeepsEmbedded(t *testing.T) {
 }
 
 // TestSupportChunkPathsListsOnlyShadows: the reload watcher polls the paths
-// this returns, so it has to name exactly the chunks that are files on disk —
-// a shadow. An embedded chunk is not a path and must not be reported as one, or
-// the watcher would poll something that does not exist.
+// this returns, so it only reports shadowed chunks on disk.
 func TestSupportChunkPathsListsOnlyShadows(t *testing.T) {
 	Register()
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "recency.lua"), []byte("-- override\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "recency.ts"), []byte("// override\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	luacode.SetPluginDir(dir)
@@ -95,10 +93,9 @@ func TestSupportChunkPathsListsOnlyShadows(t *testing.T) {
 	if len(paths) != 1 {
 		t.Fatalf("paths = %v, want only the shadowed chunk", paths)
 	}
-	if got := paths["recency"]; got != filepath.Join(dir, "recency.lua") {
+	if got := paths["recency"]; got != filepath.Join(dir, "recency.ts") {
 		t.Fatalf("recency path = %q", got)
 	}
-	// Every other chunk is embedded: no file, nothing to watch.
 	for _, name := range supportOrder {
 		if name == "recency" {
 			continue
@@ -108,17 +105,12 @@ func TestSupportChunkPathsListsOnlyShadows(t *testing.T) {
 		}
 	}
 
-	// Without a plugins.dir there are no shadows at all.
 	luacode.SetPluginDir("")
 	if got := luacode.SupportChunkPaths(); len(got) != 0 {
 		t.Fatalf("paths without plugins.dir = %v", got)
 	}
 }
 
-// TestUnknownBuiltinStillRejected: shadowing does not invent plugins. The
-// error names the prefix the caller actually wrote, and gives a working
-// example, because "unknown plugin:per_chat" alone leaves you guessing at the
-// spelling.
 func TestUnknownBuiltinStillRejected(t *testing.T) {
 	Register()
 	luacode.SetPluginDir(t.TempDir())
@@ -128,9 +120,6 @@ func TestUnknownBuiltinStillRejected(t *testing.T) {
 	}
 }
 
-// TestVersionGateCoversEmbeddedAndShadowedSupportChunks verifies embedded
-// support chunks pass the version gate and shadowed ones are refused when
-// stale or missing their prelude declaration.
 func TestVersionGateCoversSupportChunks(t *testing.T) {
 	Register()
 	dir := t.TempDir()
@@ -142,12 +131,12 @@ func TestVersionGateCoversSupportChunks(t *testing.T) {
 	}
 
 	for _, c := range []struct{ name, src string }{
-		{"no declaration", "SUPPORT = 1\n"},
-		{"another version", "-- af-prelude-version: 0\nSUPPORT = 1\n"},
-		{"declared twice", "-- af-prelude-version: 1\n-- af-prelude-version: 2\nSUPPORT = 1\n"},
+		{"no declaration", "var SUPPORT = 1;\n"},
+		{"another version", "// af-prelude-version: 0\nvar SUPPORT = 1;\n"},
+		{"declared twice", "// af-prelude-version: 1\n// af-prelude-version: 2\nvar SUPPORT = 1;\n"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			writeFile(t, filepath.Join(dir, "recency.lua"), c.src)
+			writeFile(t, filepath.Join(dir, "recency.ts"), c.src)
 			chunks, err := luacode.SupportChunks()
 			if err == nil {
 				t.Fatalf("a shadowed support chunk this core cannot serve was loaded (%d chunks)", len(chunks))
@@ -158,26 +147,24 @@ func TestVersionGateCoversSupportChunks(t *testing.T) {
 			if chunks != nil {
 				t.Fatalf("source returned alongside the refusal: %v", chunks)
 			}
-			if !strings.Contains(err.Error(), filepath.Join(dir, "recency.lua")) {
+			if !strings.Contains(err.Error(), filepath.Join(dir, "recency.ts")) {
 				t.Fatalf("refusal does not name the shadow: %v", err)
 			}
 		})
 	}
 
-	writeFile(t, filepath.Join(dir, "recency.lua"), directive()+"SUPPORT = 1\n")
+	writeFile(t, filepath.Join(dir, "recency.ts"), directive()+"var SUPPORT = 1;\n")
 	chunks, err := luacode.SupportChunks()
 	if err != nil {
 		t.Fatalf("a shadow declaring this core's version was refused: %v", err)
 	}
-	if chunks[2] != directive()+"SUPPORT = 1\n" {
+	if chunks[2] != directive()+"var SUPPORT = 1;\n" {
 		t.Fatalf("the accepted shadow is not the one that loaded:\n%s", chunks[2])
 	}
 }
 
-// TestPerChatRoutesWithoutDurableMode: the first message of a new chat has no
-// stored group mode, and router.state.get answers nil for it. A second
-// json.decode over that nil crashed the router on every new chat; the route
-// must reach deliver and park for the next message instead.
+// TestPerChatRoutesWithoutDurableMode verifies per_chat handles null router.state.get
+// without failing on a first message of a new chat.
 func TestPerChatRoutesWithoutDurableMode(t *testing.T) {
 	Register()
 	luacode.SetPluginDir("")
@@ -192,18 +179,18 @@ func TestPerChatRoutesWithoutDurableMode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stub := directive() + `
-local calls = 0
-function session.inbox()
-  calls = calls + 1
-  if calls > 1 then error("stop-loop", 0) end
-  return { message = { id = "m1", type = "user", from = "alice", channel = "webhook" }, agent = "echo" }
-end
-af.op = function(req)
-  if req.type == "router.state.get" then return nil end
-  if req.type == "deliver" then return true end
-  return nil
-end
+	stub := `
+let calls = 0;
+session.inbox = function() {
+  calls++;
+  if (calls > 1) throw new Error("stop-loop");
+  return { message: { id: "m1", type: "user", from: "alice", channel: "webhook" }, agent: "echo" };
+};
+af.op = function(req) {
+  if (req.type === "router.state.get") return null;
+  if (req.type === "deliver") return true;
+  return null;
+};
 `
 	if err := st.Eval("@route-stub", stub); err != nil {
 		t.Fatal(err)

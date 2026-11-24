@@ -124,44 +124,44 @@ func TestAgentConfigShapeAndSecretOpacity(t *testing.T) {
 		},
 	}
 	got, _ := runConfigLoop(t, `
-function loop()
-  local msg = session.inbox()
-  local cfg = agent.config()
-  if cfg.name ~= "pm" or cfg.model ~= "default" then
-    session.send("err: name/model wrong")
-    return
-  end
-  if cfg.instructions_path ~= "/deploy/prompts/pm.md" then
-    session.send("err: instructions path wrong: " .. tostring(cfg.instructions_path))
-    return
-  end
-  if not (cfg.goal and cfg.goal.type == "autonomous" and cfg.goal.success_signal == "PR merged"
-          and cfg.goal.max_turns == 40 and cfg.goal.on_goal_met == "report") then
-    session.send("err: goal wrong: " .. json.encode(cfg.goal))
-    return
-  end
-  if cfg.extras.workflow ~= "release-train" then
-    session.send("err: extras wrong")
-    return
-  end
-  if not (type(cfg.extras.api_key) == "table" and cfg.extras.api_key.env == "PM_API_KEY") then
-    session.send("err: api_key not an opaque env marker: " .. json.encode(cfg.extras.api_key))
-    return
-  end
-  if not (type(cfg.extras.slack) == "table" and cfg.extras.slack.cred == "slack_bot") then
-    session.send("err: slack not an opaque cred marker")
-    return
-  end
-  if not (type(cfg.extras.options.key) == "table" and cfg.extras.options.key.env == "PM_API_KEY") then
-    session.send("err: nested secret not opaque")
-    return
-  end
-  if cfg.extras.options.retries ~= "3" then
-    session.send("err: non-secret extras mangled")
-    return
-  end
-  session.send("CONFIG:" .. json.encode(cfg))
-end
+function loop() {
+  session.inbox();
+  const cfg = agent.config();
+  if (cfg.name !== "pm" || cfg.model !== "default") {
+    session.send("err: name/model wrong");
+    return;
+  }
+  if (cfg.instructions_path !== "/deploy/prompts/pm.md") {
+    session.send("err: instructions path wrong: " + String(cfg.instructions_path));
+    return;
+  }
+  if (!(cfg.goal && cfg.goal.type === "autonomous" && cfg.goal.success_signal === "PR merged"
+        && cfg.goal.max_turns === 40 && cfg.goal.on_goal_met === "report")) {
+    session.send("err: goal wrong: " + json.encode(cfg.goal));
+    return;
+  }
+  if (cfg.extras.workflow !== "release-train") {
+    session.send("err: extras wrong");
+    return;
+  }
+  if (!(typeof cfg.extras.api_key === "object" && cfg.extras.api_key && cfg.extras.api_key.env === "PM_API_KEY")) {
+    session.send("err: api_key not an opaque env marker: " + json.encode(cfg.extras.api_key));
+    return;
+  }
+  if (!(typeof cfg.extras.slack === "object" && cfg.extras.slack && cfg.extras.slack.cred === "slack_bot")) {
+    session.send("err: slack not an opaque cred marker");
+    return;
+  }
+  if (!(typeof cfg.extras.options.key === "object" && cfg.extras.options.key && cfg.extras.options.key.env === "PM_API_KEY")) {
+    session.send("err: nested secret not opaque");
+    return;
+  }
+  if (cfg.extras.options.retries !== "3") {
+    session.send("err: non-secret extras mangled");
+    return;
+  }
+  session.send("CONFIG:" + json.encode(cfg));
+}
 `, info, nil, nil, nil)
 
 	if !strings.HasPrefix(got, "CONFIG:") {
@@ -182,38 +182,38 @@ func TestAgentConfigPrompts(t *testing.T) {
 		Prompts: session.NewPromptRegistry(map[string]string{"kb_header": "[Knowledge base]", "distiller": "You are a distiller."}),
 	}
 	got, _ := runConfigLoop(t, `
-function loop()
-  local msg = session.inbox()
-  local cfg = agent.config()
-  if cfg.prompts.kb_header ~= "[Knowledge base]" then
-    session.send("err: kb_header: " .. tostring(cfg.prompts.kb_header))
-    return
-  end
-  if cfg.prompts.distiller ~= "You are a distiller." then
-    session.send("err: distiller: " .. tostring(cfg.prompts.distiller))
-    return
-  end
-  session.send("ok")
-end
+function loop() {
+  session.inbox();
+  const cfg = agent.config();
+  if (cfg.prompts.kb_header !== "[Knowledge base]") {
+    session.send("err: kb_header: " + String(cfg.prompts.kb_header));
+    return;
+  }
+  if (cfg.prompts.distiller !== "You are a distiller.") {
+    session.send("err: distiller: " + String(cfg.prompts.distiller));
+    return;
+  }
+  session.send("ok");
+}
 `, info, nil, nil, nil)
 	if got != "ok" {
 		t.Fatalf("loop failed: %s", got)
 	}
 
 	got, _ = runConfigLoop(t, `
-function loop()
-  local msg = session.inbox()
-  local cfg = agent.config()
-  if type(cfg.prompts) ~= "table" then
-    session.send("err: prompts is not a table: " .. type(cfg.prompts))
-    return
-  end
-  if next(cfg.prompts) ~= nil then
-    session.send("err: prompts should be empty: " .. json.encode(cfg.prompts))
-    return
-  end
-  session.send("empty")
-end
+function loop() {
+  session.inbox();
+  const cfg = agent.config();
+  if (typeof cfg.prompts !== "object" || cfg.prompts === null) {
+    session.send("err: prompts is not an object: " + typeof cfg.prompts);
+    return;
+  }
+  if (Object.keys(cfg.prompts).length !== 0) {
+    session.send("err: prompts should be empty: " + json.encode(cfg.prompts));
+    return;
+  }
+  session.send("empty");
+}
 `, &session.Info{Name: "bot"}, nil, nil, nil)
 	if got != "empty" {
 		t.Fatalf("empty-registry loop failed: %s", got)
@@ -231,23 +231,23 @@ func TestAgentConfigInstructionsPrompt(t *testing.T) {
 		Prompts:            session.NewPromptRegistry(map[string]string{"assistant_system": "You are the assistant."}),
 	}
 	got, _ := runConfigLoop(t, `
-function loop()
-  local msg = session.inbox()
-  local cfg = agent.config()
-  if cfg.instructions_prompt ~= "assistant_system" then
-    session.send("err: prompt key: " .. tostring(cfg.instructions_prompt))
-    return
-  end
-  if cfg.instructions_path ~= "" then
-    session.send("err: path should be empty for a prompt source: " .. tostring(cfg.instructions_path))
-    return
-  end
-  if cfg.prompts[cfg.instructions_prompt] ~= "You are the assistant." then
-    session.send("err: registry lookup failed")
-    return
-  end
-  session.send("ok")
-end
+function loop() {
+  session.inbox();
+  const cfg = agent.config();
+  if (cfg.instructions_prompt !== "assistant_system") {
+    session.send("err: prompt key: " + String(cfg.instructions_prompt));
+    return;
+  }
+  if (cfg.instructions_path !== "") {
+    session.send("err: path should be empty for a prompt source: " + String(cfg.instructions_path));
+    return;
+  }
+  if (cfg.prompts[cfg.instructions_prompt] !== "You are the assistant.") {
+    session.send("err: registry lookup failed");
+    return;
+  }
+  session.send("ok");
+}
 `, info, nil, nil, nil)
 	if got != "ok" {
 		t.Fatalf("loop failed: %s", got)
@@ -262,15 +262,15 @@ func TestAgentConfigPromptsAreLive(t *testing.T) {
 	reg.Set("kb_header", "reloaded text")
 
 	got, _ := runConfigLoop(t, `
-function loop()
-  local msg = session.inbox()
-  local cfg = agent.config()
-  if cfg.prompts.kb_header ~= "reloaded text" then
-    session.send("err: stale prompt: " .. tostring(cfg.prompts.kb_header))
-    return
-  end
-  session.send("live")
-end
+function loop() {
+  session.inbox();
+  const cfg = agent.config();
+  if (cfg.prompts.kb_header !== "reloaded text") {
+    session.send("err: stale prompt: " + String(cfg.prompts.kb_header));
+    return;
+  }
+  session.send("live");
+}
 `, &session.Info{Name: "bot", Prompts: reg}, nil, nil, nil)
 	if got != "live" {
 		t.Fatalf("loop failed: %s", got)
@@ -288,32 +288,32 @@ func TestRuntimeTriggersMerge(t *testing.T) {
 			Target: config.TriggerTarget{Profile: "worker"}},
 	}
 	got, _ := runConfigLoop(t, `
-function loop()
-  local msg = session.inbox()
-  local r = runtime.triggers()
-  if not (r and r.ok and #r.triggers == 3) then
-    session.send("err: trigger count wrong: " .. json.encode(r))
-    return
-  end
-  local byName = {}
-  for _, tr in ipairs(r.triggers) do byName[tr.name] = tr end
-  if not (byName.digest and byName.digest.kind == "cron" and byName.digest.cron == "30 9 * * *"
-          and byName.digest.run_on_boot == true and byName.digest.target.profile == "worker"
-          and byName.digest.payload.topic == "news") then
-    session.send("err: digest wrong: " .. json.encode(byName.digest))
-    return
-  end
-  if not (byName.heartbeat and byName.heartbeat.kind == "every" and byName.heartbeat.every == "15m") then
-    session.send("err: heartbeat wrong")
-    return
-  end
-  if not (byName.ticket and byName.ticket.kind == "event" and byName.ticket.event.channel == "webhook"
-          and byName.ticket.event.match == "urgent") then
-    session.send("err: ticket wrong")
-    return
-  end
-  session.send("done")
-end
+function loop() {
+  session.inbox();
+  const r = runtime.triggers();
+  if (!(r && r.ok && r.triggers.length === 3)) {
+    session.send("err: trigger count wrong: " + json.encode(r));
+    return;
+  }
+  const byName = {};
+  for (const tr of r.triggers) byName[tr.name] = tr;
+  if (!(byName.digest && byName.digest.kind === "cron" && byName.digest.cron === "30 9 * * *"
+        && byName.digest.run_on_boot === true && byName.digest.target.profile === "worker"
+        && byName.digest.payload.topic === "news")) {
+    session.send("err: digest wrong: " + json.encode(byName.digest));
+    return;
+  }
+  if (!(byName.heartbeat && byName.heartbeat.kind === "every" && byName.heartbeat.every === "15m")) {
+    session.send("err: heartbeat wrong");
+    return;
+  }
+  if (!(byName.ticket && byName.ticket.kind === "event" && byName.ticket.event.channel === "webhook"
+        && byName.ticket.event.match === "urgent")) {
+    session.send("err: ticket wrong");
+    return;
+  }
+  session.send("done");
+}
 `, &session.Info{Name: "bot"}, nil, triggers, nil)
 	if got != "done" {
 		t.Fatalf("loop failed: %s", got)
@@ -339,17 +339,15 @@ func TestCredentialGetGrantDeny(t *testing.T) {
 
 	// Granted: the value comes back.
 	got, gw := runConfigLoop(t, `
-function loop()
-  local msg = session.inbox()
-  local r = credential.get("deploy_token")
-  if not (r and r.ok and r.value == "sk-JOURNAL-SAFE-VALUE") then
-    session.send("err: grant wrong: " .. json.encode(r))
-    return
-  end
-  -- Egress that must stay free of the secret (the runtime never journals the
-  -- op response; the loop also must not echo it for this contract to hold).
-  session.send("fetched")
-end
+function loop() {
+  session.inbox();
+  const r = credential.get("deploy_token");
+  if (!(r && r.ok && r.value === "sk-JOURNAL-SAFE-VALUE")) {
+    session.send("err: grant wrong: " + json.encode(r));
+    return;
+  }
+  session.send("fetched");
+}
 `, &session.Info{Name: "deployer", Credentials: []string{"deploy_token"}}, store, nil, &logBuf)
 	if got != "fetched" {
 		t.Fatalf("grant loop failed: %s", got)
@@ -365,15 +363,21 @@ end
 	// Unlisted name on an agent with a list.
 	logBuf.Reset()
 	got, _ = runConfigLoop(t, `
-function loop()
-  local msg = session.inbox()
-  local ok, res = pcall(credential.get, "other_secret")
-  if ok or not string.find(tostring(res), "allow-list", 1, true) then
-    session.send("err: unlisted name did not deny: " .. tostring(res))
-    return
-  end
-  session.send("denied")
-end
+function loop() {
+  session.inbox();
+  try {
+    const res = credential.get("other_secret");
+    session.send("err: unlisted name did not deny: " + String(res));
+    return;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!msg.includes("allow-list")) {
+      session.send("err: unlisted name wrong err: " + msg);
+      return;
+    }
+  }
+  session.send("denied");
+}
 `, &session.Info{Name: "deployer", Credentials: []string{"deploy_token"}}, store, nil, &logBuf)
 	if got != "denied" {
 		t.Fatalf("unlisted loop failed: %s", got)
@@ -385,15 +389,21 @@ end
 	// Missing allow-list entirely.
 	logBuf.Reset()
 	got, _ = runConfigLoop(t, `
-function loop()
-  local msg = session.inbox()
-  local ok, res = pcall(credential.get, "deploy_token")
-  if ok or not string.find(tostring(res), "allow-list", 1, true) then
-    session.send("err: missing list did not deny: " .. tostring(res))
-    return
-  end
-  session.send("denied")
-end
+function loop() {
+  session.inbox();
+  try {
+    const res = credential.get("deploy_token");
+    session.send("err: missing list did not deny: " + String(res));
+    return;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!msg.includes("allow-list")) {
+      session.send("err: missing list wrong err: " + msg);
+      return;
+    }
+  }
+  session.send("denied");
+}
 `, &session.Info{Name: "nolist"}, store, nil, &logBuf)
 	if got != "denied" {
 		t.Fatalf("missing-list loop failed: %s", got)
@@ -402,15 +412,21 @@ end
 	// No store at all: clear "not enabled" error, not a crash.
 	logBuf.Reset()
 	got, _ = runConfigLoop(t, `
-function loop()
-  local msg = session.inbox()
-  local ok, res = pcall(credential.get, "deploy_token")
-  if ok or not string.find(tostring(res), "not enabled", 1, true) then
-    session.send("err: nil store did not error clearly: " .. tostring(res))
-    return
-  end
-  session.send("disabled")
-end
+function loop() {
+  session.inbox();
+  try {
+    const res = credential.get("deploy_token");
+    session.send("err: nil store did not error clearly: " + String(res));
+    return;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!msg.includes("not enabled")) {
+      session.send("err: nil store wrong err: " + msg);
+      return;
+    }
+  }
+  session.send("disabled");
+}
 `, &session.Info{Name: "anyone", Credentials: []string{"deploy_token"}}, nil, nil, &logBuf)
 	if got != "disabled" {
 		t.Fatalf("nil-store loop failed: %s", got)
@@ -437,27 +453,27 @@ func TestSpawnedChildConfigExtras(t *testing.T) {
 		},
 	}
 	got, _ := runConfigLoop(t, `
-function loop()
-  local msg = session.inbox()
-  local cfg = agent.config()
-  if cfg.name ~= "spawn:pm" then
-    session.send("err: name " .. tostring(cfg.name))
-    return
-  end
-  if cfg.extras.workflow ~= "release-train" then
-    session.send("err: child extras missing: " .. json.encode(cfg.extras))
-    return
-  end
-  if not (cfg.goal and cfg.goal.type == "autonomous" and cfg.goal.max_turns == 12) then
-    session.send("err: child goal missing")
-    return
-  end
-  if not (type(cfg.extras.api_key) == "table" and cfg.extras.api_key.env == "PM_API_KEY") then
-    session.send("err: child secret not opaque: " .. json.encode(cfg.extras.api_key))
-    return
-  end
-  session.send("CHILD:" .. json.encode(cfg))
-end
+function loop() {
+  session.inbox();
+  const cfg = agent.config();
+  if (cfg.name !== "spawn:pm") {
+    session.send("err: name " + String(cfg.name));
+    return;
+  }
+  if (cfg.extras.workflow !== "release-train") {
+    session.send("err: child extras missing: " + json.encode(cfg.extras));
+    return;
+  }
+  if (!(cfg.goal && cfg.goal.type === "autonomous" && cfg.goal.max_turns === 12)) {
+    session.send("err: child goal missing");
+    return;
+  }
+  if (!(typeof cfg.extras.api_key === "object" && cfg.extras.api_key && cfg.extras.api_key.env === "PM_API_KEY")) {
+    session.send("err: child secret not opaque: " + json.encode(cfg.extras.api_key));
+    return;
+  }
+  session.send("CHILD:" + json.encode(cfg));
+}
 `, info, nil, nil, nil)
 	if !strings.HasPrefix(got, "CHILD:") {
 		t.Fatalf("loop failed: %s", got)

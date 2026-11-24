@@ -19,7 +19,7 @@ import (
 // directive is the leading comment line every chunk has to declare. The loop
 // fixtures in this package are chunks: vm.State.Start refuses one that declares
 // nothing, so they go through this the way a shipped loop does.
-func directive() string { return fmt.Sprintf("-- af-prelude-version: %d\n", vm.PreludeVersion) }
+func directive() string { return fmt.Sprintf("// af-prelude-version: %d\n", vm.PreludeVersion) }
 
 // Observations cross the Lua boundary through a fake gateway: loops report
 // outcomes with session.send, and pushes arrive as direct sends.
@@ -132,11 +132,15 @@ func waitFor(t *testing.T, what string, d time.Duration, cond func() bool) {
 func TestSessionPushRequiresCapability(t *testing.T) {
 	gw := &fakeGW{}
 	a, _ := newTestActor(t, map[string]bool{}, gw, `
-function loop()
-  local msg = session.inbox()
-  local ok, err = pcall(session.push, "telegram", "123", "hello")
-  session.send(tostring(ok) .. ":" .. tostring(err))
-end
+function loop() {
+  session.inbox();
+  try {
+    const r = session.push("telegram", "123", "hello");
+    session.send("true:" + String(r));
+  } catch (err) {
+    session.send("false:" + (err instanceof Error ? err.message : String(err)));
+  }
+}
 `)
 	a.Mailbox <- Message{ID: "1", Type: "user", From: "u", Text: "go", Channel: "webhook", ReplyTo: "r1"}
 
@@ -156,11 +160,15 @@ end
 func TestSessionPushDelivers(t *testing.T) {
 	gw := &fakeGW{}
 	a, _ := newTestActor(t, map[string]bool{"channel.push": true}, gw, `
-function loop()
-  local msg = session.inbox()
-  local ok, err = pcall(session.push, "telegram", "123", "background update")
-  session.send(tostring(ok))
-end
+function loop() {
+  session.inbox();
+  try {
+    session.push("telegram", "123", "background update");
+    session.send("true");
+  } catch (err) {
+    session.send("false:" + (err instanceof Error ? err.message : String(err)));
+  }
+}
 `)
 	a.Mailbox <- Message{ID: "1", Type: "user", From: "u", Text: "go", Channel: "webhook", ReplyTo: "r1"}
 
@@ -181,7 +189,7 @@ func TestSessionExitTerminates(t *testing.T) {
 		Identity{SessionID: "worker|test", Agent: "worker", Capabilities: map[string]bool{}},
 		&Info{Name: "worker", HistoryBudget: 100},
 		gw, nil, nil, nil, nil, map[string]OpHandler{}, pool.New(1), log)
-	a.LoopSrc = directive() + `function loop() session.exit() end`
+	a.LoopSrc = directive() + `function loop() { session.exit(); }`
 
 	exits := make(chan EndReason, 4)
 	a.OnExit = func(id Identity, reason EndReason) { exits <- reason }
@@ -208,11 +216,11 @@ func TestSessionExitTerminates(t *testing.T) {
 func TestAgentInfoIncludesIdentity(t *testing.T) {
 	gw := &fakeGW{}
 	a, _ := newTestActor(t, map[string]bool{}, gw, `
-function loop()
-  local msg = session.inbox()
-  local info = agent.info()
-  session.send(info.address .. "|" .. info.session_id)
-end
+function loop() {
+  session.inbox();
+  const info = agent.info();
+  session.send(info.address + "|" + info.session_id);
+}
 `)
 	a.Mailbox <- Message{ID: "1", Type: "user", From: "u", Text: "go", Channel: "webhook", ReplyTo: "r1"}
 
@@ -258,11 +266,15 @@ func TestSessionPushUserResolvesAndDelivers(t *testing.T) {
 		"u_abc": {"telegram", "12345"},
 	}}
 	a, _ := newUserTestActor(t, map[string]bool{"channel.push": true}, gw, users, `
-function loop()
-  local msg = session.inbox()
-  local ok, err = pcall(session.push_user, "u_abc", "reaching out")
-  session.send(tostring(ok) .. ":" .. tostring(err))
-end
+function loop() {
+  session.inbox();
+  try {
+    const r = session.push_user("u_abc", "reaching out");
+    session.send("true:" + String(r));
+  } catch (err) {
+    session.send("false:" + (err instanceof Error ? err.message : String(err)));
+  }
+}
 `)
 	a.Mailbox <- Message{ID: "1", Type: "user", From: "user:u_abc", Text: "go", Channel: "webhook", ReplyTo: "r1"}
 
@@ -280,11 +292,15 @@ func TestSessionPushUserUnknownUUID(t *testing.T) {
 	gw := &fakeGW{}
 	users := &fakeUsers{lookup: map[string]struct{ channel, replyTo string }{}}
 	a, _ := newUserTestActor(t, map[string]bool{"channel.push": true}, gw, users, `
-function loop()
-  local msg = session.inbox()
-  local ok, err = pcall(session.push_user, "u_nope", "x")
-  session.send(tostring(ok) .. ":" .. tostring(err))
-end
+function loop() {
+  session.inbox();
+  try {
+    const r = session.push_user("u_nope", "x");
+    session.send("true:" + String(r));
+  } catch (err) {
+    session.send("false:" + (err instanceof Error ? err.message : String(err)));
+  }
+}
 `)
 	a.Mailbox <- Message{ID: "1", Type: "user", From: "user:u_abc", Text: "go", Channel: "webhook", ReplyTo: "r1"}
 
@@ -302,11 +318,15 @@ func TestSessionPushUserRequiresCapability(t *testing.T) {
 	}}
 	// No channel.push capability.
 	a, _ := newUserTestActor(t, map[string]bool{}, gw, users, `
-function loop()
-  local msg = session.inbox()
-  local ok, err = pcall(session.push_user, "u_abc", "x")
-  session.send(tostring(ok) .. ":" .. tostring(err))
-end
+function loop() {
+  session.inbox();
+  try {
+    const r = session.push_user("u_abc", "x");
+    session.send("true:" + String(r));
+  } catch (err) {
+    session.send("false:" + (err instanceof Error ? err.message : String(err)));
+  }
+}
 `)
 	a.Mailbox <- Message{ID: "1", Type: "user", From: "user:u_abc", Text: "go", Channel: "webhook", ReplyTo: "r1"}
 
@@ -321,11 +341,15 @@ func TestSessionPushUserRequiresIdentity(t *testing.T) {
 	gw := &fakeGW{}
 	// users is nil — identity layer disabled.
 	a, _ := newUserTestActor(t, map[string]bool{"channel.push": true}, gw, nil, `
-function loop()
-  local msg = session.inbox()
-  local ok, err = pcall(session.push_user, "u_abc", "x")
-  session.send(tostring(ok) .. ":" .. tostring(err))
-end
+function loop() {
+  session.inbox();
+  try {
+    const r = session.push_user("u_abc", "x");
+    session.send("true:" + String(r));
+  } catch (err) {
+    session.send("false:" + (err instanceof Error ? err.message : String(err)));
+  }
+}
 `)
 	a.Mailbox <- Message{ID: "1", Type: "user", From: "user:u_abc", Text: "go", Channel: "webhook", ReplyTo: "r1"}
 

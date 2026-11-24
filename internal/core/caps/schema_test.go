@@ -121,17 +121,21 @@ func TestToolSchemaVMRoundTrip(t *testing.T) {
 		&session.Info{Name: "main", HistoryBudget: 100},
 		gw, nil, nil, nil, nil, handlers, pool.New(1), log)
 	a.LoopSrc = directive() + `
-function loop()
-  local msg = session.inbox()
-  local defs = tools.list()
-  local ctools = {}
-  for _, d in ipairs(defs) do
-    local f = d["function"]
-    table.insert(ctools, { name = f.name, description = f.description, parameters = f.parameters })
-  end
-  local ok, reply = pcall(llm.chat, { { role = "user", content = "hi" } }, { model = "default", tools = ctools })
-  if ok then session.send("done") else session.send("err: " .. tostring(reply)) end
-end
+function loop() {
+  session.inbox();
+  const defs = tools.list();
+  const ctools = [];
+  for (const d of defs) {
+    const f = d["function"];
+    ctools.push({ name: f.name, description: f.description, parameters: f.parameters });
+  }
+  try {
+    llm.chat([{ role: "user", content: "hi" }], { model: "default", tools: ctools });
+    session.send("done");
+  } catch (e) {
+    session.send("err: " + (e instanceof Error ? e.message : String(e)));
+  }
+}
 `
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

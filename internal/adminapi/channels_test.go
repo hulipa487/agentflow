@@ -36,7 +36,7 @@ gateway:
 runtime:
   studio: { enabled: true }
 `)
-	write("profiles/base.yaml", "name: base\nloop: ./base.lua\n")
+	write("profiles/base.yaml", "name: base\nloop: ./base.ts\n")
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	cfg, err := config.LoadDir(dir, log)
 	if err != nil {

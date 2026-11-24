@@ -414,14 +414,14 @@ type stack struct {
 	mu       sync.Mutex
 }
 
-const passthroughLoopSrc = `-- af-prelude-version: 1
-function loop()
-  while true do
-    local msg = session.inbox()
-    local reply = llm.forward()
-    session.reply(reply)
-  end
-end
+const passthroughLoopSrc = `// af-prelude-version: 2
+function loop() {
+  while (true) {
+    const msg = session.inbox();
+    const reply = llm.forward();
+    session.reply(reply);
+  }
+}
 `
 
 func newStack(t *testing.T, opt stackOpts) *stack {

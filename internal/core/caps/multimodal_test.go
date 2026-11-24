@@ -67,17 +67,21 @@ func TestLLMChatResolvesAttachmentHandleToBase64(t *testing.T) {
 		},
 		pool.New(1), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	a.LoopSrc = directive() + `
-function loop()
-  local msg = session.inbox()
-  local parts = {}
-  for _, att in ipairs(msg.attachments or {}) do
-    table.insert(parts, { type = "text", text = "describe" })
-    table.insert(parts, att)
-  end
-  local info = agent.info()
-  local ok, reply = pcall(llm.chat, { { role = "user", parts = parts } }, { model = info.model })
-  if ok then session.send("done") else session.send("err: " .. tostring(reply)) end
-end
+function loop() {
+  const msg = session.inbox();
+  const parts = [];
+  for (const att of msg.attachments || []) {
+    parts.push({ type: "text", text: "describe" });
+    parts.push(att);
+  }
+  const info = agent.info();
+  try {
+    llm.chat([{ role: "user", parts: parts }], { model: info.model });
+    session.send("done");
+  } catch (e) {
+    session.send("err: " + (e instanceof Error ? e.message : String(e)));
+  }
+}
 `
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

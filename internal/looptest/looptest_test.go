@@ -21,17 +21,17 @@ func write(t *testing.T, path, body string) {
 
 func TestEchoScenario(t *testing.T) {
 	dir := t.TempDir()
-	write(t, filepath.Join(dir, "echo.lua"), `-- af-prelude-version: 1
-function loop()
-  while true do
-    local msg = session.inbox()
-    session.send("echo: " .. (msg.text or ""))
-  end
-end
+	write(t, filepath.Join(dir, "echo.ts"), `// af-prelude-version: 2
+function loop() {
+  while (true) {
+    const msg = session.inbox();
+    session.send("echo: " + (msg.text || ""));
+  }
+}
 `)
 	scenario := filepath.Join(dir, "scenario.yaml")
 	write(t, scenario, `agent: echo
-loop: ./echo.lua
+loop: ./echo.ts
 messages:
   - from: alice
     text: hi
@@ -50,18 +50,18 @@ expect:
 
 func TestLLMScenario(t *testing.T) {
 	dir := t.TempDir()
-	write(t, filepath.Join(dir, "chat.lua"), `-- af-prelude-version: 1
-function loop()
-  while true do
-    local msg = session.inbox()
-    local reply = llm.chat({ { role = "user", content = msg.text } }, { model = "test" })
-    session.send(reply.text)
-  end
-end
+	write(t, filepath.Join(dir, "chat.ts"), `// af-prelude-version: 2
+function loop() {
+  while (true) {
+    const msg = session.inbox();
+    const reply = llm.chat([{ role: "user", content: msg.text }], { model: "test" });
+    session.send(reply.text);
+  }
+}
 `)
 	scenario := filepath.Join(dir, "scenario.yaml")
 	write(t, scenario, `agent: chat
-loop: ./chat.lua
+loop: ./chat.ts
 llm:
   - match: refund
     text: I can help.
@@ -82,23 +82,24 @@ expect:
 
 func TestPackageScenario(t *testing.T) {
 	dir := t.TempDir()
-	write(t, filepath.Join(dir, "pkg", "manifest.yaml"), "name: greet\nprelude_api: 1\nfiles: [greet.lua]\n")
-	write(t, filepath.Join(dir, "pkg", "greet.lua"), `-- af-prelude-version: 1
-Greeting = {}
-function Greeting.hello(name) return "hello, " .. name end
+	write(t, filepath.Join(dir, "pkg", "manifest.yaml"), "name: greet\nprelude_api: 2\nfiles: [greet.ts]\n")
+	write(t, filepath.Join(dir, "pkg", "greet.ts"), `// af-prelude-version: 2
+var Greeting = {
+  hello(name) { return "hello, " + name; }
+};
 `)
-	write(t, filepath.Join(dir, "loop.lua"), `-- af-prelude-version: 1
--- af-import: greet
-function loop()
-  while true do
-    local msg = session.inbox()
-    session.send(Greeting.hello(msg.text))
-  end
-end
+	write(t, filepath.Join(dir, "loop.ts"), `// af-prelude-version: 2
+// af-import: greet
+function loop() {
+  while (true) {
+    const msg = session.inbox();
+    session.send(Greeting.hello(msg.text));
+  }
+}
 `)
 	scenario := filepath.Join(dir, "scenario.yaml")
 	write(t, scenario, `agent: pkg
-loop: ./loop.lua
+loop: ./loop.ts
 packages:
   greet: ./pkg
 messages:
@@ -128,14 +129,14 @@ func mustRead(t *testing.T, path string) []byte {
 func TestRunWithResultCapturesTraceUsageAndAssertions(t *testing.T) {
 	sc := &Scenario{
 		Agent: "eval-agent",
-		LoopSource: `-- af-prelude-version: 1
-function loop()
-  while true do
-    local msg = session.inbox()
-    local reply = llm.chat({ { role = "user", content = msg.text or "" } }, { model = "test-model" })
-    session.send(reply.text or "")
-  end
-end
+		LoopSource: `// af-prelude-version: 2
+function loop() {
+  while (true) {
+    const msg = session.inbox();
+    const reply = llm.chat([{ role: "user", content: msg.text || "" }], { model: "test-model" });
+    session.send(reply.text || "");
+  }
+}
 `,
 		Safety: "default",
 		LLM: []LLMReply{

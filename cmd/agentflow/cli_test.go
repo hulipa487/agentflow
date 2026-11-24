@@ -86,7 +86,7 @@ func TestConfigPathAndShow(t *testing.T) {
 	body := `version: "1"
 agents:
   echo:
-    loop: ./loops/echo.lua
+    loop: ./loops/echo.ts
 `
 	if err := os.WriteFile(cfgPath, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
@@ -105,7 +105,7 @@ agents:
 	if code := cmdConfigShow([]string{"-config", cfgPath}, &out, &errOut); code != 0 {
 		t.Fatalf("config show exit = %d: %s", code, errOut.String())
 	}
-	wantLoop := filepath.Join(dir, "loops", "echo.lua")
+	wantLoop := filepath.Join(dir, "loops", "echo.ts")
 	if !strings.Contains(out.String(), "loop.echo: "+wantLoop) {
 		t.Errorf("config show did not resolve the loop against the config file:\n%s", out.String())
 	}
@@ -165,8 +165,8 @@ func TestExampleConfigValidates(t *testing.T) {
 
 func TestLoopCheckAndLoopTestCLI(t *testing.T) {
 	dir := t.TempDir()
-	loopPath := filepath.Join(dir, "echo.lua")
-	loopSrc := "-- af-prelude-version: 1\nfunction loop()\n  local msg = session.inbox()\n  session.send(\"echo: \" .. (msg.text or \"\"))\nend\n"
+	loopPath := filepath.Join(dir, "echo.ts")
+	loopSrc := "// af-prelude-version: 2\nfunction loop() {\n  const msg = session.inbox();\n  session.send(\"echo: \" + (msg.text || \"\"));\n}\n"
 	if err := os.WriteFile(loopPath, []byte(loopSrc), 0o600); err != nil {
 		t.Fatal(err)
 	}

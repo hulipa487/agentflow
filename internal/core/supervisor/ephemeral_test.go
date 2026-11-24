@@ -45,12 +45,12 @@ func testSupervisor(t *testing.T, loopSrc string) (*Supervisor, *benchDriver) {
 }
 
 const echoLoop = `
-function loop()
-  while true do
-    local m = session.inbox()
-    session.send(m.text)
-  end
-end`
+function loop() {
+  while (true) {
+    const m = session.inbox();
+    session.send(m.text);
+  }
+}`
 
 func ephemeralMsg(t *testing.T, id, key, tenant string) session.Message {
 	t.Helper()
@@ -199,11 +199,11 @@ func TestEphemeralSessionWritesNoLeaseOrInboxRow(t *testing.T) {
 // session is genuinely in flight when the second request arrives.
 func TestEphemeralCapRefusesAndRecovers(t *testing.T) {
 	sup, drv := testSupervisor(t, `
-function loop()
-  local m = session.inbox()
-  time.sleep(0.3)
-  session.send(m.text)
-end`)
+function loop() {
+  const m = session.inbox();
+  time.sleep(0.3);
+  session.send(m.text);
+}`)
 	sup.SetEphemeralCap(1)
 
 	if err := sup.DeliverEphemeral("echo", "req-1", ephemeralMsg(t, "m1", "req-1", "tenant-a")); err != nil {
@@ -246,11 +246,11 @@ func TestCrashingEphemeralLoopIsNotRestarted(t *testing.T) {
 	var mu sync.Mutex
 	runs := 0
 	sup, _ := testSupervisor(t, `
-function loop()
-  local m = session.inbox()
-  af.op({ type = "count" })
-  error("boom")
-end`)
+function loop() {
+  const m = session.inbox();
+  af.op({ type: "count" });
+  throw new Error("boom");
+}`)
 	sup.defs["echo"].Handlers["count"] = func(context.Context, session.Op) (string, bool) {
 		mu.Lock()
 		runs++

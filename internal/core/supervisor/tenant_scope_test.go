@@ -37,13 +37,13 @@ const (
 // assertion is made on the stored key stratum rather than on a helper's opinion
 // of it.
 var probeLoop = directive() + `
-function loop()
-  while true do
-    local _ = session.inbox()
-    store.put("t", "wrote", "v")
-    af.op({ type = "probe.done" })
-  end
-end
+function loop() {
+  while (true) {
+    session.inbox();
+    store.put("t", "wrote", "v");
+    af.op({ type: "probe.done" });
+  }
+}
 `
 
 // delegatingLoop is an ordinary agent loop that delegates to another agent. It
@@ -52,23 +52,23 @@ end
 // (planner → middle → worker), the shape the production bug took: a pm → worker
 // swarm, where every hop is a chance to lose the tenant.
 func delegatingLoop(target string, forge bool) string {
-	payload := `{ note = "task" }`
+	payload := `{ note: "task" }`
 	if forge {
-		payload = `{ user_uuid = "` + tenantB + `", note = "task" }`
+		payload = `{ user_uuid: "` + tenantB + `", note: "task" }`
 	}
 	return directive() + `
-function loop()
-  while true do
-    local _ = session.inbox()
-    agent.send("agent:` + target + `", ` + payload + `)
-  end
-end
+function loop() {
+  while (true) {
+    session.inbox();
+    agent.send("agent:` + target + `", ` + payload + `);
+  }
+}
 `
 }
 
 // parkedLoop never touches the mailbox, so a test can inspect a delivered
 // message itself instead of racing the actor for it.
-var parkedLoop = directive() + `function loop() time.sleep(3600) end`
+var parkedLoop = directive() + `function loop() { time.sleep(3600); }`
 
 type tenantFixture struct {
 	sup      *Supervisor

@@ -19,7 +19,7 @@ func TestTemplatesCompile(t *testing.T) {
 		}
 		seen[tpl.Name] = true
 		t.Run(tpl.Name, func(t *testing.T) {
-			path := tpl.Name + ".lua"
+			path := tpl.Name + ".ts"
 			if err := vm.CheckChunkVersion(path, tpl.Loop); err != nil {
 				t.Fatalf("prelude version: %v", err)
 			}

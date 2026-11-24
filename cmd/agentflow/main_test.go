@@ -30,8 +30,8 @@ func TestSessionHubWiring(t *testing.T) {
 // scheduler logs it and skips the trigger — never a boot failure).
 func TestTriggerTarget(t *testing.T) {
 	cfg := &config.Config{
-		Agents:   map[string]config.Agent{"digest": {Loop: "x.lua"}},
-		Profiles: config.Profiles{Agent: map[string]config.SpawnProfile{"pm": {Loop: "y.lua"}}},
+		Agents:   map[string]config.Agent{"digest": {Loop: "x.ts"}},
+		Profiles: config.Profiles{Agent: map[string]config.SpawnProfile{"pm": {Loop: "y.ts"}}},
 	}
 	cases := []struct {
 		profile string

@@ -175,7 +175,7 @@ func RunWithResult(ctx context.Context, sc *Scenario) (*Result, error) {
 		err   error
 	)
 	if strings.TrimSpace(sc.LoopSource) != "" {
-		name := first(sc.Loop, "inline.lua")
+		name := first(sc.Loop, "inline.ts")
 		src, err = luacode.ResolveSource(name, sc.LoopSource)
 		if err != nil {
 			return nil, fmt.Errorf("loop: %w", err)

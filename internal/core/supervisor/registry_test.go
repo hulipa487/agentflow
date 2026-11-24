@@ -31,7 +31,7 @@ func registryDef(name string) *AgentDef {
 	return &AgentDef{
 		Info:     &session.Info{Name: name, HistoryBudget: 100},
 		Handlers: map[string]session.OpHandler{},
-		LoopSrc:  directive() + "function loop() while true do session.inbox() end end",
+		LoopSrc:  directive() + "function loop() { while (true) { session.inbox(); } }",
 	}
 }
 
@@ -98,7 +98,7 @@ func TestUpsertReplacesLiveSessions(t *testing.T) {
 	// the running loop was built from resolves. The restarted loop calling
 	// the new handler is the observable of E19's grace semantics.
 	probeLoop := directive() +
-		"function loop() while true do session.inbox() af.op({type=\"probedef\"}) end end"
+		"function loop() { while (true) { session.inbox(); af.op({ type: \"probedef\" }); } }"
 	old := &AgentDef{
 		Info:     &session.Info{Name: "helper", HistoryBudget: 100},
 		Handlers: map[string]session.OpHandler{},

@@ -34,7 +34,7 @@ func TestSpawnInheritsParentSafety(t *testing.T) {
 
 	got := spawnSafety(t, sup, &SpawnTemplate{
 		Name:          "child",
-		LoopSrc:       directive() + "function loop() while true do session.inbox() end end",
+		LoopSrc:       directive() + "function loop() { while (true) { session.inbox(); } }",
 		Capabilities:  map[string]bool{"llm.chat": true},
 		Handlers:      map[string]session.OpHandler{},
 		Memory:        &session.Info{Name: "spawn:child"},
@@ -61,7 +61,7 @@ func TestSpawnExplicitSafetyWins(t *testing.T) {
 
 	got := spawnSafety(t, sup, &SpawnTemplate{
 		Name:         "child",
-		LoopSrc:      directive() + "function loop() while true do session.inbox() end end",
+		LoopSrc:      directive() + "function loop() { while (true) { session.inbox(); } }",
 		Capabilities: map[string]bool{"llm.chat": true},
 		Handlers:     map[string]session.OpHandler{},
 		Memory:       &session.Info{Name: "spawn:child"},

@@ -304,8 +304,8 @@ func (w *Watcher) seedDir(agent, dir string) {
 	w.members[watchKey{agent, dir}] = members
 }
 
-// dirMembers lists a directory's *.lua member names, sorted (the concatenation
-// order luacode.Resolve uses).
+// dirMembers lists a directory's *.ts / *.js member names (excluding .d.ts),
+// sorted (the concatenation order luacode.Resolve uses).
 func dirMembers(dir string) ([]string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -313,10 +313,14 @@ func dirMembers(dir string) ([]string, error) {
 	}
 	var names []string
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".lua") {
+		name := e.Name()
+		if e.IsDir() || strings.HasSuffix(name, ".d.ts") {
 			continue
 		}
-		names = append(names, e.Name())
+		if !strings.HasSuffix(name, ".ts") && !strings.HasSuffix(name, ".js") {
+			continue
+		}
+		names = append(names, name)
 	}
 	sort.Strings(names)
 	return names, nil
@@ -687,7 +691,7 @@ func readLoop(path string) (string, error) {
 		return "", err
 	}
 	if len(names) == 0 {
-		return "", fmt.Errorf("plugin dir %s has no .lua files", path)
+		return "", fmt.Errorf("plugin dir %s has no .ts or .js files", path)
 	}
 	var parts []string
 	for _, n := range names {

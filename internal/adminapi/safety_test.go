@@ -168,20 +168,20 @@ func TestStudioSafetyClassifierAPI(t *testing.T) {
 	}
 }
 
-func TestStudioSafetyLuaFilterAPI(t *testing.T) {
+func TestStudioSafetyScriptFilterAPI(t *testing.T) {
 	ui, dir := safetyAPIFixture(t)
 
 	// Validation catches syntax error.
 	rec := do(t, ui.API(), http.MethodPost, "/admin/api/studio/safety/validate", map[string]any{
-		"kind":     "lua_filter",
+		"kind":     "script_filter",
 		"creating": true,
-		"lua_filter": map[string]any{
+		"script_filter": map[string]any{
 			"name":   "bad",
-			"source": "function ingress(input) return",
+			"source": "function ingress(input) { return",
 		},
 	})
 	if rec.Code != http.StatusOK {
-		t.Fatalf("validate lua_filter: %d %s", rec.Code, rec.Body.String())
+		t.Fatalf("validate script_filter: %d %s", rec.Code, rec.Body.String())
 	}
 	var verdict struct {
 		OK     bool     `json:"ok"`
@@ -191,62 +191,62 @@ func TestStudioSafetyLuaFilterAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	if verdict.OK || len(verdict.Errors) == 0 {
-		t.Fatalf("expected invalid lua syntax verdict, got %+v", verdict)
+		t.Fatalf("expected invalid script syntax verdict, got %+v", verdict)
 	}
 
-	// Create valid Lua filter.
-	rec = do(t, ui.API(), http.MethodPost, "/admin/api/studio/safety/lua-filters", map[string]any{
-		"lua_filter": map[string]any{
-			"name":        "pii_mask",
-			"source":      "function egress(input) return { text = string.gsub(input.text, 'secret', '***') } end",
-			"directions":  []string{"egress"},
-			"sources":     []string{"channel"},
-			"timeout":     "150ms",
+	// Create valid script filter.
+	rec = do(t, ui.API(), http.MethodPost, "/admin/api/studio/safety/script-filters", map[string]any{
+		"script_filter": map[string]any{
+			"name":         "pii_mask",
+			"source":       "export function egress(input: { text: string }) { return { text: input.text.replace(/secret/g, '***') }; }",
+			"directions":   []string{"egress"},
+			"sources":      []string{"channel"},
+			"timeout":      "150ms",
 			"instr_budget": 50000,
-			"on_error":    "pass",
+			"on_error":     "pass",
 		},
 	})
 	if rec.Code != http.StatusOK {
-		t.Fatalf("create lua filter: %d %s", rec.Code, rec.Body.String())
+		t.Fatalf("create script filter: %d %s", rec.Code, rec.Body.String())
 	}
 	list := decodeSafety(t, rec.Body.Bytes())
-	if len(list.LuaFilters) != 1 || list.LuaFilters[0].Name != "pii_mask" || !list.RestartRequired {
-		t.Fatalf("lua filters = %+v", list.LuaFilters)
+	if len(list.ScriptFilters) != 1 || list.ScriptFilters[0].Name != "pii_mask" || !list.RestartRequired {
+		t.Fatalf("script filters = %+v", list.ScriptFilters)
 	}
 
-	// Attach lua:pii_mask to a profile and confirm config loads cleanly.
+	// Attach script:pii_mask to a profile and confirm config loads cleanly.
 	rec = do(t, ui.API(), http.MethodPost, "/admin/api/studio/safety/profiles", map[string]any{
-		"profile": map[string]any{"name": "masked", "filters": []string{"source-attribution", "lua:pii_mask"}},
+		"profile": map[string]any{"name": "masked", "filters": []string{"source-attribution", "script:pii_mask"}},
 		"mtime":   list.MTime,
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("create masked profile: %d %s", rec.Code, rec.Body.String())
 	}
 	list = decodeSafety(t, rec.Body.Bytes())
-	if len(list.LuaFilters[0].UsedBy) != 1 || list.LuaFilters[0].UsedBy[0] != "masked" {
-		t.Fatalf("expected used_by=[masked], got %+v", list.LuaFilters[0].UsedBy)
+	if len(list.ScriptFilters[0].UsedBy) != 1 || list.ScriptFilters[0].UsedBy[0] != "masked" {
+		t.Fatalf("expected used_by=[masked], got %+v", list.ScriptFilters[0].UsedBy)
 	}
 	if _, err := config.LoadDir(dir, slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
-		t.Fatalf("configdir does not load after attaching lua filter: %v", err)
+		t.Fatalf("configdir does not load after attaching script filter: %v", err)
 	}
 
-	// Deleting a referenced lua filter is refused.
-	rec = do(t, ui.API(), http.MethodDelete, "/admin/api/studio/safety/lua-filters/pii_mask?mtime=0", nil)
+	// Deleting a referenced script filter is refused.
+	rec = do(t, ui.API(), http.MethodDelete, "/admin/api/studio/safety/script-filters/pii_mask?mtime=0", nil)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected in-use delete refusal, got %d %s", rec.Code, rec.Body.String())
 	}
 
-	// Delete profile then delete lua filter cleanly.
+	// Delete profile then delete script filter cleanly.
 	rec = do(t, ui.API(), http.MethodDelete, "/admin/api/studio/safety/profiles/masked?mtime=0", nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("delete masked profile: %d %s", rec.Code, rec.Body.String())
 	}
-	rec = do(t, ui.API(), http.MethodDelete, "/admin/api/studio/safety/lua-filters/pii_mask?mtime=0", nil)
+	rec = do(t, ui.API(), http.MethodDelete, "/admin/api/studio/safety/script-filters/pii_mask?mtime=0", nil)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("delete lua filter: %d %s", rec.Code, rec.Body.String())
+		t.Fatalf("delete script filter: %d %s", rec.Code, rec.Body.String())
 	}
 	list = decodeSafety(t, rec.Body.Bytes())
-	if len(list.LuaFilters) != 0 {
-		t.Fatalf("expected empty lua filters after delete, got %+v", list.LuaFilters)
+	if len(list.ScriptFilters) != 0 {
+		t.Fatalf("expected empty script filters after delete, got %+v", list.ScriptFilters)
 	}
 }

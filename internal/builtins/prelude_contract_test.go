@@ -12,55 +12,18 @@ import (
 	"agentflow/internal/vm"
 )
 
-// directive renders the prelude version line a fixture carries, so a test that
-// only needs *a* well-formed chunk does not have to be edited when the version
-// moves. The chunks this repo actually ships spell the number literally, and
-// TestPreludeContract is what keeps those literals honest.
-func directive() string { return fmt.Sprintf("-- af-prelude-version: %d\n", vm.PreludeVersion) }
+func directive() string { return fmt.Sprintf("// af-prelude-version: %d\n", vm.PreludeVersion) }
 
-// TestPreludeContract runs one contract against every Lua chunk in the tree,
-// the way TestBackendContract runs one contract against every memory backend.
-//
-// The contract is the version gate plus a compile: a chunk must declare the
-// prelude API version it targets, that version must be the one this core
-// provides, and this core's Luau must still parse it. The first two are the
-// separation's commercial safety net — core and proprietary Lua move on
-// separate release cadences, so something has to fail on our side when the API
-// moves rather than on a customer's first turn.
-//
-// The proprietary Lua repo runs this suite in its CI, from a checkout of this
-// repo at the core version it is pinned to:
-//
-//	AF_CONFORMANCE_LUA_DIR=/path/to/proprietary/lua go test ./internal/builtins/ -run TestPreludeContract
-//
-// Every *.lua under that directory is a case. A core release that changes the
-// prelude's surface bumps vm.PreludeVersion; a chunk left declaring the old
-// version fails here, in the other repo's build, which is the whole point.
-//
-// The env var is the shape rather than an exported Go API because everything in
-// this module is under internal/, which a separate module cannot import — so
-// there is nothing to import, and the suite has to travel as source the way the
-// backends' contract does. With the variable unset the suite still checks this
-// repo's own embedded chunks, which is what makes it a build check here and
-// a compatibility check there.
-//
-// The version covers more than the list of ops a chunk may call: it covers
-// everything a chunk can observe, including the shape of what an op hands back.
-// The one a loop meets on every turn is the message from session.inbox() — its
-// field set, and the three-state provenance.user_uuid inside it (absent vs ""
-// vs a uuid). That shape is part of this contract and has already moved under
-// loops once, when the tenant left msg.payload.user_uuid for the provenance
-// field, so it is pinned rather than described: TestInboxWireShape and
-// TestInboxShapeReachesLua in internal/core/session assert the exact bytes the
-// inbox op marshals and the keys a running loop decodes, at the seam where the
-// wire is produced. Those two fail this repo's build on any shape change, which
-// is what forces the version decision this gate enforces for every chunk.
-//
-// What it does NOT cover: whether the chunk uses an op that no longer exists.
-// That needs the chunk to run, and running a loop is not something a test can
-// do to arbitrary sources. The version declaration is the contract that stands
-// in for it, so a core release that removes an op without bumping the version
-// is caught by review of the prelude diff, not here.
+func isContractScript(name string) bool {
+	if strings.HasSuffix(name, ".d.ts") {
+		return false
+	}
+	return strings.HasSuffix(name, ".ts") || strings.HasSuffix(name, ".js")
+}
+
+// TestPreludeContract validates every embedded builtin script chunk and any
+// external conformance tree (AF_CONFORMANCE_SCRIPT_DIR or AF_CONFORMANCE_LUA_DIR)
+// against the current prelude version gate and TypeScript/JS Goja compiler.
 func TestPreludeContract(t *testing.T) {
 	names := make([]string, 0, len(sources))
 	for name := range sources {
@@ -74,9 +37,12 @@ func TestPreludeContract(t *testing.T) {
 		})
 	}
 
-	dir := os.Getenv("AF_CONFORMANCE_LUA_DIR")
+	dir := os.Getenv("AF_CONFORMANCE_SCRIPT_DIR")
 	if dir == "" {
-		t.Log("AF_CONFORMANCE_LUA_DIR is unset: this repo's own chunks were checked, no external tree was")
+		dir = os.Getenv("AF_CONFORMANCE_LUA_DIR")
+	}
+	if dir == "" {
+		t.Log("AF_CONFORMANCE_SCRIPT_DIR is unset: this repo's own chunks were checked, no external tree was")
 		return
 	}
 	root := filepath.Clean(dir)
@@ -85,7 +51,7 @@ func TestPreludeContract(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() || !strings.HasSuffix(d.Name(), ".lua") {
+		if d.IsDir() || !isContractScript(d.Name()) {
 			return nil
 		}
 		rel, relErr := filepath.Rel(root, path)
@@ -103,36 +69,20 @@ func TestPreludeContract(t *testing.T) {
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("walking AF_CONFORMANCE_LUA_DIR=%s: %v", dir, err)
+		t.Fatalf("walking conformance script dir %s: %v", dir, err)
 	}
-	// A directory with nothing in it would make the suite pass while checking
-	// nothing, which is worse than failing: the caller believes the Lua was
-	// validated.
 	if checked == 0 {
-		t.Fatalf("AF_CONFORMANCE_LUA_DIR=%s holds no *.lua files; the suite checked nothing", dir)
+		t.Fatalf("conformance script dir %s holds no *.ts/*.js files; the suite checked nothing", dir)
 	}
 	t.Logf("checked %d chunk(s) under %s", checked, dir)
 }
 
-// runPreludeContract is the contract one chunk owes this core. Both assertions
-// are refusals, not warnings: there is no compatibility window, so a chunk that
-// cannot be served is a chunk the core must not load.
 func runPreludeContract(t *testing.T, name, src string) {
 	t.Helper()
-
-	// CheckChunkVersion is the gate the runtime itself uses, so a passing
-	// contract here is the same answer the boot path and the hot reload path
-	// give. It covers both halves: that the chunk declares a version at all
-	// (silence is refused, never assumed compatible) and that the version is
-	// this core's.
 	if err := vm.CheckChunkVersion(name, src); err != nil {
 		t.Fatal(err)
 	}
-
-	// The version says which API the chunk was written for; the compile says
-	// the core can still read the syntax. A Luau-level change that broke a
-	// chunk's syntax would otherwise slip past a version that nobody bumped.
 	if err := vm.CompileCheck(name, src); err != nil {
-		t.Fatalf("%s does not compile on this core's Luau: %v", name, err)
+		t.Fatalf("%s does not compile on this core's Goja runtime: %v", name, err)
 	}
 }

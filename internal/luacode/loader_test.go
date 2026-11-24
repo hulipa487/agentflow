@@ -11,7 +11,7 @@ import (
 	"agentflow/internal/vm"
 )
 
-func directive() string { return fmt.Sprintf("-- af-prelude-version: %d\n", vm.PreludeVersion) }
+func directive() string { return fmt.Sprintf("// af-prelude-version: %d\n", vm.PreludeVersion) }
 
 func writeFile(t *testing.T, path, body string) {
 	t.Helper()
@@ -28,9 +28,9 @@ func withTestBuiltins(t *testing.T) map[string]string {
 	prevSources := builtinSources
 	prevOrder := supportOrder
 	srcs := map[string]string{
-		"alpha": directive() + "ALPHA = 1\n",
-		"beta":  directive() + "BETA = 2\n",
-		"route": directive() + "function loop() end\n",
+		"alpha": directive() + "var ALPHA = 1;\n",
+		"beta":  directive() + "var BETA = 2;\n",
+		"route": directive() + "function loop() {}\n",
 	}
 	SetBuiltins(srcs, []string{"alpha", "beta"})
 	t.Cleanup(func() {
@@ -44,15 +44,15 @@ func withTestBuiltins(t *testing.T) map[string]string {
 func TestPluginDirShadowsRegisteredBuiltin(t *testing.T) {
 	srcs := withTestBuiltins(t)
 	dir := t.TempDir()
-	shadowSrc := directive() + "BETA = 99\n"
-	writeFile(t, filepath.Join(dir, "beta.lua"), shadowSrc)
+	shadowSrc := directive() + "var BETA = 99;\n"
+	writeFile(t, filepath.Join(dir, "beta.ts"), shadowSrc)
 	SetPluginDir(dir)
 
 	src, watch, err := Resolve("plugin:beta")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if src != shadowSrc || watch != filepath.Join(dir, "beta.lua") {
+	if src != shadowSrc || watch != filepath.Join(dir, "beta.ts") {
 		t.Fatalf("got (%q, %q), want shadow", src, watch)
 	}
 
@@ -65,7 +65,7 @@ func TestPluginDirShadowsRegisteredBuiltin(t *testing.T) {
 	}
 
 	paths := SupportChunkPaths()
-	if len(paths) != 1 || paths["beta"] != filepath.Join(dir, "beta.lua") {
+	if len(paths) != 1 || paths["beta"] != filepath.Join(dir, "beta.ts") {
 		t.Fatalf("unexpected shadow paths: %v", paths)
 	}
 
@@ -79,6 +79,22 @@ func TestPluginDirShadowsRegisteredBuiltin(t *testing.T) {
 	}
 }
 
+func TestPluginDirSupportsJSFallbackShadow(t *testing.T) {
+	withTestBuiltins(t)
+	dir := t.TempDir()
+	shadowSrc := directive() + "var BETA = 77;\n"
+	writeFile(t, filepath.Join(dir, "beta.js"), shadowSrc)
+	SetPluginDir(dir)
+
+	src, watch, err := Resolve("plugin:beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if src != shadowSrc || watch != filepath.Join(dir, "beta.js") {
+		t.Fatalf("got (%q, %q), want .js shadow", src, watch)
+	}
+}
+
 func TestUnknownPluginRejected(t *testing.T) {
 	withTestBuiltins(t)
 	if _, _, err := Resolve("plugin:nope"); err == nil || !strings.Contains(err.Error(), "unknown plugin") {
@@ -88,18 +104,18 @@ func TestUnknownPluginRejected(t *testing.T) {
 
 func TestVersionGateRefusesEveryRoute(t *testing.T) {
 	withTestBuiltins(t)
-	stale := "-- af-prelude-version: 0\nfunction loop() end\n"
-	undeclared := "function loop() end\n"
+	stale := "// af-prelude-version: 0\nfunction loop() {}\n"
+	undeclared := "function loop() {}\n"
 
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "loop.lua"), stale)
+	writeFile(t, filepath.Join(dir, "loop.ts"), stale)
 	members := filepath.Join(dir, "members")
-	writeFile(t, filepath.Join(members, "10-main.lua"), directive()+"function loop() end\n")
-	writeFile(t, filepath.Join(members, "20-tools.lua"), stale)
-	writeFile(t, filepath.Join(dir, "undeclared.lua"), undeclared)
+	writeFile(t, filepath.Join(members, "10-main.ts"), directive()+"function loop() {}\n")
+	writeFile(t, filepath.Join(members, "20-tools.ts"), stale)
+	writeFile(t, filepath.Join(dir, "undeclared.ts"), undeclared)
 
 	shadows := t.TempDir()
-	writeFile(t, filepath.Join(shadows, "beta.lua"), stale)
+	writeFile(t, filepath.Join(shadows, "beta.ts"), stale)
 	SetPluginDir(shadows)
 
 	for _, c := range []struct {
@@ -107,10 +123,10 @@ func TestVersionGateRefusesEveryRoute(t *testing.T) {
 		ref    string
 		wantIn []string
 	}{
-		{"shadowed builtin", "plugin:beta", []string{filepath.Join(shadows, "beta.lua")}},
-		{"single file", filepath.Join(dir, "loop.lua"), []string{filepath.Join(dir, "loop.lua")}},
-		{"directory loop", members, []string{filepath.Join(members, "20-tools.lua")}},
-		{"no declaration", filepath.Join(dir, "undeclared.lua"), []string{filepath.Join(dir, "undeclared.lua"), "af-prelude-version"}},
+		{"shadowed builtin", "plugin:beta", []string{filepath.Join(shadows, "beta.ts")}},
+		{"single file", filepath.Join(dir, "loop.ts"), []string{filepath.Join(dir, "loop.ts")}},
+		{"directory loop", members, []string{filepath.Join(members, "20-tools.ts")}},
+		{"no declaration", filepath.Join(dir, "undeclared.ts"), []string{filepath.Join(dir, "undeclared.ts"), "af-prelude-version"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			src, _, err := Resolve(c.ref)
@@ -133,22 +149,22 @@ func TestVersionGateRefusesEveryRoute(t *testing.T) {
 func TestPackageImportAndCycleDetection(t *testing.T) {
 	withTestBuiltins(t)
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "a", "a.lua"), directive()+"-- af-import: b\nA = B + 1\n")
-	writeFile(t, filepath.Join(dir, "b", "b.lua"), directive()+"B = 41\n")
-	writeFile(t, filepath.Join(dir, "main.lua"), directive()+"-- af-import: a\nfunction loop() return A end\n")
+	writeFile(t, filepath.Join(dir, "a", "a.ts"), directive()+"// af-import: b\nvar A = B + 1;\n")
+	writeFile(t, filepath.Join(dir, "b", "b.ts"), directive()+"var B = 41;\n")
+	writeFile(t, filepath.Join(dir, "main.ts"), directive()+"// af-import: a\nfunction loop() { return A; }\n")
 
 	SetPackages(map[string]string{
 		"a": filepath.Join(dir, "a"),
 		"b": filepath.Join(dir, "b"),
 	})
-	src, watch, err := Resolve(filepath.Join(dir, "main.lua"))
+	src, watch, err := Resolve(filepath.Join(dir, "main.ts"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if watch != filepath.Join(dir, "main.lua") {
+	if watch != filepath.Join(dir, "main.ts") {
 		t.Fatalf("watch = %q", watch)
 	}
-	if !strings.Contains(src, "B = 41") || !strings.Contains(src, "A = B + 1") {
+	if !strings.Contains(src, "var B = 41") || !strings.Contains(src, "var A = B + 1") {
 		t.Fatalf("expanded source missing package bodies:\n%s", src)
 	}
 	if strings.Count(src, "af-prelude-version") != 1 {
@@ -156,8 +172,8 @@ func TestPackageImportAndCycleDetection(t *testing.T) {
 	}
 
 	// Cycle detection.
-	writeFile(t, filepath.Join(dir, "b", "b.lua"), directive()+"-- af-import: a\nB = 1\n")
-	if _, _, err := Resolve(filepath.Join(dir, "main.lua")); err == nil || !strings.Contains(err.Error(), "cycle") {
+	writeFile(t, filepath.Join(dir, "b", "b.ts"), directive()+"// af-import: a\nvar B = 1;\n")
+	if _, _, err := Resolve(filepath.Join(dir, "main.ts")); err == nil || !strings.Contains(err.Error(), "cycle") {
 		t.Fatalf("expected cycle error, got %v", err)
 	}
 }

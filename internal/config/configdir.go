@@ -297,6 +297,11 @@ func rebaseConfigPaths(dir string, c *Config) {
 	for name, p := range c.Packages {
 		c.Packages[name] = rebasePath(dir, p)
 	}
+	for name, a := range c.APIs {
+		a.Dir = rebasePath(dir, a.Dir)
+		a.Entry = rebasePath(dir, a.Entry)
+		c.APIs[name] = a
+	}
 	for name, b := range c.Memory.Backends {
 		if b.Provider != "sqlite" || b.Config == nil {
 			continue

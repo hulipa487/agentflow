@@ -1,1153 +1,837 @@
 package vm
 
-// jsonLib is a compact pure-Lua JSON implementation, preloaded into every
-// state as the `json` global (values cross the Go boundary as JSON).
-const jsonLib = `
-json = {}
+// prelude defines the TypeScript/JS-facing capability surface on top of the
+// native primitives (__af_op, __af_now, __af_mem_cap).
+const prelude = `(function(global) {
+  "use strict";
 
--- encode --------------------------------------------------------------------
-
-local escapes = {
-  ['"'] = '\\"', ['\\'] = '\\\\', ['\b'] = '\\b', ['\f'] = '\\f',
-  ['\n'] = '\\n', ['\r'] = '\\r', ['\t'] = '\\t',
-}
-
-local function is_array(t)
-  local n = #t
-  -- Empty tables encode as objects ({}), not arrays. Every op payload table
-  -- in this runtime is object-shaped (map[string]any on the Go side); an
-  -- empty {} must not cross the bridge as [] or cgo unmarshal fails.
-  if n == 0 then return false end
-  local i = 0
-  for k in pairs(t) do
-    if type(k) ~= "number" then return false end
-    i = i + 1
-  end
-  return i == n
-end
-
-local encode_value
-local function encode_string(s)
-  return '"' .. s:gsub('[%c"\\]', escapes) .. '"'
-end
-
-local function encode_table(t)
-  if is_array(t) then
-    local parts = {}
-    for i = 1, #t do parts[i] = encode_value(t[i]) end
-    return "[" .. table.concat(parts, ",") .. "]"
-  end
-  local parts = {}
-  for k, v in pairs(t) do
-    parts[#parts + 1] = encode_string(tostring(k)) .. ":" .. encode_value(v)
-  end
-  return "{" .. table.concat(parts, ",") .. "}"
-end
-
-encode_value = function(v)
-  local ty = type(v)
-  if v == nil then return "null" end
-  if ty == "string" then return encode_string(v) end
-  if ty == "number" then
-    if v ~= v or v == math.huge or v == -math.huge then return "null" end
-    if v == math.floor(v) and math.abs(v) < 2^52 then return string.format("%d", v) end
-    return string.format("%.14g", v)
-  end
-  if ty == "boolean" then return v and "true" or "false" end
-  if ty == "table" then return encode_table(v) end
-  error("json: cannot encode " .. ty)
-end
-
-function json.encode(v) return encode_value(v) end
-
--- decode --------------------------------------------------------------------
-
-local function decode_error(s, pos, msg)
-  error(string.format("json: %s at position %d", msg, pos), 0)
-end
-
-local parse_value
-
-local function skip_ws(s, pos)
-  local _, e = s:find("^[ \n\r\t]*", pos)
-  return (e or pos - 1) + 1
-end
-
-local function parse_string(s, pos)
-  local parts = {}
-  local i = pos + 1
-  while true do
-    local j = s:find('["\\]', i)
-    if not j then decode_error(s, pos, "unterminated string") end
-    parts[#parts + 1] = s:sub(i, j - 1)
-    local c = s:sub(j, j)
-    if c == '"' then
-      return table.concat(parts), j + 1
-    end
-    local esc = s:sub(j + 1, j + 1)
-    local map = { ['"'] = '"', ['\\'] = '\\', ['/'] = '/',
-      b = '\b', f = '\f', n = '\n', r = '\r', t = '\t' }
-    if map[esc] then
-      parts[#parts + 1] = map[esc]
-      i = j + 2
-    elseif esc == 'u' then
-      local hex = s:sub(j + 2, j + 5)
-      local cp = tonumber(hex, 16) or decode_error(s, j, "bad \\u escape")
-      parts[#parts + 1] = utf8.char(cp)
-      i = j + 6
-    else
-      decode_error(s, j, "bad escape " .. esc)
-    end
-  end
-end
-
-local function parse_number(s, pos)
-  local num = s:match("^-?%d+%.?%d*[eE]?[+-]?%d*", pos)
-  if not num or #num == 0 then decode_error(s, pos, "invalid number") end
-  return tonumber(num), pos + #num
-end
-
-local function parse_array(s, pos)
-  local arr = {}
-  pos = skip_ws(s, pos + 1)
-  if s:sub(pos, pos) == "]" then return arr, pos + 1 end
-  while true do
-    local v
-    v, pos = parse_value(s, pos)
-    arr[#arr + 1] = v
-    pos = skip_ws(s, pos)
-    local c = s:sub(pos, pos)
-    if c == "]" then return arr, pos + 1 end
-    if c ~= "," then decode_error(s, pos, "expected ',' or ']'") end
-    pos = skip_ws(s, pos + 1)
-  end
-end
-
-local function parse_object(s, pos)
-  local obj = {}
-  pos = skip_ws(s, pos + 1)
-  if s:sub(pos, pos) == "}" then return obj, pos + 1 end
-  while true do
-    pos = skip_ws(s, pos)
-    if s:sub(pos, pos) ~= '"' then decode_error(s, pos, "expected string key") end
-    local key
-    key, pos = parse_string(s, pos)
-    pos = skip_ws(s, pos)
-    if s:sub(pos, pos) ~= ":" then decode_error(s, pos, "expected ':'") end
-    local v
-    v, pos = parse_value(s, skip_ws(s, pos + 1))
-    obj[key] = v
-    pos = skip_ws(s, pos)
-    local c = s:sub(pos, pos)
-    if c == "}" then return obj, pos + 1 end
-    if c ~= "," then decode_error(s, pos, "expected ',' or '}'") end
-    pos = pos + 1
-  end
-end
-
-parse_value = function(s, pos)
-  pos = skip_ws(s, pos)
-  local c = s:sub(pos, pos)
-  if c == '"' then return parse_string(s, pos) end
-  if c == "{" then return parse_object(s, pos) end
-  if c == "[" then return parse_array(s, pos) end
-  if c == "-" or c:match("%d") then return parse_number(s, pos) end
-  if s:sub(pos, pos + 3) == "true" then return true, pos + 4 end
-  if s:sub(pos, pos + 4) == "false" then return false, pos + 5 end
-  if s:sub(pos, pos + 3) == "null" then return nil, pos + 4 end
-  decode_error(s, pos, "unexpected character '" .. c .. "'")
-end
-
-function json.decode(s)
-  if type(s) ~= "string" then error("json: expected string", 2) end
-  local v, pos = parse_value(s, 1)
-  return v
-end
-`
-
-// prelude defines the Lua-facing capability surface on top of the single
-// native primitive __af_op. Everything here is policy, written in Lua,
-// exactly where the design says it should live.
-const prelude = `
--- agentflow prelude (phase 1)
--- Native primitive: __af_op(request_json) -> (response_json, ok)
-
-local function op(req)
-  local resp, ok = __af_op(json.encode(req))
-  if not ok then
-    -- failures cross the bridge as JSON strings; unwrap for readable errors,
-    -- and raise with level 0 so bubbles don't carry prelude line numbers
-    local msg = resp
-    local pok, v = pcall(json.decode, resp)
-    if pok and type(v) == "string" then msg = v end
-    error(msg, 0)
-  end
-  return json.decode(resp)
-end
-
-af = { op = op }
-
--- af.version is the prelude API version this core implements (PreludeVersion in
--- the Go side of this package). It is the contract between the core and every
--- loop, support chunk and route handler written against it, and it is declared
--- here because the prelude is the API.
---
--- A Lua file declares the version it targets with a line in its leading comment
--- block:
---
---   -- af-prelude-version: 1
---
--- The core then refuses to load a file that declares another version, or none
--- at all. There is no deprecation window: the prelude and the Lua that uses it
--- move together, so a mismatch is a hard refusal, not a warning. A comment
--- rather than a call, because the refusal has to happen before the chunk runs
--- (vm.CheckChunkVersion reads it out of the source; the gate runs on the boot
--- path and on hot reload). Bump it for any change a chunk can observe; see the
--- comment on PreludeVersion in version.go for what that means in practice.
-af.version = 1
-
-session = {}
-function session.inbox() return op({ type = "inbox" }) end
--- session.state is a small durable key/value store for this session alone: a
--- cursor, a step count, the last thing said. It survives a restart, and in a
--- fleet it follows the session to whichever instance owns it next. Needs the
--- session.state capability. Keys may contain letters, digits and . _ - :
--- (128 chars); values are any JSON-encodable Lua value, up to 64 KiB, and 256
--- keys per session. get returns nil for a key that was never set.
-session.state = {}
-function session.state.set(key, value)
-  return op({ type = "session.state.set", key = key, value = value })
-end
-function session.state.get(key)
-  return op({ type = "session.state.get", key = key })
-end
-function session.state.delete(key)
-  return op({ type = "session.state.delete", key = key })
-end
-function session.state.list()
-  return op({ type = "session.state.list" })
-end
--- session.send(text, opts?) replies to the active inbound message. opts may
--- carry attachments = array of part tables ({type="image", mime=..., handle=...})
--- — typically msg.attachments forwarded from the inbound message. Channels
--- that cannot deliver media fail the op (honest, never a silent drop).
-function session.send(text, opts)
-  local req = { type = "send", text = text }
-  if opts and opts.attachments then req.attachments = opts.attachments end
-  op(req)
-end
--- session.reply(t) finishes the turn with a structured assistant message:
--- {text, tool_calls, finish_reason, usage, reasoning}. It is the op behind the
--- OpenAI channel's chat.completion answer: tool_calls are passed through
--- unchanged, usage becomes the client-visible token counts, and reasoning is
--- only sent by a channel configured to expose it (an llm.forward or llm.chat
--- result calls it thinking, which is read when reasoning is absent, so
--- session.reply(reply) carries it). A tool call's arguments string, when
--- present, is sent as it is — it is the model's own text, and unlike the args
--- table it survives Lua intact; clear it on a call whose args you edit. At
--- most one reply per turn;
--- the text goes through the same safety and journal path as session.send.
--- Channels that cannot express a structured reply fall back to the text (and
--- refuse tool calls rather than dropping them).
-function session.reply(t)
-  t = t or {}
-  local req = {
-    type = "reply",
-    text = t.text,
-    finish_reason = t.finish_reason,
-    reasoning = t.reasoning or t.thinking,
-  }
-  -- An empty Lua table encodes as {} (an object), which the Go side cannot
-  -- decode into a slice; omit empty arrays rather than crash the loop.
-  if t.tool_calls and #t.tool_calls > 0 then req.tool_calls = t.tool_calls end
-  if t.usage then req.usage = t.usage end
-  return op(req)
-end
--- session.send_delta(text) sends one fragment of the answer. The engine relays
--- it live only when nothing can veto the text afterwards; otherwise it holds
--- the fragments and releases the checked answer at the end of the turn. A loop
--- that streams and also calls session.reply should let reply carry the text —
--- the channel sends only what it has not already received.
-function session.send_delta(text)
-  return op({ type = "send.delta", text = text })
-end
--- session.push sends to an explicit channel/recipient without an active
--- inbound message (proactive/background egress). Requires the channel.push
--- capability. reply_to is the channel-specific recipient (e.g. telegram
--- chat id). opts.attachments as in session.send.
-function session.push(channel, reply_to, text, opts)
-  local req = { type = "session.push", channel = channel, reply_to = reply_to, text = text }
-  if opts and opts.attachments then req.attachments = opts.attachments end
-  return op(req)
-end
--- session.push_user sends to a user by identity UUID. Channel-agnostic: pass
--- the UUID from msg.from ("user:<uuid>" -> strip the prefix) of a prior turn.
--- Requires the channel.push capability and the identity layer to be enabled.
-function session.push_user(uuid, text)
-  return op({ type = "session.push_user", address = "user:" .. uuid, text = text })
-end
--- session.exit terminates this session cleanly: the loop is not restarted,
--- timers/requests are reaped, and the parent (if any) receives agent.died.
--- The calling coroutine is never resumed.
-function session.exit() op({ type = "session.exit" }) end
-
-log = {}
-local function mklog(level)
-  return function(msg) op({ type = "log", level = level, msg = tostring(msg) }) end
-end
-log.debug = mklog("debug")
-log.info  = mklog("info")
-log.warn  = mklog("warn")
-log.error = mklog("error")
-
-time = {}
-function time.sleep(seconds) op({ type = "sleep", seconds = seconds }) end
-
-agent = {}
--- agent.info() -> this session's own identity: name, session_id, address,
--- model, instructions, history_budget, memory bindings, shell, skills and
--- capabilities. Two fields follow the *person* being served rather than the
--- agent: a profile may name a model and may add a layer of instructions, and
--- when it does, model is that model (with agent_model carrying what the agent
--- would otherwise have used) and instructions is the agent's instructions with
--- the person's layer appended as its own paragraph — instructions_append
--- carries that layer alone. A loop that reads these two fields honours a
--- per-user override without knowing it exists; one that wants to branch on the
--- preference can read agent_model and instructions_append.
-function agent.info()
-  return op({ type = "agent.info" })
-end
--- agent.config() -> this agent's own profile: name, model, the instructions
--- path, goal{type, success_signal, max_turns, on_goal_met} (when the profile
--- declares one under extras.goal), and the remaining extras (a pm options
--- block, a workflow name, ...). Secret references render as opaque markers
--- ({env="VAR"} / {cred="service"}) — resolved values never appear here.
-function agent.config()
-  return op({ type = "agent.config" })
-end
-function agent.send(address, payload)
-  return op({ type = "agent.send", address = address, payload = payload or {} })
-end
-function agent.request(address, payload, timeout)
-  return op({ type = "agent.request", address = address, payload = payload or {}, timeout = timeout or 30 })
-end
-function agent.reply(request_id, payload)
-  return op({ type = "agent.reply", request = request_id, payload = payload or {} })
-end
-function agent.list()
-  return op({ type = "agent.list" })
-end
-function agent.spawn(profile, spec)
-  return op({ type = "agent.spawn", profile = profile, spec = spec or {} })
-end
-
-scheduler = {}
-function scheduler.every(interval, opts)
-  opts = opts or {}
-  return op({ type = "scheduler.every", interval = interval })
-end
-function scheduler.after(delay, opts)
-  opts = opts or {}
-  return op({ type = "scheduler.after", delay = delay })
-end
-function scheduler.cron(expr, opts)
-  return op({ type = "scheduler.cron", cron = expr })
-end
-function scheduler.cancel(timer_id)
-  return op({ type = "scheduler.cancel", timer_id = timer_id })
-end
-
-store = {}
-function store.put(table, key, value, opts)
-  opts = opts or {}
-  return op({ type = "store.put", table = table, key = key, value = value, ttl = opts.ttl, vector = opts.vector })
-end
-function store.get(table, key)
-  return op({ type = "store.get", table = table, key = key })
-end
-function store.query(table, query)
-  query = query or {}
-  query.table = table
-  return op({ type = "store.query", query = query })
-end
-function store.delete(table, key)
-  return op({ type = "store.delete", table = table, key = key })
-end
--- store.scopes(table) -> { "user:<uuid>", ... } — the user scopes present in
--- a table, sorted. Maintenance provenance only (system/scheduler sessions,
--- e.g. the nightly distiller); channel and agent-hop sessions are denied —
--- scope enumeration must never be reachable from a user's own turn.
-function store.scopes(table)
-  return op({ type = "store.scopes", table = table })
-end
-
--- The user surface: read-only facts about the person this turn belongs to.
--- A loop learns a name and a channel, never an email or a secret — credential
--- values are only ever reached as the opaque auth={service=...} reference the
--- engine resolves.
-user = {}
--- user.current() -> {ok, registered, id, display_name, identities}. A turn with
--- no registered user (engine work, or a handle nobody has linked) reports
--- registered=false, so a loop can greet a guest differently.
-function user.current()
-  return op({ type = "user.current" })
-end
--- user.usage() -> {ok, input, output, cached, reasoning, calls, failed,
--- billable, used, limit, remaining, unlimited, in_flight} for the current user,
--- so a loop can warn before the quota bites.
-function user.usage()
-  return op({ type = "user.usage" })
-end
--- user.has_credential(service) -> {ok, service, present}: whether the user holds
--- a credential. The value is never exposed; only the engine can use it.
-function user.has_credential(service)
-  return op({ type = "user.has_credential", service = service })
-end
--- user.get(id) -> one profile, and user.list() -> every profile. Maintenance
--- provenance only (system/scheduler): a user's own turn cannot read another
--- account.
-function user.get(id)
-  return op({ type = "user.get", user_id = id })
-end
-function user.list()
-  return op({ type = "user.list" })
-end
-
-memory = {}
-function memory.write(record)
-  local targets = memory_routing_table(record)
-  local info = agent.info()
-  local mem = info.memory or {}
-  local embed_model = mem.embed_model
-  local stores = mem.stores or {}
-  for _, t in ipairs(targets) do
-    local opts = { ttl = t.ttl }
-    -- Embed only when the profile names an embed_model AND the target
-    -- store's backend can hold vectors; other stores get plain puts.
-    if embed_model and embed_model ~= "" then
-      local can_vector = false
-      local s = stores[t.store]
-      if s and s.features then
-        for _, f in ipairs(s.features) do
-          if f == "vector" then can_vector = true; break end
-        end
-      end
-      if can_vector then
-        local text = t.value
-        if type(text) == "table" then text = text.text or json.encode(text) end
-        -- Multimodal records: attachments ride alongside the text as one
-        -- merged embedding (Jina content group), so recall by text finds the
-        -- media too. Requires an omni embedding model (e.g.
-        -- jina-embeddings-v5-omni-small); text-only models error honestly.
-        local atts = record.attachments
-        if atts and #atts > 0 then
-          local parts = {}
-          if type(text) == "string" and #text > 0 then
-            table.insert(parts, text)
-          end
-          for _, att in ipairs(atts) do table.insert(parts, att) end
-          local r = llm.embed(parts, { model = embed_model, merged = true })
-          if r and r.vectors and r.vectors[1] then
-            opts.vector = r.vectors[1]
-          end
-        elseif type(text) == "string" and #text > 0 then
-          local r = llm.embed({ text }, { model = embed_model })
-          if r and r.vectors and r.vectors[1] then
-            opts.vector = r.vectors[1]
-          end
-        end
-      end
-    end
-    store.put(t.store, t.key, t.value, opts)
-  end
-  return true
-end
-function memory.recall(query, opts)
-  -- The memory profile selects the recall handler; plugin:semantic is
-  -- handled by its support chunk, everything else uses the default.
-  local info = agent.info()
-  local recall = info.memory and info.memory.recall
-  if recall == "plugin:semantic" and memory_semantic_recall_handler then
-    return memory_semantic_recall_handler(query, opts)
-  end
-  return memory_recall_handler(query, opts)
-end
-
-tools = {}
-function tools.list()
-  return op({ type = "tools.list" })
-end
-function tools.run(name, args, opts)
-  local req = { type = "tools.run", tool = name, args = args or {} }
-  if opts then
-    if opts.confirmed then req.confirmed = true; req.confirm_id = opts.confirm_id end
-  end
-  return op(req)
-end
-
--- Lua-declared tools: a loop (or a support chunk) registers its own
--- model-visible tools with tool.def. Declared tools merge into tools.list and
--- intercept tools.run; the handler runs synchronously on the loop coroutine,
--- so it may itself call any op (llm.chat, memory.*, ...).
---
--- Visibility follows the same rule as Go-registered tools: the agent's skills
--- list, or tools.policy.default when skills is empty. A declared tool this
--- agent cannot see is left out of tools.list — which is what lets one shared
--- loop directory carry tools only some agents get. That is a behavior change
--- for a deployment with tools.policy.default: none and no skills: declared
--- tools used to be listed unconditionally and now are not. The filter is
--- applied before shadowing, so a hidden declared tool does not suppress a
--- visible Go tool of the same name.
---
--- tools.run applies the same rule: a declared name this agent cannot see is
--- not dispatchable and falls through to the Go path, which answers
--- not-available like it does for any other invisible tool. Registered tools
--- were always refused at dispatch, and tools.run is the model-facing path — the
--- one a hallucinated or injected tool call travels — so the two must agree. A
--- loop that wants its own handler can call the function directly; it does not
--- need tools.run to reach a tool its model is not shown.
---
--- Declared tools are the loop's own code: the Go tools policy (forbidden,
--- needs_confirm, permission: forbidden) does not gate them.
---
--- tools.policy.overrides may target a declared tool by name: its description
--- (literal or {prompt: key} from the prompts registry) replaces the spec's,
--- and params.<param>.description refines one declared parameter. The spec's
--- own description and params are the fallback when no override names it, and
--- an override can never add or remove a list entry. Overrides are resolved
--- when the list is built, not at boot, so editing a file:-backed prompt is
--- reflected on the next tools.list().
-tool = {}
-local lua_tools = {}
-local go_tools_list = tools.list
-local go_tools_run = tools.run
-
-function tool.def(spec)
-  assert(type(spec) == "table", "tool.def: spec must be a table")
-  assert(type(spec.name) == "string" and #spec.name > 0, "tool.def: spec.name must be a non-empty string")
-  assert(type(spec.handler) == "function", "tool.def: spec.handler must be a function")
-  if spec.params ~= nil then
-    assert(type(spec.params) == "table", "tool.def: spec.params must be a JSON-schema table")
-  end
-  lua_tools[spec.name] = spec
-end
-
--- tool_override_params returns the declared schema with any overridden param
--- description merged in. The spec's own table is never mutated: it belongs to
--- the loop and is reused on every turn. A param the schema does not declare is
--- skipped, matching the Go registry's rule.
-local function tool_override_params(params, ovparams)
-  local base = params or { type = "object", properties = {} }
-  if ovparams == nil then
-    return base
-  end
-  local out = {}
-  for k, v in pairs(base) do out[k] = v end
-  local props = {}
-  for k, v in pairs(base.properties or {}) do props[k] = v end
-  for pname, po in pairs(ovparams) do
-    local declared = props[pname]
-    if po.description and type(declared) == "table" then
-      local merged = {}
-      for k, v in pairs(declared) do merged[k] = v end
-      merged.description = po.description
-      props[pname] = merged
-    end
-  end
-  out.properties = props
-  return out
-end
-
--- tool_declared asks the engine which of these declared names this agent can
--- see, and for the config overrides targeting them. Both tools.list and
--- tools.run go through it, so the surface the model is shown and the surface
--- it can invoke are decided by one answer.
-local function tool_declared(names)
-  local res = op({ type = "tools.declared", tool_names = names }) or {}
-  return res.visible or {}, res.overrides or {}
-end
-
-function tools.list()
-  -- The full declared set goes over the wire either way: a declared-but-hidden
-  -- tool still counts as declared, so an override aimed at it is not reported
-  -- as naming nothing. Resolved per call against the live prompt registry, so
-  -- a reloaded file:-backed prompt shows up here without a session restart.
-  local visible, overrides = {}, {}
-  if next(lua_tools) ~= nil then
-    local names = {}
-    for name in pairs(lua_tools) do names[#names + 1] = name end
-    visible, overrides = tool_declared(names)
-  end
-
-  local out = {}
-  for _, def in ipairs(go_tools_list()) do
-    local f = def["function"]
-    -- A visible declared tool shadows a Go tool of the same name. One this
-    -- agent cannot see must not suppress the Go tool.
-    if not (f and visible[f.name]) then
-      out[#out + 1] = def
-    end
-  end
-  for name, spec in pairs(lua_tools) do
-    if visible[name] then
-      local ov = overrides[name]
-      out[#out + 1] = {
-        type = "function",
-        ["function"] = {
-          name = name,
-          description = (ov and ov.description) or spec.description or "",
-          parameters = tool_override_params(spec.params, ov and ov.params),
-        },
+  // Soft allocation guards honoring vm.State.SetMemoryCap(capBytes).
+  const origRepeat = String.prototype.repeat;
+  String.prototype.repeat = function(count) {
+    const cap = __af_mem_cap();
+    if (cap > 0) {
+      const n = Math.floor(Number(count));
+      if (n > 0 && this.length > 0 && n * this.length > cap) {
+        throw new RangeError("out of memory");
       }
-    end
-  end
-  return out
-end
+    }
+    return origRepeat.call(this, count);
+  };
 
-function tools.run(name, args, opts)
-  local spec = lua_tools[name]
-  if spec == nil then
-    return go_tools_run(name, args, opts)
-  end
-  -- A declared tool this agent cannot see is not dispatchable either: it is
-  -- absent from tools.list, so a call naming it can only come from a
-  -- hallucinated or injected tool call. Registered tools are already refused
-  -- at dispatch; this makes the two surfaces agree. Fall through to the Go
-  -- path so the answer is the same not-available result.
-  local visible = tool_declared({ name })
-  if not visible[name] then
-    return go_tools_run(name, args, opts)
-  end
-  local ok, res = pcall(spec.handler, args or {})
-  if not ok then
-    return { ok = false, tool = name, error = tostring(res) }
-  end
-  if res == nil then
-    res = { ok = true, tool = name }
-  end
-  return res
-end
+  const origJoin = Array.prototype.join;
+  Array.prototype.join = function(sep) {
+    const cap = __af_mem_cap();
+    if (cap > 0 && this.length > 0) {
+      const s = sep === undefined ? "," : String(sep);
+      let total = Math.max(0, this.length - 1) * s.length;
+      for (let i = 0; i < this.length; i++) {
+        const item = this[i];
+        if (item !== undefined && item !== null) {
+          total += typeof item === "string" ? item.length : String(item).length;
+        }
+        if (total > cap) {
+          throw new RangeError("out of memory");
+        }
+      }
+    }
+    return origJoin.call(this, sep);
+  };
 
-shell = {}
-function shell.spawn(opts)
-  opts = opts or {}
-  return op({ type = "shell.spawn",
-    image      = opts.image,
-    workdir    = opts.workdir,
-    env        = opts.env,
-    network    = opts.network,
-    mem_limit  = opts.mem_limit,
-    cpu_limit  = opts.cpu_limit,
-    provider   = opts.provider,
-    host       = opts.host,
-    user       = opts.user,
-    password   = opts.password,
-    key_file   = opts.key_file,
-    volumes    = opts.volumes,
-    project    = opts.project,
-    ref        = opts.ref,
-    scratch_mount = opts.scratch_mount,
-    shell_opts = opts.shell_opts,
-    environment = opts.environment,
-  })
-end
-function shell.exec(handle_id, command, opts)
-  opts = opts or {}
-  return op({ type = "shell.exec", shell_handle = handle_id, cmd = command, timeout = opts.timeout })
-end
--- shell.run(command, opts?) runs one command as one sandbox job on a project
--- and returns { ok, exit_code, stdout, stderr, duration_ms, timed_out,
--- truncated, changed, deleted, conflicts, skipped }. opts: project,
--- environment, workdir, env, timeout (seconds). There is no handle: nothing
--- outlives the command except what it wrote into the project.
-local function shell_job(kind, command, opts)
-  opts = opts or {}
-  return op({ type = kind, cmd = command,
-    project     = opts.project,
-    environment = opts.environment,
-    workdir     = opts.workdir,
-    env         = opts.env,
-    timeout     = opts.timeout,
-  })
-end
-function shell.run(command, opts)
-  return shell_job("shell.run", command, opts)
-end
--- shell.start(command, opts?) queues the same job in the background and
--- returns { id, state = "running", ... } at once. Its result arrives in the
--- inbox as a message with type "shell.result" and the job in msg.payload.
-function shell.start(command, opts)
-  return shell_job("shell.start", command, opts)
-end
-function shell.status(job_id)
-  return op({ type = "shell.status", job_id = job_id })
-end
-function shell.cancel(job_id)
-  return op({ type = "shell.cancel", job_id = job_id })
-end
-function shell.write(handle_id, filepath, content)
-  return op({ type = "shell.write", shell_handle = handle_id, path = filepath, content = content })
-end
-function shell.destroy(handle_id)
-  return op({ type = "shell.destroy", shell_handle = handle_id })
-end
+  // JSON convenience alias alongside standard global JSON.
+  const json = {
+    encode: function(v) {
+      const out = JSON.stringify(v);
+      if (out === undefined) {
+        throw new TypeError("json: cannot encode " + typeof v);
+      }
+      return out;
+    },
+    decode: function(s) {
+      if (typeof s !== "string") {
+        throw new TypeError("json: expected string");
+      }
+      return JSON.parse(s);
+    },
+  };
+  global.json = json;
 
--- http issues a single HTTP request and returns the full response. No
--- streaming, no retry; a loop that wants retry wraps it. Secrets go in
--- headers via os.env so they never sit in Lua source.
-http = {}
-function http.request(opts)
-  opts = opts or {}
-  return op({
-    type        = "http.request",
-    method      = opts.method or "GET",
-    url         = opts.url,
-    headers     = opts.headers,
-    body        = opts.body,
-    -- The wire key is query_params: session.Op reads json:"query_params", and
-    -- this builder used to emit "query", which decoded to the zero value. The
-    -- option was accepted and silently ignored, so a loop that built a query
-    -- string this way sent an unparameterized request and got no error.
-    query_params = opts.query,
-    json        = opts.json,
-    timeout     = opts.timeout,
-    auth        = opts.auth,   -- {service=...}: a stored credential, resolved by Go
-    -- save_to names a scratch file the response body is written to, so a large
-    -- body never crosses the bridge. The op and the Go handler both supported
-    -- it (and builtin:fetch documents it), but no builder emitted it, so the
-    -- documented feature was unreachable from Lua.
-    save_to     = opts.save_to,
-  })
-end
-function http.get(url, opts)
-  opts = opts or {}; opts.method = "GET"; opts.url = url; return http.request(opts)
-end
-function http.post(url, body, opts)
-  opts = opts or {}; opts.method = "POST"; opts.url = url; opts.body = body; return http.request(opts)
-end
-
--- os: the sandbox's minimal process surface. os.env reads a process
--- environment variable at call time (for API keys and other secrets that must
--- not be hardcoded in Lua source); it returns "" if unset. os.time/os.date are
--- the wall clock, UTC only (see below). No other os.* exists — there is no
--- io, no filesystem, no process control.
-os = {}
-function os.env(name) return op({ type = "os.env", name = name }) end
-
--- Wall clock. Everything here is UTC: the engine has no notion of a local
--- timezone, so the fields are the same on every host. The native primitive is
--- __af_now() (Unix seconds, from the process clock).
-local SECS_PER_DAY = 86400
-
--- days-since-epoch -> y, m, d (Howard Hinnant's civil_from_days).
-local function civil_from_days(z)
-  z = z + 719468
-  local era = math.floor(z / 146097)
-  local doe = z - era * 146097
-  local yoe = math.floor((doe - math.floor(doe / 1460) + math.floor(doe / 36524) - math.floor(doe / 146096)) / 365)
-  local y = yoe + era * 400
-  local doy = doe - (365 * yoe + math.floor(yoe / 4) - math.floor(yoe / 100))
-  local mp = math.floor((5 * doy + 2) / 153)
-  local d = doy - math.floor((153 * mp + 2) / 5) + 1
-  local m = mp + (mp < 10 and 3 or -9)
-  if m <= 2 then y = y + 1 end
-  return y, m, d
-end
-
-local function days_from_civil(y, m, d)
-  if m <= 2 then y = y - 1 end
-  local era = math.floor(y / 400)
-  local yoe = y - era * 400
-  local mp = (m + 9) % 12
-  local doy = math.floor((153 * mp + 2) / 5) + d - 1
-  local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
-  return era * 146097 + doe - 719468
-end
-
-local WDAY = { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" }
-local MONTH = { "January", "February", "March", "April", "May", "June",
-                "July", "August", "September", "October", "November", "December" }
-
--- The Lua os.date table for a UTC instant: year/month/day/hour/min/sec, wday
--- (1 = Sunday .. 7 = Saturday), yday (1-366), isdst (always false).
-local function date_fields(t)
-  local days = math.floor(t / SECS_PER_DAY)
-  local secs = t - days * SECS_PER_DAY
-  local y, m, d = civil_from_days(days)
-  return {
-    year = y, month = m, day = d,
-    hour = math.floor(secs / 3600),
-    min = math.floor((secs % 3600) / 60),
-    sec = secs % 60,
-    wday = (days + 4) % 7 + 1,
-    yday = days - days_from_civil(y, 1, 1) + 1,
-    isdst = false,
+  // Native primitive: __af_op(request_json) -> [response_json, ok]
+  function op(req) {
+    const res = __af_op(json.encode(req));
+    const resp = res[0];
+    const ok = res[1];
+    if (!ok) {
+      let msg = resp;
+      try {
+        const v = JSON.parse(resp);
+        if (typeof v === "string") {
+          msg = v;
+        }
+      } catch (_) {}
+      throw new Error(String(msg));
+    }
+    return JSON.parse(resp);
   }
-end
 
-local function pad2(n) return string.format("%02d", n) end
+  function callOp(req) {
+    return global.af.op(req);
+  }
 
--- strftime subset: %Y %y %m %d %e %H %I %M %S %p %A %a %B %b %j %w %u %Z %%.
--- An unknown directive is left verbatim (a literal "%" then the character).
-local function strftime(f, t)
-  local dt = date_fields(t)
-  return (f:gsub("%%([%a%%])", function(c)
-    if c == "Y" then return string.format("%04d", dt.year) end
-    if c == "y" then return pad2(dt.year % 100) end
-    if c == "m" then return pad2(dt.month) end
-    if c == "d" then return pad2(dt.day) end
-    if c == "e" then return string.format("%2d", dt.day) end
-    if c == "H" then return pad2(dt.hour) end
-    if c == "I" then return pad2(((dt.hour + 11) % 12) + 1) end
-    if c == "M" then return pad2(dt.min) end
-    if c == "S" then return pad2(dt.sec) end
-    if c == "p" then return dt.hour < 12 and "AM" or "PM" end
-    if c == "A" then return WDAY[dt.wday] end
-    if c == "a" then return string.sub(WDAY[dt.wday], 1, 3) end
-    if c == "B" then return MONTH[dt.month] end
-    if c == "b" then return string.sub(MONTH[dt.month], 1, 3) end
-    if c == "j" then return string.format("%03d", dt.yday) end
-    if c == "w" then return tostring(dt.wday - 1) end
-    if c == "u" then return tostring(dt.wday == 1 and 7 or dt.wday - 1) end
-    if c == "Z" then return "UTC" end
-    if c == "%" then return "%" end
-    return "%" .. c
-  end))
-end
+  const af = { op: op };
+af.version = 2;
+  global.af = af;
 
--- os.time() -> Unix seconds, no arguments. (Real Lua's os.time(table) is not
--- implemented: a table would silently mean "now" here, which is worse than an
--- error. Convert with os.date/os.time arithmetic instead.)
-function os.time(...)
-  if select("#", ...) > 0 then
-    error("os.time: takes no arguments (UTC Unix seconds)", 2)
-  end
-  return __af_now()
-end
+  const session = {
+    inbox: function() { return callOp({ type: "inbox" }); },
+    state: {
+      set: function(key, value) {
+        return callOp({ type: "session.state.set", key: key, value: value });
+      },
+      get: function(key) {
+        return callOp({ type: "session.state.get", key: key });
+      },
+      delete: function(key) {
+        return callOp({ type: "session.state.delete", key: key });
+      },
+      list: function() {
+        return callOp({ type: "session.state.list" });
+      },
+    },
+    send: function(text, opts) {
+      const req = { type: "send", text: text };
+      if (opts && opts.attachments) req.attachments = opts.attachments;
+      callOp(req);
+    },
+    reply: function(t) {
+      t = t || {};
+      const req = {
+        type: "reply",
+        text: t.text,
+        finish_reason: t.finish_reason,
+        reasoning: t.reasoning !== undefined && t.reasoning !== null ? t.reasoning : t.thinking,
+      };
+      if (t.tool_calls && t.tool_calls.length > 0) req.tool_calls = t.tool_calls;
+      if (t.usage) req.usage = t.usage;
+      return callOp(req);
+    },
+    send_delta: function(text) {
+      return callOp({ type: "send.delta", text: text });
+    },
+    push: function(channel, reply_to, text, opts) {
+      const req = { type: "session.push", channel: channel, reply_to: reply_to, text: text };
+      if (opts && opts.attachments) req.attachments = opts.attachments;
+      return callOp(req);
+    },
+    push_user: function(uuid, text) {
+      return callOp({ type: "session.push_user", address: "user:" + uuid, text: text });
+    },
+    exit: function() {
+      callOp({ type: "session.exit" });
+    },
+  };
+  global.session = session;
 
--- os.date([format,] time) -> a UTC date table, or a formatted string when
--- the format is a strftime string ("*t"/"!*t"/nil all return the table; a
--- leading "!" is accepted and is a no-op because the clock is always UTC).
--- The time argument is Unix seconds and defaults to now.
-function os.date(format, t)
-  if type(format) == "number" and t == nil then
-    t, format = format, nil
-  end
-  if t == nil then t = __af_now() end
-  if type(t) ~= "number" then
-    error("os.date: time must be a number (Unix seconds)", 2)
-  end
-  if format == nil or format == "" or format == "*t" or format == "!*t" then
-    return date_fields(t)
-  end
-  if type(format) ~= "string" then
-    error("os.date: format must be a string", 2)
-  end
-  if string.sub(format, 1, 1) == "!" then format = string.sub(format, 2) end
-  if format == "*t" then return date_fields(t) end
-  return strftime(format, t)
-end
+  function mklog(level) {
+    return function(msg) { callOp({ type: "log", level: level, msg: String(msg) }); };
+  }
+  global.log = {
+    debug: mklog("debug"),
+    info: mklog("info"),
+    warn: mklog("warn"),
+    error: mklog("error"),
+  };
 
--- runtime.config surface: deployment configuration as read-only Lua data.
-runtime = {}
--- runtime.triggers() -> { ok, triggers = [ { name, kind, run_on_boot, target =
--- {profile}, payload, and the schedule fields (event={channel,match} |
--- cron | every) }, ... ] } — the merged triggers/*.yaml (or top-level
--- triggers:) list, snapshotted at boot. This replaces baking CRON_TASKS /
--- ROUTES tables into Lua source. every:/cron: entries are also fired by the
--- engine itself; reading them here is unchanged and still safe (the shape is
--- stable), so a loop can use the schedule data for its own bookkeeping.
-function runtime.triggers()
-  return op({ type = "runtime.triggers" })
-end
+  global.time = {
+    sleep: function(seconds) { callOp({ type: "sleep", seconds: seconds }); },
+  };
 
--- credential.get(name) -> { ok, name, value } — the stored engine-wide
--- secret, ONLY when the agent's profile lists the name under credentials:[]
--- (empty/missing list = denied, error says so). Every access is logged and
--- counted; the value is never journaled (op responses are not journal
--- records) and should never be echoed into session.send.
-credential = {}
-function credential.get(name)
-  return op({ type = "credential.get", cred_name = name })
-end
+  const agent = {
+    info: function() { return callOp({ type: "agent.info" }); },
+    config: function() { return callOp({ type: "agent.config" }); },
+    send: function(address, payload) {
+      return callOp({ type: "agent.send", address: address, payload: payload || {} });
+    },
+    request: function(address, payload, timeout) {
+      return callOp({
+        type: "agent.request",
+        address: address,
+        payload: payload || {},
+        timeout: timeout !== undefined && timeout !== null ? timeout : 30,
+      });
+    },
+    reply: function(request_id, payload) {
+      return callOp({ type: "agent.reply", request: request_id, payload: payload || {} });
+    },
+    list: function() { return callOp({ type: "agent.list" }); },
+    spawn: function(profile, spec) {
+      return callOp({ type: "agent.spawn", profile: profile, spec: spec || {} });
+    },
+  };
+  global.agent = agent;
 
--- mail: IMAP fetch and SMTP send, in-process via the net.mail runtime cap.
--- Like http.request, auth={service=...} names a stored credential resolved by
--- Go; the password never crosses the Lua bridge. Host/port/username come from
--- the loop (typically via os.env) and never sit in Lua source.
-mail = {}
--- mail.imap_fetch{host, port, user, mailbox, unseen, limit, auth} ->
---   {ok, mailbox, count, messages:[{seq,uid,flags,subject,from,to,date,body}]}
-function mail.imap_fetch(opts)
-  opts = opts or {}
-  return op({
-    type     = "mail.imap.fetch",
-    mail_host = opts.host,
-    mail_port = opts.port,
-    mail_user = opts.user,
-    mailbox   = opts.mailbox,
-    unseen    = opts.unseen,
-    limit     = opts.limit,
-    auth      = opts.auth,   -- {service=...}: stored IMAP password
-  })
-end
--- mail.smtp_send{host, port, user, from, to, subject, text_body, auth} ->
---   {ok, sent}
-function mail.smtp_send(opts)
-  opts = opts or {}
-  return op({
-    type      = "mail.smtp.send",
-    mail_host = opts.host,
-    mail_port = opts.port,
-    mail_user = opts.user,
-    mail_from = opts.from,
-    mail_to   = opts.to,     -- array of recipient addresses
-    subject   = opts.subject,
-    text_body = opts.text_body or opts.body,
-    auth      = opts.auth,   -- {service=...}: stored SMTP password
-  })
-end
+  global.scheduler = {
+    every: function(interval, _opts) {
+      return callOp({ type: "scheduler.every", interval: interval });
+    },
+    after: function(delay, _opts) {
+      return callOp({ type: "scheduler.after", delay: delay });
+    },
+    cron: function(expr, _opts) {
+      return callOp({ type: "scheduler.cron", cron: expr });
+    },
+    cancel: function(timer_id) {
+      return callOp({ type: "scheduler.cancel", timer_id: timer_id });
+    },
+  };
 
--- tool_choice and stop each have a second, friendlier spelling. The engine
--- takes tool_choice as one string ("auto" | "none" | "required" |
--- "function:<name>") and stop as an array; a named choice written as
--- { name = "x" } and a single stop string are normalised here, because a value
--- of the wrong shape would make the whole op undecodable.
-local function norm_tool_choice(v)
-  if type(v) == "table" then
-    local name = v.name or (type(v["function"]) == "table" and v["function"].name)
-    if type(name) == "string" and name ~= "" then return "function:" .. name end
-    error("tool_choice: a table must name a function, e.g. { name = \"lookup\" }", 3)
-  end
-  return v
-end
-local function norm_stop(v)
-  if type(v) == "string" then return { v } end
-  -- An empty table would encode as {} (an object); no stop sequences is nil.
-  if type(v) == "table" and #v == 0 then return nil end
-  return v
-end
-local function with_opts(req, opts)
-  if opts then for k, v in pairs(opts) do req[k] = v end end
-  req.tool_choice = norm_tool_choice(req.tool_choice)
-  req.stop = norm_stop(req.stop)
-  return req
-end
+  const store = {
+    put: function(table, key, value, opts) {
+      opts = opts || {};
+      return callOp({ type: "store.put", table: table, key: key, value: value, ttl: opts.ttl, vector: opts.vector });
+    },
+    get: function(table, key) {
+      return callOp({ type: "store.get", table: table, key: key });
+    },
+    query: function(table, query) {
+      const q = Object.assign({}, query || {}, { table: table });
+      return callOp({ type: "store.query", query: q });
+    },
+    delete: function(table, key) {
+      return callOp({ type: "store.delete", table: table, key: key });
+    },
+    scopes: function(table) {
+      return callOp({ type: "store.scopes", table: table });
+    },
+  };
+  global.store = store;
 
-llm = {}
--- llm.chat(messages, opts): messages are {role, content} tables, or
--- {role, parts = {...}} for multimodal turns. Parts are tables:
---   {type="text", text="..."} or
---   {type="image"|"audio"|"video"|"file", mime="...", handle="media:...",
---    name="..."} — media parts typically come from msg.attachments and the
---   runtime resolves the handle to bytes; data (base64) and url also work.
--- Providers that cannot take a part type fail the call with a clear error.
--- opts.thinking overrides the model's default thinking level for this call:
--- "off" | "low" | "medium" | "high" | "xhigh" | "max" — one vocabulary,
--- mapped per provider (Anthropic budget, OpenAI effort, Gemini budget).
--- The reply carries reasoning the provider sent: reply.thinking (text),
--- reply.thinking_blocks (raw blocks), usage.reasoning (token count). Pass
--- the blocks back on an assistant turn (thinking_blocks = reply.thinking_blocks)
--- to continue Anthropic tool loops with thinking enabled.
-function llm.chat(messages, opts)
-  return op(with_opts({ type = "llm.chat", messages = messages }, opts))
-end
+  global.user = {
+    current: function() { return callOp({ type: "user.current" }); },
+    usage: function() { return callOp({ type: "user.usage" }); },
+    has_credential: function(service) {
+      return callOp({ type: "user.has_credential", service: service });
+    },
+    get: function(id) { return callOp({ type: "user.get", user_id: id }); },
+    list: function() { return callOp({ type: "user.list" }); },
+  };
 
--- llm.forward(opts?) -> { text, tool_calls, finish_reason, usage, thinking,
--- thinking_blocks } forwards the current turn's request to a model. With no
--- arguments it is the client's own request: its messages, tools, tool_choice
--- and sampling parameters. opts may override any of them:
---   model             use another model entry
---   messages          replace the client's message list
---   prepend / append  add turns before / after the client's
---   tools             add tool definitions to the client's
---   params            override sampling: temperature, max_tokens, top_p, stop,
---                     seed, response_format, parallel_tool_calls, tool_choice,
---                     thinking
---   max_tokens_cap    clamp the client's max_tokens
--- It uses the same metered path as llm.stream (budget, quota, usage ledger).
--- If the client asked for a stream and the safety profile cannot veto the
--- answer, text deltas are relayed as they arrive; otherwise the whole text is
--- returned for session.reply to send. It does not finish the HTTP response.
--- Outside an openai-channel turn with no opts.messages it returns an error.
-function llm.forward(opts)
-  local req = { type = "llm.forward" }
-  if opts then
-    req.model = opts.model
-    req.messages = opts.messages
-    req.prepend = opts.prepend
-    req.append = opts.append
-    req.tools = opts.tools
-    req.max_tokens_cap = opts.max_tokens_cap
-    local p = opts.params or {}
-    req.temperature = p.temperature
-    req.max_tokens = p.max_tokens
-    req.top_p = p.top_p
-    req.stop = norm_stop(p.stop)
-    req.seed = p.seed
-    req.response_format = p.response_format
-    req.parallel_tool_calls = p.parallel_tool_calls
-    req.tool_choice = norm_tool_choice(p.tool_choice)
-    req.thinking = p.thinking
-  end
-  return op(req)
-end
+  global.memory = {
+    write: function(record) {
+      const targets = global.memory_routing_table(record) || [];
+      const info = agent.info();
+      const mem = (info && info.memory) || {};
+      const embedModel = mem.embed_model;
+      const stores = mem.stores || {};
+      for (let i = 0; i < targets.length; i++) {
+        const t = targets[i];
+        const opts = { ttl: t.ttl };
+        if (embedModel && embedModel !== "") {
+          const s = stores[t.store];
+          const canVector = Boolean(s && Array.isArray(s.features) && s.features.indexOf("vector") >= 0);
+          if (canVector) {
+            let text = t.value;
+            if (text && typeof text === "object") {
+              text = text.text !== undefined && text.text !== null ? text.text : json.encode(text);
+            }
+            const atts = record && record.attachments;
+            if (Array.isArray(atts) && atts.length > 0) {
+              const parts = [];
+              if (typeof text === "string" && text.length > 0) {
+                parts.push(text);
+              }
+              for (let j = 0; j < atts.length; j++) {
+                parts.push(atts[j]);
+              }
+              const r = global.llm.embed(parts, { model: embedModel, merged: true });
+              if (r && Array.isArray(r.vectors) && r.vectors.length > 0) {
+                opts.vector = r.vectors[0];
+              }
+            } else if (typeof text === "string" && text.length > 0) {
+              const r = global.llm.embed([text], { model: embedModel });
+              if (r && Array.isArray(r.vectors) && r.vectors.length > 0) {
+                opts.vector = r.vectors[0];
+              }
+            }
+          }
+        }
+        store.put(t.store, t.key, t.value, opts);
+      }
+      return true;
+    },
+    recall: function(query, opts) {
+      const info = agent.info();
+      const recall = info && info.memory && info.memory.recall;
+      if (recall === "plugin:semantic" && typeof global.memory_semantic_recall_handler === "function") {
+        return global.memory_semantic_recall_handler(query, opts);
+      }
+      return global.memory_recall_handler(query, opts);
+    },
+  };
 
--- openai.request() -> the full request the current turn arrived with, as Lua
--- data: { model, messages, tools, tool_choice, params, metadata, user,
--- stream }. It is refused above 4 MiB of JSON — forward the request with
--- llm.forward instead of materialising a body that large. Outside an
--- openai-channel turn it returns an error naming the limitation.
-openai = {}
-function openai.request()
-  return op({ type = "openai.request" })
-end
+  function goToolsList() {
+    return callOp({ type: "tools.list" });
+  }
+  function goToolsRun(name, args, opts) {
+    const req = { type: "tools.run", tool: name, args: args || {} };
+    if (opts && opts.confirmed) {
+      req.confirmed = true;
+      req.confirm_id = opts.confirm_id;
+    }
+    return callOp(req);
+  }
 
--- llm.embed(inputs, opts) -> { vectors = { {..}, .. }, usage = { input = n } }
--- inputs may be a single string, an array of strings, or a mixed array of
--- strings and part tables ({type="image", handle="media:...", url=...}) for
--- multimodal embeddings (Jina jina-embeddings-v5-omni-*: text+image+video+
--- audio+pdf in one vector space). Strings normalize to text parts.
--- opts: model, task (retrieval.query | retrieval.passage | text-matching |
--- clustering | classification), dimensions (Matryoshka truncation),
--- merged = true (fold all inputs into ONE embedding).
--- Text-only batches serialize as plain strings on the wire — vanilla
--- OpenAI/Ollama/vLLM endpoints see the exact historical request.
-function llm.embed(inputs, opts)
-  local arr = type(inputs) == "table" and inputs or { inputs }
-  local parts = {}
-  for _, item in ipairs(arr) do
-    if type(item) == "string" then
-      table.insert(parts, { type = "text", text = item })
-    elseif type(item) == "table" then
-      table.insert(parts, item)
-    end
-  end
-  return op(with_opts({ type = "llm.embed", inputs = parts }, opts))
-end
+  const scriptTools = Object.create(null);
 
--- llm.rerank(query, documents, opts) -> { results = { { index = i, score = s }, .. } }
--- index is 0-based into documents. opts.model names a provider="rerank"
--- models: entry; opts.top_n trims the ranked list.
-function llm.rerank(query, documents, opts)
-  return op(with_opts({ type = "llm.rerank", text = query, documents = documents }, opts))
-end
+  global.tool = {
+    def: function(spec) {
+      if (!spec || typeof spec !== "object" || Array.isArray(spec)) {
+        throw new TypeError("tool.def: spec must be an object");
+      }
+      if (typeof spec.name !== "string" || spec.name.length === 0) {
+        throw new TypeError("tool.def: spec.name must be a non-empty string");
+      }
+      if (typeof spec.handler !== "function") {
+        throw new TypeError("tool.def: spec.handler must be a function");
+      }
+      if (spec.params !== undefined && spec.params !== null && (typeof spec.params !== "object" || Array.isArray(spec.params))) {
+        throw new TypeError("tool.def: spec.params must be a JSON-schema object");
+      }
+      scriptTools[spec.name] = spec;
+    },
+  };
 
--- llm.stream(msgs, opts) -> next_delta, close
---
---   local next_delta, close = llm.stream(msgs)
---   while true do
---     local d = next_delta()          -- nil when the provider is done
---     if d == nil then break end
---     ...
---   end
---   close()                           -- after an early break/return
---
--- Do NOT write a generic for over llm.stream(...). The iterator yields across the
--- native bridge, and Luau refuses that from the generic-for C boundary
--- ("attempt to yield across metamethod/C-call boundary"). Call next_delta
--- directly instead. The iterator closes the stream itself at done; an early
--- exit must call close(), or the stream stays open — holding its goroutine,
--- provider connection and cancel func — until the session's context ends.
--- The iterator returns text deltas only: it does not expose the terminal
--- frame's usage or tool_calls, so use llm.chat when you need those.
-function llm.stream(messages, opts)
-  local h = op(with_opts({ type = "llm.stream.open", messages = messages }, opts))
-  local done = false
-  local function close()
-    if done then return end
-    done = true
-    op({ type = "llm.stream.close", stream = h.id })
-  end
-  local function next_delta(...)
-    if select("#", ...) > 0 then
-      error("attempt to yield across a C-call boundary (call next_delta() in a while loop instead of generic for)", 2)
-    end
-    if done then return nil end
-    local r = op({ type = "llm.stream.next", stream = h.id })
-    if r.done then close(); return nil end
-    return r.delta
-  end
-  return next_delta, close
-end
+  function toolOverrideParams(params, ovparams) {
+    const base = params || { type: "object", properties: {} };
+    if (!ovparams) {
+      return base;
+    }
+    const out = Object.assign({}, base);
+    const props = Object.assign({}, base.properties || {});
+    const ovKeys = Object.keys(ovparams);
+    for (let i = 0; i < ovKeys.length; i++) {
+      const pname = ovKeys[i];
+      const po = ovparams[pname];
+      const declared = props[pname];
+      if (po && po.description && declared && typeof declared === "object") {
+        props[pname] = Object.assign({}, declared, { description: po.description });
+      }
+    }
+    out.properties = props;
+    return out;
+  }
 
-files = {}
--- User-scoped file store (cap: files). Scope is engine-resolved from the
--- turn's identity — a loop can never name another user's scope. Bytes never
--- cross the bridge: put takes utf-8 content or {data=base64, mime=...};
--- read returns the handle + metadata ({path, handle, size, mime, ts,
--- revision}), materialization is engine-side.
--- files.put(project, path, content|{data=...,mime=...}, {mime=...}?) -> {ok, entry}
-function files.put(project, path, content, opts)
-  opts = opts or {}
-  local req = { type = "files.put", project = project, path = path }
-  if type(content) == "table" then
-    req.data = content.data
-    req.handle = content.handle
-    req.mime = content.mime or opts.mime
-  else
-    req.content = content
-    req.mime = opts.mime
-  end
-  return op(req)
-end
--- files.read(project, path) -> {ok, entry}
-function files.read(project, path)
-  return op({ type = "files.read", project = project, path = path })
-end
--- files.list(project, prefix?) -> {ok, entries}
-function files.list(project, prefix)
-  return op({ type = "files.list", project = project, path = prefix or "" })
-end
--- files.projects() -> {ok, projects}: the project names in the caller's own
--- scope. Scope is engine-resolved, so a loop can only ever see its own; there
--- is no way to name someone else's.
-function files.projects()
-  return op({ type = "files.projects" })
-end
--- files.delete(project, path) -> {ok=true}
-function files.delete(project, path)
-  return op({ type = "files.delete", project = project, path = path })
-end
--- files.commit(project, {ref="main", message=...}?) -> {ok, commit}. A commit
--- snapshots the whole working tree (content-addressed: unchanged files are
--- shared) and moves the named ref; the parent chain is the history.
-function files.commit(project, opts)
-  opts = opts or {}
-  return op({ type = "files.commit", project = project, ref = opts.ref, commit_msg = opts.message })
-end
--- files.checkout(project, ref|commit_id) -> {ok, manifest={commit, files}}
-function files.checkout(project, ref)
-  return op({ type = "files.checkout", project = project, ref = ref })
-end
--- Per-session scratch space, TTL'd (files.scratch_ttl). Keyed by the calling
--- session — other sessions cannot see it.
-files.scratch = {}
-function files.scratch.put(name, content, opts)
-  opts = opts or {}
-  local req = { type = "files.scratch.put", path = name }
-  if type(content) == "table" then
-    req.data = content.data
-    req.handle = content.handle
-    req.mime = content.mime or opts.mime
-  else
-    req.content = content
-    req.mime = opts.mime
-  end
-  return op(req)
-end
-function files.scratch.read(name)
-  return op({ type = "files.scratch.read", path = name })
-end
-function files.scratch.list()
-  return op({ type = "files.scratch.list" })
-end
+  function toolDeclared(names) {
+    const res = callOp({ type: "tools.declared", tool_names: names }) || {};
+    return [res.visible || {}, res.overrides || {}];
+  }
+
+  global.tools = {
+    list: function() {
+      const names = Object.keys(scriptTools);
+      let visible = {};
+      let overrides = {};
+      if (names.length > 0) {
+        const pair = toolDeclared(names);
+        visible = pair[0];
+        overrides = pair[1];
+      }
+
+      const out = [];
+      const nativeList = goToolsList() || [];
+      for (let i = 0; i < nativeList.length; i++) {
+        const def = nativeList[i];
+        const f = def && def["function"];
+        if (!(f && visible[f.name])) {
+          out.push(def);
+        }
+      }
+      for (let i = 0; i < names.length; i++) {
+        const name = names[i];
+        if (visible[name]) {
+          const spec = scriptTools[name];
+          const ov = overrides[name];
+          out.push({
+            type: "function",
+            "function": {
+              name: name,
+              description: (ov && ov.description) || spec.description || "",
+              parameters: toolOverrideParams(spec.params, ov && ov.params),
+            },
+          });
+        }
+      }
+      return out;
+    },
+    run: function(name, args, opts) {
+      const spec = scriptTools[name];
+      if (!spec) {
+        return goToolsRun(name, args, opts);
+      }
+      const pair = toolDeclared([name]);
+      const visible = pair[0];
+      if (!visible[name]) {
+        return goToolsRun(name, args, opts);
+      }
+      try {
+        const res = spec.handler(args || {});
+        if (res === undefined || res === null) {
+          return { ok: true, tool: name };
+        }
+        return res;
+      } catch (err) {
+        return {
+          ok: false,
+          tool: name,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+    },
+  };
+
+  function shellJob(kind, command, opts) {
+    opts = opts || {};
+    return callOp({
+      type: kind,
+      cmd: command,
+      project: opts.project,
+      environment: opts.environment,
+      workdir: opts.workdir,
+      env: opts.env,
+      timeout: opts.timeout,
+    });
+  }
+
+  global.shell = {
+    spawn: function(opts) {
+      opts = opts || {};
+      return callOp({
+        type: "shell.spawn",
+        image: opts.image,
+        workdir: opts.workdir,
+        env: opts.env,
+        network: opts.network,
+        mem_limit: opts.mem_limit,
+        cpu_limit: opts.cpu_limit,
+        provider: opts.provider,
+        host: opts.host,
+        user: opts.user,
+        password: opts.password,
+        key_file: opts.key_file,
+        volumes: opts.volumes,
+        project: opts.project,
+        ref: opts.ref,
+        scratch_mount: opts.scratch_mount,
+        shell_opts: opts.shell_opts,
+        environment: opts.environment,
+      });
+    },
+    exec: function(handle_id, command, opts) {
+      opts = opts || {};
+      return callOp({ type: "shell.exec", shell_handle: handle_id, cmd: command, timeout: opts.timeout });
+    },
+    run: function(command, opts) { return shellJob("shell.run", command, opts); },
+    start: function(command, opts) { return shellJob("shell.start", command, opts); },
+    status: function(job_id) { return callOp({ type: "shell.status", job_id: job_id }); },
+    cancel: function(job_id) { return callOp({ type: "shell.cancel", job_id: job_id }); },
+    write: function(handle_id, filepath, content) {
+      return callOp({ type: "shell.write", shell_handle: handle_id, path: filepath, content: content });
+    },
+    destroy: function(handle_id) {
+      return callOp({ type: "shell.destroy", shell_handle: handle_id });
+    },
+  };
+
+  const httpNS = {
+    request: function(opts) {
+      opts = opts || {};
+      return callOp({
+        type: "http.request",
+        method: opts.method || "GET",
+        url: opts.url,
+        headers: opts.headers,
+        body: opts.body,
+        query_params: opts.query,
+        json: opts.json,
+        timeout: opts.timeout,
+        auth: opts.auth,
+        save_to: opts.save_to,
+      });
+    },
+    get: function(url, opts) {
+      return httpNS.request(Object.assign({}, opts || {}, { method: "GET", url: url }));
+    },
+    post: function(url, body, opts) {
+      return httpNS.request(Object.assign({}, opts || {}, { method: "POST", url: url, body: body }));
+    },
+  };
+  global.http = httpNS;
+
+  const WDAY = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  const MONTH = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+  ];
+
+  function dateFields(t) {
+    const d = new Date(Math.trunc(t) * 1000);
+    const year = d.getUTCFullYear();
+    const month = d.getUTCMonth() + 1;
+    const day = d.getUTCDate();
+    const hour = d.getUTCHours();
+    const min = d.getUTCMinutes();
+    const sec = d.getUTCSeconds();
+    const dow = d.getUTCDay();
+    const jan1 = Date.UTC(year, 0, 1);
+    const cur = Date.UTC(year, month - 1, day);
+    const yday = Math.floor((cur - jan1) / 86400000) + 1;
+    return {
+      year: year,
+      month: month,
+      day: day,
+      hour: hour,
+      min: min,
+      sec: sec,
+      wday: dow + 1,
+      yday: yday,
+      isdst: false,
+    };
+  }
+
+  function pad2(n) { return (n < 10 ? "0" : "") + n; }
+  function pad3(n) { return (n < 10 ? "00" : n < 100 ? "0" : "") + n; }
+  function pad4(n) {
+    const s = String(n);
+    if (s.length >= 4) return s;
+    return ("0000" + s).slice(-4);
+  }
+
+  function strftime(f, t) {
+    const dt = dateFields(t);
+    return f.replace(/%([a-zA-Z%])/g, function(_, c) {
+      if (c === "Y") return pad4(dt.year);
+      if (c === "y") return pad2(dt.year % 100);
+      if (c === "m") return pad2(dt.month);
+      if (c === "d") return pad2(dt.day);
+      if (c === "e") return (dt.day < 10 ? " " : "") + dt.day;
+      if (c === "H") return pad2(dt.hour);
+      if (c === "I") return pad2(((dt.hour + 11) % 12) + 1);
+      if (c === "M") return pad2(dt.min);
+      if (c === "S") return pad2(dt.sec);
+      if (c === "p") return dt.hour < 12 ? "AM" : "PM";
+      if (c === "A") return WDAY[dt.wday - 1];
+      if (c === "a") return WDAY[dt.wday - 1].slice(0, 3);
+      if (c === "B") return MONTH[dt.month - 1];
+      if (c === "b") return MONTH[dt.month - 1].slice(0, 3);
+      if (c === "j") return pad3(dt.yday);
+      if (c === "w") return String(dt.wday - 1);
+      if (c === "u") return String(dt.wday === 1 ? 7 : dt.wday - 1);
+      if (c === "Z") return "UTC";
+      if (c === "%") return "%";
+      return "%" + c;
+    });
+  }
+
+  global.os = {
+    env: function(name) { return callOp({ type: "os.env", name: name }); },
+    time: function() {
+      if (arguments.length > 0) {
+        throw new Error("os.time: takes no arguments (UTC Unix seconds)");
+      }
+      return __af_now();
+    },
+    date: function(format, t) {
+      if (typeof format === "number" && t === undefined) {
+        t = format;
+        format = undefined;
+      }
+      if (t === undefined || t === null) {
+        t = __af_now();
+      }
+      if (typeof t !== "number" || Number.isNaN(t)) {
+        throw new TypeError("os.date: time must be a number (Unix seconds)");
+      }
+      if (format === undefined || format === null || format === "" || format === "*t" || format === "!*t") {
+        return dateFields(t);
+      }
+      if (typeof format !== "string") {
+        throw new TypeError("os.date: format must be a string");
+      }
+      if (format.charAt(0) === "!") format = format.slice(1);
+      if (format === "*t") return dateFields(t);
+      return strftime(format, t);
+    },
+  };
+
+  global.runtime = {
+    triggers: function() { return callOp({ type: "runtime.triggers" }); },
+  };
+
+  global.credential = {
+    get: function(name) { return callOp({ type: "credential.get", cred_name: name }); },
+  };
+
+  global.mail = {
+    imap_fetch: function(opts) {
+      opts = opts || {};
+      return callOp({
+        type: "mail.imap.fetch",
+        mail_host: opts.host,
+        mail_port: opts.port,
+        mail_user: opts.user,
+        mailbox: opts.mailbox,
+        unseen: opts.unseen,
+        limit: opts.limit,
+        auth: opts.auth,
+      });
+    },
+    smtp_send: function(opts) {
+      opts = opts || {};
+      return callOp({
+        type: "mail.smtp.send",
+        mail_host: opts.host,
+        mail_port: opts.port,
+        mail_user: opts.user,
+        mail_from: opts.from,
+        mail_to: opts.to,
+        subject: opts.subject,
+        text_body: opts.text_body !== undefined && opts.text_body !== null ? opts.text_body : opts.body,
+        auth: opts.auth,
+      });
+    },
+  };
+
+  function normToolChoice(v) {
+    if (v && typeof v === "object") {
+      const name = v.name || (v["function"] && v["function"].name);
+      if (typeof name === "string" && name !== "") {
+        return "function:" + name;
+      }
+      throw new TypeError('tool_choice: an object must name a function, e.g. { name: "lookup" }');
+    }
+    return v;
+  }
+
+  function normStop(v) {
+    if (typeof v === "string") return [v];
+    if (Array.isArray(v) && v.length === 0) return undefined;
+    return v;
+  }
+
+  function withOpts(req, opts) {
+    if (opts && typeof opts === "object") {
+      const keys = Object.keys(opts);
+      for (let i = 0; i < keys.length; i++) {
+        req[keys[i]] = opts[keys[i]];
+      }
+    }
+    req.tool_choice = normToolChoice(req.tool_choice);
+    req.stop = normStop(req.stop);
+    return req;
+  }
+
+  global.llm = {
+    chat: function(messages, opts) {
+      return callOp(withOpts({ type: "llm.chat", messages: messages }, opts));
+    },
+    forward: function(opts) {
+      const req = { type: "llm.forward" };
+      if (opts) {
+        req.model = opts.model;
+        req.messages = opts.messages;
+        req.prepend = opts.prepend;
+        req.append = opts.append;
+        req.tools = opts.tools;
+        req.max_tokens_cap = opts.max_tokens_cap;
+        const p = opts.params || {};
+        req.temperature = p.temperature;
+        req.max_tokens = p.max_tokens;
+        req.top_p = p.top_p;
+        req.stop = normStop(p.stop);
+        req.seed = p.seed;
+        req.response_format = p.response_format;
+        req.parallel_tool_calls = p.parallel_tool_calls;
+        req.tool_choice = normToolChoice(p.tool_choice);
+        req.thinking = p.thinking;
+      }
+      return callOp(req);
+    },
+    embed: function(inputs, opts) {
+      const arr = Array.isArray(inputs) ? inputs : [inputs];
+      const parts = [];
+      for (let i = 0; i < arr.length; i++) {
+        const item = arr[i];
+        if (typeof item === "string") {
+          parts.push({ type: "text", text: item });
+        } else if (item && typeof item === "object") {
+          parts.push(item);
+        }
+      }
+      return callOp(withOpts({ type: "llm.embed", inputs: parts }, opts));
+    },
+    rerank: function(query, documents, opts) {
+      return callOp(withOpts({ type: "llm.rerank", text: query, documents: documents }, opts));
+    },
+    stream: function(messages, opts) {
+      const h = callOp(withOpts({ type: "llm.stream.open", messages: messages }, opts));
+      let done = false;
+      function close() {
+        if (done) return;
+        done = true;
+        callOp({ type: "llm.stream.close", stream: h.id });
+      }
+      const iter = {
+        close: close,
+        next: function() {
+          if (done) return { value: undefined, done: true };
+          const r = callOp({ type: "llm.stream.next", stream: h.id });
+          if (r && r.done) {
+            close();
+            return { value: undefined, done: true };
+          }
+          return { value: r && r.delta, done: false };
+        },
+        return: function() {
+          close();
+          return { value: undefined, done: true };
+        },
+      };
+      iter[Symbol.iterator] = function() { return iter; };
+      return iter;
+    },
+  };
+
+  global.openai = {
+    request: function() { return callOp({ type: "openai.request" }); },
+  };
+
+  global.files = {
+    put: function(project, path, content, opts) {
+      opts = opts || {};
+      const req = { type: "files.put", project: project, path: path };
+      if (content && typeof content === "object") {
+        req.data = content.data;
+        req.handle = content.handle;
+        req.mime = content.mime || opts.mime;
+      } else {
+        req.content = content;
+        req.mime = opts.mime;
+      }
+      return callOp(req);
+    },
+    read: function(project, path) {
+      return callOp({ type: "files.read", project: project, path: path });
+    },
+    list: function(project, prefix) {
+      return callOp({ type: "files.list", project: project, path: prefix || "" });
+    },
+    projects: function() {
+      return callOp({ type: "files.projects" });
+    },
+    delete: function(project, path) {
+      return callOp({ type: "files.delete", project: project, path: path });
+    },
+    commit: function(project, opts) {
+      opts = opts || {};
+      return callOp({ type: "files.commit", project: project, ref: opts.ref, commit_msg: opts.message });
+    },
+    checkout: function(project, ref) {
+      return callOp({ type: "files.checkout", project: project, ref: ref });
+    },
+    scratch: {
+      put: function(name, content, opts) {
+        opts = opts || {};
+        const req = { type: "files.scratch.put", path: name };
+        if (content && typeof content === "object") {
+          req.data = content.data;
+          req.handle = content.handle;
+          req.mime = content.mime || opts.mime;
+        } else {
+          req.content = content;
+          req.mime = opts.mime;
+        }
+        return callOp(req);
+      },
+      read: function(name) {
+        return callOp({ type: "files.scratch.read", path: name });
+      },
+      list: function() {
+        return callOp({ type: "files.scratch.list" });
+      },
+    },
+  };
+
+  // External APIs (api.list, api.call, api.batch + api.<pkg>.<action>(args) proxy)
+  const apiBase = Object.freeze({
+    list: function() {
+      return callOp({ type: "api.list" });
+    },
+    call: function(pkg, action, args) {
+      return callOp({
+        type: "api.call",
+        api: String(pkg),
+        action: String(action),
+        args: args || {},
+      });
+    },
+    batch: function(calls) {
+      const list = Array.isArray(calls) ? calls : [];
+      const norm = [];
+      for (let i = 0; i < list.length; i++) {
+        const c = list[i] || {};
+        norm.push({
+          api: String(c.api || ""),
+          action: String(c.action || ""),
+          args: c.args || {},
+        });
+      }
+      return callOp({ type: "api.batch", calls: norm });
+    },
+  });
+
+  global.api = new Proxy(apiBase, {
+    get: function(target, prop, receiver) {
+      if (typeof prop === "symbol" || Object.prototype.hasOwnProperty.call(target, prop)) {
+        return Reflect.get(target, prop, receiver);
+      }
+      if (prop === "then" || prop === "toJSON") {
+        return undefined;
+      }
+      const pkg = String(prop);
+      return new Proxy({}, {
+        get: function(_t, action) {
+          if (typeof action === "symbol" || action === "then" || action === "toJSON") {
+            return undefined;
+          }
+          const act = String(action);
+          return function(args) {
+            return apiBase.call(pkg, act, args);
+          };
+        },
+        set: function() {
+          throw new TypeError("api." + pkg + " is read-only");
+        },
+        defineProperty: function() {
+          throw new TypeError("api." + pkg + " is read-only");
+        },
+        deleteProperty: function() {
+          throw new TypeError("api." + pkg + " is read-only");
+        },
+      });
+    },
+    set: function() {
+      throw new TypeError("api is read-only");
+    },
+    defineProperty: function() {
+      throw new TypeError("api is read-only");
+    },
+    deleteProperty: function() {
+      throw new TypeError("api is read-only");
+    },
+  });
+})(globalThis);
 `
 
-// LoadBase installs the json library and the prelude into the state.
+// LoadBase installs the TypeScript/JS prelude into the state.
 func (s *State) LoadBase() error {
-	if err := s.Eval("@json", jsonLib); err != nil {
-		return err
-	}
 	return s.Eval("@prelude", prelude)
 }

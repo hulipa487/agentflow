@@ -20,12 +20,29 @@ import (
 
 // ErrPluginConflict means a plugin or package file changed on disk since the
 // caller read it.
-var ErrPluginConflict = errors.New("the Lua file changed on disk since it was read; reload before saving")
+var ErrPluginConflict = errors.New("the script file changed on disk since it was read; reload before saving")
 
 var (
 	pluginPackageNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
-	pluginFileNameRe    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.lua$`)
+	pluginFileNameRe    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.(?:ts|js)$`)
 )
+
+func isPluginScriptFile(name string) bool {
+	if strings.HasSuffix(name, ".d.ts") {
+		return false
+	}
+	return strings.HasSuffix(name, ".ts") || strings.HasSuffix(name, ".js")
+}
+
+func resolveBuiltinShadowPath(pluginDir, name string) (string, bool) {
+	for _, ext := range []string{".ts", ".js"} {
+		candidate := filepath.Join(pluginDir, name+ext)
+		if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+			return candidate, true
+		}
+	}
+	return filepath.Join(pluginDir, name+".ts"), false
+}
 
 // builtinSummaries describes each runtime builtin surfaced in Studio.
 var builtinSummaries = map[string]string{
@@ -262,16 +279,18 @@ func (p *Plugins) listLocked() (PluginsList, error) {
 			BuiltinSource: builtinSrc,
 		}
 		if sec.pluginDirConfigured && sec.pluginDir != "" {
-			candidate := filepath.Join(sec.pluginDir, name+".lua")
-			if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
-				b, err := os.ReadFile(candidate)
-				if err != nil {
-					return PluginsList{}, fmt.Errorf("read %s: %w", candidate, err)
+			if candidate, exists := resolveBuiltinShadowPath(sec.pluginDir, name); exists {
+				st, err := os.Stat(candidate)
+				if err == nil && !st.IsDir() {
+					b, err := os.ReadFile(candidate)
+					if err != nil {
+						return PluginsList{}, fmt.Errorf("read %s: %w", candidate, err)
+					}
+					view.Shadowed = true
+					view.Path = candidate
+					view.MTime = st.ModTime().UnixNano()
+					view.Source = string(b)
 				}
-				view.Shadowed = true
-				view.Path = candidate
-				view.MTime = st.ModTime().UnixNano()
-				view.Source = string(b)
 			}
 		}
 		builtins = append(builtins, view)
@@ -324,7 +343,7 @@ func readPackageFiles(dir string) ([]PackageFileView, error) {
 	}
 	var names []string
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".lua") {
+		if !e.IsDir() && isPluginScriptFile(e.Name()) {
 			names = append(names, e.Name())
 		}
 	}
@@ -350,7 +369,7 @@ func readPackageFiles(dir string) ([]PackageFileView, error) {
 	return files, nil
 }
 
-// Validate checks metadata and Lua compilation for a builtin override or a
+// Validate checks metadata and script compilation for a builtin override or a
 // shared package file without touching disk.
 func (p *Plugins) Validate(kind, name, file, source string) []string {
 	var errs []string
@@ -368,9 +387,9 @@ func (p *Plugins) Validate(kind, name, file, source string) []string {
 			errs = append(errs, "package name must be 1-64 characters of letters, digits, ., _ or -")
 		}
 		if file == "" {
-			file = "init.lua"
+			file = "init.ts"
 		}
-		if err := checkLuaFilename(file); err != nil {
+		if err := checkScriptFilename(file); err != nil {
 			errs = append(errs, err.Error())
 		}
 		if err := luacode.CheckSource("package:"+name+"/"+file, source, name); err != nil {
@@ -394,7 +413,7 @@ func (p *Plugins) SaveBuiltin(name, source string, expectMTime int64) (PluginsLi
 	if _, ok := luacode.BuiltinSource(name); !ok {
 		return PluginsList{}, fmt.Errorf("unknown built-in plugin %q", name)
 	}
-	if err := luacode.CheckSource(name+".lua", source, ""); err != nil {
+	if err := luacode.CheckSource(name+".ts", source, ""); err != nil {
 		return PluginsList{}, err
 	}
 
@@ -420,12 +439,20 @@ func (p *Plugins) SaveBuiltin(name, source string, expectMTime int64) (PluginsLi
 		luacode.SetPluginDir(pluginDir)
 	}
 
-	target := filepath.Join(pluginDir, name+".lua")
-	if err := checkFileMTime(target, expectMTime); err != nil {
+	target := filepath.Join(pluginDir, name+".ts")
+	existingPath, existed := resolveBuiltinShadowPath(pluginDir, name)
+	mtimeTarget := target
+	if existed {
+		mtimeTarget = existingPath
+	}
+	if err := checkFileMTime(mtimeTarget, expectMTime); err != nil {
 		return PluginsList{}, err
 	}
 	if err := writeAtomic(target, []byte(normalizeLF(source))); err != nil {
 		return PluginsList{}, err
+	}
+	if existed && existingPath != target {
+		_ = os.Remove(existingPath)
 	}
 	p.triggerBuiltinReload(name)
 	return p.listLocked()
@@ -446,8 +473,8 @@ func (p *Plugins) ResetBuiltin(name string, expectMTime int64) (PluginsList, err
 	if !sec.pluginDirConfigured || sec.pluginDir == "" {
 		return p.listLocked()
 	}
-	target := filepath.Join(sec.pluginDir, name+".lua")
-	if _, err := os.Stat(target); errors.Is(err, os.ErrNotExist) {
+	target, existed := resolveBuiltinShadowPath(sec.pluginDir, name)
+	if !existed {
 		return p.listLocked()
 	}
 	if err := checkFileMTime(target, expectMTime); err != nil {
@@ -462,7 +489,7 @@ func (p *Plugins) ResetBuiltin(name string, expectMTime int64) (PluginsList, err
 }
 
 // CreatePackage creates a managed package directory under `<base>/packages/<name>`
-// with an initial `.lua` file, registers it under `packages:` in config, and
+// with an initial `.ts` file, registers it under `packages:` in config, and
 // refreshes live packages.
 func (p *Plugins) CreatePackage(name, file, source string) (PluginsList, error) {
 	p.mu.Lock()
@@ -474,13 +501,13 @@ func (p *Plugins) CreatePackage(name, file, source string) (PluginsList, error) 
 		return PluginsList{}, errors.New("package name must be 1-64 characters of letters, digits, ., _ or -")
 	}
 	if file == "" {
-		file = "init.lua"
+		file = "init.ts"
 	}
-	if err := checkLuaFilename(file); err != nil {
+	if err := checkScriptFilename(file); err != nil {
 		return PluginsList{}, err
 	}
 	if strings.TrimSpace(source) == "" {
-		source = fmt.Sprintf("-- af-prelude-version: %d\n-- Shared Lua package: %s\n\nlocal M = {}\n\nreturn M\n", vm.PreludeVersion, name)
+		source = fmt.Sprintf("// af-prelude-version: %d\n// Shared TypeScript package: %s\n\nexport const packageName = %q;\n", vm.PreludeVersion, name, name)
 	}
 	if err := luacode.CheckSource("package:"+name+"/"+file, source, name); err != nil {
 		return PluginsList{}, err
@@ -519,7 +546,7 @@ func (p *Plugins) CreatePackage(name, file, source string) (PluginsList, error) 
 	return p.listLocked()
 }
 
-// SavePackageFile creates or updates one `.lua` file inside an existing
+// SavePackageFile creates or updates one `.ts`/`.js` file inside an existing
 // package directory, checks syntax/prelude version, and reloads sessions.
 func (p *Plugins) SavePackageFile(pkgName, fileName, source string, expectMTime int64) (PluginsList, error) {
 	p.mu.Lock()
@@ -527,7 +554,7 @@ func (p *Plugins) SavePackageFile(pkgName, fileName, source string, expectMTime 
 	if p.sourcePath() == "" {
 		return PluginsList{}, errors.New("this instance has no editable config source")
 	}
-	if err := checkLuaFilename(fileName); err != nil {
+	if err := checkScriptFilename(fileName); err != nil {
 		return PluginsList{}, err
 	}
 	sec, err := p.readSections()
@@ -558,12 +585,12 @@ func (p *Plugins) SavePackageFile(pkgName, fileName, source string, expectMTime 
 	return p.listLocked()
 }
 
-// DeletePackageFile removes one `.lua` file from a package directory while
-// keeping at least one `.lua` file intact so configured loops remain resolvable.
+// DeletePackageFile removes one script file from a package directory while
+// keeping at least one script file intact so configured loops remain resolvable.
 func (p *Plugins) DeletePackageFile(pkgName, fileName string, expectMTime int64) (PluginsList, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if err := checkLuaFilename(fileName); err != nil {
+	if err := checkScriptFilename(fileName); err != nil {
 		return PluginsList{}, err
 	}
 	sec, err := p.readSections()
@@ -590,7 +617,7 @@ func (p *Plugins) DeletePackageFile(pkgName, fileName string, expectMTime int64)
 		return PluginsList{}, os.ErrNotExist
 	}
 	if len(files) <= 1 {
-		return PluginsList{}, errors.New("cannot delete the only .lua file in a package; delete the package instead")
+		return PluginsList{}, errors.New("cannot delete the only script file in a package; delete the package instead")
 	}
 	if err := checkFileMTime(target, expectMTime); err != nil {
 		return PluginsList{}, err
@@ -689,9 +716,10 @@ func (p *Plugins) findPackageImporters(pkgName string, sec pluginSections) ([]st
 	if sec.pluginDirConfigured && sec.pluginDir != "" {
 		if entries, err := os.ReadDir(sec.pluginDir); err == nil {
 			for _, e := range entries {
-				if !e.IsDir() && strings.HasSuffix(e.Name(), ".lua") {
+				if !e.IsDir() && isPluginScriptFile(e.Name()) {
 					if refImportsPackage(filepath.Join(sec.pluginDir, e.Name()), pkgName) {
-						users = append(users, "plugin:"+strings.TrimSuffix(e.Name(), ".lua"))
+						baseName := strings.TrimSuffix(strings.TrimSuffix(e.Name(), ".ts"), ".js")
+						users = append(users, "plugin:"+baseName)
 					}
 				}
 			}
@@ -720,7 +748,7 @@ func refImportsPackage(path, pkgName string) bool {
 		}
 		for _, line := range strings.Split(string(b), "\n") {
 			trimmed := strings.TrimSpace(line)
-			if rest, ok := strings.CutPrefix(trimmed, "-- af-import:"); ok {
+			if rest, ok := strings.CutPrefix(trimmed, "// af-import:"); ok {
 				if strings.TrimSpace(rest) == pkgName {
 					return true
 				}
@@ -736,7 +764,7 @@ func refImportsPackage(path, pkgName string) bool {
 		return false
 	}
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".lua") {
+		if !e.IsDir() && isPluginScriptFile(e.Name()) {
 			if checkFile(filepath.Join(path, e.Name())) {
 				return true
 			}
@@ -815,12 +843,12 @@ func (p *Plugins) editConfigYAML(mutate func(root *yaml.Node) error) error {
 	return writeSystemYAML(p.configDir, path, out, p.log)
 }
 
-func checkLuaFilename(name string) error {
+func checkScriptFilename(name string) error {
 	if name == "" || name != filepath.Base(name) || strings.ContainsAny(name, `/\`) {
 		return fmt.Errorf("file name must be a plain filename without path separators")
 	}
-	if !pluginFileNameRe.MatchString(name) {
-		return fmt.Errorf("file name must be 1-64 characters of letters, digits, ., _ or - and end in .lua")
+	if strings.HasSuffix(name, ".d.ts") || !pluginFileNameRe.MatchString(name) {
+		return fmt.Errorf("file name must be 1-64 characters of letters, digits, ., _ or - and end in .ts or .js")
 	}
 	return nil
 }

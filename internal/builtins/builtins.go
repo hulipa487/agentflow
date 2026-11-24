@@ -25,19 +25,19 @@ import (
 	"agentflow/internal/luacode"
 )
 
-//go:embed lua/per_chat.lua
+//go:embed ts/per_chat.ts
 var perChat string
 
-//go:embed lua/token_budget.lua
+//go:embed ts/token_budget.ts
 var tokenBudget string
 
-//go:embed lua/routing_table.lua
+//go:embed ts/routing_table.ts
 var routingTable string
 
-//go:embed lua/recency.lua
+//go:embed ts/recency.ts
 var recency string
 
-//go:embed lua/semantic.lua
+//go:embed ts/semantic.ts
 var semantic string
 
 var sources = map[string]string{

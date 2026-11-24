@@ -21,7 +21,7 @@ import (
 // directive is the leading comment line every chunk has to declare. The loop
 // fixtures here are chunks: vm.State.Start refuses one that declares nothing,
 // so they go through this the way a shipped loop does.
-func directive() string { return fmt.Sprintf("-- af-prelude-version: %d\n", vm.PreludeVersion) }
+func directive() string { return fmt.Sprintf("// af-prelude-version: %d\n", vm.PreludeVersion) }
 
 // TestConfigDirEveryTriggerReachesItsAgent is the end-to-end check for engine
 // scheduling: a config-directory deployment whose triggers/tick.yaml declares
@@ -35,7 +35,7 @@ func TestConfigDirEveryTriggerReachesItsAgent(t *testing.T) {
 		"system.yaml": "version: \"1\"\ngateway:\n  listen: \":0\"\n",
 		"profiles/worker.yaml": `
 name: worker
-loop: worker.lua
+loop: worker.ts
 `,
 		"triggers/tick.yaml": `
 triggers:
@@ -72,16 +72,16 @@ triggers:
 			Info:         &session.Info{Name: "worker", HistoryBudget: 100},
 			Capabilities: map[string]bool{},
 			Handlers:     map[string]session.OpHandler{},
-			LoopSrc: directive() + `function loop()
-  while true do
-    local msg = session.inbox()
-    log.info("GOT type=" .. tostring(msg.type)
-      .. " id=" .. tostring(msg.id)
-      .. " from=" .. tostring(msg.from)
-      .. " topic=" .. tostring(msg.payload.topic)
-      .. " n=" .. tostring(msg.payload.n))
-  end
-end`,
+			LoopSrc: directive() + `function loop() {
+  while (true) {
+    const msg = session.inbox();
+    log.info("GOT type=" + String(msg.type)
+      + " id=" + String(msg.id)
+      + " from=" + String(msg.from)
+      + " topic=" + String(msg.payload.topic)
+      + " n=" + String(msg.payload.n));
+  }
+}`,
 		},
 	}
 	sup := supervisor.New(defs, gateway.NewRegistry(log), pool.New(1), nil, log)
@@ -142,7 +142,7 @@ loop: plugin:per_chat
 		"profiles/pm.yaml": `
 name: pm
 spawn: true
-loop: pm.lua
+loop: pm.ts
 `,
 		"triggers/digest.yaml": `
 triggers:
@@ -179,13 +179,13 @@ triggers:
 			Info:         &session.Info{Name: "spawn:pm", HistoryBudget: 100},
 			Capabilities: map[string]bool{},
 			Handlers:     map[string]session.OpHandler{},
-			LoopSrc: directive() + `function loop()
-  while true do
-    local msg = session.inbox()
-    log.info("CHILD type=" .. tostring(msg.type) .. " id=" .. tostring(msg.id)
-      .. " kind=" .. tostring(msg.payload.kind))
-  end
-end`,
+			LoopSrc: directive() + `function loop() {
+  while (true) {
+    const msg = session.inbox();
+    log.info("CHILD type=" + String(msg.type) + " id=" + String(msg.id)
+      + " kind=" + String(msg.payload.kind));
+  }
+}`,
 		},
 	}
 	sup := supervisor.New(defs, gateway.NewRegistry(log), pool.New(1), nil, log)

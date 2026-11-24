@@ -161,122 +161,115 @@ func runToolDefLoop(t *testing.T, loopSrc string) string {
 // helper that looks a tool up in tools.list() and returns its description and
 // one param description as "desc|paramdesc".
 const describeToolLua = `
-local function describe(name, param)
-  for _, d in ipairs(tools.list()) do
-    local f = d["function"]
-    if f and f.name == name then
-      local pd = ""
-      if param and f.parameters and f.parameters.properties and f.parameters.properties[param] then
-        pd = f.parameters.properties[param].description or ""
-      end
-      return (f.description or "") .. "|" .. pd
-    end
-  end
-  return "absent|"
-end
+function describe(name, param) {
+  for (const d of tools.list()) {
+    const f = d["function"];
+    if (f && f.name === name) {
+      let pd = "";
+      if (param && f.parameters && f.parameters.properties && f.parameters.properties[param]) {
+        pd = f.parameters.properties[param].description || "";
+      }
+      return (f.description || "") + "|" + pd;
+    }
+  }
+  return "absent|";
+}
 `
 
-// TestToolDefDeclaredToolListedAndRuns: a Luau chunk calling tool.def sees its
-// tool in tools.list (OpenAI function shape, next to the Go tools) and
-// tools.run dispatches to the Lua handler; unregistered names still fall
-// through to the Go registry.
 func TestToolDefDeclaredToolListedAndRuns(t *testing.T) {
 	got := runToolDefLoop(t, `
 tool.def({
-  name = "lua:shout",
-  description = "Shout the text back",
-  params = { type = "object", properties = { text = { type = "string" } }, required = { "text" } },
-  handler = function(args)
-    return { ok = true, shouted = string.upper(args.text or "") }
-  end,
-})
+  name: "lua:shout",
+  description: "Shout the text back",
+  params: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
+  handler: function(args) {
+    return { ok: true, shouted: String(args.text || "").toUpperCase() };
+  },
+});
 
-function loop()
-  local msg = session.inbox()
-  local listed = false
-  local go_listed = false
-  for _, d in ipairs(tools.list()) do
-    local f = d["function"]
-    if f and f.name == "lua:shout" and f.description == "Shout the text back"
-       and f.parameters and f.parameters.required then
-      listed = true
-    end
-    if f and f.name == "builtin:echo" then
-      go_listed = true
-    end
-  end
-  if not listed then
-    session.send("err: lua tool not listed")
-    return
-  end
-  if not go_listed then
-    session.send("err: go tool dropped from list")
-    return
-  end
-  local res = tools.run("lua:shout", { text = "hi" })
-  if not (res and res.ok and res.shouted == "HI") then
-    session.send("err: lua handler result wrong")
-    return
-  end
-  local gres = tools.run("builtin:echo", { text = "ping" })
-  if not (gres and gres.ok and gres.echoed == "ping") then
-    session.send("err: go tool fallthrough broken")
-    return
-  end
-  session.send("done")
-end
+function loop() {
+  session.inbox();
+  let listed = false;
+  let go_listed = false;
+  for (const d of tools.list()) {
+    const f = d["function"];
+    if (f && f.name === "lua:shout" && f.description === "Shout the text back" &&
+        f.parameters && f.parameters.required) {
+      listed = true;
+    }
+    if (f && f.name === "builtin:echo") {
+      go_listed = true;
+    }
+  }
+  if (!listed) {
+    session.send("err: lua tool not listed");
+    return;
+  }
+  if (!go_listed) {
+    session.send("err: go tool dropped from list");
+    return;
+  }
+  const res = tools.run("lua:shout", { text: "hi" });
+  if (!(res && res.ok && res.shouted === "HI")) {
+    session.send("err: lua handler result wrong");
+    return;
+  }
+  const gres = tools.run("builtin:echo", { text: "ping" });
+  if (!(gres && gres.ok && gres.echoed === "ping")) {
+    session.send("err: go tool fallthrough broken");
+    return;
+  }
+  session.send("done");
+}
 `)
 	if got != "done" {
 		t.Fatalf("loop failed: %s", got)
 	}
 }
 
-// TestToolDefShadowsGoToolAndErrorPath: a declared name shadows a Go tool of
-// the same name (one list entry, Lua handler wins), and a handler error comes
-// back as an { ok = false, error = ... } result rather than killing the loop.
 func TestToolDefShadowsGoToolAndErrorPath(t *testing.T) {
 	got := runToolDefLoop(t, `
 tool.def({
-  name = "builtin:echo",
-  description = "Lua echo",
-  handler = function(args)
-    return { ok = true, echoed = "LUA:" .. (args.text or "") }
-  end,
-})
+  name: "builtin:echo",
+  description: "Lua echo",
+  handler: function(args) {
+    return { ok: true, echoed: "LUA:" + (args.text || "") };
+  },
+});
 tool.def({
-  name = "lua:boom",
-  handler = function(args)
-    error("kaboom")
-  end,
-})
+  name: "lua:boom",
+  handler: function(_args) {
+    throw new Error("kaboom");
+  },
+});
 
-function loop()
-  local msg = session.inbox()
-  local n = 0
-  local desc = nil
-  for _, d in ipairs(tools.list()) do
-    local f = d["function"]
-    if f and f.name == "builtin:echo" then
-      n = n + 1
-      desc = f.description
-    end
-  end
-  if n ~= 1 or desc ~= "Lua echo" then
-    session.send("err: shadowed tool listed " .. n .. " times")
-    return
-  end
-  local res = tools.run("builtin:echo", { text = "x" })
-  if not (res and res.ok and res.echoed == "LUA:x") then
-    session.send("err: shadow did not take over run")
-    return
-  end
-  local bad = tools.run("lua:boom", {})
-  if not (bad and bad.ok == false and bad.error and string.find(bad.error, "kaboom")) then
-    session.send("err: handler error not returned as result")
-    return
-  end
-  session.send("done")
-end
+function loop() {
+  session.inbox();
+  let n = 0;
+  let desc = null;
+  for (const d of tools.list()) {
+    const f = d["function"];
+    if (f && f.name === "builtin:echo") {
+      n++;
+      desc = f.description;
+    }
+  }
+  if (n !== 1 || desc !== "Lua echo") {
+    session.send("err: shadowed tool listed " + n + " times");
+    return;
+  }
+  const res = tools.run("builtin:echo", { text: "x" });
+  if (!(res && res.ok && res.echoed === "LUA:x")) {
+    session.send("err: shadow did not take over run");
+    return;
+  }
+  const bad = tools.run("lua:boom", {});
+  if (!(bad && bad.ok === false && bad.error && String(bad.error).includes("kaboom"))) {
+    session.send("err: handler error not returned as result");
+    return;
+  }
+  session.send("done");
+}
 `)
 	if got != "done" {
 		t.Fatalf("loop failed: %s", got)

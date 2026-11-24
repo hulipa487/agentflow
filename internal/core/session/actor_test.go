@@ -44,8 +44,8 @@ func (l *logBuf) String() string {
 // seeing it. The session is restarted the way the reload watcher restarts one.
 func TestSupportChunkEditThatGoesBadKeepsTheRunningVersion(t *testing.T) {
 	dir := t.TempDir()
-	file := filepath.Join(dir, "token_budget.lua")
-	if err := os.WriteFile(file, []byte(directive()+"SUPPORT_MARK = \"v1\"\n"), 0o600); err != nil {
+	file := filepath.Join(dir, "token_budget.ts")
+	if err := os.WriteFile(file, []byte(directive()+"var SUPPORT_MARK = \"v1\";\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	luacode.SetPluginDir(dir)
@@ -58,10 +58,10 @@ func TestSupportChunkEditThatGoesBadKeepsTheRunningVersion(t *testing.T) {
 		&Info{Name: "main", HistoryBudget: 100},
 		gw, nil, nil, nil, nil, map[string]OpHandler{}, pool.New(1),
 		slog.New(slog.NewTextHandler(logs, nil)))
-	a.LoopSrc = directive() + `function loop()
-  local _ = session.inbox()
-  session.send("mark:" .. tostring(SUPPORT_MARK))
-end`
+	a.LoopSrc = directive() + `function loop() {
+  session.inbox();
+  session.send("mark:" + String(SUPPORT_MARK));
+}`
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -82,7 +82,7 @@ end`
 
 	// The edit that breaks it: a chunk declaring no prelude version, which the
 	// gate refuses. The reload signal is what a watcher sends after an edit.
-	if err := os.WriteFile(file, []byte("SUPPORT_MARK = \"v2\"\n"), 0o600); err != nil {
+	if err := os.WriteFile(file, []byte("var SUPPORT_MARK = \"v2\";\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	a.Reload()

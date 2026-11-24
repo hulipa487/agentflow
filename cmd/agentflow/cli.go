@@ -789,16 +789,16 @@ channels.yaml and profiles/*.yaml instead. Either way, -config DIR loads it.`,
 	}
 	// The directive comes from vm.PreludeVersion so a version bump cannot leave
 	// init writing a loop that this same binary refuses to load.
-	loop := fmt.Sprintf("-- af-prelude-version: %d\n", vm.PreludeVersion) + `-- Echo loop: the smallest runnable agent. Replace it with your own behavior.
-function loop()
-  while true do
-    local msg = session.inbox()
-    session.send("echo: " .. (msg.text or ""))
-  end
-end
+	loop := fmt.Sprintf("// af-prelude-version: %d\n", vm.PreludeVersion) + `// Echo loop: the smallest runnable agent. Replace it with your own behavior.
+function loop(): void {
+  while (true) {
+    const msg = session.inbox();
+    session.send("echo: " + (msg.text || ""));
+  }
+}
 `
 	files := map[string]string{
-		filepath.Join(*dir, "loops", "echo.lua"): loop,
+		filepath.Join(*dir, "loops", "echo.ts"): loop,
 		filepath.Join(*dir, ".env.example"): `# Copy to .env (or export) before running.
 ADMIN_TOKEN=change-me
 # Required only when runtime.credentials.enabled is true.
@@ -821,9 +821,7 @@ gateway:
     path: /webhook/local/
 
   # OpenAI-compatible endpoint: point any Chat Completions client at
-  # http://<host>:8080/v1 with the key below. Uncomment and set the key. An
-  # exposed agent runs its own loop; see agentflow-studio/examples/loops/openai_passthrough.lua
-  # to make an agent answer as its model.
+  # http://<host>:8080/v1 with the key below. Uncomment and set the key.
   # - name: api
   #   type: openai
   #   path: /v1/
@@ -832,7 +830,7 @@ gateway:
   #   keys: ["${COMPAT_API_KEY}"]
 `
 		files[filepath.Join(*dir, "profiles", "echo.yaml")] = `name: echo
-loop: ./loops/echo.lua
+loop: ./loops/echo.ts
 `
 	} else {
 		files[filepath.Join(*dir, "agentflow.yaml")] = `version: "1"
@@ -849,9 +847,7 @@ gateway:
       path: /webhook/local/
 
     # OpenAI-compatible endpoint: point any Chat Completions client at
-    # http://<host>:8080/v1 with the key below. Uncomment and set the key. An
-    # exposed agent runs its own loop; see agentflow-studio/examples/loops/openai_passthrough.lua
-    # to make an agent answer as its model.
+    # http://<host>:8080/v1 with the key below. Uncomment and set the key.
     # - name: api
     #   type: openai
     #   path: /v1/
@@ -861,7 +857,7 @@ gateway:
 
 agents:
   echo:
-    loop: ./loops/echo.lua
+    loop: ./loops/echo.ts
 `
 	}
 	keys := sortedKeys(files)

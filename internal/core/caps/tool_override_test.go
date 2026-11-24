@@ -12,22 +12,21 @@ import (
 // required list.
 const toolDefText = `
 tool.def({
-  name = "lua:doc",
-  description = "literal description",
-  params = { type = "object", properties = {
-    text = { type = "string", description = "literal param" },
-    count = { type = "number" },
-  }, required = { "text" } },
-  handler = function(args) return { ok = true } end,
-})
+  name: "lua:doc",
+  description: "literal description",
+  params: { type: "object", properties: {
+    text: { type: "string", description: "literal param" },
+    count: { type: "number" },
+  }, required: ["text"] },
+  handler: function(_args) { return { ok: true }; },
+});
 `
 
-// oneShotLoopBody reports lua:doc's listed text once.
 const oneShotLoopBody = `
-function loop()
-  local msg = session.inbox()
-  session.send(describe("lua:doc", "text"))
-end
+function loop() {
+  session.inbox();
+  session.send(describe("lua:doc", "text"));
+}
 `
 
 // TestDeclaredToolKeepsLiteralTextWithoutOverride: a declared tool with no
@@ -79,59 +78,57 @@ func TestParamOverrideRefinesOneParamOfDeclaredTool(t *testing.T) {
 		}},
 	}, nil)
 	got := fx.runLoop(t, `
--- The loop keeps its own reference to the schema table it handed tool.def:
--- that table is reused on every turn, so an override must copy, never mutate.
-local docParams = { type = "object", properties = {
-  text = { type = "string", description = "literal param" },
-  count = { type = "number" },
-}, required = { "text" } }
+// The loop keeps its own reference to the schema table it handed tool.def:
+// that table is reused on every turn, so an override must copy, never mutate.
+const docParams = { type: "object", properties: {
+  text: { type: "string", description: "literal param" },
+  count: { type: "number" },
+}, required: ["text"] };
 tool.def({
-  name = "lua:doc",
-  description = "literal description",
-  params = docParams,
-  handler = function(args) return { ok = true } end,
-})
-function loop()
-  local msg = session.inbox()
-  for _, d in ipairs(tools.list()) do
-    local f = d["function"]
-    if f and f.name == "lua:doc" then
-      local props = f.parameters.properties
-      if not (props.text.description == "what to look up") then
-        session.send("err: param description not overridden: " .. json.encode(props))
-        return
-      end
-      if props.text.type ~= "string" or props.count.type ~= "number" then
-        session.send("err: schema clobbered: " .. json.encode(props))
-        return
-      end
-      if props.ghost ~= nil then
-        session.send("err: undeclared param was added")
-        return
-      end
-      if f.parameters.required[1] ~= "text" then
-        session.send("err: required clobbered")
-        return
-      end
-      -- The loop's own table must be untouched.
-      if docParams.properties.text.description ~= "literal param" then
-        session.send("err: the declared spec table was mutated in place")
-        return
-      end
-      -- And a second call must not drift.
-      for _, d2 in ipairs(tools.list()) do
-        local f2 = d2["function"]
-        if f2 and f2.name == "lua:doc" and f2.parameters.properties.text.description ~= "what to look up" then
-          session.send("err: second call disagreed")
-          return
-        end
-      end
-      session.send("ok")
-      return
-    end
-  end
-  session.send("err: tool absent")
-end
+  name: "lua:doc",
+  description: "literal description",
+  params: docParams,
+  handler: function(_args) { return { ok: true }; },
+});
+function loop() {
+  session.inbox();
+  for (const d of tools.list()) {
+    const f = d["function"];
+    if (f && f.name === "lua:doc") {
+      const props = f.parameters.properties;
+      if (props.text.description !== "what to look up") {
+        session.send("err: param description not overridden: " + json.encode(props));
+        return;
+      }
+      if (props.text.type !== "string" || props.count.type !== "number") {
+        session.send("err: schema clobbered: " + json.encode(props));
+        return;
+      }
+      if (props.ghost !== undefined) {
+        session.send("err: undeclared param was added");
+        return;
+      }
+      if (f.parameters.required[0] !== "text") {
+        session.send("err: required clobbered");
+        return;
+      }
+      if (docParams.properties.text.description !== "literal param") {
+        session.send("err: the declared spec table was mutated in place");
+        return;
+      }
+      for (const d2 of tools.list()) {
+        const f2 = d2["function"];
+        if (f2 && f2.name === "lua:doc" && f2.parameters.properties.text.description !== "what to look up") {
+          session.send("err: second call disagreed");
+          return;
+        }
+      }
+      session.send("ok");
+      return;
+    }
+  }
+  session.send("err: tool absent");
+}
 `)
 	if got != "ok" {
 		t.Fatalf("loop failed: %s", got)
@@ -147,12 +144,12 @@ func TestPromptEditChangesDeclaredToolTextNextCall(t *testing.T) {
 	}, map[string]string{"doc_prompt": "first text"})
 
 	gw, a := fx.start(t, describeToolLua+`
-function loop()
-  while true do
-    local msg = session.inbox()
-    session.send(describe("lua:doc", "text"))
-  end
-end
+function loop() {
+  while (true) {
+    session.inbox();
+    session.send(describe("lua:doc", "text"));
+  }
+}
 `+toolDefText)
 
 	if got := deliver(t, a, gw, 0, "m1"); got != "first text|literal param" {
@@ -177,32 +174,33 @@ func TestDeclaredShadowOfGoToolTakesTheOverride(t *testing.T) {
 	}, nil)
 	got := fx.runLoop(t, `
 tool.def({
-  name = "builtin:echo",
-  description = "lua echo",
-  handler = function(args) return { ok = true, echoed = "LUA:" .. (args.text or "") } end,
-})
-function loop()
-  local msg = session.inbox()
-  local n, desc = 0, nil
-  for _, d in ipairs(tools.list()) do
-    local f = d["function"]
-    if f and f.name == "builtin:echo" then n = n + 1; desc = f.description end
-  end
-  if n ~= 1 then
-    session.send("err: shadowed tool listed " .. n .. " times")
-    return
-  end
-  if desc ~= "overridden echo" then
-    session.send("err: override not applied to the winner: " .. tostring(desc))
-    return
-  end
-  local res = tools.run("builtin:echo", { text = "x" })
-  if not (res and res.ok and res.echoed == "LUA:x") then
-    session.send("err: shadow did not take over run")
-    return
-  end
-  session.send("done")
-end
+  name: "builtin:echo",
+  description: "lua echo",
+  handler: function(args) { return { ok: true, echoed: "LUA:" + (args.text || "") }; },
+});
+function loop() {
+  session.inbox();
+  let n = 0;
+  let desc = null;
+  for (const d of tools.list()) {
+    const f = d["function"];
+    if (f && f.name === "builtin:echo") { n++; desc = f.description; }
+  }
+  if (n !== 1) {
+    session.send("err: shadowed tool listed " + n + " times");
+    return;
+  }
+  if (desc !== "overridden echo") {
+    session.send("err: override not applied to the winner: " + String(desc));
+    return;
+  }
+  const res = tools.run("builtin:echo", { text: "x" });
+  if (!(res && res.ok && res.echoed === "LUA:x")) {
+    session.send("err: shadow did not take over run");
+    return;
+  }
+  session.send("done");
+}
 `)
 	if got != "done" {
 		t.Fatalf("loop failed: %s", got)
@@ -218,17 +216,17 @@ func TestOverrideNeverAddsAListEntry(t *testing.T) {
 		"lua:absent": {Description: &config.PromptString{Value: "should never appear"}},
 	}, nil)
 	got := fx.runLoop(t, describeToolLua+`
-function loop()
-  local msg = session.inbox()
-  for _, d in ipairs(tools.list()) do
-    local f = d["function"]
-    if f and f.name == "lua:absent" then
-      session.send("err: an override conjured a tool into the list")
-      return
-    end
-  end
-  session.send(describe("lua:doc", "text"))
-end
+function loop() {
+  session.inbox();
+  for (const d of tools.list()) {
+    const f = d["function"];
+    if (f && f.name === "lua:absent") {
+      session.send("err: an override conjured a tool into the list");
+      return;
+    }
+  }
+  session.send(describe("lua:doc", "text"));
+}
 `+toolDefText)
 	if got != "literal description|literal param" {
 		t.Fatalf("got %q; want the declared tool unchanged and no extra entry", got)

@@ -35,9 +35,11 @@ import (
 	"agentflow/internal/core/caps"
 	"agentflow/internal/core/chatreq"
 	"agentflow/internal/core/credentials"
+	"agentflow/internal/core/ext"
 	"agentflow/internal/core/files"
 	"agentflow/internal/core/fleet"
 	"agentflow/internal/core/gateway"
+	"agentflow/internal/core/hosthttp"
 	"agentflow/internal/core/identity"
 	"agentflow/internal/core/inbox"
 	"agentflow/internal/core/lease"
@@ -910,8 +912,19 @@ func main() {
 		}
 	}
 
+	// External APIs (Script/Goja & Wasm/wazero): share the core hosthttp
+	// NetGuard + Credential Proxy pipeline and optionally expose actions as tools.
+	hostHTTP := hosthttp.New(log, credStore, netPolicy)
+	extReg := ext.NewRegistry(ext.HostDeps{HTTP: hostHTTP, Log: log})
+	defer extReg.Close(context.Background())
+	if err := registerConfiguredAPIs(extReg, cfg.APIs, cfgSource.Dir); err != nil {
+		log.Error("external apis failed", "err", err)
+		os.Exit(1)
+	}
+	extReg.RegisterTools(toolReg)
+
 	// Bake config-level tool spec overrides (tools.policy.overrides) into the
-	// registry — after every Register* call (builtins, legal, shell, MCP) and
+	// registry — after every Register* call (builtins, legal, shell, MCP, APIs) and
 	// before any Expose. An override naming no registered tool is left for the
 	// Lua path (it may target a tool.def-declared tool, which does not exist
 	// until a chunk loads); a description referencing an unknown prompt key
@@ -1114,6 +1127,9 @@ func main() {
 		for k, h := range gateOps(enforce, name, effectiveCaps, "tools", caps.ToolHandlers(agentSet, toolWiring), &withheld) {
 			handlers[k] = h
 		}
+		for k, h := range gateOps(enforce, name, effectiveCaps, "apis", caps.APIHandlers(extReg), &withheld) {
+			handlers[k] = h
+		}
 		for k, h := range gateOps(enforce, name, effectiveCaps, "shell.exec", caps.ShellHandlers(shellFront, name, deliverJob), &withheld) {
 			handlers[k] = h
 		}
@@ -1288,6 +1304,9 @@ func main() {
 			handlers[k] = h
 		}
 		for k, h := range gateOps(enforce, pname, profileCaps, "tools", caps.ToolHandlers(agentSet, toolWiring), &withheld) {
+			handlers[k] = h
+		}
+		for k, h := range gateOps(enforce, pname, profileCaps, "apis", caps.APIHandlers(extReg), &withheld) {
 			handlers[k] = h
 		}
 		for k, h := range gateOps(enforce, pname, profileCaps, "shell.exec", caps.ShellHandlers(shellFront, pname, deliverJob), &withheld) {
@@ -2726,7 +2745,7 @@ func gateOps(enforce bool, agent string, granted map[string]bool, capability str
 // said which one a name belonged to.
 func loopHint(value string, toolNames, loopNames []string) string {
 	if slices.Contains(toolNames, value) {
-		return value + " is a tool name, not a loop — tools are listed under skills:, while loop: takes a plugin:<name> reference or a .lua path"
+		return value + " is a tool name, not a loop — tools are listed under skills:, while loop: takes a plugin:<name> reference or a .ts/.js path"
 	}
 	if name, ok := strings.CutPrefix(value, "builtin:"); ok && slices.Contains(loopNames, "plugin:"+name) {
 		return "loops are spelled plugin: now, not builtin: — write plugin:" + name
@@ -2877,16 +2896,16 @@ func resolveSafety(cfg *config.Config, ref string, classifiers map[string]*moder
 			filters = append(filters, safety.NewClassifierFilter(classifierOptions(cname, profile, client, agent)))
 			continue
 		}
-		if lname, ok := strings.CutPrefix(name, "lua:"); ok {
-			profile, exists := cfg.Safety.LuaFilters[lname]
+		if sname, ok := strings.CutPrefix(name, "script:"); ok {
+			profile, exists := cfg.Safety.ScriptFilters[sname]
 			if !exists {
-				return nil, fmt.Errorf("safety profile %q references lua filter %q, which is not configured", ref, lname)
+				return nil, fmt.Errorf("safety profile %q references script filter %q, which is not configured", ref, sname)
 			}
-			lf, err := safety.NewLuaFilter(luaFilterOptions(lname, profile))
+			sf, err := safety.NewScriptFilter(scriptFilterOptions(sname, profile))
 			if err != nil {
-				return nil, fmt.Errorf("safety profile %q lua filter %q: %w", ref, lname, err)
+				return nil, fmt.Errorf("safety profile %q script filter %q: %w", ref, sname, err)
 			}
-			filters = append(filters, lf)
+			filters = append(filters, sf)
 			continue
 		}
 		f, ok := safety.Builtin(name)
@@ -2938,7 +2957,7 @@ func classifierOptions(name string, p config.ClassifierProfile, client *moderati
 	}
 }
 
-func luaFilterOptions(name string, p config.LuaFilterProfile) safety.LuaFilterOptions {
+func scriptFilterOptions(name string, p config.ScriptFilterProfile) safety.ScriptFilterOptions {
 	ingress, egress := true, true
 	if len(p.Directions) > 0 {
 		ingress, egress = false, false
@@ -2951,7 +2970,7 @@ func luaFilterOptions(name string, p config.LuaFilterProfile) safety.LuaFilterOp
 			}
 		}
 	}
-	return safety.LuaFilterOptions{
+	return safety.ScriptFilterOptions{
 		Name:        name,
 		Source:      p.EffectiveSource(),
 		Ingress:     ingress,

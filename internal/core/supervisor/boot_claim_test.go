@@ -66,10 +66,10 @@ func TestDaemonBootsOnlyOnTheInstanceThatClaimsIt(t *testing.T) {
 					Info:       &session.Info{Name: "daemon", HistoryBudget: 100},
 					Handlers:   map[string]session.OpHandler{"probe.record": probeHandler(recorded)},
 					Persistent: true,
-					LoopSrc: directive() + `function loop()
-  local msg = session.inbox()
-  af.op({ type = "probe.record", text = msg.type })
-end`,
+					LoopSrc: directive() + `function loop() {
+  const msg = session.inbox();
+  af.op({ type: "probe.record", text: msg.type });
+}`,
 				},
 			}
 			ctx := context.Background()
@@ -127,10 +127,10 @@ func TestDaemonFailoverBootsAnUnownedDaemon(t *testing.T) {
 					Info:       &session.Info{Name: "daemon", HistoryBudget: 100},
 					Handlers:   map[string]session.OpHandler{"probe.record": probeHandler(recorded)},
 					Persistent: true,
-					LoopSrc: directive() + `function loop()
-  local msg = session.inbox()
-  af.op({ type = "probe.record", text = msg.type })
-end`,
+					LoopSrc: directive() + `function loop() {
+  const msg = session.inbox();
+  af.op({ type: "probe.record", text: msg.type });
+}`,
 				},
 			}
 			ctx := context.Background()

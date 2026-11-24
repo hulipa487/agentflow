@@ -55,7 +55,7 @@ func newStudioFixture(t *testing.T) *studioFixture {
 	if err := os.MkdirAll(filepath.Join(dir, "profiles"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "profiles", "base.yaml"), []byte("name: base\nloop: ./base.lua\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "profiles", "base.yaml"), []byte("name: base\nloop: ./base.ts\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	// A minimal runtime config for validation (ValidateAgent only needs the
@@ -110,7 +110,7 @@ func newStudioFixture(t *testing.T) *studioFixture {
 }
 
 func testLoopBody() string {
-	return fmt.Sprintf("-- af-prelude-version: %d\nfunction loop()\n  local m = session.inbox()\n  session.send(m.text)\nend\n", vm.PreludeVersion)
+	return fmt.Sprintf("// af-prelude-version: %d\nfunction loop() {\n  const m = session.inbox();\n  session.send(m.text);\n}\n", vm.PreludeVersion)
 }
 
 func TestStudioCatalogAndValidate(t *testing.T) {
@@ -122,7 +122,7 @@ func TestStudioCatalogAndValidate(t *testing.T) {
 
 	body := map[string]any{
 		"name":       "lab",
-		"agent_yaml": "loop: ./lab.lua\ncapabilities: [tools]\n",
+		"agent_yaml": "loop: ./lab.ts\ncapabilities: [tools]\n",
 		"loop":       testLoopBody(),
 	}
 	rec = do(t, f.ui.API(), "POST", "/admin/api/studio/agents/validate", body)
@@ -135,7 +135,7 @@ func TestStudioCatalogAndValidate(t *testing.T) {
 		t.Fatalf("valid agent rejected: %v", v.Errors)
 	}
 
-	body["loop"] = "function loop() end\n" // no prelude directive
+	body["loop"] = "function loop() {}\n" // no prelude directive
 	rec = do(t, f.ui.API(), "POST", "/admin/api/studio/agents/validate", body)
 	_ = json.Unmarshal(rec.Body.Bytes(), &v)
 	if v.OK {
@@ -146,7 +146,7 @@ func TestStudioCatalogAndValidate(t *testing.T) {
 func TestStudioApplyPersistAndDelete(t *testing.T) {
 	f := newStudioFixture(t)
 	body := map[string]any{
-		"agent_yaml":   "loop: ./lab.lua\ncapabilities: [tools]\n",
+		"agent_yaml":   "loop: ./lab.ts\ncapabilities: [tools]\n",
 		"loop":         testLoopBody(),
 		"instructions": "Be terse.",
 		"persist":      true,
@@ -203,7 +203,7 @@ func TestStudioApplyPersistAndDelete(t *testing.T) {
 func TestStudioGetPrefersTheLiveEdit(t *testing.T) {
 	f := newStudioFixture(t)
 	body := map[string]any{
-		"agent_yaml": "loop: ./base.lua\ncapabilities: [tools, llm.chat]\n",
+		"agent_yaml": "loop: ./base.ts\ncapabilities: [tools, llm.chat]\n",
 		"loop":       testLoopBody(),
 		"persist":    false,
 	}
@@ -370,7 +370,7 @@ messages:
 expect:
   - "echo:ping"
 `,
-		"loop_source": fmt.Sprintf("-- af-prelude-version: %d\nfunction loop()\n  while true do\n    local m = session.inbox()\n    session.send(\"echo:\" .. (m.text or \"\"))\n  end\nend\n", vm.PreludeVersion),
+		"loop_source": fmt.Sprintf("// af-prelude-version: %d\nfunction loop() {\n  while (true) {\n    const m = session.inbox();\n    session.send(\"echo:\" + (m.text || \"\"));\n  }\n}\n", vm.PreludeVersion),
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("inline loop test code = %d: %s", rec.Code, rec.Body.String())

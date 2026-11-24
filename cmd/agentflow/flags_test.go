@@ -89,7 +89,7 @@ func TestPositionalArgumentsAreChecked(t *testing.T) {
 	cases := [][]string{
 		{"validate", "stray"},
 		{"loop", "check"},
-		{"loop", "check", "a.lua", "b.lua"},
+		{"loop", "check", "a.ts", "b.ts"},
 		{"user", "export"},
 		{"user", "import"},
 		{"migrate", "blobs"},

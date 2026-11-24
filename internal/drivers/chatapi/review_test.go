@@ -155,15 +155,15 @@ func TestJoinedStreamGetsEveryFrame(t *testing.T) {
 // then replies with the same text gets it sent once, whether or not the client
 // asked for a stream.
 func TestSendDeltaThenReplyDoesNotDuplicate(t *testing.T) {
-	loop := `-- af-prelude-version: 1
-function loop()
-  while true do
-    session.inbox()
-    session.send_delta("Hello, ")
-    session.send_delta("world")
-    session.reply({ text = "Hello, world" })
-  end
-end`
+	loop := `// af-prelude-version: 2
+function loop() {
+  while (true) {
+    session.inbox();
+    session.send_delta("Hello, ");
+    session.send_delta("world");
+    session.reply({ text: "Hello, world" });
+  }
+}`
 	st := newStack(t, stackOpts{auth: "none", loopSrc: loop})
 	_, body := readAll(t, st.do(t, "POST", "/v1/chat/completions", minimalBody("hi"), nil))
 	if !strings.Contains(body, `"content":"Hello, world"`) {
@@ -179,11 +179,11 @@ end`
 // server error. Reported as 502 upstream_error it sends an operator to the
 // model provider's status page.
 func TestLoopFailureIsNotBlamedOnTheModel(t *testing.T) {
-	loop := `-- af-prelude-version: 1
-function loop()
-  session.inbox()
-  error("a bug in the loop")
-end`
+	loop := `// af-prelude-version: 2
+function loop() {
+  session.inbox();
+  throw new Error("a bug in the loop");
+}`
 	st := newStack(t, stackOpts{auth: "none", loopSrc: loop})
 	status, body := readAll(t, st.do(t, "POST", "/v1/chat/completions", minimalBody("hi"), nil))
 	if status != http.StatusInternalServerError || !strings.Contains(body, `"code":"server_error"`) {
@@ -198,12 +198,12 @@ end`
 // message and delivers it nowhere used to leave the client waiting out the
 // whole request timeout, and its callback registered in the router forever.
 func TestRouteThatDropsTheRequestAnswersAtOnce(t *testing.T) {
-	route := `-- af-prelude-version: 1
-function loop()
-  while true do
-    af.op({ type = "inbox" })
-  end
-end`
+	route := `// af-prelude-version: 2
+function loop() {
+  while (true) {
+    af.op({ type: "inbox" });
+  }
+}`
 	st := newStack(t, stackOpts{auth: "none", routeSrc: route, timeout: 30 * time.Second})
 	start := time.Now()
 	status, body := readAll(t, st.do(t, "POST", "/v1/chat/completions", minimalBody("hi"), nil))
@@ -247,13 +247,13 @@ func TestBlockedInputIs400EvenWithRefusalText(t *testing.T) {
 // has its text refused ends the turn with finish_reason content_filter, the
 // same as a refused session.reply.
 func TestBlockedSendIsContentFilter(t *testing.T) {
-	loop := `-- af-prelude-version: 1
-function loop()
-  while true do
-    session.inbox()
-    pcall(session.send, "secret")
-  end
-end`
+	loop := `// af-prelude-version: 2
+function loop() {
+  while (true) {
+    session.inbox();
+    try { session.send("secret"); } catch (e) {}
+  }
+}`
 	disp := safety.New(&safety.Profile{Name: "test", Filters: []safety.Filter{dropEgressFilter{}}})
 	st := newStack(t, stackOpts{auth: "none", safety: disp, loopSrc: loop})
 	status, body := readAll(t, st.do(t, "POST", "/v1/chat/completions", minimalBody("hi"), nil))
@@ -309,14 +309,14 @@ func TestClientOptionsReachTheModel(t *testing.T) {
 // TestForwardOptionSpellings: a named tool choice written as a table and a
 // single stop string are accepted from Lua.
 func TestForwardOptionSpellings(t *testing.T) {
-	loop := `-- af-prelude-version: 1
-function loop()
-  while true do
-    session.inbox()
-    local reply = llm.forward({ params = { tool_choice = { name = "lookup" }, stop = "END" } })
-    session.reply(reply)
-  end
-end`
+	loop := `// af-prelude-version: 2
+function loop() {
+  while (true) {
+    session.inbox();
+    const reply = llm.forward({ params: { tool_choice: { name: "lookup" }, stop: "END" } });
+    session.reply(reply);
+  }
+}`
 	st := newStack(t, stackOpts{auth: "none", canned: canned{text: "ok"}, loopSrc: loop})
 	req := `{"model":"coder","messages":[{"role":"user","content":"hi"}],
 		"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}]}`

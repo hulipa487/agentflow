@@ -64,6 +64,8 @@ type Config struct {
 	// "-- af-import: <name>" (or is set to "package:<name>" directly). Package
 	// code is version-gated and concatenated before the importing chunk.
 	Packages map[string]string `yaml:"packages"`
+	// APIs declares external API extension packages (TypeScript/Goja or Wasm/wazero).
+	APIs map[string]APIConfig `yaml:"apis,omitempty"`
 }
 
 // Prompt is one registry entry. Exactly one of File, Inline, or Text must be
@@ -776,16 +778,16 @@ type SafetyProfile struct {
 	Filters []string `yaml:"filters"`
 }
 
-// SafetyConfig holds deployment-wide model classifiers and custom Lua filters.
-// Profiles reference them by name as "classifier:<name>" or "lua:<name>" in
+// SafetyConfig holds deployment-wide model classifiers and custom script filters.
+// Profiles reference them by name as "classifier:<name>" or "script:<name>" in
 // profiles.safety.<name>.filters.
 type SafetyConfig struct {
-	Classifiers map[string]ClassifierProfile `yaml:"classifiers,omitempty"`
-	LuaFilters  map[string]LuaFilterProfile  `yaml:"lua_filters,omitempty"`
+	Classifiers   map[string]ClassifierProfile   `yaml:"classifiers,omitempty"`
+	ScriptFilters map[string]ScriptFilterProfile `yaml:"script_filters,omitempty"`
 }
 
-// LuaFilterProfile defines one sandboxed Lua 5.1 ingress/egress safety filter.
-type LuaFilterProfile struct {
+// ScriptFilterProfile defines one sandboxed TypeScript/JS ingress/egress safety filter.
+type ScriptFilterProfile struct {
 	Source      string   `yaml:"source,omitempty" json:"source,omitempty"`
 	File        string   `yaml:"file,omitempty" json:"file,omitempty"`
 	Resolved    string   `yaml:"-" json:"-"`
@@ -798,8 +800,8 @@ type LuaFilterProfile struct {
 	Fallback    string   `yaml:"fallback,omitempty" json:"fallback,omitempty"`
 }
 
-// TimeoutD returns the Lua filter timeout, defaulting to 200ms.
-func (p LuaFilterProfile) TimeoutD() time.Duration {
+// TimeoutD returns the script filter timeout, defaulting to 200ms.
+func (p ScriptFilterProfile) TimeoutD() time.Duration {
 	if p.Timeout == "" {
 		return 200 * time.Millisecond
 	}
@@ -810,8 +812,8 @@ func (p LuaFilterProfile) TimeoutD() time.Duration {
 	return d
 }
 
-// EffectiveSource returns the resolved Lua source (inline or loaded from file).
-func (p LuaFilterProfile) EffectiveSource() string {
+// EffectiveSource returns the resolved script source (inline or loaded from file).
+func (p ScriptFilterProfile) EffectiveSource() string {
 	if p.Resolved != "" {
 		return p.Resolved
 	}
@@ -1422,7 +1424,7 @@ type ChannelMedia struct {
 // "users" is in the default set because the surface is read-only and scoped to
 // the caller's own turn; the profile directory behind it is gated on
 // maintenance provenance in the handler, not on the capability.
-var DefaultCapabilities = []string{"llm.chat", "memory", "tools", "agent.send", "net.http", "users"}
+var DefaultCapabilities = []string{"llm.chat", "memory", "tools", "apis", "agent.send", "net.http", "users"}
 
 // memoryProviderKnown reports whether name is a supported memory backend
 // provider, for the hint that catches the retired "builtin:" spelling.
@@ -1855,8 +1857,8 @@ func validateSafetyProfiles(path string, c *Config) error {
 		known[ref] = true
 		customRefs = append(customRefs, ref)
 	}
-	for name := range c.Safety.LuaFilters {
-		ref := "lua:" + name
+	for name := range c.Safety.ScriptFilters {
+		ref := "script:" + name
 		known[ref] = true
 		customRefs = append(customRefs, ref)
 	}
@@ -1894,21 +1896,21 @@ func validateSafetyProfiles(path string, c *Config) error {
 }
 
 // ValidateSafetySections checks a proposed replacement for the deployment's
-// safety profiles, model-backed classifiers, and custom Lua filters against the
+// safety profiles, model-backed classifiers, and custom script filters against the
 // rest of the config. It runs the same checks boot runs, so a Studio edit is
 // refused for the reasons a restart would fail.
-func ValidateSafetySections(path string, base *Config, profiles map[string]SafetyProfile, classifiers map[string]ClassifierProfile, luaFilters map[string]LuaFilterProfile) error {
+func ValidateSafetySections(path string, base *Config, profiles map[string]SafetyProfile, classifiers map[string]ClassifierProfile, scriptFilters map[string]ScriptFilterProfile) error {
 	if base == nil {
 		return fmt.Errorf("%s: no configuration to validate against", path)
 	}
 	clone := *base
 	clone.Profiles.Safety = profiles
 	clone.Safety.Classifiers = classifiers
-	clone.Safety.LuaFilters = luaFilters
+	clone.Safety.ScriptFilters = scriptFilters
 	if err := validateClassifiers(path, &clone); err != nil {
 		return err
 	}
-	if err := validateLuaFilters(path, &clone); err != nil {
+	if err := validateScriptFilters(path, &clone); err != nil {
 		return err
 	}
 	return validateSafetyProfiles(path, &clone)
@@ -2030,7 +2032,7 @@ func validateClassifiers(path string, c *Config) error {
 	return nil
 }
 
-func validateLuaFilters(path string, c *Config) error {
+func validateScriptFilters(path string, c *Config) error {
 	validSource := map[string]bool{
 		"channel": true, "agent": true, "scheduler": true, "system": true,
 	}
@@ -2042,17 +2044,17 @@ func validateLuaFilters(path string, c *Config) error {
 			baseDir = filepath.Dir(path)
 		}
 	}
-	for name, p := range c.Safety.LuaFilters {
+	for name, p := range c.Safety.ScriptFilters {
 		if name == "" || strings.ContainsAny(name, " \t/:|") || len(name) > 64 {
-			return fmt.Errorf("%s: safety.lua_filters: %q is not a valid lua filter name", path, name)
+			return fmt.Errorf("%s: safety.script_filters: %q is not a valid script filter name", path, name)
 		}
 		hasSrc := strings.TrimSpace(p.Source) != ""
 		hasFile := strings.TrimSpace(p.File) != ""
 		if hasSrc && hasFile {
-			return fmt.Errorf("%s: safety.lua_filters.%s: cannot set both source and file", path, name)
+			return fmt.Errorf("%s: safety.script_filters.%s: cannot set both source and file", path, name)
 		}
 		if !hasSrc && !hasFile {
-			return fmt.Errorf("%s: safety.lua_filters.%s: source or file is required", path, name)
+			return fmt.Errorf("%s: safety.script_filters.%s: source or file is required", path, name)
 		}
 		resolved := p.Source
 		if hasFile {
@@ -2062,44 +2064,44 @@ func validateLuaFilters(path string, c *Config) error {
 			}
 			raw, err := os.ReadFile(filePath)
 			if err != nil {
-				return fmt.Errorf("%s: safety.lua_filters.%s: read file %q: %w", path, name, p.File, err)
+				return fmt.Errorf("%s: safety.script_filters.%s: read file %q: %w", path, name, p.File, err)
 			}
 			resolved = string(raw)
 		}
-		if err := safety.ValidateLuaSource(resolved); err != nil {
-			return fmt.Errorf("%s: safety.lua_filters.%s: %w", path, name, err)
+		if err := safety.ValidateScriptSource(resolved); err != nil {
+			return fmt.Errorf("%s: safety.script_filters.%s: %w", path, name, err)
 		}
 		p.Resolved = resolved
-		c.Safety.LuaFilters[name] = p
+		c.Safety.ScriptFilters[name] = p
 
 		for _, d := range p.Directions {
 			switch d {
 			case "ingress", "egress":
 			default:
-				return fmt.Errorf("%s: safety.lua_filters.%s: direction %q is not ingress or egress", path, name, d)
+				return fmt.Errorf("%s: safety.script_filters.%s: direction %q is not ingress or egress", path, name, d)
 			}
 		}
 		for _, s := range p.Sources {
 			if !validSource[s] {
-				return fmt.Errorf("%s: safety.lua_filters.%s: source %q is not channel, agent, scheduler, or system", path, name, s)
+				return fmt.Errorf("%s: safety.script_filters.%s: source %q is not channel, agent, scheduler, or system", path, name, s)
 			}
 		}
 		if p.Timeout != "" {
 			d, err := time.ParseDuration(p.Timeout)
 			if err != nil || d <= 0 {
-				return fmt.Errorf("%s: safety.lua_filters.%s: timeout %q must be a positive duration", path, name, p.Timeout)
+				return fmt.Errorf("%s: safety.script_filters.%s: timeout %q must be a positive duration", path, name, p.Timeout)
 			}
 			if d > 10*time.Second {
-				return fmt.Errorf("%s: safety.lua_filters.%s: timeout %q must be at most 10s", path, name, p.Timeout)
+				return fmt.Errorf("%s: safety.script_filters.%s: timeout %q must be at most 10s", path, name, p.Timeout)
 			}
 		}
 		if p.InstrBudget < 0 {
-			return fmt.Errorf("%s: safety.lua_filters.%s: instr_budget must not be negative", path, name)
+			return fmt.Errorf("%s: safety.script_filters.%s: instr_budget must not be negative", path, name)
 		}
 		switch p.OnError {
 		case "", "pass", "block":
 		default:
-			return fmt.Errorf("%s: safety.lua_filters.%s: on_error %q is not pass or block", path, name, p.OnError)
+			return fmt.Errorf("%s: safety.script_filters.%s: on_error %q is not pass or block", path, name, p.OnError)
 		}
 	}
 	return nil
@@ -2404,6 +2406,9 @@ func validate(path string, c *Config) error {
 		// configdir has rebased the path onto its own directory. Checking here
 		// would test a relative path against the process CWD instead.
 	}
+	if err := validateAPIs(path, c); err != nil {
+		return err
+	}
 
 	// Memory store retention. This runs over every declared profile AND the
 	// built-in preset, because a retention that does not parse is silently
@@ -2421,11 +2426,11 @@ func validate(path string, c *Config) error {
 		return err
 	}
 
-	// Model-backed classifiers and custom Lua filters must resolve before profiles reference them.
+	// Model-backed classifiers and custom script filters must resolve before profiles reference them.
 	if err := validateClassifiers(path, c); err != nil {
 		return err
 	}
-	if err := validateLuaFilters(path, c); err != nil {
+	if err := validateScriptFilters(path, c); err != nil {
 		return err
 	}
 

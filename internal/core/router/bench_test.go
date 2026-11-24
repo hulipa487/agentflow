@@ -96,13 +96,13 @@ func BenchmarkRouterHop(b *testing.B) {
 				"echo": {
 					Info:     &session.Info{Name: "echo", HistoryBudget: 100},
 					Handlers: map[string]session.OpHandler{},
-					LoopSrc: fmt.Sprintf("-- af-prelude-version: %d\n", vm.PreludeVersion) + `
-function loop()
-  while true do
-    local m = session.inbox()
-    session.send(m.text)
-  end
-end`,
+					LoopSrc: fmt.Sprintf("// af-prelude-version: %d\n", vm.PreludeVersion) + `
+function loop() {
+  while (true) {
+    const m = session.inbox();
+    session.send(m.text);
+  }
+}`,
 				},
 			}
 			sup := supervisor.New(defs, gw, pool.New(2), nil, log)

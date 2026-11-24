@@ -21,8 +21,8 @@ func pluginsFixture(t *testing.T, systemYAML string) (*Plugins, string, *pluginH
 	})
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "system.yaml"), systemYAML)
-	writeFile(t, filepath.Join(dir, "loops", "chat.lua"), "-- af-prelude-version: 1\nfunction loop() end\n")
-	writeFile(t, filepath.Join(dir, "profiles", "chat.yaml"), "name: chat\nloop: ./loops/chat.lua\nsafety: none\n")
+	writeFile(t, filepath.Join(dir, "loops", "chat.ts"), "// af-prelude-version: 2\nfunction loop() {}\n")
+	writeFile(t, filepath.Join(dir, "profiles", "chat.yaml"), "name: chat\nloop: ./loops/chat.ts\nsafety: none\n")
 	cfg, err := config.LoadDir(dir, safetyLog())
 	if err != nil {
 		t.Fatal(err)
@@ -84,7 +84,7 @@ func TestPluginsBuiltinLifecycle(t *testing.T) {
 
 	// Saving a shadow auto-enables plugins.dir: ./plugins in system.yaml and
 	// fires OnReloadSupport (not OnReloadRoute).
-	customBudget := "-- af-prelude-version: 1\nfunction token_budget(messages, budget)\n  return messages\nend\n"
+	customBudget := "// af-prelude-version: 2\nfunction token_budget(messages, budget) {\n  return messages;\n}\n"
 	list, err = p.SaveBuiltin("token_budget", customBudget, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -99,7 +99,7 @@ func TestPluginsBuiltinLifecycle(t *testing.T) {
 	if !tb.Shadowed || tb.MTime == 0 || tb.Source != customBudget {
 		t.Fatalf("saved builtin mismatch: %+v", tb)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "plugins", "token_budget.lua")); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, "plugins", "token_budget.ts")); err != nil {
 		t.Fatalf("shadow file missing on disk: %v", err)
 	}
 	sysBytes, err := os.ReadFile(filepath.Join(dir, "system.yaml"))
@@ -113,7 +113,7 @@ func TestPluginsBuiltinLifecycle(t *testing.T) {
 	}
 
 	// Saving route override fires OnReloadRoute.
-	routeSrc := "-- af-prelude-version: 1\nfunction route(msg)\n  return nil\nend\n"
+	routeSrc := "// af-prelude-version: 2\nfunction route(msg) {\n  return null;\n}\n"
 	if _, err := p.SaveBuiltin("per_chat", routeSrc, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -134,17 +134,17 @@ func TestPluginsBuiltinLifecycle(t *testing.T) {
 		t.Fatalf("reset builtin still shadowed: %+v", tb)
 	}
 
-	// Invalid Lua is rejected without touching disk.
-	if _, err := p.SaveBuiltin("token_budget", "-- af-prelude-version: 1\nfunction broken(\n", 0); err == nil {
-		t.Fatal("expected syntax error on broken Lua")
+	// Invalid JS/TS is rejected without touching disk.
+	if _, err := p.SaveBuiltin("token_budget", "// af-prelude-version: 2\nfunction broken(\n", 0); err == nil {
+		t.Fatal("expected syntax error on broken script")
 	}
 }
 
 func TestPluginsPackagesLifecycle(t *testing.T) {
 	p, dir, calls := pluginsFixture(t, minimalPluginSystem)
 
-	src := "-- af-prelude-version: 1\nlocal M = {}\nfunction M.hi() return 'ok' end\nreturn M\n"
-	list, err := p.CreatePackage("shared", "helpers.lua", src)
+	src := "// af-prelude-version: 2\nvar M = { hi() { return 'ok'; } };\n"
+	list, err := p.CreatePackage("shared", "helpers.ts", src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,49 +154,49 @@ func TestPluginsPackagesLifecycle(t *testing.T) {
 	if len(list.Packages) != 1 || list.Packages[0].Name != "shared" || !list.Packages[0].Managed {
 		t.Fatalf("unexpected packages list: %+v", list.Packages)
 	}
-	if len(list.Packages[0].Files) != 1 || list.Packages[0].Files[0].Name != "helpers.lua" {
+	if len(list.Packages[0].Files) != 1 || list.Packages[0].Files[0].Name != "helpers.ts" {
 		t.Fatalf("unexpected package files: %+v", list.Packages[0].Files)
 	}
 
 	// Path traversal / invalid filenames are rejected.
-	if _, err := p.SavePackageFile("shared", "../escape.lua", src, 0); err == nil {
+	if _, err := p.SavePackageFile("shared", "../escape.ts", src, 0); err == nil {
 		t.Fatal("expected path traversal rejection")
 	}
-	if _, err := p.CreatePackage("../bad", "a.lua", src); err == nil {
+	if _, err := p.CreatePackage("../bad", "a.ts", src); err == nil {
 		t.Fatal("expected invalid package name rejection")
 	}
 
 	// Deleting the only file is refused.
 	onlyMTime := list.Packages[0].Files[0].MTime
-	if _, err := p.DeletePackageFile("shared", "helpers.lua", onlyMTime); err == nil {
-		t.Fatal("expected refusal when deleting the sole .lua file")
+	if _, err := p.DeletePackageFile("shared", "helpers.ts", onlyMTime); err == nil {
+		t.Fatal("expected refusal when deleting the sole .ts file")
 	}
 
-	// Add a second file, then delete helpers.lua succeeds.
-	extraSrc := "-- af-prelude-version: 1\nlocal E = {}\nreturn E\n"
-	list, err = p.SavePackageFile("shared", "extra.lua", extraSrc, 0)
+	// Add a second file, then delete helpers.ts succeeds.
+	extraSrc := "// af-prelude-version: 2\nvar E = {};\n"
+	list, err = p.SavePackageFile("shared", "extra.ts", extraSrc, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(list.Packages[0].Files) != 2 {
 		t.Fatalf("expected 2 package files, got %d", len(list.Packages[0].Files))
 	}
-	list, err = p.DeletePackageFile("shared", "helpers.lua", onlyMTime)
+	list, err = p.DeletePackageFile("shared", "helpers.ts", onlyMTime)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(list.Packages[0].Files) != 1 || list.Packages[0].Files[0].Name != "extra.lua" {
+	if len(list.Packages[0].Files) != 1 || list.Packages[0].Files[0].Name != "extra.ts" {
 		t.Fatalf("unexpected files after delete: %+v", list.Packages[0].Files)
 	}
 
 	// When an agent loop imports the package, DeletePackage refuses.
-	writeFile(t, filepath.Join(dir, "loops", "chat.lua"), "-- af-prelude-version: 1\n-- af-import: shared\nfunction loop() end\n")
+	writeFile(t, filepath.Join(dir, "loops", "chat.ts"), "// af-prelude-version: 2\n// af-import: shared\nfunction loop() {}\n")
 	if _, err := p.DeletePackage("shared"); err == nil || !strings.Contains(err.Error(), "chat") {
 		t.Fatalf("expected import refusal naming agent chat, got %v", err)
 	}
 
 	// After removing the import, DeletePackage cleans config and managed dir.
-	writeFile(t, filepath.Join(dir, "loops", "chat.lua"), "-- af-prelude-version: 1\nfunction loop() end\n")
+	writeFile(t, filepath.Join(dir, "loops", "chat.ts"), "// af-prelude-version: 2\nfunction loop() {}\n")
 	list, err = p.DeletePackage("shared")
 	if err != nil {
 		t.Fatal(err)

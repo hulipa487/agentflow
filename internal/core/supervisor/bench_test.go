@@ -48,12 +48,12 @@ func BenchmarkSessionSpawn(b *testing.B) {
 			Info:     &session.Info{Name: "echo", HistoryBudget: 100},
 			Handlers: map[string]session.OpHandler{},
 			LoopSrc: directive() + `
-function loop()
-  while true do
-    local m = session.inbox()
-    session.send(m.text)
-  end
-end`,
+function loop() {
+  while (true) {
+    const m = session.inbox();
+    session.send(m.text);
+  }
+}`,
 		},
 	}
 	sup := New(defs, gw, pool.New(2), nil, log)

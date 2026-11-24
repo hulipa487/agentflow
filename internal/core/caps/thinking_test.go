@@ -74,11 +74,15 @@ func TestThinkingSurvivesTheLuaBridge(t *testing.T) {
 		&session.Info{Name: "main", HistoryBudget: 100},
 		gw, nil, nil, nil, nil, handlers, pool.New(1), log)
 	a.LoopSrc = directive() + `
-function loop()
-  local msg = session.inbox()
-  local ok, reply = pcall(llm.chat, { { role = "user", content = "hi" } }, { thinking = "xhigh" })
-  if ok then session.send("done") else session.send("err: " .. tostring(reply)) end
-end
+function loop() {
+  session.inbox();
+  try {
+    llm.chat([{ role: "user", content: "hi" }], { thinking: "xhigh" });
+    session.send("done");
+  } catch (e) {
+    session.send("err: " + (e instanceof Error ? e.message : String(e)));
+  }
+}
 `
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -137,11 +141,15 @@ func TestThinkingCaptureSurvivesTheLuaBridge(t *testing.T) {
 		&session.Info{Name: "main", HistoryBudget: 100},
 		gw, nil, nil, nil, nil, handlers, pool.New(1), log)
 	a.LoopSrc = directive() + `
-function loop()
-  local msg = session.inbox()
-  local ok, reply = pcall(llm.chat, { { role = "user", content = "hi" } })
-  if ok then session.send("T:" .. (reply.thinking or "NONE")) else session.send("err: " .. tostring(reply)) end
-end
+function loop() {
+  session.inbox();
+  try {
+    const reply = llm.chat([{ role: "user", content: "hi" }]);
+    session.send("T:" + (reply.thinking || "NONE"));
+  } catch (e) {
+    session.send("err: " + (e instanceof Error ? e.message : String(e)));
+  }
+}
 `
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -223,17 +231,26 @@ data: {"type":"message_stop"}
 		&session.Info{Name: "main", HistoryBudget: 100},
 		gw, nil, nil, nil, nil, handlers, pool.New(1), log)
 	a.LoopSrc = directive() + `
-function loop()
-  local msg = session.inbox()
-  local ok1, r1 = pcall(llm.chat, { { role = "user", content = "q" } }, { thinking = "low" })
-  if not ok1 then session.send("err1: " .. tostring(r1)) return end
-  local ok2, r2 = pcall(llm.chat, {
-    { role = "user", content = "q" },
-    { role = "assistant", content = "", tool_calls = r1.tool_calls, thinking_blocks = r1.thinking_blocks },
-    { role = "tool", tool_call_id = r1.tool_calls[1].id, content = "42" },
-  }, { thinking = "low" })
-  if ok2 then session.send("done2") else session.send("err2: " .. tostring(r2)) end
-end
+function loop() {
+  session.inbox();
+  let r1;
+  try {
+    r1 = llm.chat([{ role: "user", content: "q" }], { thinking: "low" });
+  } catch (e) {
+    session.send("err1: " + (e instanceof Error ? e.message : String(e)));
+    return;
+  }
+  try {
+    llm.chat([
+      { role: "user", content: "q" },
+      { role: "assistant", content: "", tool_calls: r1.tool_calls, thinking_blocks: r1.thinking_blocks },
+      { role: "tool", tool_call_id: r1.tool_calls[0].id, content: "42" },
+    ], { thinking: "low" });
+    session.send("done2");
+  } catch (e) {
+    session.send("err2: " + (e instanceof Error ? e.message : String(e)));
+  }
+}
 `
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

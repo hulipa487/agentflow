@@ -12,7 +12,7 @@ import (
 )
 
 func testLoop(body string) string {
-	return fmt.Sprintf("-- af-prelude-version: %d\n", vm.PreludeVersion) + body
+	return fmt.Sprintf("// af-prelude-version: %d\n", vm.PreludeVersion) + body
 }
 
 func writeFile(t *testing.T, path, body string) {
@@ -33,7 +33,7 @@ func TestConfigDirRoundTrip(t *testing.T) {
 
 	ws := NewWorkspace(dir, "", "", nil, discard())
 	agent := config.Agent{Loop: "ignored", Capabilities: []string{"tools", "llm.chat"}}
-	loop := testLoop("function loop()\n  local m = session.inbox()\n  session.send(m.text)\nend\n")
+	loop := testLoop("function loop() {\n  const m = session.inbox();\n  session.send(m.text);\n}\n")
 	files, err := ws.Save("echo", agent, loop, "Be terse.", 0, false)
 	if err != nil {
 		t.Fatal(err)
@@ -56,7 +56,7 @@ func TestConfigDirRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Loop != "loops/echo.lua" {
+	if got.Loop != "loops/echo.ts" {
 		t.Errorf("persisted loop = %q", got.Loop)
 	}
 	if got.Instructions.File != "prompts/echo.md" {
@@ -89,18 +89,18 @@ func TestConfigDirRoundTrip(t *testing.T) {
 func TestConfigDirRefusesUnmanagedProfile(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "system.yaml"), "version: \"1\"\n")
-	writeFile(t, filepath.Join(dir, "profiles", "hand.yaml"), "name: hand\nloop: ./hand.lua\n")
+	writeFile(t, filepath.Join(dir, "profiles", "hand.yaml"), "name: hand\nloop: ./hand.ts\n")
 
 	ws := NewWorkspace(dir, "", "", nil, discard())
 	agent := config.Agent{Loop: "x"}
-	_, err := ws.Save("hand", agent, testLoop("function loop() end\n"), "", 0, false)
+	_, err := ws.Save("hand", agent, testLoop("function loop() {}\n"), "", 0, false)
 	if err != ErrNotManaged {
 		t.Fatalf("Save error = %v, want ErrNotManaged", err)
 	}
 	if _, err := ws.Remove("hand", false); err != ErrNotManaged {
 		t.Fatalf("Remove error = %v, want ErrNotManaged", err)
 	}
-	if _, err := ws.Save("hand", agent, testLoop("function loop() end\n"), "", 0, true); err != nil {
+	if _, err := ws.Save("hand", agent, testLoop("function loop() {}\n"), "", 0, true); err != nil {
 		t.Fatalf("force Save: %v", err)
 	}
 }
@@ -110,11 +110,11 @@ func TestConfigDirRefusesUnmanagedProfile(t *testing.T) {
 func TestSingleFileRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "agentflow.yaml")
-	writeFile(t, cfgPath, "version: \"1\"\nagents:\n  base:\n    loop: ./base.lua\n")
+	writeFile(t, cfgPath, "version: \"1\"\nagents:\n  base:\n    loop: ./base.ts\n")
 
 	ws := NewWorkspace("", cfgPath, filepath.Join(dir, "studio"), nil, discard())
 	agent := config.Agent{Loop: "ignored"}
-	loop := testLoop("function loop()\n  local m = session.inbox()\n  session.send(m.text)\nend\n")
+	loop := testLoop("function loop() {\n  const m = session.inbox();\n  session.send(m.text);\n}\n")
 	files, err := ws.Save("lab", agent, loop, "Be brief.", 0, false)
 	if err != nil {
 		t.Fatal(err)
@@ -158,7 +158,7 @@ func TestSaveRefusesStaleMtime(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "system.yaml"), "version: \"1\"\n")
 	ws := NewWorkspace(dir, "", "", nil, discard())
 	agent := config.Agent{Loop: "x"}
-	loop := testLoop("function loop() end\n")
+	loop := testLoop("function loop() {}\n")
 	if _, err := ws.Save("a", agent, loop, "", 0, false); err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestSingleFileSaveCreatesAgentsSection(t *testing.T) {
 	writeFile(t, cfgPath, "version: \"1\"\nruntime:\n  persistence: sqlite://./data/empty.db\n")
 
 	ws := NewWorkspace("", cfgPath, filepath.Join(dir, "studio"), nil, discard())
-	files, err := ws.Save("first", config.Agent{}, testLoop("function loop()\n  session.send(\"ready\")\nend\n"), "", 0, false)
+	files, err := ws.Save("first", config.Agent{}, testLoop("function loop() {\n  session.send(\"ready\");\n}\n"), "", 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}

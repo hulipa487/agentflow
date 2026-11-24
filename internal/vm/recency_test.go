@@ -7,17 +7,10 @@ import (
 	"testing"
 )
 
-// TestRecencyTimeRecallUsesTheBackendsKind: the default recall handler's "time"
-// mode forwarded its window but left `kind` as "time", and every backend
-// switches on "time_range" — so the one documented recall mode that takes a
-// window errored with `unsupported query kind "time"` on all of them.
-//
-// The handler asks agent.info() for the store list before it builds the query,
-// so the test answers that op and then reads the query it produces.
 func TestRecencyTimeRecallUsesTheBackendsKind(t *testing.T) {
-	code, err := os.ReadFile(filepath.Join("..", "builtins", "lua", "recency.lua"))
+	code, err := os.ReadFile(filepath.Join("..", "builtins", "ts", "recency.ts"))
 	if err != nil {
-		t.Fatalf("read recency.lua: %v", err)
+		t.Fatalf("read recency.ts: %v", err)
 	}
 	st := New(1_000_000)
 	defer st.Close()
@@ -28,9 +21,9 @@ func TestRecencyTimeRecallUsesTheBackendsKind(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	status, msg := st.Start("loop", "test chunk", directive()+`return memory_recall_handler({
-  kind = "time", store = "dialogue",
-  from = "2026-01-01T00:00:00Z", to = "2026-02-01T00:00:00Z" })`)
+	status, msg := st.Start("loop", "test chunk", directive()+`function loop() { return memory_recall_handler({
+  kind: "time", store: "dialogue",
+  from: "2026-01-01T00:00:00Z", to: "2026-02-01T00:00:00Z" }); }`)
 	if status != Yielded {
 		t.Fatalf("expected agent.info to yield, got %v: %s", status, msg)
 	}

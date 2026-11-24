@@ -128,7 +128,7 @@ func (w *Workspace) StageTransient(name, loopSrc, instructionsSrc string) (loopP
 		return "", "", fmt.Errorf("loop source is empty")
 	}
 	stageRoot := filepath.Join(os.TempDir(), "agentflow-studio-stage")
-	loopPath = filepath.Join(stageRoot, "loops", name+".lua")
+	loopPath = filepath.Join(stageRoot, "loops", name+".ts")
 	promptPath = filepath.Join(stageRoot, "prompts", name+".md")
 	if err := os.MkdirAll(filepath.Dir(loopPath), 0o755); err != nil {
 		return "", "", err
@@ -197,9 +197,9 @@ func (w *Workspace) profilePath(name string) string {
 
 func (w *Workspace) loopPath(name string) string {
 	if w.ConfigDir != "" {
-		return filepath.Join(w.ConfigDir, "loops", name+".lua")
+		return filepath.Join(w.ConfigDir, "loops", name+".ts")
 	}
-	return filepath.Join(w.Root, "loops", name+".lua")
+	return filepath.Join(w.Root, "loops", name+".ts")
 }
 
 func (w *Workspace) promptPath(name string) string {
@@ -313,7 +313,7 @@ func (w *Workspace) Save(name string, a config.Agent, loopSrc, instructionsSrc s
 	if w.Mode() == "configdir" {
 		// Paths in a configdir are rebased onto the directory, so the fragment
 		// stores them relative to it.
-		a.Loop = filepath.ToSlash(filepath.Join("loops", name+".lua"))
+		a.Loop = filepath.ToSlash(filepath.Join("loops", name+".ts"))
 		if !keepPromptRef {
 			if instructionsSrc != "" {
 				a.Instructions = config.InstructionsRef{File: filepath.ToSlash(filepath.Join("prompts", name+".md"))}

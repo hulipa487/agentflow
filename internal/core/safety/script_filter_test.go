@@ -7,59 +7,66 @@ import (
 	"time"
 )
 
-func TestValidateLuaSource(t *testing.T) {
-	if err := ValidateLuaSource("   \n "); err == nil {
+func TestValidateScriptSource(t *testing.T) {
+	if err := ValidateScriptSource("   \n "); err == nil {
 		t.Fatal("expected blank source error")
 	}
-	if err := ValidateLuaSource("function ingress(input) return"); err == nil {
+	if err := ValidateScriptSource("function ingress(input) { return"); err == nil {
 		t.Fatal("expected syntax error")
 	}
-	if err := ValidateLuaSource("local x = 1 + 2"); err == nil {
+	if err := ValidateScriptSource("const x: number = 1 + 2;"); err == nil {
 		t.Fatal("expected missing ingress/egress hook error")
 	}
-	if err := ValidateLuaSource("while true do end"); err == nil {
-		t.Fatal("expected infinite init loop to hit instruction budget")
+	if err := ValidateScriptSource("while (true) {}"); err == nil {
+		t.Fatal("expected infinite init loop to hit sandbox timeout")
 	}
-	if err := ValidateLuaSource(`function ingress(input) return { text = input.message } end`); err != nil {
+	if err := ValidateScriptSource(`export function ingress(input: { message: string }) { return { text: input.message }; }`); err != nil {
 		t.Fatalf("unexpected validation error: %v", err)
 	}
 }
 
-func TestLuaFilterIngressEgressAndDispatcher(t *testing.T) {
-	lf, err := NewLuaFilter(LuaFilterOptions{
-		Name:    "pii_guard",
-		Ingress: true,
-		Egress:  true,
-		Refusal: "blocked by policy",
+func TestScriptFilterIngressEgressAndDispatcher(t *testing.T) {
+	sf, err := NewScriptFilter(ScriptFilterOptions{
+		Name:     "pii_guard",
+		Ingress:  true,
+		Egress:   true,
+		Refusal:  "blocked by policy",
 		Fallback: "redacted",
 		Source: `
-function ingress(input)
-  if input.annotations and input.annotations["source-attribution"] == "quoted" then
-    return { reason = "quoted-bypass" }
-  end
-  if string.find(string.lower(input.message), "secret_cmd", 1, true) then
-    return { drop = true, reason = "forbidden-cmd" }
-  end
-  if string.find(string.lower(input.message), "tone", 1, true) then
-    return { directive = "Be brief.", directives = { "Stay factual." }, reason = "tone-directive" }
-  end
-  return { text = "[checked] " .. input.message, annotations = { ["custom"] = "ok" }, reason = "checked" }
-end
+interface HookInput {
+  message?: string;
+  text?: string;
+  annotations?: Record<string, string>;
+}
 
-function egress(input)
-  local cleaned = string.gsub(input.text, "sk%-[A-Za-z0-9]+", "[REDACTED]")
-  if string.find(cleaned, "FORBIDDEN_OUT", 1, true) then
-    return { drop = true, reason = "egress-blocked" }
-  end
-  return { text = cleaned, reason = "egress-clean" }
-end
+export function ingress(input: HookInput) {
+  if (input.annotations && input.annotations["source-attribution"] === "quoted") {
+    return { reason: "quoted-bypass" };
+  }
+  const lower = (input.message || "").toLowerCase();
+  if (lower.includes("secret_cmd")) {
+    return { drop: true, reason: "forbidden-cmd" };
+  }
+  if (lower.includes("tone")) {
+    return { directive: "Be brief.", directives: ["Stay factual."], reason: "tone-directive" };
+  }
+  return { text: "[checked] " + input.message, annotations: { custom: "ok" }, reason: "checked" };
+}
+
+export function egress(input: HookInput) {
+  const cleaned = (input.text || "").replace(/sk-[A-Za-z0-9]+/g, "[REDACTED]");
+  if (cleaned.includes("FORBIDDEN_OUT")) {
+    return { drop: true, reason: "egress-blocked" };
+  }
+  return { text: cleaned, reason: "egress-clean" };
+}
 `,
 	})
 	if err != nil {
-		t.Fatalf("NewLuaFilter: %v", err)
+		t.Fatalf("NewScriptFilter: %v", err)
 	}
 
-	disp := New(&Profile{Name: "custom", Filters: []Filter{SourceAttribution{}, lf}})
+	disp := New(&Profile{Name: "custom", Filters: []Filter{SourceAttribution{}, sf}})
 
 	// Blocked ingress drops and skips loop with configured refusal.
 	dropRes := disp.Ingress(context.Background(), IngressInput{Message: "please run secret_cmd", Source: "channel"})
@@ -73,7 +80,7 @@ end
 		t.Fatalf("unexpected quotedRes = %+v", quotedRes)
 	}
 
-	// Directives propagate from Lua return table.
+	// Directives propagate from return object.
 	dirRes := disp.Ingress(context.Background(), IngressInput{Message: "watch tone", Source: "channel"})
 	if dirRes.Drop || dirRes.Text != "watch tone" || len(dirRes.Directives) != 2 || dirRes.Directives[0] != "Be brief." || dirRes.Directives[1] != "Stay factual." {
 		t.Fatalf("unexpected dirRes = %+v", dirRes)
@@ -81,7 +88,7 @@ end
 
 	// Text mutation and custom annotations carry cleanly.
 	mutRes := disp.Ingress(context.Background(), IngressInput{Message: "hello", Source: "channel"})
-	if mutRes.Text != "[checked] hello" || mutRes.Annotations["custom"] != "ok" || mutRes.Annotations["lua:pii_guard"] != "checked" {
+	if mutRes.Text != "[checked] hello" || mutRes.Annotations["custom"] != "ok" || mutRes.Annotations["script:pii_guard"] != "checked" {
 		t.Fatalf("unexpected mutRes = %+v", mutRes)
 	}
 
@@ -96,90 +103,91 @@ end
 	}
 }
 
-func TestLuaFilterSandboxAndBudget(t *testing.T) {
-	// Sandboxed VM removes os/io/require; attempting os.getenv fails cleanly under OnError policy.
-	sandboxFilter, err := NewLuaFilter(LuaFilterOptions{
+func TestScriptFilterSandboxAndBudget(t *testing.T) {
+	// Sandboxed VM removes host globals; attempting process.env fails cleanly under OnError policy.
+	sandboxFilter, err := NewScriptFilter(ScriptFilterOptions{
 		Name:    "sandbox_probe",
 		Ingress: true,
 		OnError: "block",
 		Refusal: "error-blocked",
 		Source: `
-function ingress(input)
-  return { text = os.getenv("PATH") }
-end
+function ingress(_input: unknown) {
+  return { text: (process as unknown as Record<string, string>).env };
+}
 `,
 	})
 	if err != nil {
-		t.Fatalf("NewLuaFilter sandbox: %v", err)
+		t.Fatalf("NewScriptFilter sandbox: %v", err)
 	}
 	res := sandboxFilter.Ingress(context.Background(), IngressInput{Message: "hi", Source: "channel"})
-	if !res.Drop || !res.Skip || res.Refusal != "error-blocked" || res.Reason != "lua-error:sandbox_probe" {
+	if !res.Drop || !res.Skip || res.Refusal != "error-blocked" || res.Reason != "script-error:sandbox_probe" {
 		t.Fatalf("expected sandbox violation block, got %+v", res)
 	}
 
-	// Infinite loop trips instruction budget and respects OnError: pass vs block.
-	loopPass, err := NewLuaFilter(LuaFilterOptions{
+	// Infinite loop trips timeout/budget and respects OnError: pass vs block.
+	loopPass, err := NewScriptFilter(ScriptFilterOptions{
 		Name:        "spin_pass",
 		Ingress:     true,
 		InstrBudget: 500,
 		Timeout:     100 * time.Millisecond,
 		OnError:     "pass",
-		Source:      "function ingress(input) while true do end end",
+		Source:      "function ingress(_input) { while (true) {} }",
 	})
 	if err != nil {
-		t.Fatalf("NewLuaFilter spin_pass: %v", err)
+		t.Fatalf("NewScriptFilter spin_pass: %v", err)
 	}
 	passRes := loopPass.Ingress(context.Background(), IngressInput{Message: "hello", Source: "channel"})
-	if passRes.Drop || passRes.Text != "hello" || !strings.HasPrefix(passRes.Reason, "lua-error-pass:") {
+	if passRes.Drop || passRes.Text != "hello" || !strings.HasPrefix(passRes.Reason, "script-error-pass:") {
 		t.Fatalf("expected pass on error, got %+v", passRes)
 	}
 }
 
-func TestLuaFilterDirectionsAndSources(t *testing.T) {
-	lf, err := NewLuaFilter(LuaFilterOptions{
+func TestScriptFilterDirectionsAndSources(t *testing.T) {
+	sf, err := NewScriptFilter(ScriptFilterOptions{
 		Name:    "channel_ingress_only",
 		Ingress: true,
 		Egress:  false,
 		Sources: []string{"channel"},
 		Source: `
-function ingress(input) return { text = "in:" .. input.message } end
-function egress(input) return { text = "out:" .. input.text } end
+function ingress(input: { message: string }) { return { text: "in:" + input.message }; }
+function egress(input: { text: string }) { return { text: "out:" + input.text }; }
 `,
 	})
 	if err != nil {
-		t.Fatalf("NewLuaFilter: %v", err)
+		t.Fatalf("NewScriptFilter: %v", err)
 	}
-	if got := lf.Ingress(context.Background(), IngressInput{Message: "m", Source: "scheduler"}); got.Text != "m" {
+	if got := sf.Ingress(context.Background(), IngressInput{Message: "m", Source: "scheduler"}); got.Text != "m" {
 		t.Fatalf("scheduler source should be skipped, got %+v", got)
 	}
-	if got := lf.Ingress(context.Background(), IngressInput{Message: "m", Source: "channel"}); got.Text != "in:m" {
+	if got := sf.Ingress(context.Background(), IngressInput{Message: "m", Source: "channel"}); got.Text != "in:m" {
 		t.Fatalf("channel source should run, got %+v", got)
 	}
-	if got := lf.Egress(context.Background(), EgressInput{Text: "r", Source: "channel"}); got.Text != "r" {
+	if got := sf.Egress(context.Background(), EgressInput{Text: "r", Source: "channel"}); got.Text != "r" {
 		t.Fatalf("egress disabled should pass through, got %+v", got)
 	}
 }
 
-func TestLuaFilterRedirectIngressAndDispatcher(t *testing.T) {
-	lf, err := NewLuaFilter(LuaFilterOptions{
+func TestScriptFilterRedirectIngressAndDispatcher(t *testing.T) {
+	sf, err := NewScriptFilter(ScriptFilterOptions{
 		Name:    "keyword_router",
 		Ingress: true,
 		Source: `
-function ingress(input)
-  if string.find(string.lower(input.message), "legal", 1, true) then
-    return { redirect = "Legal-Pro", directive = "Cite statutes." }
-  end
-  if string.find(string.lower(input.message), "code", 1, true) then
-    return { model = "Code-Max", reason = "code-route" }
-  end
-  return nil
-end
+function ingress(input: { message: string }) {
+  const lower = input.message.toLowerCase();
+  if (lower.includes("legal")) {
+    return { redirect: "Legal-Pro", directive: "Cite statutes." };
+  }
+  if (lower.includes("code")) {
+    return { model: "Code-Max", reason: "code-route" };
+  }
+  return null;
+}
 `,
 	})
 	if err != nil {
-		t.Fatalf("NewLuaFilter: %v", err)
+		t.Fatalf("NewScriptFilter: %v", err)
 	}
-	disp := New(&Profile{Name: "route", Filters: []Filter{SourceAttribution{}, lf}})
+	disp := New(&Profile{Name: "route", Filters: []Filter{SourceAttribution{}, sf}})
 
 	resLegal := disp.Ingress(context.Background(), IngressInput{Message: "Need legal contract advice", Source: "channel"})
 	if resLegal.Drop || resLegal.ModelOverride != "Legal-Pro" || resLegal.Reason != "redirect:Legal-Pro" {
@@ -188,7 +196,7 @@ end
 	if len(resLegal.Directives) != 1 || resLegal.Directives[0] != "Cite statutes." {
 		t.Fatalf("expected directive preserved with redirect, got %+v", resLegal.Directives)
 	}
-	if resLegal.Meta == nil || resLegal.Meta.Action != "redirect" || resLegal.Meta.RedirectModel != "Legal-Pro" || resLegal.Meta.Classifier != "lua:keyword_router" {
+	if resLegal.Meta == nil || resLegal.Meta.Action != "redirect" || resLegal.Meta.RedirectModel != "Legal-Pro" || resLegal.Meta.Classifier != "script:keyword_router" {
 		t.Fatalf("unexpected resLegal meta = %+v", resLegal.Meta)
 	}
 

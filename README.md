@@ -15,15 +15,15 @@
 
 ## What is AgentFlow
 
-> TL;DR - A LLM Runtime with Lua programmable, hot reloadable loops
+> TL;DR - A LLM Runtime with TypeScript/JS programmable, hot reloadable loops & Wasm External APIs
 
 AgentFlow is an open-source, pure-Go single-binary runtime for LLM agents.
 
-Configure all the routines - API keys, LLM Upstreams, Tools, Channels, Memory - with simple YAML, while you enjoy the fun of coding agentic loops in Lua, without sacrificing control! You name it, we've got it.
+Configure all the routines - API keys, LLM Upstreams, Tools, Channels, Memory - with simple YAML, while you enjoy the fun of coding agentic loops in TypeScript/JS and Wasm extensions, without sacrificing control! You name it, we've got it.
 - [x] Direct r/w control over vectordb?
-- [x] User prompts accessible to Lua?
+- [x] User prompts accessible to scripts?
 - [x] Custom ReAct loops?
-- [x] Per-user credentials your Lua can use but never see?
+- [x] Per-user credentials your script can use but never see?
 - [x] Hot reload without dropping a conversation?
 - [ ] Flying pigs? (working on it)
 
@@ -39,15 +39,15 @@ Interact with your agents with Telegram, QQ, Feishu/Lark, WeCom and Webhooks, or
      │  gateway + router   │   who is this, and which agent gets it?
      └──────────┬──────────┘
                 ▼
-     ┌─────────────────────┐   one isolated Lua state per conversation,
+     ┌─────────────────────┐   one isolated Goja JS/TS VM per conversation,
      │  session (your loop)│   running *your* loop: inbox → think → send
      └──────────┬──────────┘
                 ▼
-   models · memory · tools · http · files · shell · timers · other agents
+   models · memory · tools · external APIs (Goja/wazero) · http · files · timers · agents
         (the engine owns these: keys, quotas, safety, audit)
 ```
 
-Every conversation gets its own session running your loop. The loop decides *what* happens - which model, what to remember, which tool to call, when to hand off to another agent. The engine decides *whether it may*: it holds the API keys, enforces capabilities and quotas, runs the safety checks, and keeps the records. Your Lua stays small, and nothing it does can leak a key.
+Every conversation gets its own session running your loop. The loop decides *what* happens - which model, what to remember, which tool or external API to call, when to hand off to another agent. The engine decides *whether it may*: it holds the API keys, enforces capabilities and quotas, runs the safety checks, and keeps the records. Your loop stays small, and nothing it does can leak a key.
 
 ## A taste
 
@@ -64,7 +64,7 @@ models:
 
 agents:
   helper:
-    loop: ./loops/helper.lua
+    loop: ./loops/helper.ts
     model: default
     instructions: ./prompts/helper.md
     capabilities: [llm.chat]
@@ -78,20 +78,20 @@ gateway:
       path: /webhook/local/
 ```
 
-`loops/helper.lua` - the exceptional:
+`loops/helper.ts` — the agent loop:
 
-```lua
--- af-prelude-version: 1
-function loop()
-  while true do
-    local msg = session.inbox()
-    local reply = llm.chat({
-      { role = "system", content = agent.info().instructions },
-      { role = "user", content = msg.text or "" },
-    })
-    session.send(reply.text or "")
-  end
-end
+```ts
+// af-prelude-version: 2
+function loop() {
+  while (true) {
+    const msg = session.inbox();
+    const reply = llm.chat([
+      { role: "system", content: agent.info().instructions },
+      { role: "user", content: msg.text || "" },
+    ]);
+    session.send(reply.text || "");
+  }
+}
 ```
 
 Then:
@@ -106,9 +106,9 @@ Edit the loop while it runs and every live session switches to the new code at i
 
 ## What's in the box
 
-**🧠 Loops in Lua**
-- A sandboxed pure-Go Lua 5.1 (`gopher-lua`) state per conversation, with an instruction budget and memory guards.
-- One small API: `llm.chat` / `llm.stream` / `llm.embed` / `llm.rerank`, `memory.recall` / `memory.write`, `store.*`, `tools.run`, `http.request`, `files.*`, `shell.run`, `mail.*`, `scheduler.after` / `every` / `cron`, `agent.spawn` / `send` / `request`, `user.*`.
+**🧠 Loops in TypeScript/JS + Wasm External APIs**
+- A sandboxed pure-Go TypeScript/JS VM ([`goja`](https://github.com/dop251/goja)) per conversation, with an operation budget and memory guards, plus pure-Go Wasm extensions ([`wazero`](https://github.com/tetratelabs/wazero)) for external APIs.
+- One small API (`// af-prelude-version: 2`): `llm.chat` / `llm.stream` / `llm.embed` / `llm.rerank`, `memory.recall` / `memory.write`, `store.*`, `tools.run`, `api.list` / `api.call` / `api.batch`, `http.request`, `files.*`, `shell.run`, `mail.*`, `scheduler.after` / `every` / `cron`, `agent.spawn` / `send` / `request`, `user.*`.
 - Built-in plugins for the boring parts: recency and semantic recall, per-chat routing, token budgets.
 - `agentflow loop test` runs scripted scenarios against a loop, so loops get tests too.
 
@@ -137,7 +137,7 @@ Edit the loop while it runs and every live session switches to the new code at i
 **🛡️ Safety and control**
 - Capabilities are declared per agent and enforced: an agent without `net.http` cannot make a request.
 - Safety profiles and classifiers on input and output, a network guard on outbound calls, and an audit trail.
-- Every message carries where it came from, and tenancy is checked from that record, never from what the Lua claims.
+- Every message carries where it came from, and tenancy is checked from that record, never from what the script claims.
 
 **📊 Operations**
 - Pure headless runtime — one HTTP port for everything: the channels, `/healthz` / `/readyz` / `/metrics`, and the authenticated `/admin/api/` JSON & SSE API that **AgentFlow Studio** connects to.
@@ -203,26 +203,26 @@ agentflow run -config mybot      # go
 
 ## AgentFlow Studio & Documentation
 
-AgentFlow itself is strictly a headless runtime; all UI, full documentation, and runnable examples live in [**AgentFlow Studio**](https://github.com/hulipa487/agentflow-studio). Connect Studio (desktop or web) to any deployment's `/admin/api/` endpoint to get an overview of sessions and instances, an agent builder with a Lua editor and analyzer, a playground with execution traces, and screens for models, channels, safety, users, credentials, usage, and logs. The complete guides (getting started, architecture, configuration reference, Lua API reference, deployment guides) ship inside Studio offline, and full runnable scenarios & single-pattern loops live under Studio's [`examples/`](https://github.com/hulipa487/agentflow-studio/tree/main/examples).
+AgentFlow itself is strictly a headless runtime; all UI, full documentation, and runnable examples live in [**AgentFlow Studio**](https://github.com/hulipa487/agentflow-studio). Connect Studio (desktop or web) to any deployment's `/admin/api/` endpoint to get an overview of sessions and instances, an agent builder with a TypeScript/JS editor and analyzer, a playground with execution traces, and screens for models, channels, safety, users, credentials, usage, and logs. The complete guides (getting started, architecture, configuration reference, Script API reference, deployment guides) ship inside Studio offline, and full runnable scenarios & single-pattern loops live under Studio's [`examples/`](https://github.com/hulipa487/agentflow-studio/tree/main/examples).
 
 ## For developers
 
 | Path | What's there |
 |---|---|
 | `cmd/agentflow` | The binary: engine wiring and the CLI |
-| `internal/vm` | The pure-Go Lua 5.1 VM (`gopher-lua`) and the prelude every loop runs on |
+| `internal/vm` | The pure-Go TypeScript/JS VM (`goja`), Wasm host (`wazero`), and the Prelude v2 every loop runs on |
 | `internal/adminapi` | The headless `/admin/api/*` JSON & SSE control plane for AgentFlow Studio |
 | `internal/core` | Sessions, supervisor, router, memory, leases, quotas, identity, safety... |
 | `internal/drivers` | Models, channels, memory backends, sandbox (`gVisor` & `microsandbox`), MCP, browser, S3... |
-| `internal/luacode` | Lua source, package (`-- af-import:`), and shadow loader |
-| `internal/builtins` | Core-contract embedded Lua defaults (router, memory handlers, `token_budget`) |
-| `api/` | The contracts: the users OpenAPI spec and the Lua type stubs (`af.d.lua`) |
+| `internal/luacode` | Script source, package (`// af-import:`), external API modules, and shadow loader |
+| `internal/builtins` | Core-contract embedded TypeScript defaults (router, memory handlers, `token_budget`) |
+| `api/` | The contracts: the users OpenAPI spec and the TypeScript API definitions (`af.d.ts`) |
 
-`go test ./...` and `go vet ./...` (or `make test` / `make vet`) work out of the box with `CGO_ENABLED=0`. The core and the Lua API move together: every Lua file declares the prelude version it targets (`-- af-prelude-version: 1`), and a mismatch is refused at load instead of half-working.
+`go test ./...` and `go vet ./...` (or `make test` / `make vet`) work out of the box with `CGO_ENABLED=0`. The core and the script API move together: every loop/plugin script declares the prelude version it targets (`// af-prelude-version: 2`), and a mismatch is refused at load instead of half-working.
 
 ## Why exactly AgentFlow?
 - **Full Transparency**: All model parameters are within your control.
-- **Ease of Development**: High level Lua language with unified calls.
+- **Ease of Development**: TypeScript/JS loops with unified async-bridged calls and Wasm external API extensions.
 - **Safe by Default**: Keys, quotas and capabilities stay with the engine, not the script.
 - **Scales When You Do**: Same config and loops from one laptop to a cell per region.
 - **Cross Platform**: Windows, MacOS, Linux, we've got you covered.

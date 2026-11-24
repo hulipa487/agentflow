@@ -44,13 +44,17 @@ func newSafetyActor(t *testing.T, gw Gateway, proc *safety.Dispatcher, loopSrc s
 func TestReplyTwiceIsAnError(t *testing.T) {
 	gw := &fakeGW{}
 	a, _ := newSafetyActor(t, gw, safety.New(safety.None), `
-function loop()
-  local m = session.inbox()
-  session.reply({ text = "one", finish_reason = "stop" })
-  local ok, err = pcall(session.reply, { text = "two" })
-  session.send(tostring(ok) .. "|" .. tostring(err))
-  while true do session.inbox() end
-end
+function loop() {
+  session.inbox();
+  session.reply({ text: "one", finish_reason: "stop" });
+  try {
+    session.reply({ text: "two" });
+    session.send("true|");
+  } catch (e) {
+    session.send("false|" + (e instanceof Error ? e.message : String(e)));
+  }
+  while (true) session.inbox();
+}
 `)
 	a.Mailbox <- Message{ID: "m1", Type: "user", From: "u", Text: "go", Channel: "test", ReplyTo: "r1"}
 	waitFor(t, "the structured reply", 5*time.Second, func() bool { return len(gw.repliesSnapshot()) == 1 })
@@ -71,12 +75,12 @@ func TestDeltasHeldWhenSafetyCanDrop(t *testing.T) {
 	gw := &fakeGW{}
 	disp := safety.New(&safety.Profile{Name: "test", Filters: []safety.Filter{allowFilter{}}})
 	a, _ := newSafetyActor(t, gw, disp, `
-function loop()
-  local m = session.inbox()
-  session.send_delta("Hello ")
-  session.send_delta("world")
-  while true do session.inbox() end
-end
+function loop() {
+  session.inbox();
+  session.send_delta("Hello ");
+  session.send_delta("world");
+  while (true) session.inbox();
+}
 `)
 	a.Mailbox <- Message{ID: "m1", Type: "user", From: "u", Text: "go", Channel: "test", ReplyTo: "r1"}
 	waitFor(t, "the released delta", 5*time.Second, func() bool { return len(gw.deltasSnapshot()) == 1 })
@@ -93,12 +97,12 @@ end
 func TestDeltasRelayLiveWithNoSafety(t *testing.T) {
 	gw := &fakeGW{}
 	a, _ := newSafetyActor(t, gw, safety.New(safety.None), `
-function loop()
-  local m = session.inbox()
-  session.send_delta("Hello ")
-  session.send_delta("world")
-  while true do session.inbox() end
-end
+function loop() {
+  session.inbox();
+  session.send_delta("Hello ");
+  session.send_delta("world");
+  while (true) session.inbox();
+}
 `)
 	a.Mailbox <- Message{ID: "m1", Type: "user", From: "u", Text: "go", Channel: "test", ReplyTo: "r1"}
 	waitFor(t, "two live deltas", 5*time.Second, func() bool { return len(gw.deltasSnapshot()) == 2 })
@@ -109,18 +113,18 @@ end
 }
 
 // TestEndTurnOnNormalEndCrashAndCancel covers the three end-of-turn paths the
-// channel contract names: parking on the inbox, a Lua crash mid-turn, and a
+// channel contract names: parking on the inbox, a script crash mid-turn, and a
 // cancellation mid-turn.
 func TestEndTurnOnNormalEndCrashAndCancel(t *testing.T) {
 	t.Run("normal", func(t *testing.T) {
 		gw := &fakeGW{}
 		a, _ := newSafetyActor(t, gw, safety.New(safety.None), `
-function loop()
-  while true do
-    local m = session.inbox()
-    session.send(m.text)
-  end
-end
+function loop() {
+  while (true) {
+    const m = session.inbox();
+    session.send(m.text);
+  }
+}
 `)
 		a.Mailbox <- Message{ID: "m1", Type: "user", From: "u", Text: "go", Channel: "test", ReplyTo: "r1"}
 		waitFor(t, "EndTurn", 5*time.Second, func() bool { return len(gw.turnsSnapshot()) == 1 })
@@ -132,10 +136,10 @@ end
 	t.Run("crash", func(t *testing.T) {
 		gw := &fakeGW{}
 		a, _ := newSafetyActor(t, gw, safety.New(safety.None), `
-function loop()
-  local m = session.inbox()
-  error("boom")
-end
+function loop() {
+  session.inbox();
+  throw new Error("boom");
+}
 `)
 		a.Mailbox <- Message{ID: "m1", Type: "user", From: "u", Text: "go", Channel: "test", ReplyTo: "r1"}
 		waitFor(t, "EndTurn", 5*time.Second, func() bool { return len(gw.turnsSnapshot()) == 1 })
@@ -147,11 +151,11 @@ end
 	t.Run("cancel", func(t *testing.T) {
 		gw := &fakeGW{}
 		a, cancel := newSafetyActor(t, gw, safety.New(safety.None), `
-function loop()
-  local m = session.inbox()
-  time.sleep(5)
-  session.send("late")
-end
+function loop() {
+  session.inbox();
+  time.sleep(5);
+  session.send("late");
+}
 `)
 		a.Mailbox <- Message{ID: "m1", Type: "user", From: "u", Text: "go", Channel: "test", ReplyTo: "r1"}
 		waitFor(t, "the turn to start", 5*time.Second, func() bool { return a.Busy() })
@@ -170,12 +174,12 @@ end
 func TestARetriedMessageIdStillEndsItsTurn(t *testing.T) {
 	gw := &fakeGW{}
 	a, _ := newSafetyActor(t, gw, safety.New(safety.None), `
-function loop()
-  while true do
-    local m = session.inbox()
-    session.send(m.text)
-  end
-end
+function loop() {
+  while (true) {
+    const m = session.inbox();
+    session.send(m.text);
+  }
+}
 `)
 	a.Mailbox <- Message{ID: "msg-same", Type: "user", From: "u", Text: "one", Channel: "test", ReplyTo: "r1"}
 	waitFor(t, "the first EndTurn", 5*time.Second, func() bool { return len(gw.turnsSnapshot()) == 1 })

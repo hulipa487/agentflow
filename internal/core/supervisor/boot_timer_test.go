@@ -39,10 +39,10 @@ func TestBootPersistentSpawnsDaemon(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	gw := gateway.NewRegistry(log)
 	recorded := make(chan string, 2)
-	loop := directive() + `function loop()
-  local msg = session.inbox()
-  af.op({ type = "probe.record", text = msg.type })
-end`
+	loop := directive() + `function loop() {
+  const msg = session.inbox();
+  af.op({ type: "probe.record", text: msg.type });
+}`
 	defs := map[string]*AgentDef{
 		"daemon": {
 			Info:       &session.Info{Name: "daemon", HistoryBudget: 100},
@@ -88,16 +88,16 @@ func TestTimerMessagesCarryTimerID(t *testing.T) {
 		"tick": {
 			Info:     &session.Info{Name: "tick", HistoryBudget: 100},
 			Handlers: map[string]session.OpHandler{"probe.record": probeHandler(recorded)},
-			LoopSrc: directive() + `function loop()
-  scheduler.every(0.1)
-  scheduler.every(0.17)
-  while true do
-    local msg = session.inbox()
-    if msg.type == "timer" and msg.payload and msg.payload.timer_id then
-      af.op({ type = "probe.record", text = msg.payload.timer_id })
-    end
-  end
-end`,
+			LoopSrc: directive() + `function loop() {
+  scheduler.every(0.1);
+  scheduler.every(0.17);
+  while (true) {
+    const msg = session.inbox();
+    if (msg.type === "timer" && msg.payload && msg.payload.timer_id) {
+      af.op({ type: "probe.record", text: msg.payload.timer_id });
+    }
+  }
+}`,
 		},
 	}
 	sup := New(defs, gw, pool.New(2), nil, log)

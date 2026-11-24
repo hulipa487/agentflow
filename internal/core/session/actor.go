@@ -338,6 +338,18 @@ type Op struct {
 	// Confirm bypass.
 	Confirmed bool   `json:"confirmed,omitempty"`
 	ConfirmID string `json:"confirm_id,omitempty"`
+
+	// External APIs (api.call, api.batch).
+	API      string        `json:"api,omitempty"`
+	Action   string        `json:"action,omitempty"`
+	APICalls []APICallSpec `json:"calls,omitempty"`
+}
+
+// APICallSpec is one request in an api.batch op.
+type APICallSpec struct {
+	API    string         `json:"api"`
+	Action string         `json:"action"`
+	Args   map[string]any `json:"args,omitempty"`
 }
 
 // CredentialRef names a stored credential to resolve at op-handler time. It
@@ -665,6 +677,8 @@ var blockingOps = map[string]bool{
 	"llm.stream.open":      true,
 	"llm.stream.next":      true,
 	"tools.run":            true,
+	"api.call":             true,
+	"api.batch":            true,
 	"store.put":            true,
 	"store.get":            true,
 	"store.query":          true,

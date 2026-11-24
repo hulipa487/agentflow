@@ -3,21 +3,17 @@ package vm
 import (
 	"encoding/json"
 	"fmt"
-	"strings"
 	"testing"
 )
 
-// drive runs one loop chunk, answering its ops the way the actor does: yield
-// on each request, resume with a stream frame. It returns the terminal status
-// and message.
-func drive(t *testing.T, body string) (Status, string) {
+func driveStream(t *testing.T, body string) (Status, string, bool) {
 	t.Helper()
 	st := New(5_000_000)
 	defer st.Close()
 	if err := st.LoadBase(); err != nil {
 		t.Fatal(err)
 	}
-	src := fmt.Sprintf("-- af-prelude-version: %d\n%s", PreludeVersion, body)
+	src := fmt.Sprintf("// af-prelude-version: %d\n%s", PreludeVersion, body)
 	status, msg := st.Start("run", "@stream-test", src)
 	frames := []string{
 		`{"delta":"a","done":false}`,
@@ -25,6 +21,7 @@ func drive(t *testing.T, body string) (Status, string) {
 		`{"done":true}`,
 	}
 	frame := 0
+	closedCalled := false
 	for status == Yielded {
 		var req struct {
 			Type string `json:"type"`
@@ -42,48 +39,67 @@ func drive(t *testing.T, body string) (Status, string) {
 			status, msg = st.Resume(frames[frame], true)
 			frame++
 		case "llm.stream.close":
+			closedCalled = true
 			status, msg = st.Resume("true", true)
 		default:
 			t.Fatalf("unexpected op %q", req.Type)
 		}
 	}
-	return status, msg
+	return status, msg, closedCalled
 }
 
-// TestLLMStreamDirectIteratorWorks: the documented form — call next_delta
-// yourself — suspends and resumes across the bridge and returns every delta.
-func TestLLMStreamDirectIteratorWorks(t *testing.T) {
-	status, msg := drive(t, `
-function run()
-  local out = {}
-  local next_delta, close = llm.stream({ { role = "user", content = "hi" } })
-  while true do
-    local d = next_delta()
-    if d == nil then break end
-    out[#out + 1] = d
-  end
-  close()
-  assert(table.concat(out, ",") == "a,b", "got: " .. table.concat(out, ","))
-end
+func TestLLMStreamForOfWorksNatively(t *testing.T) {
+	status, msg, closed := driveStream(t, `
+function run(): void {
+  const out: string[] = [];
+  for (const d of llm.stream([{ role: "user", content: "hi" }])) {
+    out.push(d);
+  }
+  if (out.join(",") !== "a,b") {
+    throw new Error("got: " + out.join(","));
+  }
+}
 `)
-	if status != Finished {
-		t.Fatalf("direct iterator failed: status=%v msg=%q", status, msg)
+	if status != Finished || !closed {
+		t.Fatalf("for..of stream failed: status=%v msg=%q closed=%v", status, msg, closed)
 	}
 }
 
-// TestLLMStreamGenericForIsRefused pins the limitation that made the direct
-// form necessary: a generic for calls the iterator from a C boundary, and the
-// op's yield is refused there. If a Luau upgrade ever allows it, this test
-// fails and the prelude comment can be relaxed.
-func TestLLMStreamGenericForIsRefused(t *testing.T) {
-	status, msg := drive(t, `
-function run()
-  for delta in llm.stream({ { role = "user", content = "hi" } }) do
-    local _ = delta
-  end
-end
+func TestLLMStreamEarlyBreakClosesStreamAutomatically(t *testing.T) {
+	status, msg, closed := driveStream(t, `
+function run(): void {
+  const out: string[] = [];
+  for (const d of llm.stream([{ role: "user", content: "hi" }])) {
+    out.push(d);
+    break;
+  }
+  if (out.join(",") !== "a") {
+    throw new Error("got: " + out.join(","));
+  }
+}
 `)
-	if status != Failed || !strings.Contains(msg, "yield across") {
-		t.Fatalf("generic for = status %v, msg %q; want the yield-across refusal", status, msg)
+	if status != Finished || !closed {
+		t.Fatalf("early-break stream did not auto-close: status=%v msg=%q closed=%v", status, msg, closed)
+	}
+}
+
+func TestLLMStreamManualNextAndClose(t *testing.T) {
+	status, msg, closed := driveStream(t, `
+function run(): void {
+  const out: string[] = [];
+  const s = llm.stream([{ role: "user", content: "hi" }]);
+  while (true) {
+    const step = s.next();
+    if (step.done) break;
+    out.push(step.value);
+  }
+  s.close();
+  if (out.join(",") !== "a,b") {
+    throw new Error("got: " + out.join(","));
+  }
+}
+`)
+	if status != Finished || !closed {
+		t.Fatalf("manual stream failed: status=%v msg=%q closed=%v", status, msg, closed)
 	}
 }

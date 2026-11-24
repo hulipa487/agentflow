@@ -138,26 +138,22 @@ func TestInboxWireShape(t *testing.T) {
 // Asserting on the Go struct instead would have missed the decode: a field
 // dropped between marshal and the table, or an omitempty that swallowed a
 // known-empty, shows up here and nowhere else.
-func TestInboxShapeReachesLua(t *testing.T) {
+func TestInboxShapeReachesScript(t *testing.T) {
 	const loopSrc = `
-function loop()
-  local msg = session.inbox()
-  local mk = {}
-  for k in pairs(msg) do mk[#mk+1] = k end
-  table.sort(mk)
-  local pk = {}
-  local tenant = "ABSENT"
-  if type(msg.provenance) == "table" then
-    for k in pairs(msg.provenance) do pk[#pk+1] = k end
-    table.sort(pk)
-    local uu = msg.provenance.user_uuid
-    if uu == nil then tenant = "ABSENT"
-    elseif uu == "" then tenant = "EMPTY"
-    else tenant = uu end
-  end
-  session.send("msg[" .. table.concat(mk, " ") .. "] provenance[" .. table.concat(pk, " ") ..
-               "] user_uuid=" .. tenant)
-end
+function loop() {
+  const msg = session.inbox();
+  const mk = Object.keys(msg).sort();
+  let pk = [];
+  let tenant = "ABSENT";
+  if (msg.provenance && typeof msg.provenance === "object") {
+    pk = Object.keys(msg.provenance).sort();
+    const uu = msg.provenance.user_uuid;
+    if (uu === undefined || uu === null) tenant = "ABSENT";
+    else if (uu === "") tenant = "EMPTY";
+    else tenant = uu;
+  }
+  session.send("msg[" + mk.join(" ") + "] provenance[" + pk.join(" ") + "] user_uuid=" + tenant);
+}
 `
 
 	fullMsgKeys := "attachments channel from id payload provenance reply_to text to ts type"

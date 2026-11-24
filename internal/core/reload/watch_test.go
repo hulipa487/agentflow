@@ -27,7 +27,7 @@ import (
 // keeps a version bump from turning every fixture in this file red for a reason
 // that has nothing to do with what it tests — the chunks this repo ships spell
 // the number literally, and the conformance suite is what pins those.
-func directive() string { return fmt.Sprintf("-- af-prelude-version: %d\n", vm.PreludeVersion) }
+func directive() string { return fmt.Sprintf("// af-prelude-version: %d\n", vm.PreludeVersion) }
 
 // syncBuf is a goroutine-safe log sink (the watcher polls on its own goroutine
 // while the test reads).
@@ -90,12 +90,12 @@ type dirLoop struct {
 func newDirLoop(t *testing.T, names ...string) *dirLoop {
 	t.Helper()
 	dir := t.TempDir()
-	writeMember(t, dir, "10-main.lua", directive()+"function loop() while true do session.inbox() end end\n")
-	writeMember(t, dir, "20-tools.lua", directive()+"-- tools member\n")
+	writeMember(t, dir, "10-main.ts", directive()+"function loop() { while (true) { session.inbox(); } }\n")
+	writeMember(t, dir, "20-tools.ts", directive()+"// tools member\n")
 
 	logs := &syncBuf{}
 	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	loopSrc := directive() + "function loop() while true do session.inbox() end end"
+	loopSrc := directive() + "function loop() { while (true) { session.inbox(); } }"
 
 	defs := map[string]*supervisor.AgentDef{}
 	for _, name := range names {
@@ -214,7 +214,7 @@ func newPromptFixture(t *testing.T, names ...string) *promptFixture {
 			},
 			Capabilities: map[string]bool{},
 			Handlers:     map[string]session.OpHandler{},
-			LoopSrc:      directive() + "function loop() while true do session.inbox() end end",
+			LoopSrc:      directive() + "function loop() { while (true) { session.inbox(); } }",
 		}
 	}
 
@@ -432,7 +432,7 @@ func TestSharedLoopPathReloadsEveryAgent(t *testing.T) {
 	w.Start()
 	defer w.Stop()
 
-	touch(t, filepath.Join(fx.dir, "20-tools.lua"))
+	touch(t, filepath.Join(fx.dir, "20-tools.ts"))
 
 	waitFor(t, "both agents to accept the new loop", 10*time.Second, func() bool {
 		return len(agentsNamed(fx.logs.String(), "reload: new version accepted", "agent=", "alpha", "beta")) == 2
@@ -455,7 +455,7 @@ func TestDeletedLoopMemberReloadsEveryAgent(t *testing.T) {
 	w.Start()
 	defer w.Stop()
 
-	if err := os.Remove(filepath.Join(fx.dir, "20-tools.lua")); err != nil {
+	if err := os.Remove(filepath.Join(fx.dir, "20-tools.ts")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -491,7 +491,7 @@ func TestUnchangedDirectoryMembersDoNotReload(t *testing.T) {
 // written from one goroutine and the assertions are deterministic.
 func TestDeletedMemberEntryIsPruned(t *testing.T) {
 	fx := newDirLoop(t, "alpha")
-	gone := filepath.Join(fx.dir, "20-tools.lua")
+	gone := filepath.Join(fx.dir, "20-tools.ts")
 
 	w := New(fx.sup, nil, fx.log)
 	w.seedDir("alpha", fx.dir) // what Start() does for a directory loop
@@ -525,9 +525,9 @@ func TestDeletedMemberEntryIsPruned(t *testing.T) {
 func TestEmptyDirectoryLoopIsRefused(t *testing.T) {
 	fx := newDirLoop(t, "alpha")
 	// Start from a one-member directory: drop the second member before the
-	// watcher seeds, reproducing a loop directory that holds exactly one .lua.
-	last := filepath.Join(fx.dir, "10-main.lua")
-	if err := os.Remove(filepath.Join(fx.dir, "20-tools.lua")); err != nil {
+	// watcher seeds, reproducing a loop directory that holds exactly one .ts.
+	last := filepath.Join(fx.dir, "10-main.ts")
+	if err := os.Remove(filepath.Join(fx.dir, "20-tools.ts")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -605,8 +605,8 @@ func TestSharedInstructionsPathUpdatesEveryAgent(t *testing.T) {
 
 // TestUnchangedPathDoesNotReload: the same guard for a single-file loop.
 func TestUnchangedPathDoesNotReload(t *testing.T) {
-	shared := filepath.Join(t.TempDir(), "loop.lua")
-	if err := os.WriteFile(shared, []byte(directive()+"function loop() end\n"), 0o600); err != nil {
+	shared := filepath.Join(t.TempDir(), "loop.ts")
+	if err := os.WriteFile(shared, []byte(directive()+"function loop() {}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -643,14 +643,14 @@ func TestUnchangedPathDoesNotReload(t *testing.T) {
 // whole loop through.
 func TestVersionMismatchKeepsRunningLoop(t *testing.T) {
 	fx := newDirLoop(t, "alpha")
-	stale := fmt.Sprintf("-- af-prelude-version: %d\n-- tools member\n", vm.PreludeVersion+1)
+	stale := fmt.Sprintf("// af-prelude-version: %d\n// tools member\n", vm.PreludeVersion+1)
 
 	w := New(fx.sup, nil, fx.log)
 	w.Start()
 	defer w.Stop()
 
-	writeMember(t, fx.dir, "20-tools.lua", stale)
-	touch(t, filepath.Join(fx.dir, "20-tools.lua"))
+	writeMember(t, fx.dir, "20-tools.ts", stale)
+	touch(t, filepath.Join(fx.dir, "20-tools.ts"))
 
 	waitFor(t, "the watcher to refuse the mismatched loop", 10*time.Second, func() bool {
 		// Error level, not Warn: a chunk written against another API is a
@@ -660,8 +660,8 @@ func TestVersionMismatchKeepsRunningLoop(t *testing.T) {
 
 	// The member is correct again. The refusal must not be sticky — the next
 	// edit reloads as any other edit would.
-	writeMember(t, fx.dir, "20-tools.lua", directive()+"-- tools member\n")
-	touch(t, filepath.Join(fx.dir, "20-tools.lua"))
+	writeMember(t, fx.dir, "20-tools.ts", directive()+"// tools member\n")
+	touch(t, filepath.Join(fx.dir, "20-tools.ts"))
 
 	waitFor(t, "the fixed loop to be accepted", 10*time.Second, func() bool {
 		return strings.Contains(fx.logs.String(), "reload: new version accepted")
@@ -690,9 +690,9 @@ type routeFixture struct {
 }
 
 var (
-	routeFirst  = directive() + "function loop() while true do session.inbox() end end -- v1\n"
-	routeSecond = directive() + "function loop() while true do session.inbox() end end -- v2\n"
-	routeBroken = directive() + "function loop() while true do this is not lua end\n"
+	routeFirst  = directive() + "function loop() { while (true) { session.inbox(); } } // v1\n"
+	routeSecond = directive() + "function loop() { while (true) { session.inbox(); } } // v2\n"
+	routeBroken = directive() + "function loop() { while (true) { this is not js; } }\n"
 )
 
 func newRouteFixture(t *testing.T) *routeFixture {
@@ -700,7 +700,7 @@ func newRouteFixture(t *testing.T) *routeFixture {
 	dir := t.TempDir()
 	// The shape the vision describes: the deployment's own routing, shadowing
 	// the builtin by name in plugins.dir.
-	file := filepath.Join(dir, "per_chat.lua")
+	file := filepath.Join(dir, "per_chat.ts")
 	if err := os.WriteFile(file, []byte(routeFirst), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -848,23 +848,23 @@ type supportFixture struct {
 }
 
 var (
-	chunkFirst  = directive() + "SUPPORT_MARK = \"v1\"\n"
-	chunkSecond = directive() + "SUPPORT_MARK = \"v2\"\n"
+	chunkFirst  = directive() + "var SUPPORT_MARK = \"v1\";\n"
+	chunkSecond = directive() + "var SUPPORT_MARK = \"v2\";\n"
 )
 
 // markLoop reports the marker the shadowed chunk defines, on every turn.
-var markLoop = directive() + `function loop()
-  while true do
-    local m = session.inbox()
-    log.info("MARK:" .. tostring(SUPPORT_MARK))
-  end
-end
+var markLoop = directive() + `function loop() {
+  while (true) {
+    const m = session.inbox();
+    log.info("MARK:" + String(SUPPORT_MARK));
+  }
+}
 `
 
 func newSupportFixture(t *testing.T, names ...string) *supportFixture {
 	t.Helper()
 	dir := t.TempDir()
-	file := filepath.Join(dir, "token_budget.lua")
+	file := filepath.Join(dir, "token_budget.ts")
 	if err := os.WriteFile(file, []byte(chunkFirst), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -968,7 +968,7 @@ func TestSupportChunkCompileFailureKeepsOldVersion(t *testing.T) {
 	fx := newSupportFixture(t, "alpha")
 	fx.startWatcher(t)
 
-	fx.edit(t, directive()+"SUPPORT_MARK = \"v2\"\nfunction broken( end\n")
+	fx.edit(t, directive()+"var SUPPORT_MARK = \"v2\";\nfunction broken( }\n")
 
 	waitFor(t, "the bad chunk to be refused", 10*time.Second, func() bool {
 		return loggedLine(fx.logs.String(), "reload: support chunk compile failed", "chunk=token_budget")
@@ -1000,7 +1000,7 @@ func TestSupportChunkVersionMismatchKeepsOldVersion(t *testing.T) {
 	fx := newSupportFixture(t, "alpha")
 	fx.startWatcher(t)
 
-	stale := fmt.Sprintf("-- af-prelude-version: %d\nSUPPORT_MARK = \"v2\"\n", vm.PreludeVersion+1)
+	stale := fmt.Sprintf("// af-prelude-version: %d\nvar SUPPORT_MARK = \"v2\";\n", vm.PreludeVersion+1)
 	fx.edit(t, stale)
 
 	waitFor(t, "the mismatched chunk to be refused", 10*time.Second, func() bool {

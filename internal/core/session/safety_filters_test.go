@@ -41,16 +41,16 @@ func TestDefaultSafetyInjectsDirectiveAndCapsSupportOffer(t *testing.T) {
 		traces = append(traces, ev)
 		mu.Unlock()
 	}
-	a.LoopSrc = directive() + `function loop()
-  while true do
-    local m = session.inbox()
-    local r = llm.chat({
-      {role = "system", content = "You are helpful."},
-      {role = "user", content = m.text or ""},
-    })
-    session.send(r.text or "")
-  end
-end`
+	a.LoopSrc = directive() + `function loop() {
+  while (true) {
+    const m = session.inbox();
+    const r = llm.chat([
+      { role: "system", content: "You are helpful." },
+      { role: "user", content: m.text || "" },
+    ]);
+    session.send(r.text || "");
+  }
+}`
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -120,21 +120,21 @@ func (routeTestClassifier) Classify(_ context.Context, req safety.ClassifyReques
 	return safety.Verdict{Label: "safe", Score: 0.99, Model: "guard"}, nil
 }
 
-func TestSafetyRedirectClassifierAndLuaFilterActor(t *testing.T) {
-	lf, err := safety.NewLuaFilter(safety.LuaFilterOptions{
+func TestSafetyRedirectClassifierAndScriptFilterActor(t *testing.T) {
+	lf, err := safety.NewScriptFilter(safety.ScriptFilterOptions{
 		Name:    "legal_router",
 		Ingress: true,
 		Source: `
-function ingress(input)
-  if string.find(string.lower(input.message), "legal", 1, true) then
-    return { redirect = "Legal-Pro", directive = "Cite statutes." }
-  end
-  return nil
-end
+export function ingress(input: { message: string }) {
+  if (input.message.toLowerCase().includes("legal")) {
+    return { redirect: "Legal-Pro", directive: "Cite statutes." };
+  }
+  return null;
+}
 `,
 	})
 	if err != nil {
-		t.Fatalf("NewLuaFilter: %v", err)
+		t.Fatalf("NewScriptFilter: %v", err)
 	}
 	clf := safety.NewClassifierFilter(safety.ClassifierOptions{
 		Name:       "complexity",
@@ -211,27 +211,24 @@ end
 		traces = append(traces, ev)
 		mu.Unlock()
 	}
-	a.LoopSrc = directive() + `function loop()
-  while true do
-    local m = session.inbox()
-    local info = agent.info()
-    local msgs = {{role = "user", content = m.text or ""}}
-    if string.find(m.text or "", "legal", 1, true) then
-      local next_delta = llm.stream(msgs, { model = "loop-fast" })
-      local out = ""
-      while true do
-        local d = next_delta()
-        if not d then break end
-        out = out .. d
-      end
-      session.send((info.model or "") .. "|" .. out)
-    else
-      local r1 = llm.chat(msgs)
-      local r2 = llm.chat(msgs, { model = "loop-explicit" })
-      session.send((info.model or "") .. "|" .. (info.agent_model or "") .. "|" .. (r1.text or "") .. "|" .. (r2.text or ""))
-    end
-  end
-end`
+	a.LoopSrc = directive() + `function loop() {
+  while (true) {
+    const m = session.inbox();
+    const info = agent.info();
+    const msgs = [{ role: "user", content: m.text || "" }];
+    if ((m.text || "").includes("legal")) {
+      let out = "";
+      for (const d of llm.stream(msgs, { model: "loop-fast" })) {
+        out += d;
+      }
+      session.send((info.model || "") + "|" + out);
+    } else {
+      const r1 = llm.chat(msgs);
+      const r2 = llm.chat(msgs, { model: "loop-explicit" });
+      session.send((info.model || "") + "|" + (info.agent_model || "") + "|" + (r1.text || "") + "|" + (r2.text || ""));
+    }
+  }
+}`
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

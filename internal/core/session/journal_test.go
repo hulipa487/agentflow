@@ -14,10 +14,10 @@ import (
 func TestEgressJournalRecordsDelivery(t *testing.T) {
 	gw := &fakeGW{}
 	a, _ := newTestActor(t, map[string]bool{}, gw, `
-function loop()
-  local msg = session.inbox()
-  session.send("a cat")
-end
+function loop() {
+  session.inbox();
+  session.send("a cat");
+}
 `)
 	var got []EgressRecord
 	a.Journal = func(r EgressRecord) { got = append(got, r) }
@@ -54,10 +54,10 @@ func TestJournalMetadataNeverStoresText(t *testing.T) {
 
 	gw := &fakeGW{}
 	a, _ := newTestActor(t, map[string]bool{}, gw, `
-function loop()
-  local msg = session.inbox()
-  session.send("SUPER-SECRET-BODY")
-end
+function loop() {
+  session.inbox();
+  session.send("SUPER-SECRET-BODY");
+}
 `)
 	a.JournalModeOf = func(string) JournalMode { return JournalMetadata }
 	a.Journal = func(r EgressRecord) {
@@ -103,10 +103,10 @@ end
 func TestJournalOffWritesNothing(t *testing.T) {
 	gw := &fakeGW{}
 	a, _ := newTestActor(t, map[string]bool{}, gw, `
-function loop()
-  local msg = session.inbox()
-  session.send("hello")
-end
+function loop() {
+  session.inbox();
+  session.send("hello");
+}
 `)
 	calls := 0
 	a.JournalModeOf = func(string) JournalMode { return JournalOff }

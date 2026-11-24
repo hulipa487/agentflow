@@ -163,19 +163,19 @@ func TestFilesOpsLuaBridge(t *testing.T) {
 		&session.Info{Name: "main", HistoryBudget: 100},
 		gw, nil, nil, nil, nil, handlers, pool.New(4), log)
 	a.LoopSrc = directive() + `
-function loop()
-  local msg = session.inbox()
-  local p = files.put("proj", "hello.txt", "hi there")
-  local c = files.commit("proj", { ref = "main", message = "init" })
-  local k = files.checkout("proj", "main")
-  local s = files.scratch.put("tmp.txt", "scratch-body")
-  local sl = files.scratch.list()
-  if p.ok and c.ok and k.ok and s.ok and #sl.entries == 1 and k.manifest.files[1].path == "hello.txt" then
-    session.send("ok:" .. p.entry.handle)
-  else
-    session.send("bad")
-  end
-end
+function loop() {
+  session.inbox();
+  const p = files.put("proj", "hello.txt", "hi there");
+  const c = files.commit("proj", { ref: "main", message: "init" });
+  const k = files.checkout("proj", "main");
+  const s = files.scratch.put("tmp.txt", "scratch-body");
+  const sl = files.scratch.list();
+  if (p.ok && c.ok && k.ok && s.ok && sl.entries.length === 1 && k.manifest.files[0].path === "hello.txt") {
+    session.send("ok:" + p.entry.handle);
+  } else {
+    session.send("bad");
+  }
+}
 `
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

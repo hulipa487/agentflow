@@ -248,7 +248,7 @@ func (r *Router) runOnce(ctx context.Context) runOutcome {
 	// The route handler's own surface, on top of the shared prelude: it exists
 	// only in this state, so an agent loop never reaches an op that is not its
 	// business.
-	if err := st.Eval("@route_state", routeStateLua); err != nil {
+	if err := st.Eval("@route_state", routeStateJS); err != nil {
 		r.log.Warn("route state api load failed", "err", err)
 		return runCrashed
 	}
@@ -434,31 +434,33 @@ const (
 	defaultRouteStateTTL = 30 * 24 * time.Hour
 )
 
-// routeStateLua defines the route handler's own API. It is loaded into the
+// routeStateJS defines the route handler's own API. It is loaded into the
 // router's service state on top of the shared prelude, so the namespace exists
-// exactly where it belongs: an agent loop calling router.state gets a Lua error
-// naming an undefined global, not an op the engine quietly refuses.
-//
-// A key may contain letters, digits and . _ - : (128 characters); a value is
-// any JSON-encodable Lua value up to 64 KiB. get returns nil for a key that was
-// never set (an unset key is not an error, so a handler needs no pcall).
-const routeStateLua = `
-router = {}
-router.state = {}
-function router.state.get(key)
-  return af.op({ type = "router.state.get", key = key })
-end
-function router.state.set(key, value, opts)
-  opts = opts or {}
-  return af.op({ type = "router.state.set", key = key, value = value,
-                 ttl_seconds = opts.ttl_seconds })
-end
-function router.state.delete(key)
-  return af.op({ type = "router.state.delete", key = key })
-end
-function router.state.list(prefix)
-  return af.op({ type = "router.state.list", key = prefix })
-end
+// exactly where it belongs: an agent loop calling router.state gets a runtime
+// error naming an undefined global rather than an op the engine quietly refuses.
+const routeStateJS = `
+var router = {
+  state: {
+    get: function(key) {
+      return af.op({ type: "router.state.get", key: key });
+    },
+    set: function(key, value, opts) {
+      opts = opts || {};
+      return af.op({
+        type: "router.state.set",
+        key: key,
+        value: value,
+        ttl_seconds: opts.ttl_seconds,
+      });
+    },
+    delete: function(key) {
+      return af.op({ type: "router.state.delete", key: key });
+    },
+    list: function(prefix) {
+      return af.op({ type: "router.state.list", key: prefix });
+    },
+  },
+};
 `
 
 // stateGet reads one key's value as stored, or "null" when it was never set.

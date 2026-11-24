@@ -33,11 +33,11 @@ func TestNamespaceHints(t *testing.T) {
 		t.Fatalf("a valid loop name must produce no hint, got %q", h)
 	}
 	// So is a path.
-	if h := loopHint("./loops/bot.lua", tools, loops); h != "" {
+	if h := loopHint("./loops/bot.ts", tools, loops); h != "" {
 		t.Fatalf("a path must produce no hint, got %q", h)
 	}
 	// And an unknown name is somebody's own file, not a mistake to report.
-	if h := loopHint("my_loop.lua", tools, loops); h != "" {
+	if h := loopHint("my_loop.ts", tools, loops); h != "" {
 		t.Fatalf("an unrelated value must produce no hint, got %q", h)
 	}
 

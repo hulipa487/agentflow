@@ -224,10 +224,10 @@ func TestStatefulRouteHandlerAlternatesAgents(t *testing.T) {
 			return "true", true
 		}
 	}
-	loop := directive() + `function loop()
-  local msg = session.inbox()
-  af.op({ type = "probe.record", text = msg.text })
-end`
+	loop := directive() + `function loop() {
+  const msg = session.inbox();
+  af.op({ type: "probe.record", text: msg.text });
+}`
 	defs := map[string]*supervisor.AgentDef{
 		"one": {
 			Info:     &session.Info{Name: "one", HistoryBudget: 100},
@@ -246,17 +246,17 @@ end`
 	sup.Start(ctx)
 
 	routeSrc := directive() + `
-function loop()
-  while true do
-    local item = session.inbox()
-    local msg = item.message
-    local n = router.state.get("chat:" .. msg.from) or 0
-    router.state.set("chat:" .. msg.from, n + 1)
-    local target = "one"
-    if n % 2 == 1 then target = "two" end
-    af.op({ type = "deliver", agent = target, key = msg.from, message = msg })
-  end
-end`
+function loop() {
+  while (true) {
+    const item = session.inbox();
+    const msg = item.message;
+    const n = router.state.get("chat:" + msg.from) || 0;
+    router.state.set("chat:" + msg.from, n + 1);
+    let target = "one";
+    if (n % 2 === 1) target = "two";
+    af.op({ type: "deliver", agent: target, key: msg.from, message: msg });
+  }
+}`
 	r, st := stateRouterWith(t, routeSrc, sup)
 	go r.Run(ctx)
 

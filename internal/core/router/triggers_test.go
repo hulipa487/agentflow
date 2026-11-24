@@ -58,12 +58,12 @@ func TestRouterAnswersRuntimeTriggers(t *testing.T) {
 
 	ch := make(chan string, 8)
 	r := New(directive()+`
-function loop()
-  while true do
-    local item = session.inbox()
-    log.info("TRIGGERS:" .. json.encode(runtime.triggers()))
-  end
-end
+function loop() {
+  while (true) {
+    session.inbox();
+    log.info("TRIGGERS:" + json.encode(runtime.triggers()));
+  }
+}
 `, caps.TriggersResponse(triggers), nil, slog.New(chanHandler{ch: ch}))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -162,13 +162,13 @@ func dropNulls(v any) any {
 func TestRouterTriggersDefaultsEmpty(t *testing.T) {
 	ch := make(chan string, 8)
 	r := New(directive()+`
-function loop()
-  while true do
-    local item = session.inbox()
-    local t = runtime.triggers()
-    log.info("N:" .. tostring(#t.triggers))
-  end
-end
+function loop() {
+  while (true) {
+    session.inbox();
+    const t = runtime.triggers();
+    log.info("N:" + String(t.triggers.length));
+  }
+}
 `, "", nil, slog.New(chanHandler{ch: ch}))
 
 	ctx, cancel := context.WithCancel(context.Background())

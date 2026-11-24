@@ -1,8 +1,10 @@
 package vm
 
 import (
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestInstructionBudgetKillsInfiniteLoop(t *testing.T) {
@@ -11,54 +13,33 @@ func TestInstructionBudgetKillsInfiniteLoop(t *testing.T) {
 	if err := st.LoadBase(); err != nil {
 		t.Fatal(err)
 	}
-	status, msg := st.Start("loop", "@spin.lua", directive()+`
-function loop()
-  while true do end
-end
+	status, msg := st.Start("loop", "@spin.ts", directive()+`
+function loop(): void {
+  while (true) {}
+}
 `)
 	if status != Failed || !strings.Contains(msg, "instruction budget exceeded") {
 		t.Fatalf("infinite loop = (%v, %q); want Failed with instruction budget exceeded", status, msg)
 	}
 }
 
-func TestInstructionBudgetCannotBeSwallowedByPCall(t *testing.T) {
+func TestInstructionBudgetCannotBeSwallowedByTryCatch(t *testing.T) {
 	st := New(5_000)
 	defer st.Close()
 	if err := st.LoadBase(); err != nil {
 		t.Fatal(err)
 	}
-	status, msg := st.Start("loop", "@pcall-spin.lua", directive()+`
-function loop()
-  local ok, err = pcall(function()
-    while true do end
-  end)
-  -- Must not keep running after budget exhaustion.
-  local x = 0
-  for i = 1, 1000 do x = x + i end
-end
-`)
-	if status != Failed || !strings.Contains(msg, "instruction budget exceeded") {
-		t.Fatalf("pcall spin = (%v, %q); want Failed with instruction budget exceeded", status, msg)
-	}
+	status, msg := st.Start("loop", "@try-spin.ts", directive()+`
+function loop(): void {
+  try {
+    while (true) {}
+  } catch (e) {}
+  let x = 0;
+  for (let i = 0; i < 1000; i++) x += i;
 }
-
-func TestInstructionBudgetEnforcedInUserCoroutines(t *testing.T) {
-	st := New(5_000)
-	defer st.Close()
-	if err := st.LoadBase(); err != nil {
-		t.Fatal(err)
-	}
-	status, msg := st.Start("loop", "@co-spin.lua", directive()+`
-function loop()
-  local co = coroutine.create(function()
-    while true do end
-  end)
-  local ok, err = coroutine.resume(co)
-  if not ok then error(err) end
-end
 `)
 	if status != Failed || !strings.Contains(msg, "instruction budget exceeded") {
-		t.Fatalf("coroutine spin = (%v, %q); want Failed with instruction budget exceeded", status, msg)
+		t.Fatalf("try/catch spin = (%v, %q); want Failed with instruction budget exceeded", status, msg)
 	}
 }
 
@@ -68,14 +49,14 @@ func TestInstructionBudgetRearmsPerResume(t *testing.T) {
 	if err := st.LoadBase(); err != nil {
 		t.Fatal(err)
 	}
-	status, msg := st.Start("loop", "@rearm.lua", directive()+`
-function loop()
-  for round = 1, 5 do
-    local s = 0
-    for i = 1, 1000 do s = s + i end
-    session.inbox()
-  end
-end
+	status, msg := st.Start("loop", "@rearm.ts", directive()+`
+function loop(): void {
+  for (let round = 0; round < 5; round++) {
+    let s = 0;
+    for (let i = 0; i < 1000; i++) s += i;
+    session.inbox();
+  }
+}
 `)
 	for round := 0; round < 5; round++ {
 		if status != Yielded {
@@ -88,34 +69,30 @@ end
 	}
 }
 
-func TestYieldablePCallAndXPCallAcrossHostOps(t *testing.T) {
+func TestTryCatchAcrossHostOps(t *testing.T) {
 	st := New(1_000_000)
 	defer st.Close()
 	if err := st.LoadBase(); err != nil {
 		t.Fatal(err)
 	}
-	status, msg := st.Start("loop", "@yield-pcall.lua", directive()+`
-function loop()
-  -- Nested pcall across yielding op (ok = true)
-  local ok1, ok2, res = pcall(function()
-    return pcall(session.inbox)
-  end)
-  assert(ok1 == true, "outer pcall failed")
-  assert(ok2 == true, "inner pcall failed")
-  assert(res.text == "hello", "unexpected res: " .. tostring(res and res.text))
+	status, msg := st.Start("loop", "@yield-try.ts", directive()+`
+function loop(): void {
+  let inner = null;
+  try {
+    inner = session.inbox();
+  } catch (e) {
+    throw new Error("unexpected error: " + String(e));
+  }
+  if (inner.text !== "hello") throw new Error("unexpected text: " + inner.text);
 
-  -- pcall catches op failure (ok = false)
-  local ok3, err3 = pcall(session.inbox)
-  assert(ok3 == false, "expected pcall to catch op error")
-  assert(string.find(tostring(err3), "denied", 1, true) ~= nil, "lost error: " .. tostring(err3))
-
-  -- xpcall catches op failure and runs handler
-  local ok4, err4 = xpcall(function() return session.inbox() end, function(e)
-    return "handled:" .. tostring(e)
-  end)
-  assert(ok4 == false, "expected xpcall to catch op error")
-  assert(string.find(tostring(err4), "handled:", 1, true) ~= nil, "xpcall handler did not run: " .. tostring(err4))
-end
+  let caught = "";
+  try {
+    session.inbox();
+  } catch (e) {
+    caught = String(e);
+  }
+  if (!caught.includes("denied")) throw new Error("lost error: " + caught);
+}
 `)
 	if status != Yielded {
 		t.Fatalf("op 1: got (%v, %q); want Yielded", status, msg)
@@ -124,50 +101,40 @@ end
 	if status != Yielded {
 		t.Fatalf("op 2: got (%v, %q); want Yielded", status, msg)
 	}
-	status, msg = st.Resume(`permission denied`, false)
-	if status != Yielded {
-		t.Fatalf("op 3: got (%v, %q); want Yielded", status, msg)
-	}
-	status, msg = st.Resume(`boom`, false)
+	status, msg = st.Resume(`"permission denied"`, false)
 	if status != Finished {
 		t.Fatalf("final: got (%v, %q); want Finished", status, msg)
 	}
 }
 
-func TestSandboxStripsUnsafeGlobalsAndSealsStdlib(t *testing.T) {
+func TestSandboxStripsUnsafeGlobalsAndSealsNamespaces(t *testing.T) {
 	st := New(1_000_000)
 	defer st.Close()
 	if err := st.LoadBase(); err != nil {
 		t.Fatal(err)
 	}
-	status, msg := st.Start("loop", "@sandbox.lua", directive()+`
-TOP_LEVEL = 42
-function loop()
-  -- Unsafe libraries/functions must not exist.
-  for _, name in ipairs({
-    "io", "debug", "package", "require", "dofile", "load",
-    "loadfile", "loadstring", "module", "setfenv", "getfenv",
-    "_printregs", "collectgarbage",
-  }) do
-    assert(_G[name] == nil, "unsafe global exposed: " .. name)
-  end
-  assert(os.execute == nil and os.remove == nil and os.exit == nil, "unsafe os.* exposed")
-  assert(string.dump == nil, "string.dump exposed")
+	status, msg := st.Start("loop", "@sandbox.ts", directive()+`
+var TOP_LEVEL = 42;
+export function loop(): void {
+  const assert = (c: boolean, m?: string) => { if (!c) throw new Error(m || "assertion failed"); };
+  for (const name of ["io", "debug", "package", "require", "process", "fs", "fetch", "Buffer"]) {
+    assert(typeof (globalThis as Record<string, unknown>)[name] === "undefined", "unsafe global exposed: " + name);
+  }
+  assert(os.execute === undefined && os.remove === undefined && os.exit === undefined, "unsafe os.* exposed");
+  assert(TOP_LEVEL === 42);
 
-  -- Thread-local globals work, and string methods still work after sealing.
-  assert(TOP_LEVEL == 42)
-  assert(("hello"):sub(1, 3) == "hel")
+  // Sealed prelude namespaces reject property writes/reassignment.
+  assert(Reflect.set(os, "evil", 1) === false, "mutating sealed os succeeded");
+  assert(Reflect.set(http, "request", () => {}) === false, "mutating sealed http succeeded");
 
-  -- Sealed stdlib tables reject mutation via assignment, rawset, and table.insert.
-  local ok1 = pcall(function() string.evil = 1 end)
-  assert(not ok1, "mutating string table succeeded")
-  local ok2 = pcall(function() rawset(string, "evil", 1) end)
-  assert(not ok2, "rawset on sealed string table succeeded")
-  local ok3 = pcall(function() table.insert(string, 1) end)
-  assert(not ok3, "table.insert on sealed string table succeeded")
-  local ok4 = pcall(function() setmetatable(_G, {}) end)
-  assert(not ok4, "setmetatable(_G) succeeded")
-end
+  let proxyThrew = false;
+  try {
+    (api as Record<string, unknown>).evil = 1;
+  } catch (_) {
+    proxyThrew = true;
+  }
+  assert(proxyThrew, "api proxy allowed property write");
+}
 `)
 	if status != Finished {
 		t.Fatalf("sandbox test failed: (%v, %q)", status, msg)
@@ -180,13 +147,13 @@ func TestPhase0YieldChainsIntoLoop(t *testing.T) {
 	if err := st.LoadBase(); err != nil {
 		t.Fatal(err)
 	}
-	status, msg := st.Start("loop", "@phase0.lua", directive()+`
-local boot = session.inbox()
-function loop()
-  assert(boot.ready == true)
-  local m = session.inbox()
-  assert(m.text == "after-boot")
-end
+	status, msg := st.Start("loop", "@phase0.ts", directive()+`
+const boot = session.inbox();
+function loop(): void {
+  if (boot.ready !== true) throw new Error("boot missing");
+  const m = session.inbox();
+  if (m.text !== "after-boot") throw new Error("wrong text");
+}
 `)
 	if status != Yielded {
 		t.Fatalf("phase 0 yield: got (%v, %q); want Yielded", status, msg)
@@ -207,74 +174,71 @@ func TestMissingLoopGlobalFailsClearly(t *testing.T) {
 	if err := st.LoadBase(); err != nil {
 		t.Fatal(err)
 	}
-	status, msg := st.Start("loop", "@noloop.lua", directive()+"local x = 1\n")
+	status, msg := st.Start("loop", "@noloop.ts", directive()+"const x = 1;\n")
 	if status != Failed || !strings.Contains(msg, "global 'loop' is not defined") {
 		t.Fatalf("missing loop = (%v, %q); want Failed naming global 'loop'", status, msg)
 	}
 }
 
-func TestMemoryCapGuardsStringRepAndTableConcat(t *testing.T) {
+func TestMemoryCapGuardsRepeatAndArrayJoin(t *testing.T) {
 	st := New(1_000_000)
 	st.SetMemoryCap(4096)
 	defer st.Close()
 	if err := st.LoadBase(); err != nil {
 		t.Fatal(err)
 	}
-	status, msg := st.Start("loop", "@memcap.lua", directive()+`
-function loop()
-  local ok1, err1 = pcall(string.rep, "abcdefgh", 1000)
-  assert(not ok1 and string.find(tostring(err1), "out of memory", 1, true), "string.rep not capped: " .. tostring(err1))
+	status, msg := st.Start("loop", "@memcap.ts", directive()+`
+function loop(): void {
+  let err1 = "";
+  try {
+    "abcdefgh".repeat(1000);
+  } catch (e) {
+    err1 = String(e);
+  }
+  if (!err1.includes("out of memory")) throw new Error("repeat not capped: " + err1);
 
-  local parts = {}
-  for i = 1, 200 do parts[i] = "012345678901234567890123456789" end
-  local ok2, err2 = pcall(table.concat, parts)
-  assert(not ok2 and string.find(tostring(err2), "out of memory", 1, true), "table.concat not capped: " .. tostring(err2))
-end
+  const parts: string[] = [];
+  for (let i = 0; i < 200; i++) parts.push("012345678901234567890123456789");
+  let err2 = "";
+  try {
+    parts.join("");
+  } catch (e) {
+    err2 = String(e);
+  }
+  if (!err2.includes("out of memory")) throw new Error("join not capped: " + err2);
+}
 `)
 	if status != Finished {
 		t.Fatalf("memcap test failed: (%v, %q)", status, msg)
 	}
 }
 
-func TestUTF8Bit32AndCompatHelpers(t *testing.T) {
-	st := New(1_000_000)
-	defer st.Close()
-	if err := st.LoadBase(); err != nil {
-		t.Fatal(err)
+func TestCloseMidYieldHasZeroGoroutineLeak(t *testing.T) {
+	base := runtime.NumGoroutine()
+	for i := 0; i < 25; i++ {
+		st := New(1_000_000)
+		if err := st.LoadBase(); err != nil {
+			t.Fatal(err)
+		}
+		status, msg := st.Start("loop", "@leak.ts", directive()+`
+function loop(): void {
+  try {
+    while (true) {
+      session.inbox();
+    }
+  } catch (_) {}
+}
+`)
+		if status != Yielded {
+			st.Close()
+			t.Fatalf("iter %d: expected Yielded, got (%v, %q)", i, status, msg)
+		}
+		st.Close()
 	}
-	if err := st.Eval("@compat", `
--- utf8
-local s = utf8.char(0x4E2D, 0x6587, 0x1F600)
-assert(utf8.len(s) == 3, "utf8.len")
-local a, b, c = utf8.codepoint(s, 1, #s)
-assert(a == 0x4E2D and b == 0x6587 and c == 0x1F600, "utf8.codepoint")
-local cps = {}
-for _, cp in utf8.codes(s) do cps[#cps + 1] = cp end
-assert(#cps == 3 and cps[3] == 0x1F600, "utf8.codes")
-assert(utf8.offset(s, 2) == 4 and utf8.offset(s, -1) == 7, "utf8.offset")
-
--- bit32
-assert(bit32.band(0xF0, 0x3C) == 0x30)
-assert(bit32.bor(0xF0, 0x0F) == 0xFF)
-assert(bit32.bxor(0xFF, 0x0F) == 0xF0)
-assert(bit32.lshift(1, 8) == 256)
-assert(bit32.rshift(256, 8) == 1)
-assert(bit32.extract(0xABCD, 4, 8) == 0xBC)
-assert(bit32.replace(0xABCD, 0x12, 4, 8) == 0xA12D)
-
--- table.* & string.split
-local p = table.pack(10, nil, 30)
-assert(p.n == 3)
-local x, y, z = table.unpack({1, 2, 3})
-assert(x == 1 and y == 2 and z == 3)
-assert(table.find({"a", "b", "c"}, "b") == 2)
-local cl = table.clone({k = 7})
-assert(cl.k == 7)
-table.clear(cl)
-assert(next(cl) == nil)
-local parts = string.split("a,b,c", ",")
-assert(#parts == 3 and parts[2] == "b")
-`); err != nil {
-		t.Fatalf("compat helpers failed: %v", err)
+	runtime.GC()
+	time.Sleep(50 * time.Millisecond)
+	after := runtime.NumGoroutine()
+	if after > base+2 {
+		t.Fatalf("goroutines leaked: before=%d after=%d", base, after)
 	}
 }

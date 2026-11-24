@@ -9,25 +9,13 @@ import (
 	"testing"
 )
 
-// The prelude declares af.version, and PreludeVersion is the Go side of the same
-// number. Two spellings of one fact, so this test is the tie between them: a
-// bump that edits one and not the other fails here instead of shipping a core
-// that gates every chunk against a version the prelude does not admit to.
-var preludeAfVersionRE = regexp.MustCompile(`(?m)^af\.version\s*=\s*(\d+)\s*$`)
+var preludeAfVersionRE = regexp.MustCompile(`(?m)^\s*af\.version\s*=\s*(\d+);?\s*$`)
 
-// directive is the leading comment line every chunk the gate accepts declares.
-// A test chunk is a chunk: vm.State.Start refuses one without it exactly as it
-// refuses a session's loop, so fixtures declare it the way a shipped file does.
-func directive() string { return fmt.Sprintf("-- af-prelude-version: %d\n", PreludeVersion) }
+func directive() string { return fmt.Sprintf("// af-prelude-version: %d\n", PreludeVersion) }
 
-// TestStartRefusesAnUngatedSource is the in-memory path's gate. A loop a library
-// consumer hands to a session as raw source never passes through
-// luacode.Resolve, so this is the only place it can be stopped — and a source
-// that does go through Resolve is checked again here, which is harmless because
-// Resolve returns only what this same check accepted.
 func TestStartRefusesAnUngatedSource(t *testing.T) {
 	const name = "in-memory loop of session main|test"
-	body := "function loop() session.inbox() end\n"
+	body := "function loop() { session.inbox(); }\n"
 
 	refused := New(1_000_000)
 	defer refused.Close()
@@ -35,7 +23,7 @@ func TestStartRefusesAnUngatedSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	if status, msg := refused.Start("loop", name, body); status != Failed {
-		t.Fatalf("an ungated in-memory source was loaded (status %v, msg %q); the gate does not reach the embedding path", status, msg)
+		t.Fatalf("an ungated in-memory source was loaded (status %v, msg %q)", status, msg)
 	} else if !strings.Contains(msg, name) || !strings.Contains(msg, "af-prelude-version") {
 		t.Fatalf("refusal is not the gate's: %q", msg)
 	}
@@ -53,28 +41,24 @@ func TestStartRefusesAnUngatedSource(t *testing.T) {
 func TestPreludeDeclaresItsVersion(t *testing.T) {
 	m := preludeAfVersionRE.FindStringSubmatch(prelude)
 	if m == nil {
-		t.Fatal("the prelude no longer declares af.version on a line of its own; PreludeVersion has nothing to be tied to")
+		t.Fatal("the prelude no longer declares af.version on a line of its own")
 	}
 	n, err := strconv.Atoi(m[1])
 	if err != nil {
 		t.Fatalf("af.version = %q is not a number: %v", m[1], err)
 	}
 	if n != PreludeVersion {
-		t.Fatalf("the prelude declares af.version = %d but PreludeVersion is %d; they are one number and must be bumped together", n, PreludeVersion)
+		t.Fatalf("the prelude declares af.version = %d but PreludeVersion is %d", n, PreludeVersion)
 	}
 }
 
-// TestPreludeVersionIsVisibleToLua is the end of the wire the contract promises:
-// a loaded prelude answers af.version with the number this core gates against.
-// Reading the constant out of the Go source would not have caught the prelude
-// assigning it under a different name, or not at all.
-func TestPreludeVersionIsVisibleToLua(t *testing.T) {
+func TestPreludeVersionIsVisibleToScript(t *testing.T) {
 	st := New(1_000_000)
 	defer st.Close()
 	if err := st.LoadBase(); err != nil {
 		t.Fatal(err)
 	}
-	src := fmt.Sprintf("assert(af.version == %d, 'af.version is ' .. tostring(af.version))", PreludeVersion)
+	src := fmt.Sprintf(`if (af.version !== %d) throw new Error("af.version is " + String(af.version));`, PreludeVersion)
 	if err := st.Eval("@test", src); err != nil {
 		t.Fatalf("af.version in the loaded prelude is not %d: %v", PreludeVersion, err)
 	}
@@ -87,21 +71,16 @@ func TestDeclaredVersion(t *testing.T) {
 		want int
 		ok   bool
 	}{
-		{"first line", "-- af-prelude-version: 1\nfunction loop() end\n", 1, true},
-		{"after a banner and blank lines", "\n-- plugin:thing\n-- af-prelude-version: 7\n\nreturn 1\n", 7, true},
-		{"loose spacing", "--   af-prelude-version:   12  \nreturn 1\n", 12, true},
-		{"after a luau mode directive", "--!strict\n-- af-prelude-version: 2\nreturn 1\n", 2, true},
-		{"single line, no trailing newline", "-- af-prelude-version: 3", 3, true},
-		{"missing", "function loop() end\n", 0, false},
+		{"first line", "// af-prelude-version: 2\nfunction loop() {}\n", 2, true},
+		{"after a banner and blank lines", "\n// plugin:thing\n// af-prelude-version: 7\n\nfunction loop() {}\n", 7, true},
+		{"loose spacing", "//   af-prelude-version:   12  \nfunction loop() {}\n", 12, true},
+		{"single line, no trailing newline", "// af-prelude-version: 3", 3, true},
+		{"missing", "function loop() {}\n", 0, false},
 		{"empty", "", 0, false},
-		// The scan stops at the first line that is neither blank nor a comment,
-		// so a directive-shaped line further down is not a declaration. That is
-		// the whole parsing rule: the declaration is a comment at the top, and
-		// reading it that way needs no Lua parser and no running chunk.
-		{"after code", "local x = 1\n-- af-prelude-version: 1\nreturn x\n", 0, false},
-		{"inside a string literal", "local s = \"-- af-prelude-version: 1\"\nreturn s\n", 0, false},
-		{"mentioned in prose", "-- see af-prelude-version: 1 for the rule\nreturn 1\n", 0, false},
-		{"declared twice", "-- af-prelude-version: 1\n-- af-prelude-version: 2\nreturn 1\n", 0, false},
+		{"after code", "const x = 1;\n// af-prelude-version: 2\nfunction loop() {}\n", 0, false},
+		{"inside a string literal", "const s = \"// af-prelude-version: 2\";\n", 0, false},
+		{"mentioned in prose", "// see af-prelude-version: 2 for the rule\n", 0, false},
+		{"declared twice", "// af-prelude-version: 1\n// af-prelude-version: 2\n", 0, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -114,17 +93,17 @@ func TestDeclaredVersion(t *testing.T) {
 }
 
 func TestCheckChunkVersion(t *testing.T) {
-	const name = "loops/react.lua"
+	const name = "loops/react.ts"
 
 	t.Run("the core's own version is accepted", func(t *testing.T) {
-		src := fmt.Sprintf("-- af-prelude-version: %d\nfunction loop() end\n", PreludeVersion)
+		src := fmt.Sprintf("// af-prelude-version: %d\nfunction loop() {}\n", PreludeVersion)
 		if err := CheckChunkVersion(name, src); err != nil {
 			t.Fatalf("a chunk targeting this core's version was refused: %v", err)
 		}
 	})
 
 	t.Run("another version is refused", func(t *testing.T) {
-		src := fmt.Sprintf("-- af-prelude-version: %d\nfunction loop() end\n", PreludeVersion+1)
+		src := fmt.Sprintf("// af-prelude-version: %d\nfunction loop() {}\n", PreludeVersion+1)
 		err := CheckChunkVersion(name, src)
 		if err == nil {
 			t.Fatal("a chunk targeting another prelude version was accepted")
@@ -132,8 +111,6 @@ func TestCheckChunkVersion(t *testing.T) {
 		if !errors.Is(err, ErrPreludeVersion) {
 			t.Fatalf("refusal does not wrap ErrPreludeVersion: %v", err)
 		}
-		// Loud enough to act on without opening the source: which file, which
-		// version it wants, which version it got.
 		for _, want := range []string{name, fmt.Sprint(PreludeVersion + 1), fmt.Sprint(PreludeVersion)} {
 			if !strings.Contains(err.Error(), want) {
 				t.Fatalf("refusal does not mention %q: %v", want, err)
@@ -141,23 +118,21 @@ func TestCheckChunkVersion(t *testing.T) {
 		}
 	})
 
-	t.Run("silence is refused, not assumed compatible", func(t *testing.T) {
-		err := CheckChunkVersion(name, "function loop() end\n")
+	t.Run("silence is refused", func(t *testing.T) {
+		err := CheckChunkVersion(name, "function loop() {}\n")
 		if err == nil {
-			t.Fatal("a chunk that declares no version was accepted; the gate would then only catch chunks that opted in")
+			t.Fatal("a chunk that declares no version was accepted")
 		}
 		if !errors.Is(err, ErrPreludeVersion) {
 			t.Fatalf("refusal does not wrap ErrPreludeVersion: %v", err)
 		}
-		// The one message a loop author is most likely to meet has to say what
-		// to write, not merely that something is wrong.
 		if !strings.Contains(err.Error(), "af-prelude-version") {
 			t.Fatalf("refusal does not say which line to add: %v", err)
 		}
 	})
 
 	t.Run("declaring twice is refused", func(t *testing.T) {
-		err := CheckChunkVersion(name, "-- af-prelude-version: 1\n-- af-prelude-version: 2\nreturn 1\n")
+		err := CheckChunkVersion(name, "// af-prelude-version: 1\n// af-prelude-version: 2\n")
 		if err == nil {
 			t.Fatal("a chunk declaring two versions was accepted")
 		}

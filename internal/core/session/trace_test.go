@@ -25,12 +25,12 @@ func TestTracerEmitsTurnOpAndReplyEvents(t *testing.T) {
 			gw, nil, nil, nil, nil, map[string]OpHandler{}, pool.New(1),
 			slog.New(slog.NewTextHandler(io.Discard, nil)))
 		a.TracePayloads = payloads
-		a.LoopSrc = directive() + `function loop()
-  while true do
-    local m = session.inbox()
-    session.send("echo:" .. (m.text or ""))
-  end
-end`
+		a.LoopSrc = directive() + `function loop() {
+  while (true) {
+    const m = session.inbox();
+    session.send("echo:" + (m.text || ""));
+  }
+}`
 
 		var mu sync.Mutex
 		var events []TraceEvent

@@ -1,20 +1,24 @@
-// Package vm wraps the pure-Go gopher-lua VM behind a minimal Go API.
+// Package vm wraps the pure-Go Goja TypeScript/JavaScript engine behind a
+// minimal Go Start/Resume/Close API.
 //
-// One State owns one Lua main state and one sandboxed loop thread; a State
-// must be used from a single goroutine at a time (session actors guarantee
-// this).
+// One State owns one Goja runtime and (once Start is called) one worker
+// goroutine that executes the loop and yields across channels on host ops.
+// A State must be driven from a single caller goroutine at a time (session
+// actors and the router guarantee this).
 package vm
 
 import (
-	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	lua "github.com/yuin/gopher-lua"
-	"github.com/yuin/gopher-lua/parse"
+	"github.com/dop251/goja"
+
+	"agentflow/internal/script"
 )
 
 // Status of a Start/Resume drive step.
@@ -23,389 +27,405 @@ type Status int
 const (
 	Finished Status = iota // loop returned (session over)
 	Yielded                // loop made an op request (see message)
-	Failed                 // Lua error (see message)
+	Failed                 // runtime or compile error (see message)
 )
 
 var (
-	closedChan           = make(chan struct{})
 	errInstructionBudget = errors.New("instruction budget exceeded")
+	errClosed            = errors.New("vm state closed")
 )
 
-func init() {
-	close(closedChan)
+type stepResult struct {
+	status Status
+	msg    string
 }
 
-// budgetContext implements context.Context to enforce a deterministic
-// per-resume bytecode instruction limit inside gopher-lua's
-// mainLoopWithContext without spawning any goroutines or timers.
-type budgetContext struct {
-	max       int64
-	remaining int64
-	tripped   bool
+type resumeMsg struct {
+	respJSON string
+	ok       bool
 }
 
-func (b *budgetContext) arm() {
-	b.remaining = b.max
-	b.tripped = false
-}
-
-func (b *budgetContext) Deadline() (time.Time, bool) { return time.Time{}, false }
-func (b *budgetContext) Value(any) any               { return nil }
-
-func (b *budgetContext) Done() <-chan struct{} {
-	if b.max <= 0 {
-		return nil
-	}
-	if b.tripped {
-		return closedChan
-	}
-	b.remaining--
-	if b.remaining <= 0 {
-		b.tripped = true
-		return closedChan
-	}
-	return nil
-}
-
-func (b *budgetContext) Err() error {
-	if b.tripped {
-		return errInstructionBudget
-	}
-	return nil
-}
-
-// State is a sandboxed Lua state + loop coroutine. Not safe for concurrent use.
+// State is a sandboxed Goja runtime + channel-bridged loop worker. Not safe
+// for concurrent Start/Resume calls from multiple caller goroutines.
 type State struct {
-	L           *lua.LState
-	T           *lua.LState
-	env         *lua.LTable
-	budget      *budgetContext
+	rt          *goja.Runtime
 	instrBudget int64
-	memCap      int64
-	fn          string
-	phase       int // 0 = running plugin chunk, 1 = running loop fn
-	sealed      map[*lua.LTable]bool
+	memCap      atomic.Int64
 	isSealed    bool
+
+	watchdogMu    sync.Mutex
+	watchdogTimer *time.Timer
+	watchdogGen   atomic.Uint64
+	budgetTripped atomic.Bool
+
+	started   bool
+	inWorker  atomic.Bool
+	finished  bool
+	closed    atomic.Bool
+	closeOnce sync.Once
+	stepCh    chan stepResult
+	resumeCh  chan resumeMsg
+	stopCh    chan struct{}
+	doneCh    chan struct{}
 }
 
-// New creates a sandboxed state. instrBudget limits bytecode instructions per
-// resume (0 = unlimited).
+// budgetDuration maps a legacy instruction budget count onto a per-resume CPU
+// watchdog duration so runaway pure-JS loops still interrupt promptly.
+func budgetDuration(instrBudget int64) time.Duration {
+	if instrBudget <= 0 {
+		return 0
+	}
+	d := time.Duration(instrBudget) * 5 * time.Microsecond
+	if d < 25*time.Millisecond {
+		return 25 * time.Millisecond
+	}
+	if d > 5*time.Second {
+		return 5 * time.Second
+	}
+	return d
+}
+
+// New creates a sandboxed Goja state. instrBudget configures the per-resume CPU
+// watchdog limit (0 = unlimited).
 func New(instrBudget int64) *State {
-	L := lua.NewState(lua.Options{
-		SkipOpenLibs:        true,
-		IncludeGoStackTrace: false,
-		MinimizeStackMemory: true,
-		RegistrySize:        1024,
-		RegistryMaxSize:     65535,
-	})
+	rt := script.NewRuntime(script.RuntimeOptions{})
 	s := &State{
-		L:           L,
+		rt:          rt,
 		instrBudget: instrBudget,
-		sealed:      map[*lua.LTable]bool{},
 	}
-	if instrBudget > 0 {
-		s.budget = &budgetContext{max: instrBudget, remaining: instrBudget}
-	}
-	s.openLibs()
+
+	_ = rt.Set("__af_now", func(call goja.FunctionCall) goja.Value {
+		return rt.ToValue(time.Now().Unix())
+	})
+	_ = rt.Set("__af_mem_cap", func(call goja.FunctionCall) goja.Value {
+		return rt.ToValue(s.memCap.Load())
+	})
+	_ = rt.Set("exports", rt.NewObject())
+	_ = rt.Set("__af_op", func(call goja.FunctionCall) goja.Value {
+		return s.hostOp(call)
+	})
 	return s
 }
 
-// SetMemoryCap configures a soft memory limit in bytes for this state
-// (0 = uncapped, the default). Under pure-Go gopher-lua, Go's garbage
-// collector manages the heap, so this cap enforces guards on large string and
-// table allocations (such as string.rep and table.concat) rather than a hard
-// per-byte C allocator cap. Exceeding a guard raises an "out of memory" Lua
-// error.
+func (s *State) armWatchdog() {
+	d := budgetDuration(s.instrBudget)
+	if d <= 0 {
+		return
+	}
+	s.watchdogMu.Lock()
+	defer s.watchdogMu.Unlock()
+	if s.closed.Load() {
+		return
+	}
+	if s.watchdogTimer != nil {
+		s.watchdogTimer.Stop()
+	}
+	s.budgetTripped.Store(false)
+	gen := s.watchdogGen.Add(1)
+	s.watchdogTimer = time.AfterFunc(d, func() {
+		s.watchdogMu.Lock()
+		active := s.watchdogGen.Load() == gen && !s.closed.Load()
+		s.watchdogMu.Unlock()
+		if active {
+			s.budgetTripped.Store(true)
+			s.rt.Interrupt(errInstructionBudget)
+		}
+	})
+}
+
+func (s *State) disarmWatchdog() {
+	s.watchdogMu.Lock()
+	s.watchdogGen.Add(1)
+	if s.watchdogTimer != nil {
+		s.watchdogTimer.Stop()
+		s.watchdogTimer = nil
+	}
+	s.watchdogMu.Unlock()
+}
+
+func (s *State) throwError(msg string) {
+	if ctor, ok := goja.AssertConstructor(s.rt.Get("Error")); ok {
+		if obj, err := ctor(nil, s.rt.ToValue(msg)); err == nil {
+			panic(obj)
+		}
+	}
+	panic(s.rt.ToValue(msg))
+}
+
+func (s *State) hostOp(call goja.FunctionCall) goja.Value {
+	if !s.inWorker.Load() {
+		s.throwError("cannot yield outside loop execution")
+	}
+	reqJSON := ""
+	if len(call.Arguments) > 0 && !goja.IsUndefined(call.Arguments[0]) && !goja.IsNull(call.Arguments[0]) {
+		reqJSON = call.Arguments[0].String()
+	}
+
+	s.disarmWatchdog()
+	select {
+	case s.stepCh <- stepResult{status: Yielded, msg: reqJSON}:
+	case <-s.stopCh:
+		panic(errClosed)
+	}
+
+	select {
+	case r := <-s.resumeCh:
+		if s.closed.Load() {
+			panic(errClosed)
+		}
+		// Clear any stale interrupt that might have raced right as we disarmed.
+		s.rt.ClearInterrupt()
+		s.armWatchdog()
+		return s.rt.ToValue([]any{r.respJSON, r.ok})
+	case <-s.stopCh:
+		panic(errClosed)
+	}
+}
+
+// SetMemoryCap configures a soft memory limit in bytes for large prelude string
+// and array joins (0 = uncapped). Exceeding a guard throws RangeError("out of memory").
 func (s *State) SetMemoryCap(capBytes int64) {
 	if s == nil {
 		return
 	}
-	s.memCap = capBytes
+	s.memCap.Store(capBytes)
 }
 
-// Close destroys the state and releases its resources.
+// Close destroys the state, interrupts any running loop worker, and waits for
+// the worker goroutine (if started) to exit cleanly.
 func (s *State) Close() {
-	if s.T != nil {
-		s.T.Close()
-		s.T = nil
+	if s == nil {
+		return
 	}
-	if s.L != nil {
-		s.L.Close()
-		s.L = nil
-	}
-}
-
-// Chunk compilation is cached process-wide keyed by (name, SHA-256(source)) so
-// repeated session spawns reuse immutable compiled FunctionProtos while hot
-// reloads compile changed sources anew and preserve exact chunk names in stack
-// traces and compile error messages.
-const compileCacheMaxChunks = 4096
-
-type compiledChunk struct {
-	proto *lua.FunctionProto
-	err   string
-}
-
-var compilation = struct {
-	sync.RWMutex
-	chunks map[[32]byte]compiledChunk
-}{chunks: map[[32]byte]compiledChunk{}}
-
-func cacheKey(name, code string) [32]byte {
-	h := sha256.New()
-	h.Write([]byte(name))
-	h.Write([]byte{0})
-	h.Write([]byte(code))
-	var out [32]byte
-	h.Sum(out[:0])
-	return out
-}
-
-func formatCompileError(name string, err error) string {
-	var pe *parse.Error
-	if errors.As(err, &pe) {
-		if pe.Pos.Line == parse.EOF {
-			return fmt.Sprintf("%s:EOF: %s", name, pe.Message)
+	s.closeOnce.Do(func() {
+		s.closed.Store(true)
+		s.disarmWatchdog()
+		if s.rt != nil {
+			s.rt.Interrupt(errClosed)
 		}
-		if pe.Token != "" {
-			return fmt.Sprintf("%s:%d:%d: %s near %q", name, pe.Pos.Line, pe.Pos.Column, pe.Message, pe.Token)
+		if s.stopCh != nil {
+			close(s.stopCh)
 		}
-		return fmt.Sprintf("%s:%d:%d: %s", name, pe.Pos.Line, pe.Pos.Column, pe.Message)
-	}
-	msg := strings.TrimSpace(err.Error())
-	if strings.HasPrefix(msg, name+":") {
-		return msg
-	}
-	return fmt.Sprintf("%s: %s", name, msg)
-}
-
-func compileChunk(name, code string) (*lua.FunctionProto, error) {
-	key := cacheKey(name, code)
-	compilation.RLock()
-	entry, ok := compilation.chunks[key]
-	compilation.RUnlock()
-	if ok {
-		if entry.err != "" {
-			return nil, errors.New(entry.err)
+		if s.started && s.doneCh != nil {
+			<-s.doneCh
 		}
-		return entry.proto, nil
-	}
-
-	stmts, err := parse.Parse(strings.NewReader(code), name)
-	if err != nil {
-		msg := formatCompileError(name, err)
-		cacheStore(key, compiledChunk{err: msg})
-		return nil, errors.New(msg)
-	}
-	proto, err := lua.Compile(stmts, name)
-	if err != nil {
-		msg := formatCompileError(name, err)
-		cacheStore(key, compiledChunk{err: msg})
-		return nil, errors.New(msg)
-	}
-	cacheStore(key, compiledChunk{proto: proto})
-	return proto, nil
+	})
 }
 
-func cacheStore(key [32]byte, entry compiledChunk) {
-	compilation.Lock()
-	if len(compilation.chunks) >= compileCacheMaxChunks {
-		compilation.chunks = map[[32]byte]compiledChunk{}
-	}
-	compilation.chunks[key] = entry
-	compilation.Unlock()
-}
-
-// Eval compiles and executes a chunk on the main state (e.g. to load the
-// prelude or support chunks before Start).
+// Eval compiles (stripping TypeScript annotations when present) and executes
+// a chunk on the runtime before Start (e.g. to load the prelude, support
+// chunks, or route helpers).
 func (s *State) Eval(name, code string) error {
-	proto, err := compileChunk(name, code)
+	if s.started {
+		return errors.New("cannot Eval after Start")
+	}
+	isTS := name != "@prelude" && name != "@json"
+	prog, err := script.Compile(name, code, isTS)
 	if err != nil {
 		return err
 	}
-	// Apply the instruction budget on non-base Eval chunks so runaway code
-	// evaluated directly via Eval still terminates, while trusted prelude
-	// loading always succeeds even under tight test budgets.
-	useBudget := s.budget != nil && name != "@json" && name != "@prelude"
+	useBudget := s.instrBudget > 0 && isTS
 	if useBudget {
-		s.budget.arm()
-		s.L.SetContext(s.budget)
-		defer s.L.RemoveContext()
+		s.armWatchdog()
+		defer func() {
+			s.disarmWatchdog()
+			s.rt.ClearInterrupt()
+		}()
 	}
-	fn := s.L.NewFunctionFromProto(proto)
-	s.L.Push(fn)
-	if err := s.L.PCall(0, 0, nil); err != nil {
-		return errors.New(formatLuaError(err))
+	if _, err := s.rt.RunProgram(prog); err != nil {
+		return errors.New(s.formatJSError(err))
 	}
 	return nil
 }
 
-// sealGlobals freezes the main state's globals and reachable stdlib/prelude
-// tables read-only before user code runs in Start.
+const sealGlobalsJS = `(function(g) {
+  var names = [
+    "af", "session", "log", "time", "os", "agent", "scheduler", "store",
+    "user", "memory", "tool", "tools", "shell", "http", "runtime",
+    "credential", "mail", "llm", "openai", "files", "json", "router"
+  ];
+  for (var i = 0; i < names.length; i++) {
+    var obj = g[names[i]];
+    if (obj && typeof obj === "object") {
+      var keys = Object.keys(obj);
+      for (var j = 0; j < keys.length; j++) {
+        var child = obj[keys[j]];
+        if (child && typeof child === "object") {
+          Object.freeze(child);
+        }
+      }
+      Object.freeze(obj);
+    }
+  }
+})(globalThis);`
+
+var sealGlobalsProg = goja.MustCompile("@seal", sealGlobalsJS, false)
+
+// sealGlobals freezes the prelude and service namespace objects read-only
+// before user code runs in Start. (`api` is already a frozen Proxy.)
 func (s *State) sealGlobals() {
 	if s.isSealed {
 		return
 	}
 	s.isSealed = true
-
-	roMT := s.L.NewTable()
-	roMT.RawSetString("__newindex", s.L.NewFunction(func(L *lua.LState) int {
-		L.RaiseError("attempt to modify a readonly table")
-		return 0
-	}))
-	roMT.RawSetString("__metatable", lua.LString("The metatable is locked"))
-
-	var seal func(tbl *lua.LTable)
-	seal = func(tbl *lua.LTable) {
-		if tbl == nil || s.sealed[tbl] {
-			return
-		}
-		s.sealed[tbl] = true
-		tbl.ForEach(func(_, v lua.LValue) {
-			if child, ok := v.(*lua.LTable); ok {
-				seal(child)
-			}
-		})
-		if tbl.Metatable == lua.LNil {
-			tbl.Metatable = roMT
-		}
-	}
-	seal(s.L.G.Global)
+	_, _ = s.rt.RunProgram(sealGlobalsProg)
 }
 
-func (s *State) newLoopThread() *lua.LState {
-	th, cancel := s.L.NewThread()
-	if cancel != nil {
-		cancel()
-	}
-	th.Env = s.env
-	if s.budget != nil {
-		th.SetContext(s.budget)
-	}
-	return th
-}
-
-// Start seals globals, loads the plugin chunk onto the sandboxed loop thread,
-// runs it (top-level code may yield), then resumes the named global as the
-// loop.
-//
-// name identifies the chunk in a version refusal and compile errors.
+// Start seals prelude namespaces, compiles and executes the chunk top-level
+// (which may yield host ops), and then invokes the named global/exported loop
+// function. name identifies the chunk in version refusals and compile errors.
 func (s *State) Start(fn, name, code string) (Status, string) {
 	if err := CheckChunkVersion(name, code); err != nil {
 		return Failed, err.Error()
 	}
-	proto, err := compileChunk(name, code)
+	prog, err := script.Compile(name, code, true)
 	if err != nil {
 		return Failed, err.Error()
 	}
 
 	s.sealGlobals()
 
-	// Create a fresh sandboxed environment inheriting sealed globals read-only.
-	env := s.L.NewTable()
-	envMT := s.L.NewTable()
-	envMT.RawSetString("__index", s.L.G.Global)
-	envMT.RawSetString("__metatable", lua.LString("The metatable is locked"))
-	env.Metatable = envMT
-	env.RawSetString("_G", env)
-	s.env = env
+	s.stepCh = make(chan stepResult, 1)
+	s.resumeCh = make(chan resumeMsg)
+	s.stopCh = make(chan struct{})
+	s.doneCh = make(chan struct{})
+	s.started = true
+	s.finished = false
 
-	s.fn = fn
-	s.phase = 0
-	s.T = s.newLoopThread()
+	go s.runWorker(fn, prog)
 
-	chunkFn := s.T.NewFunctionFromProto(proto)
-	return s.drive(chunkFn)
+	res := <-s.stepCh
+	if res.status != Yielded {
+		s.finished = true
+	}
+	return res.status, res.msg
 }
 
-// Resume answers a yielded op request by passing (respJSON, ok) as return
-// values to the yielded __af_op call.
+func (s *State) runWorker(fn string, prog *goja.Program) {
+	s.inWorker.Store(true)
+	defer func() {
+		s.inWorker.Store(false)
+		s.disarmWatchdog()
+		if r := recover(); r != nil {
+			if rErr, ok := r.(error); ok && errors.Is(rErr, errClosed) {
+				close(s.doneCh)
+				return
+			}
+			close(s.doneCh)
+			panic(r)
+		}
+		close(s.doneCh)
+	}()
+
+	s.armWatchdog()
+	if _, err := s.rt.RunProgram(prog); err != nil {
+		s.disarmWatchdog()
+		if s.closed.Load() {
+			return
+		}
+		s.sendResult(stepResult{status: Failed, msg: s.formatJSError(err)})
+		return
+	}
+
+	loopFn, ok := s.lookupLoopFn(fn)
+	if !ok {
+		s.disarmWatchdog()
+		s.sendResult(stepResult{
+			status: Failed,
+			msg:    fmt.Sprintf("global '%s' is not defined (loop plugin must define it)", fn),
+		})
+		return
+	}
+
+	if _, err := loopFn(goja.Undefined()); err != nil {
+		s.disarmWatchdog()
+		if s.closed.Load() {
+			return
+		}
+		s.sendResult(stepResult{status: Failed, msg: s.formatJSError(err)})
+		return
+	}
+
+	s.disarmWatchdog()
+	s.sendResult(stepResult{status: Finished})
+}
+
+func (s *State) lookupLoopFn(fn string) (goja.Callable, bool) {
+	if call, ok := goja.AssertFunction(s.rt.Get(fn)); ok {
+		return call, true
+	}
+	if exp := s.rt.Get("exports"); exp != nil && !goja.IsUndefined(exp) && !goja.IsNull(exp) {
+		obj := exp.ToObject(s.rt)
+		if call, ok := goja.AssertFunction(obj.Get(fn)); ok {
+			return call, true
+		}
+	}
+	return nil, false
+}
+
+func (s *State) sendResult(res stepResult) {
+	select {
+	case s.stepCh <- res:
+	case <-s.stopCh:
+	}
+}
+
+// Resume answers a yielded op request by passing [respJSON, ok] back to the
+// suspended __af_op call inside the worker goroutine.
 func (s *State) Resume(respJSON string, ok bool) (Status, string) {
-	if s.T == nil {
+	if !s.started || s.finished || s.closed.Load() {
 		return Failed, "cannot resume unstarted VM state"
 	}
-	return s.drive(nil, lua.LString(respJSON), lua.LBool(ok))
+	select {
+	case s.resumeCh <- resumeMsg{respJSON: respJSON, ok: ok}:
+	case <-s.doneCh:
+		return Failed, "cannot resume finished VM state"
+	case <-s.stopCh:
+		return Failed, "cannot resume closed VM state"
+	}
+
+	res := <-s.stepCh
+	if res.status != Yielded {
+		s.finished = true
+	}
+	return res.status, res.msg
 }
 
-// drive runs the active coroutine; when the plugin chunk finishes (from Start
-// or from a later Resume), it chains into the named loop function transparently.
-func (s *State) drive(fn *lua.LFunction, args ...lua.LValue) (Status, string) {
-	st, msg := s.doResume(fn, args...)
-	if st == Finished && s.phase == 0 {
-		s.phase = 1
-		loopVal := s.L.GetField(s.env, s.fn)
-		loopFn, ok := loopVal.(*lua.LFunction)
-		if !ok {
-			return Failed, fmt.Sprintf("global '%s' is not defined (loop plugin must define it)", s.fn)
-		}
-		// Phase 0's thread is dead after returning; start phase 1 on a fresh
-		// thread sharing the exact same sandboxed environment.
-		s.T = s.newLoopThread()
-		st, msg = s.doResume(loopFn)
-	}
-	return st, msg
-}
-
-func (s *State) doResume(fn *lua.LFunction, args ...lua.LValue) (Status, string) {
-	if s.budget != nil {
-		s.budget.arm()
-	}
-	resState, err, values := s.L.Resume(s.T, fn, args...)
-	switch resState {
-	case lua.ResumeYield:
-		if len(values) > 0 {
-			return Yielded, valueToMsg(values[0])
-		}
-		return Yielded, ""
-	case lua.ResumeOK:
-		return Finished, ""
-	default:
-		return Failed, formatLuaError(err)
-	}
-}
-
-func valueToMsg(v lua.LValue) string {
-	switch tv := v.(type) {
-	case lua.LString:
-		return string(tv)
-	case lua.LNumber:
-		return tv.String()
-	case *lua.LNilType:
-		return ""
-	default:
-		return fmt.Sprintf("(non-string error: %s)", v.Type().String())
-	}
-}
-
-func formatLuaError(err error) string {
+func (s *State) formatJSError(err error) string {
 	if err == nil {
 		return ""
 	}
-	var aerr *lua.ApiError
-	if errors.As(err, &aerr) {
-		if aerr.Object != nil {
-			switch tv := aerr.Object.(type) {
-			case lua.LString:
-				return string(tv)
-			case lua.LNumber:
-				return tv.String()
-			default:
-				return fmt.Sprintf("(non-string error: %s)", aerr.Object.Type().String())
+	if s.budgetTripped.Load() || errors.Is(err, errInstructionBudget) {
+		return errInstructionBudget.Error()
+	}
+	var ierr *goja.InterruptedError
+	if errors.As(err, &ierr) {
+		if errors.Is(ierr, errInstructionBudget) {
+			return errInstructionBudget.Error()
+		}
+		return ierr.Error()
+	}
+	var ex *goja.Exception
+	if errors.As(err, &ex) {
+		raw := strings.TrimSpace(ex.Error())
+		if val := ex.Value(); val != nil && !goja.IsUndefined(val) && !goja.IsNull(val) {
+			if _, ok := val.(*goja.Object); ok && strings.HasPrefix(raw, "[object ") {
+				if b, mErr := json.Marshal(val.Export()); mErr == nil {
+					return fmt.Sprintf("(non-string error: object %s)", string(b))
+				}
+				return "(non-string error: object)"
 			}
+		}
+		if raw != "" {
+			return raw
 		}
 	}
 	return err.Error()
 }
 
-// CompileCheck validates that code parses and compiles cleanly (used by hot
-// reload and CLI validation before swapping loops).
+// CompileCheck validates that code strips TypeScript cleanly and parses under
+// Goja (used by hot reload, CLI validation, and contract tests before swapping loops).
 func CompileCheck(name, code string) error {
-	stmts, err := parse.Parse(strings.NewReader(code), name)
-	if err != nil {
-		return errors.New(formatCompileError(name, err))
-	}
-	if _, err := lua.Compile(stmts, name); err != nil {
-		return errors.New(formatCompileError(name, err))
-	}
-	return nil
+	_, err := script.Compile(name, code, true)
+	return err
 }

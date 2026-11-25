@@ -422,3 +422,88 @@ func TestValidateWeComChannel(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateEmailChannel(t *testing.T) {
+	markFalse := false
+	base := func() Channel {
+		return Channel{
+			Name:     "mail",
+			Type:     "email",
+			Agent:    "coder",
+			IMAPHost: "imap.example.com",
+			SMTPHost: "smtp.example.com",
+			Username: "bot@example.com",
+			Password: "${EMAIL_PASSWORD}",
+		}
+	}
+	cases := []struct {
+		name    string
+		mutate  func(*Channel)
+		wantErr string
+	}{
+		{name: "minimal valid", mutate: func(*Channel) {}},
+		{name: "full valid", mutate: func(ch *Channel) {
+			ch.Mode = "polling"
+			ch.IMAPPort = 993
+			ch.SMTPPort = 587
+			ch.SMTPUsername = "mailer@example.com"
+			ch.SMTPPassword = "cred:smtp_pass"
+			ch.FromAddress = "Support Bot <bot@example.com>"
+			ch.Mailbox = "Support"
+			ch.PollInterval = "15s"
+			ch.MarkSeen = &markFalse
+			ch.AllowFrom = []string{"alice@partner.org"}
+			ch.AllowDomains = []string{"@example.com", "trusted.io"}
+		}},
+		{name: "missing imap_host", mutate: func(ch *Channel) { ch.IMAPHost = " " }, wantErr: "has no imap_host"},
+		{name: "missing smtp_host", mutate: func(ch *Channel) { ch.SMTPHost = "" }, wantErr: "has no smtp_host"},
+		{name: "bad imap_port", mutate: func(ch *Channel) { ch.IMAPPort = 70000 }, wantErr: "imap_port must be 1..65535"},
+		{name: "bad smtp_port", mutate: func(ch *Channel) { ch.SMTPPort = -1 }, wantErr: "smtp_port must be 1..65535"},
+		{name: "missing username", mutate: func(ch *Channel) { ch.Username = "" }, wantErr: "has no username"},
+		{name: "missing password", mutate: func(ch *Channel) { ch.Password = "" }, wantErr: "has no password"},
+		{name: "bad mode", mutate: func(ch *Channel) { ch.Mode = "webhook" }, wantErr: "use idle or polling"},
+		{name: "path disallowed", mutate: func(ch *Channel) { ch.Path = "/email/" }, wantErr: "does not use"},
+		{name: "allow_users disallowed", mutate: func(ch *Channel) { ch.AllowUsers = []int64{1} }, wantErr: "only telegram uses"},
+		{name: "bad poll_interval", mutate: func(ch *Channel) { ch.PollInterval = "500ms" }, wantErr: "poll_interval"},
+		{name: "bad from_address", mutate: func(ch *Channel) { ch.FromAddress = "not an address" }, wantErr: "from_address"},
+		{name: "bad allow_from", mutate: func(ch *Channel) { ch.AllowFrom = []string{"no-at-sign"} }, wantErr: "allow_from"},
+		{name: "bad allow_domain", mutate: func(ch *Channel) { ch.AllowDomains = []string{"user@example.com"} }, wantErr: "allow_domains"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ch := base()
+			tc.mutate(&ch)
+			err := ValidateChannels(openAIConfig(), []Channel{ch})
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %v; want one containing %q", err, tc.wantErr)
+			}
+		})
+	}
+	if !(Channel{}).EmailMarkSeen() {
+		t.Fatal("default EmailMarkSeen should be true")
+	}
+	if (Channel{MarkSeen: &markFalse}).EmailMarkSeen() {
+		t.Fatal("explicit false EmailMarkSeen should be false")
+	}
+	ch := base()
+	ch.IMAPPort = 993
+	ch.SMTPPort = 465
+	ch.MarkSeen = &markFalse
+	ch.AllowFrom = []string{"alice@example.com"}
+	ch.AllowDomains = []string{"example.com"}
+	raw, err := yaml.Marshal(ch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"imap_host: imap.example.com", "smtp_port: 465", "mark_seen: false", "allow_from:", "allow_domains:"} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("yaml lacks %q:\n%s", want, raw)
+		}
+	}
+}

@@ -416,3 +416,109 @@ func TestChannelsSetHooksSaveLiveDeleteLiveAndRawToken(t *testing.T) {
 		t.Fatalf("deletedSeen = %v; want [tg-main]", deletedSeen)
 	}
 }
+
+func TestChannelsEmailRoundTripAndSecrets(t *testing.T) {
+	t.Setenv("EMAIL_PW", "imap-secret")
+	t.Setenv("SMTP_PW", "smtp-secret")
+	dir := writeFiles(t, map[string]string{
+		"system.yaml":           channelSystem,
+		"profiles/greeter.yaml": greeterProfile,
+		"channels.yaml":         "channels: []\n",
+	})
+	cfg, err := config.LoadDir(dir, testLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewChannels(cfg, dir, "", agentsFor("greeter"), testLog())
+
+	list0, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	markSeenFalse := false
+	saved, err := store.Save(-1, ChannelDraft{
+		Name:         "support-mail",
+		Type:         "email",
+		Agent:        "greeter",
+		Mode:         "polling",
+		IMAPHost:     "imap.example.com",
+		IMAPPort:     993,
+		SMTPHost:     "smtp.example.com",
+		SMTPPort:     465,
+		Username:     "support@example.com",
+		Password:     "${EMAIL_PW}",
+		SMTPUsername: "smtp-user@example.com",
+		SMTPPassword: "${SMTP_PW}",
+		FromAddress:  "Support <support@example.com>",
+		Mailbox:      "SupportBox",
+		PollInterval: "45s",
+		MarkSeen:     &markSeenFalse,
+		AllowFrom:    []string{"vip@partner.org"},
+		AllowDomains: []string{"example.com"},
+		MediaAllow:   []string{"text/*", "application/pdf"},
+	}, list0.MTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(saved.Channels) != 1 {
+		t.Fatalf("expected 1 channel, got %d", len(saved.Channels))
+	}
+	v := saved.Channels[0]
+	if !v.HasPassword || v.PasswordRef != "${EMAIL_PW}" {
+		t.Fatalf("password flags = (%v, %q); want (true, ${EMAIL_PW})", v.HasPassword, v.PasswordRef)
+	}
+	if !v.HasSMTPPassword || v.SMTPPasswordRef != "${SMTP_PW}" {
+		t.Fatalf("smtp password flags = (%v, %q); want (true, ${SMTP_PW})", v.HasSMTPPassword, v.SMTPPasswordRef)
+	}
+	if v.MarkSeen == nil || *v.MarkSeen {
+		t.Fatalf("MarkSeen = %v; want false", v.MarkSeen)
+	}
+	if v.IMAPHost != "imap.example.com" || v.SMTPHost != "smtp.example.com" || v.Mailbox != "SupportBox" {
+		t.Fatalf("unexpected email view fields: %+v", v)
+	}
+
+	creds, err := store.RawEmailCredentials(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if creds.Password != "${EMAIL_PW}" || creds.SMTPPassword != "${SMTP_PW}" || creds.IMAPHost != "imap.example.com" {
+		t.Fatalf("RawEmailCredentials = %+v", creds)
+	}
+
+	// Editing without touching secrets preserves password and smtp_password, while ClearSMTPPassword clears it.
+	markSeenTrue := true
+	updated, err := store.Save(0, ChannelDraft{
+		Name:              "support-mail",
+		Type:              "email",
+		Agent:             "greeter",
+		Mode:              "polling",
+		IMAPHost:          "imap.example.com",
+		IMAPPort:          993,
+		SMTPHost:          "smtp.example.com",
+		SMTPPort:          465,
+		Username:          "support@example.com",
+		SMTPUsername:      "smtp-user@example.com",
+		FromAddress:       "Support <support@example.com>",
+		Mailbox:           "INBOX",
+		PollInterval:      "30s",
+		MarkSeen:          &markSeenTrue,
+		ClearSMTPPassword: true,
+		AllowFrom:         []string{"vip@partner.org"},
+		AllowDomains:      []string{"example.com"},
+		MediaAllow:        []string{"text/*"},
+	}, saved.MTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uv := updated.Channels[0]
+	if !uv.HasPassword || uv.PasswordRef != "${EMAIL_PW}" {
+		t.Fatalf("password lost on save: %+v", uv)
+	}
+	if uv.HasSMTPPassword || uv.SMTPPasswordRef != "" {
+		t.Fatalf("smtp_password not cleared: %+v", uv)
+	}
+	if uv.MarkSeen == nil || !*uv.MarkSeen {
+		t.Fatalf("MarkSeen = %v; want true", uv.MarkSeen)
+	}
+}

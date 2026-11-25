@@ -221,6 +221,7 @@ func (u *UI) API() http.Handler {
 	mux.HandleFunc("DELETE /admin/api/studio/plugins/packages/{name}/files/{file}", u.handleStudioPackageFileDelete)
 	mux.HandleFunc("POST /admin/api/studio/channels/telegram/test", u.handleStudioTelegramTest)
 	mux.HandleFunc("POST /admin/api/studio/channels/qq/test", u.handleStudioQQTest)
+	mux.HandleFunc("POST /admin/api/studio/channels/email/test", u.handleStudioEmailTest)
 	mux.HandleFunc("GET /admin/api/studio/events", u.handleStudioEvents)
 	mux.HandleFunc("GET /admin/api/studio/session-trace", u.handleStudioSessionTrace)
 	mux.HandleFunc("GET /admin/api/studio/approvals", u.handleStudioApprovals)

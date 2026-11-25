@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"net/mail"
 	"net/url"
 	"strings"
 	"time"
@@ -231,6 +232,10 @@ func validateChannelList(path string, c *Config, channels []Channel) error {
 			}
 		case "wecom":
 			if err := validateWeComChannel(path, ch); err != nil {
+				return err
+			}
+		case "email":
+			if err := validateEmailChannel(path, ch); err != nil {
 				return err
 			}
 		default:
@@ -483,6 +488,66 @@ func validateQQChannel(path string, ch Channel) error {
 	return nil
 }
 
+// validateEmailChannel checks an IMAP/SMTP email channel. Passwords may be
+// lazy references (${VAR} / cred:<service>), so only presence is checked here.
+func validateEmailChannel(path string, ch Channel) error {
+	if strings.TrimSpace(ch.IMAPHost) == "" {
+		return fmt.Errorf("%s: email channel %q has no imap_host", path, ch.Name)
+	}
+	if ch.IMAPPort < 0 || ch.IMAPPort > 65535 {
+		return fmt.Errorf("%s: email channel %q imap_port must be 1..65535 (got %d)", path, ch.Name, ch.IMAPPort)
+	}
+	if strings.TrimSpace(ch.SMTPHost) == "" {
+		return fmt.Errorf("%s: email channel %q has no smtp_host", path, ch.Name)
+	}
+	if ch.SMTPPort < 0 || ch.SMTPPort > 65535 {
+		return fmt.Errorf("%s: email channel %q smtp_port must be 1..65535 (got %d)", path, ch.Name, ch.SMTPPort)
+	}
+	if strings.TrimSpace(ch.Username) == "" {
+		return fmt.Errorf("%s: email channel %q has no username", path, ch.Name)
+	}
+	if ch.Password == "" {
+		return fmt.Errorf("%s: email channel %q has no password; set password, e.g. ${EMAIL_PASSWORD} or cred:email", path, ch.Name)
+	}
+	switch ch.Mode {
+	case "", "idle", "polling":
+	default:
+		return fmt.Errorf("%s: email channel %q has unsupported mode %q (use idle or polling)", path, ch.Name, ch.Mode)
+	}
+	if ch.Path != "" {
+		return fmt.Errorf("%s: email channel %q sets path, which email does not use", path, ch.Name)
+	}
+	if len(ch.AllowUsers) > 0 {
+		return fmt.Errorf("%s: email channel %q sets allow_users, which only telegram uses; use allow_from or allow_domains for email", path, ch.Name)
+	}
+	if pi := strings.TrimSpace(ch.PollInterval); pi != "" {
+		d, err := time.ParseDuration(pi)
+		if err != nil || d < time.Second {
+			return fmt.Errorf("%s: email channel %q poll_interval %q must be a duration >= 1s (use e.g. \"30s\")", path, ch.Name, ch.PollInterval)
+		}
+	}
+	if from := strings.TrimSpace(ch.FromAddress); from != "" {
+		addr, err := mail.ParseAddress(from)
+		if err != nil || strings.TrimSpace(addr.Address) == "" {
+			return fmt.Errorf("%s: email channel %q has invalid from_address %q", path, ch.Name, ch.FromAddress)
+		}
+	}
+	for _, raw := range ch.AllowFrom {
+		s := strings.TrimSpace(raw)
+		local, domain, ok := strings.Cut(s, "@")
+		if s == "" || !ok || strings.ContainsAny(s, " \t\r\n") || local == "" || domain == "" || strings.Contains(domain, "@") {
+			return fmt.Errorf("%s: email channel %q allow_from entry %q must be a valid email address", path, ch.Name, raw)
+		}
+	}
+	for _, raw := range ch.AllowDomains {
+		d := strings.TrimPrefix(strings.TrimSpace(raw), "@")
+		if d == "" || strings.ContainsAny(d, "@ \t\r\n") {
+			return fmt.Errorf("%s: email channel %q allow_domains entry %q must be a domain name (e.g. example.com)", path, ch.Name, raw)
+		}
+	}
+	return nil
+}
+
 // patternsOverlap reports whether two ServeMux patterns can match the same
 // request. A pattern ending in "/" is a subtree; a request matches the longest
 // pattern, so a subtree and a path under it overlap.
@@ -643,6 +708,20 @@ func (ch Channel) MarshalYAML() (any, error) {
 		ExposeReasoning bool          `yaml:"expose_reasoning,omitempty"`
 		Journal         string        `yaml:"journal,omitempty"`
 		AllowUsers      []int64       `yaml:"allow_users,omitempty"`
+		IMAPHost        string        `yaml:"imap_host,omitempty"`
+		IMAPPort        int           `yaml:"imap_port,omitempty"`
+		SMTPHost        string        `yaml:"smtp_host,omitempty"`
+		SMTPPort        int           `yaml:"smtp_port,omitempty"`
+		Username        string        `yaml:"username,omitempty"`
+		Password        string        `yaml:"password,omitempty"`
+		SMTPUsername    string        `yaml:"smtp_username,omitempty"`
+		SMTPPassword    string        `yaml:"smtp_password,omitempty"`
+		FromAddress     string        `yaml:"from_address,omitempty"`
+		Mailbox         string        `yaml:"mailbox,omitempty"`
+		PollInterval    string        `yaml:"poll_interval,omitempty"`
+		MarkSeen        *bool         `yaml:"mark_seen,omitempty"`
+		AllowFrom       []string      `yaml:"allow_from,omitempty"`
+		AllowDomains    []string      `yaml:"allow_domains,omitempty"`
 		Media           *ChannelMedia `yaml:"media,omitempty"`
 		Timeout         string        `yaml:"timeout,omitempty"`
 		Async           bool          `yaml:"async,omitempty"`
@@ -655,7 +734,14 @@ func (ch Channel) MarshalYAML() (any, error) {
 		Scenes: ch.Scenes, APIBase: ch.APIBase, Markdown: ch.Markdown,
 		Auth: ch.Auth, Keys: ch.Keys, MaxRequestBytes: ch.MaxRequestBytes,
 		ExposeReasoning: ch.ExposeReasoning, Journal: ch.Journal,
-		AllowUsers: ch.AllowUsers, Timeout: ch.Timeout, Async: ch.Async,
+		AllowUsers: ch.AllowUsers,
+		IMAPHost:   ch.IMAPHost, IMAPPort: ch.IMAPPort, SMTPHost: ch.SMTPHost, SMTPPort: ch.SMTPPort,
+		Username: ch.Username, Password: ch.Password,
+		SMTPUsername: ch.SMTPUsername, SMTPPassword: ch.SMTPPassword,
+		FromAddress: ch.FromAddress, Mailbox: ch.Mailbox,
+		PollInterval: ch.PollInterval, MarkSeen: ch.MarkSeen,
+		AllowFrom: ch.AllowFrom, AllowDomains: ch.AllowDomains,
+		Timeout: ch.Timeout, Async: ch.Async,
 		DeliverURL: ch.DeliverURL,
 	}
 	if ch.Media.MaxBytes != 0 || len(ch.Media.Allow) > 0 {

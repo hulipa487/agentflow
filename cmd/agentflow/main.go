@@ -74,6 +74,7 @@ import (
 	"agentflow/internal/drivers/bridge"
 	"agentflow/internal/drivers/browser"
 	"agentflow/internal/drivers/chatapi"
+	"agentflow/internal/drivers/email"
 	"agentflow/internal/drivers/feishu"
 	"agentflow/internal/drivers/fetch"
 	"agentflow/internal/drivers/ghhook"
@@ -1978,6 +1979,11 @@ func main() {
 		ch   config.Channel
 		d    *qqbot.Driver
 	}
+	type emailBootEntry struct {
+		name string
+		ch   config.Channel
+		d    *email.Driver
+	}
 	type liveDriverEntry struct {
 		ch     config.Channel
 		cancel context.CancelFunc
@@ -1988,11 +1994,41 @@ func main() {
 	isQQWebsocket := func(ch config.Channel) bool {
 		return ch.Type == "qq" && (ch.Mode == "" || ch.Mode == "websocket")
 	}
+	isEmailChannel := func(ch config.Channel) bool {
+		return ch.Type == "email"
+	}
 	channelNameAt := func(i int, ch config.Channel) string {
 		if ch.Name != "" {
 			return ch.Name
 		}
 		return fmt.Sprintf("%s-%d", ch.Type, i)
+	}
+	makeAllowlistDropHook := func() func(channel, agent, chatID, sender, text, reason string) {
+		if !cfg.Audit.AuditEnabled() {
+			return nil
+		}
+		return func(channel, agent, chatID, sender, text, reason string) {
+			mode := journalModeFor(channel)
+			if mode == session.JournalOff {
+				return
+			}
+			t := text
+			if !mode.AllowsText() {
+				t = ""
+			}
+			_ = journalSink.RecordMessage(ctx, runtime.JournalEntry{
+				ID:        uuid.NewString(),
+				Direction: "in",
+				Status:    "dropped_allowlist",
+				Channel:   channel,
+				Chat:      chatID,
+				Sender:    sender,
+				Agent:     agent,
+				Text:      t,
+				TextBytes: len(text),
+				Err:       reason,
+			})
+		}
 	}
 	buildTelegramDriver := func(name string, ch config.Channel) (*telegram.Driver, string, bool) {
 		token, ok := credResolver.Resolve(ctx, ch.Token)
@@ -2010,30 +2046,7 @@ func main() {
 		}
 		d := telegram.New(name, token, ch.Agent, ch.Mode, ch.AllowUsers, ch.Path, cfg.Gateway.PublicURL, secretToken, sink, httpSrv, mstore, mpol, log)
 		d.SetMedia(mediaSvc)
-		if cfg.Audit.AuditEnabled() {
-			d.OnDrop = func(channel, agent, chatID, sender, text, reason string) {
-				mode := journalModeFor(channel)
-				if mode == session.JournalOff {
-					return
-				}
-				t := text
-				if !mode.AllowsText() {
-					t = ""
-				}
-				_ = journalSink.RecordMessage(ctx, runtime.JournalEntry{
-					ID:        uuid.NewString(),
-					Direction: "in",
-					Status:    "dropped_allowlist",
-					Channel:   channel,
-					Chat:      chatID,
-					Sender:    sender,
-					Agent:     agent,
-					Text:      t,
-					TextBytes: len(text),
-					Err:       reason,
-				})
-			}
-		}
+		d.OnDrop = makeAllowlistDropHook()
 		return d, "", true
 	}
 	buildQQDriver := func(name string, ch config.Channel) (*qqbot.Driver, bool) {
@@ -2067,9 +2080,53 @@ func main() {
 		}, sink, httpSrv, mstore, mpol, log)
 		return d, true
 	}
+	buildEmailDriver := func(name string, ch config.Channel) (*email.Driver, string, bool) {
+		password, ok := credResolver.Resolve(ctx, ch.Password)
+		if !ok {
+			return nil, "password", false
+		}
+		var smtpPassword string
+		if ch.SMTPPassword != "" {
+			v, ok := credResolver.Resolve(ctx, ch.SMTPPassword)
+			if !ok {
+				return nil, "smtp_password", false
+			}
+			smtpPassword = v
+		}
+		var pollInterval time.Duration
+		if ch.PollInterval != "" {
+			pollInterval, _ = time.ParseDuration(ch.PollInterval) // validated at config load
+		}
+		mpol, mok := mediaPol(ch)
+		var mstore media.Store
+		if mok {
+			mstore = mediaStore
+		}
+		d := email.New(name, ch.Agent, email.Options{
+			IMAPHost:     ch.IMAPHost,
+			IMAPPort:     ch.IMAPPort,
+			SMTPHost:     ch.SMTPHost,
+			SMTPPort:     ch.SMTPPort,
+			Username:     ch.Username,
+			Password:     password,
+			SMTPUsername: ch.SMTPUsername,
+			SMTPPassword: smtpPassword,
+			FromAddress:  ch.FromAddress,
+			Mailbox:      ch.Mailbox,
+			Mode:         ch.Mode,
+			PollInterval: pollInterval,
+			MarkSeen:     ch.EmailMarkSeen(),
+			AllowFrom:    ch.AllowFrom,
+			AllowDomains: ch.AllowDomains,
+			Media:        mediaSvc,
+		}, sink, mstore, mpol, log)
+		d.OnDrop = makeAllowlistDropHook()
+		return d, "", true
+	}
 
 	var telegramDrivers []tgBootEntry
 	var qqDrivers []qqBootEntry
+	var emailDrivers []emailBootEntry
 	var feishuDrivers []*feishu.Driver
 	var wecomDrivers []*wecom.Driver
 	for i, ch := range cfg.Gateway.Channels {
@@ -2125,6 +2182,19 @@ func main() {
 			}
 			gw.Register(d)
 			qqDrivers = append(qqDrivers, qqBootEntry{name: name, ch: ch, d: d})
+		case "email":
+			d, missingField, ok := buildEmailDriver(name, ch)
+			if !ok {
+				rawField := ch.Password
+				if missingField == "smtp_password" {
+					rawField = ch.SMTPPassword
+				}
+				log.Warn("channel skipped: unresolved credential",
+					"channel", name, "field", missingField, "credential", config.CredentialName(rawField))
+				continue
+			}
+			gw.Register(d)
+			emailDrivers = append(emailDrivers, emailBootEntry{name: name, ch: ch, d: d})
 		case "feishu":
 			secret, ok := resolveField("secret", ch.Secret, true)
 			if !ok {
@@ -2288,6 +2358,7 @@ func main() {
 	var liveMu sync.Mutex
 	liveTG := map[string]liveDriverEntry{}
 	liveQQ := map[string]liveDriverEntry{}
+	liveEmail := map[string]liveDriverEntry{}
 	for _, entry := range telegramDrivers {
 		if isTGPolling(entry.ch) {
 			tgCtx, tgCancel := context.WithCancel(ctx)
@@ -2320,6 +2391,15 @@ func main() {
 			exit(1)
 		}
 	}
+	for _, entry := range emailDrivers {
+		emCtx, emCancel := context.WithCancel(ctx)
+		if err := entry.d.Start(emCtx); err != nil {
+			emCancel()
+			log.Error("channel start failed", "channel", entry.name, "err", err)
+			exit(1)
+		}
+		liveEmail[entry.name] = liveDriverEntry{ch: entry.ch, cancel: emCancel}
+	}
 	if channelsStore != nil {
 		normTGMode := func(m string) string {
 			if m == "" {
@@ -2330,6 +2410,12 @@ func main() {
 		normQQMode := func(m string) string {
 			if m == "" {
 				return "websocket"
+			}
+			return m
+		}
+		normEmailMode := func(m string) string {
+			if m == "" {
+				return "idle"
 			}
 			return m
 		}
@@ -2347,6 +2433,7 @@ func main() {
 				defer liveMu.Unlock()
 				desiredTG := make(map[string]config.Channel)
 				desiredQQ := make(map[string]config.Channel)
+				desiredEmail := make(map[string]config.Channel)
 				changedName := ""
 				for i, c := range saved {
 					n := channelNameAt(i, c)
@@ -2356,6 +2443,9 @@ func main() {
 					if isQQWebsocket(c) {
 						desiredQQ[n] = c
 					}
+					if isEmailChannel(c) {
+						desiredEmail[n] = c
+					}
 					if changed != nil && changed.Name != "" && n == changed.Name {
 						changedName = n
 					}
@@ -2363,26 +2453,26 @@ func main() {
 				if changedName == "" && changed != nil {
 					changedName = changed.Name
 				}
-				var stoppedDeleted bool
-				for name, cur := range liveTG {
-					if _, keep := desiredTG[name]; !keep {
-						cur.cancel()
-						gw.Unregister(name)
-						delete(liveTG, name)
-						if deletedName != "" && name == deletedName {
-							stoppedDeleted = true
+				stopRemoved := func(live map[string]liveDriverEntry, desired map[string]config.Channel) bool {
+					var removedDeleted bool
+					for name, cur := range live {
+						if _, keep := desired[name]; !keep {
+							cur.cancel()
+							gw.Unregister(name)
+							delete(live, name)
+							if deletedName != "" && name == deletedName {
+								removedDeleted = true
+							}
 						}
 					}
+					return removedDeleted
 				}
-				for name, cur := range liveQQ {
-					if _, keep := desiredQQ[name]; !keep {
-						cur.cancel()
-						gw.Unregister(name)
-						delete(liveQQ, name)
-						if deletedName != "" && name == deletedName {
-							stoppedDeleted = true
-						}
-					}
+				stoppedDeleted := stopRemoved(liveTG, desiredTG)
+				if stopRemoved(liveQQ, desiredQQ) {
+					stoppedDeleted = true
+				}
+				if stopRemoved(liveEmail, desiredEmail) {
+					stoppedDeleted = true
 				}
 				if changed == nil {
 					return stoppedDeleted, nil
@@ -2426,6 +2516,25 @@ func main() {
 					}
 					liveQQ[changedName] = liveDriverEntry{ch: *changed, cancel: qqCancel}
 					return true, nil
+				case isEmailChannel(*changed):
+					if cur, ok := liveEmail[changedName]; ok {
+						cur.cancel()
+						gw.Unregister(changedName)
+						delete(liveEmail, changedName)
+					}
+					d, missingField, ok := buildEmailDriver(changedName, *changed)
+					if !ok {
+						return false, fmt.Errorf("unresolved %s credential for email channel %q", missingField, changedName)
+					}
+					emCtx, emCancel := context.WithCancel(ctx)
+					gw.Register(d)
+					if err := d.Start(emCtx); err != nil {
+						emCancel()
+						gw.Unregister(changedName)
+						return false, err
+					}
+					liveEmail[changedName] = liveDriverEntry{ch: *changed, cancel: emCancel}
+					return true, nil
 				default:
 					return false, nil
 				}
@@ -2462,6 +2571,33 @@ func main() {
 						cur.ch.Markdown == ch.Markdown &&
 						cur.ch.Journal == ch.Journal &&
 						slices.Equal(cur.ch.Scenes, ch.Scenes) &&
+						slices.Equal(cur.ch.Media.Allow, ch.Media.Allow) &&
+						cur.ch.Media.MaxBytes == ch.Media.MaxBytes
+					return match, true
+				}
+				if isEmailChannel(ch) {
+					liveMu.Lock()
+					cur, ok := liveEmail[ch.Name]
+					liveMu.Unlock()
+					if !ok {
+						return false, true
+					}
+					match := cur.ch.Name == ch.Name &&
+						cur.ch.Agent == ch.Agent &&
+						normEmailMode(cur.ch.Mode) == normEmailMode(ch.Mode) &&
+						cur.ch.IMAPHost == ch.IMAPHost &&
+						cur.ch.IMAPPort == ch.IMAPPort &&
+						cur.ch.SMTPHost == ch.SMTPHost &&
+						cur.ch.SMTPPort == ch.SMTPPort &&
+						cur.ch.Username == ch.Username &&
+						cur.ch.SMTPUsername == ch.SMTPUsername &&
+						cur.ch.FromAddress == ch.FromAddress &&
+						cur.ch.Mailbox == ch.Mailbox &&
+						cur.ch.PollInterval == ch.PollInterval &&
+						cur.ch.EmailMarkSeen() == ch.EmailMarkSeen() &&
+						cur.ch.Journal == ch.Journal &&
+						slices.Equal(cur.ch.AllowFrom, ch.AllowFrom) &&
+						slices.Equal(cur.ch.AllowDomains, ch.AllowDomains) &&
 						slices.Equal(cur.ch.Media.Allow, ch.Media.Allow) &&
 						cur.ch.Media.MaxBytes == ch.Media.MaxBytes
 					return match, true

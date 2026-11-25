@@ -3,6 +3,7 @@ package adminapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 
 	"agentflow/internal/config"
 	"agentflow/internal/core/studio"
+	"agentflow/internal/drivers/email"
 	"agentflow/internal/drivers/qqbot"
 	"agentflow/internal/drivers/telegram"
 )
@@ -313,6 +315,126 @@ func TestStudioQQTestEndpoint(t *testing.T) {
 		"api_base": srv.URL,
 	})
 	if rec.Code != http.StatusBadRequest || strings.Contains(rec.Body.String(), "bad-qq-secret") {
+		t.Fatalf("expected 400 scrubbed error, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestStudioEmailTestEndpoint(t *testing.T) {
+	orig := testEmailConnection
+	t.Cleanup(func() { testEmailConnection = orig })
+
+	testEmailConnection = func(_ context.Context, opts email.TestOptions) (email.ConnectionInfo, error) {
+		if opts.Password == "bad-email-secret" {
+			return email.ConnectionInfo{}, errors.New("login failed with bad-email-secret")
+		}
+		if opts.IMAPHost != "imap.example.com" || opts.SMTPHost != "smtp.example.com" || opts.Username != "bot@example.com" || opts.Password != "real-imap-pw" {
+			return email.ConnectionInfo{}, errors.New("unexpected options passed to TestConnection")
+		}
+		return email.ConnectionInfo{
+			IMAPHost:    opts.IMAPHost,
+			IMAPPort:    993,
+			SMTPHost:    opts.SMTPHost,
+			SMTPPort:    465,
+			Username:    opts.Username,
+			Mailbox:     opts.Mailbox,
+			Messages:    12,
+			IDLESupport: true,
+			IMAPOK:      true,
+			SMTPOK:      true,
+		}, nil
+	}
+
+	ui, _ := channelAPIFixture(t)
+	ui.deps.ResolveSecret = func(_ context.Context, raw string) (string, bool) {
+		switch raw {
+		case "credential:mail-pw":
+			return "real-imap-pw", true
+		case "credential:smtp-pw":
+			return "real-smtp-pw", true
+		case "credential:missing":
+			return "", false
+		default:
+			return raw, true
+		}
+	}
+
+	rec := do(t, ui.API(), http.MethodPost, "/admin/api/studio/channels", map[string]any{
+		"channel": map[string]any{
+			"name": "support-mail", "type": "email", "agent": "base", "mode": "idle",
+			"imap_host": "imap.example.com", "imap_port": 993,
+			"smtp_host": "smtp.example.com", "smtp_port": 465,
+			"username": "bot@example.com", "password": "credential:mail-pw",
+			"smtp_password": "credential:smtp-pw",
+			"mailbox": "INBOX", "allow_domains": []string{"example.com"},
+		},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save email channel: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Inline test with direct secrets.
+	rec = do(t, ui.API(), http.MethodPost, "/admin/api/studio/channels/email/test", map[string]any{
+		"imap_host": "imap.example.com",
+		"smtp_host": "smtp.example.com",
+		"username":  "bot@example.com",
+		"password":  "real-imap-pw",
+		"mailbox":   "INBOX",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("inline email test: %d %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		OK    bool                 `json:"ok"`
+		Email email.ConnectionInfo `json:"email"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK || !resp.Email.IMAPOK || !resp.Email.SMTPOK || !resp.Email.IDLESupport || resp.Email.Messages != 12 {
+		t.Fatalf("unexpected email test info: %+v", resp)
+	}
+
+	// Saved-index test falls back to persisted secrets/refs without echoing them.
+	idx := 0
+	rec = do(t, ui.API(), http.MethodPost, "/admin/api/studio/channels/email/test", map[string]any{
+		"index": idx,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("saved index email test: %d %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "real-imap-pw") || strings.Contains(rec.Body.String(), "real-smtp-pw") {
+		t.Fatalf("response leaked resolved secrets: %s", rec.Body.String())
+	}
+
+	// Missing required fields -> 400.
+	rec = do(t, ui.API(), http.MethodPost, "/admin/api/studio/channels/email/test", map[string]any{
+		"smtp_host": "smtp.example.com",
+		"username":  "bot@example.com",
+		"password":  "real-imap-pw",
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing imap_host, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Unresolvable credential ref -> 400.
+	rec = do(t, ui.API(), http.MethodPost, "/admin/api/studio/channels/email/test", map[string]any{
+		"imap_host": "imap.example.com",
+		"smtp_host": "smtp.example.com",
+		"username":  "bot@example.com",
+		"password":  "credential:missing",
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unresolved credential, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Secret scrubbed from error output.
+	rec = do(t, ui.API(), http.MethodPost, "/admin/api/studio/channels/email/test", map[string]any{
+		"imap_host": "imap.example.com",
+		"smtp_host": "smtp.example.com",
+		"username":  "bot@example.com",
+		"password":  "bad-email-secret",
+	})
+	if rec.Code != http.StatusBadRequest || strings.Contains(rec.Body.String(), "bad-email-secret") {
 		t.Fatalf("expected 400 scrubbed error, got %d %s", rec.Code, rec.Body.String())
 	}
 }

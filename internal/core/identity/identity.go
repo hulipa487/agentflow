@@ -75,7 +75,10 @@ var channelDefaults = map[string]ChannelTraits{
 	// Feishu / Lark authenticates the sender's open_id and delivers into chats.
 	"feishu": {Trust: TrustVerified, Deliverable: true, Linkable: true},
 	// WeCom authenticates corporate UserID and delivers via agent message API.
-	"wecom":     {Trust: TrustVerified, Deliverable: true, Linkable: true},
+	"wecom": {Trust: TrustVerified, Deliverable: true, Linkable: true},
+	// Email senders are authenticated only as well as the upstream MX/IMAP
+	// server guarantees, and replies deliver back into the email thread.
+	"email":     {Trust: TrustAsserted, Deliverable: true, Linkable: true},
 	oidcChannel: {Trust: TrustVerified}, // a login, not an address: nothing to deliver to
 	"webhook":   {Trust: TrustAsserted, Deliverable: false, Linkable: false},
 	"ghhook":    {Trust: TrustSystem, Deliverable: false, Linkable: false},

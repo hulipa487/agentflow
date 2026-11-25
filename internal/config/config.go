@@ -1355,8 +1355,8 @@ type Gateway struct {
 
 type Channel struct {
 	Name   string   `yaml:"name"`
-	Type   string   `yaml:"type"` // webhook | telegram | ghhook | bridge | openai | qq | feishu | wecom
-	Mode   string   `yaml:"mode"` // telegram: polling (default) | webhook | auto; qq | feishu: websocket (default) | webhook; wecom: webhook
+	Type   string   `yaml:"type"` // webhook | telegram | ghhook | bridge | openai | qq | feishu | wecom | email
+	Mode   string   `yaml:"mode"` // telegram: polling (default) | webhook | auto; qq | feishu: websocket (default) | webhook; wecom: webhook; email: idle (default) | polling
 	Agent  string   `yaml:"agent"`
 	Agents []string `yaml:"agents"` // openai: the agents exposed as model ids
 	Path   string   `yaml:"path"`   // route mounted on the shared server, e.g. /webhook/<chan>/<uuid>/
@@ -1371,6 +1371,21 @@ type Channel struct {
 	// EncryptKey is the feishu webhook Encrypt Key (optional unless encrypting
 	// callbacks) or the wecom 43-character EncodingAESKey.
 	EncryptKey string `yaml:"encrypt_key"`
+	// Email (IMAP + SMTP) channel settings.
+	IMAPHost     string   `yaml:"imap_host"`
+	IMAPPort     int      `yaml:"imap_port"` // default 993 (implicit TLS); 143 uses STARTTLS
+	SMTPHost     string   `yaml:"smtp_host"`
+	SMTPPort     int      `yaml:"smtp_port"` // default 465 (implicit TLS); 587/25 uses STARTTLS
+	Username     string   `yaml:"username"`
+	Password     string   `yaml:"password"`      // supports ${VAR} and cred:<service>
+	SMTPUsername string   `yaml:"smtp_username"` // optional override; defaults to username
+	SMTPPassword string   `yaml:"smtp_password"` // optional override; supports ${VAR} and cred:<service>
+	FromAddress  string   `yaml:"from_address"`  // optional From: header; defaults to smtp_username or username
+	Mailbox      string   `yaml:"mailbox"`       // IMAP folder to watch (default "INBOX")
+	PollInterval string   `yaml:"poll_interval"` // polling cadence / IDLE recycle interval (default "30s")
+	MarkSeen     *bool    `yaml:"mark_seen"`     // mark processed inbound messages \Seen (default true)
+	AllowFrom    []string `yaml:"allow_from"`    // exact sender email allowlist
+	AllowDomains []string `yaml:"allow_domains"` // sender domain allowlist
 	// Scenes are where a qq channel takes messages from: c2c (private chats),
 	// group (@-mentions in groups), guild (@-mentions in guild channels) and dm
 	// (guild direct messages). Empty means c2c, group and guild.
@@ -1416,6 +1431,15 @@ type Channel struct {
 	// type: bridge; the adapter translates the neutral reply into the
 	// platform's API call.
 	DeliverURL string `yaml:"deliver_url"`
+}
+
+// EmailMarkSeen reports whether processed inbound emails should be marked \Seen
+// on the IMAP server (default true when mark_seen is omitted).
+func (ch Channel) EmailMarkSeen() bool {
+	if ch.MarkSeen == nil {
+		return true
+	}
+	return *ch.MarkSeen
 }
 
 // ChannelMedia gates inbound media on a channel. Media is opt-in: with no

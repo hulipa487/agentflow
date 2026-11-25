@@ -49,10 +49,26 @@ type ChannelDraft struct {
 	EncryptKey      string   `json:"encrypt_key,omitempty"`
 	ClearEncryptKey bool     `json:"clear_encrypt_key,omitempty"`
 	Scenes          []string `json:"scenes,omitempty"`
-	APIBase         string   `json:"api_base,omitempty"`
-	Markdown        bool     `json:"markdown,omitempty"`
-	MediaAllow      []string `json:"media_allow,omitempty"`
-	MediaMaxBytes   int      `json:"media_max_bytes,omitempty"`
+	APIBase           string   `json:"api_base,omitempty"`
+	Markdown          bool     `json:"markdown,omitempty"`
+	IMAPHost          string   `json:"imap_host,omitempty"`
+	IMAPPort          int      `json:"imap_port,omitempty"`
+	SMTPHost          string   `json:"smtp_host,omitempty"`
+	SMTPPort          int      `json:"smtp_port,omitempty"`
+	Username          string   `json:"username,omitempty"`
+	Password          string   `json:"password,omitempty"`
+	ClearPassword     bool     `json:"clear_password,omitempty"`
+	SMTPUsername      string   `json:"smtp_username,omitempty"`
+	SMTPPassword      string   `json:"smtp_password,omitempty"`
+	ClearSMTPPassword bool     `json:"clear_smtp_password,omitempty"`
+	FromAddress       string   `json:"from_address,omitempty"`
+	Mailbox           string   `json:"mailbox,omitempty"`
+	PollInterval      string   `json:"poll_interval,omitempty"`
+	MarkSeen          *bool    `json:"mark_seen,omitempty"`
+	AllowFrom         []string `json:"allow_from,omitempty"`
+	AllowDomains      []string `json:"allow_domains,omitempty"`
+	MediaAllow        []string `json:"media_allow,omitempty"`
+	MediaMaxBytes     int      `json:"media_max_bytes,omitempty"`
 }
 
 // ChannelView is a channel as the editor sees it. Secrets are never included;
@@ -75,6 +91,18 @@ type ChannelView struct {
 	Scenes          []string `json:"scenes,omitempty"`
 	APIBase         string   `json:"api_base,omitempty"`
 	Markdown        bool     `json:"markdown,omitempty"`
+	IMAPHost        string   `json:"imap_host,omitempty"`
+	IMAPPort        int      `json:"imap_port,omitempty"`
+	SMTPHost        string   `json:"smtp_host,omitempty"`
+	SMTPPort        int      `json:"smtp_port,omitempty"`
+	Username        string   `json:"username,omitempty"`
+	SMTPUsername    string   `json:"smtp_username,omitempty"`
+	FromAddress     string   `json:"from_address,omitempty"`
+	Mailbox         string   `json:"mailbox,omitempty"`
+	PollInterval    string   `json:"poll_interval,omitempty"`
+	MarkSeen        *bool    `json:"mark_seen,omitempty"`
+	AllowFrom       []string `json:"allow_from,omitempty"`
+	AllowDomains    []string `json:"allow_domains,omitempty"`
 	Auth            string   `json:"auth,omitempty"`
 	MaxRequestBytes int      `json:"max_request_bytes,omitempty"`
 	ExposeReasoning bool     `json:"expose_reasoning,omitempty"`
@@ -86,11 +114,15 @@ type ChannelView struct {
 	HasSecret       bool     `json:"has_secret"`
 	HasSecretTok    bool     `json:"has_secret_token"`
 	HasEncryptKey   bool     `json:"has_encrypt_key"`
+	HasPassword     bool     `json:"has_password"`
+	HasSMTPPassword bool     `json:"has_smtp_password"`
 	HasKeys         bool     `json:"has_keys"`
 	TokenRef        string   `json:"token_ref,omitempty"`
 	SecretRef       string   `json:"secret_ref,omitempty"`
 	SecretTokRef    string   `json:"secret_token_ref,omitempty"`
 	EncryptKeyRef   string   `json:"encrypt_key_ref,omitempty"`
+	PasswordRef     string   `json:"password_ref,omitempty"`
+	SMTPPasswordRef string   `json:"smtp_password_ref,omitempty"`
 	KeyRefs         []string `json:"key_refs,omitempty"`
 	Live            bool     `json:"live"`
 }
@@ -170,6 +202,48 @@ func (c *Channels) RawQQCredentials(index int) (appID, secret, apiBase string, e
 	return raw[index].AppID, raw[index].Secret, raw[index].APIBase, nil
 }
 
+// EmailCredentials carries the persisted non-public connection settings and
+// secret references for one email channel so the admin test endpoint can test
+// stored credentials without exposing secrets to the browser.
+type EmailCredentials struct {
+	IMAPHost     string
+	IMAPPort     int
+	SMTPHost     string
+	SMTPPort     int
+	Username     string
+	Password     string
+	SMTPUsername string
+	SMTPPassword string
+	Mailbox      string
+}
+
+// RawEmailCredentials returns the persisted email connection settings and
+// secrets/refs for one channel so an authenticated admin test endpoint can
+// verify stored credentials without returning secrets to the client.
+func (c *Channels) RawEmailCredentials(index int) (EmailCredentials, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	raw, err := c.readRaw()
+	if err != nil {
+		return EmailCredentials{}, err
+	}
+	if index < 0 || index >= len(raw) {
+		return EmailCredentials{}, fmt.Errorf("channel #%d does not exist", index+1)
+	}
+	ch := raw[index]
+	return EmailCredentials{
+		IMAPHost:     ch.IMAPHost,
+		IMAPPort:     ch.IMAPPort,
+		SMTPHost:     ch.SMTPHost,
+		SMTPPort:     ch.SMTPPort,
+		Username:     ch.Username,
+		Password:     ch.Password,
+		SMTPUsername: ch.SMTPUsername,
+		SMTPPassword: ch.SMTPPassword,
+		Mailbox:      ch.Mailbox,
+	}, nil
+}
+
 // NewChannels builds the store. agentNames should return the live agent names
 // (not spawn templates), so a channel can target an agent created in Studio
 // since boot; nil falls back to the boot config's agents.
@@ -237,13 +311,21 @@ func (c *Channels) view(i int, ch config.Channel) ChannelView {
 		Mode: ch.Mode, Path: ch.Path, Timeout: ch.Timeout, Async: ch.Async,
 		DeliverURL: ch.DeliverURL, AppID: ch.AppID, CorpID: ch.CorpID, AgentID: ch.AgentID,
 		Scenes: ch.Scenes, APIBase: ch.APIBase, Markdown: ch.Markdown,
+		IMAPHost: ch.IMAPHost, IMAPPort: ch.IMAPPort, SMTPHost: ch.SMTPHost, SMTPPort: ch.SMTPPort,
+		Username: ch.Username, SMTPUsername: ch.SMTPUsername, FromAddress: ch.FromAddress,
+		Mailbox: ch.Mailbox, PollInterval: ch.PollInterval,
+		AllowFrom: ch.AllowFrom, AllowDomains: ch.AllowDomains,
 		Auth: ch.Auth, MaxRequestBytes: ch.MaxRequestBytes, ExposeReasoning: ch.ExposeReasoning,
 		Journal:    ch.Journal,
 		AllowUsers: ch.AllowUsers, MediaAllow: ch.Media.Allow, MediaMaxBytes: ch.Media.MaxBytes,
 		HasToken: ch.Token != "", HasSecret: ch.Secret != "", HasSecretTok: ch.SecretToken != "",
-		HasEncryptKey: ch.EncryptKey != "",
+		HasEncryptKey: ch.EncryptKey != "", HasPassword: ch.Password != "", HasSMTPPassword: ch.SMTPPassword != "",
 		TokenRef:      secretRef(ch.Token), SecretRef: secretRef(ch.Secret), SecretTokRef: secretRef(ch.SecretToken),
-		EncryptKeyRef: secretRef(ch.EncryptKey),
+		EncryptKeyRef: secretRef(ch.EncryptKey), PasswordRef: secretRef(ch.Password), SMTPPasswordRef: secretRef(ch.SMTPPassword),
+	}
+	if ch.Type == "email" {
+		ms := ch.EmailMarkSeen()
+		v.MarkSeen = &ms
 	}
 	for _, k := range ch.Keys {
 		v.HasKeys = true
@@ -276,6 +358,12 @@ func (c *Channels) live(i int, raw config.Channel) bool {
 		l.Async == raw.Async && l.DeliverURL == raw.DeliverURL &&
 		l.AppID == raw.AppID && l.CorpID == raw.CorpID && l.AgentID == raw.AgentID &&
 		equalStrings(l.Scenes, raw.Scenes) && l.APIBase == raw.APIBase && l.Markdown == raw.Markdown &&
+		l.IMAPHost == raw.IMAPHost && l.IMAPPort == raw.IMAPPort &&
+		l.SMTPHost == raw.SMTPHost && l.SMTPPort == raw.SMTPPort &&
+		l.Username == raw.Username && l.SMTPUsername == raw.SMTPUsername &&
+		l.FromAddress == raw.FromAddress && l.Mailbox == raw.Mailbox &&
+		l.PollInterval == raw.PollInterval && l.EmailMarkSeen() == raw.EmailMarkSeen() &&
+		equalStrings(l.AllowFrom, raw.AllowFrom) && equalStrings(l.AllowDomains, raw.AllowDomains) &&
 		equalInts(l.AllowUsers, raw.AllowUsers) &&
 		equalStrings(l.Media.Allow, raw.Media.Allow)
 }
@@ -473,12 +561,23 @@ func channelFromDraft(d ChannelDraft, existing *config.Channel) config.Channel {
 		Async: d.Async, DeliverURL: strings.TrimSpace(d.DeliverURL), AllowUsers: d.AllowUsers,
 		AppID: strings.TrimSpace(d.AppID), CorpID: strings.TrimSpace(d.CorpID), AgentID: d.AgentID,
 		Scenes: d.Scenes, APIBase: strings.TrimSpace(d.APIBase), Markdown: d.Markdown,
+		IMAPHost: strings.TrimSpace(d.IMAPHost), IMAPPort: d.IMAPPort,
+		SMTPHost: strings.TrimSpace(d.SMTPHost), SMTPPort: d.SMTPPort,
+		Username: strings.TrimSpace(d.Username), SMTPUsername: strings.TrimSpace(d.SMTPUsername),
+		FromAddress: strings.TrimSpace(d.FromAddress), Mailbox: strings.TrimSpace(d.Mailbox),
+		PollInterval: strings.TrimSpace(d.PollInterval),
+		AllowFrom: d.AllowFrom, AllowDomains: d.AllowDomains,
 		Auth: strings.TrimSpace(d.Auth), MaxRequestBytes: d.MaxRequestBytes,
 		ExposeReasoning: d.ExposeReasoning, Journal: strings.TrimSpace(d.Journal),
 		Media: config.ChannelMedia{Allow: d.MediaAllow, MaxBytes: d.MediaMaxBytes},
 	}
+	if d.MarkSeen != nil {
+		ms := *d.MarkSeen
+		ch.MarkSeen = &ms
+	}
 	if existing != nil {
 		ch.Token, ch.Secret, ch.SecretToken, ch.EncryptKey = existing.Token, existing.Secret, existing.SecretToken, existing.EncryptKey
+		ch.Password, ch.SMTPPassword = existing.Password, existing.SMTPPassword
 		ch.Keys = existing.Keys
 		// A draft that does not mention the audit mode keeps the stored one.
 		// The setting exists on every channel type, but an editor may only
@@ -507,6 +606,16 @@ func channelFromDraft(d ChannelDraft, existing *config.Channel) config.Channel {
 		ch.EncryptKey = d.EncryptKey
 	} else if d.ClearEncryptKey {
 		ch.EncryptKey = ""
+	}
+	if d.Password != "" {
+		ch.Password = d.Password
+	} else if d.ClearPassword {
+		ch.Password = ""
+	}
+	if d.SMTPPassword != "" {
+		ch.SMTPPassword = d.SMTPPassword
+	} else if d.ClearSMTPPassword {
+		ch.SMTPPassword = ""
 	}
 	if len(d.Keys) > 0 {
 		ch.Keys = d.Keys

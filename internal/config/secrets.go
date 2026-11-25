@@ -34,6 +34,8 @@ var secretPathPatterns = []string{
 	"gateway.channels.[].secret",
 	"gateway.channels.[].secret_token",
 	"gateway.channels.[].encrypt_key",
+	"gateway.channels.[].password",
+	"gateway.channels.[].smtp_password",
 	"gateway.channels.[].keys.[]",
 	"memory.backends.*.config.url",
 	"memory.backends.*.config.password",

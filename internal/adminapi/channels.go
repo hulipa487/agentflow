@@ -8,9 +8,12 @@ import (
 	"strings"
 
 	"agentflow/internal/core/studio"
+	"agentflow/internal/drivers/email"
 	"agentflow/internal/drivers/qqbot"
 	"agentflow/internal/drivers/telegram"
 )
+
+var testEmailConnection = email.TestConnection
 
 // channelResponse flattens the channel list and adds the outcome of the write.
 type channelResponse struct {
@@ -268,5 +271,144 @@ func (u *UI) handleStudioQQTest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":  true,
 		"bot": info,
+	})
+}
+
+func scrubEmailSecret(err error, secrets ...string) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	for _, sec := range secrets {
+		if sec != "" {
+			msg = strings.ReplaceAll(msg, sec, "[redacted]")
+		}
+	}
+	return msg
+}
+
+// handleStudioEmailTest verifies IMAP login/mailbox select and SMTP
+// authentication without altering mailbox flags or echoing stored secrets.
+func (u *UI) handleStudioEmailTest(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Index             *int   `json:"index,omitempty"`
+		IMAPHost          string `json:"imap_host,omitempty"`
+		IMAPPort          int    `json:"imap_port,omitempty"`
+		SMTPHost          string `json:"smtp_host,omitempty"`
+		SMTPPort          int    `json:"smtp_port,omitempty"`
+		Username          string `json:"username,omitempty"`
+		Password          string `json:"password,omitempty"`
+		SMTPUsername      string `json:"smtp_username,omitempty"`
+		SMTPPassword      string `json:"smtp_password,omitempty"`
+		ClearSMTPPassword bool   `json:"clear_smtp_password,omitempty"`
+		Mailbox           string `json:"mailbox,omitempty"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	imapHost := strings.TrimSpace(req.IMAPHost)
+	imapPort := req.IMAPPort
+	smtpHost := strings.TrimSpace(req.SMTPHost)
+	smtpPort := req.SMTPPort
+	username := strings.TrimSpace(req.Username)
+	rawPass := strings.TrimSpace(req.Password)
+	smtpUser := strings.TrimSpace(req.SMTPUsername)
+	rawSMTPPass := strings.TrimSpace(req.SMTPPassword)
+	mailbox := strings.TrimSpace(req.Mailbox)
+
+	if req.Index != nil && *req.Index >= 0 {
+		ch, ok := u.channelsReady(w)
+		if !ok {
+			return
+		}
+		stored, err := ch.RawEmailCredentials(*req.Index)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if imapHost == "" {
+			imapHost = strings.TrimSpace(stored.IMAPHost)
+		}
+		if imapPort <= 0 {
+			imapPort = stored.IMAPPort
+		}
+		if smtpHost == "" {
+			smtpHost = strings.TrimSpace(stored.SMTPHost)
+		}
+		if smtpPort <= 0 {
+			smtpPort = stored.SMTPPort
+		}
+		if username == "" {
+			username = strings.TrimSpace(stored.Username)
+		}
+		if rawPass == "" {
+			rawPass = strings.TrimSpace(stored.Password)
+		}
+		if smtpUser == "" {
+			smtpUser = strings.TrimSpace(stored.SMTPUsername)
+		}
+		if rawSMTPPass == "" && !req.ClearSMTPPassword {
+			rawSMTPPass = strings.TrimSpace(stored.SMTPPassword)
+		}
+		if mailbox == "" {
+			mailbox = strings.TrimSpace(stored.Mailbox)
+		}
+	}
+
+	if imapHost == "" {
+		writeErr(w, http.StatusBadRequest, "enter an IMAP host first")
+		return
+	}
+	if smtpHost == "" {
+		writeErr(w, http.StatusBadRequest, "enter an SMTP host first")
+		return
+	}
+	if username == "" {
+		writeErr(w, http.StatusBadRequest, "enter a mailbox username first")
+		return
+	}
+	if rawPass == "" {
+		writeErr(w, http.StatusBadRequest, "enter an IMAP password first")
+		return
+	}
+
+	password := rawPass
+	if u.deps.ResolveSecret != nil {
+		resolved, ok := u.deps.ResolveSecret(r.Context(), rawPass)
+		if !ok || strings.TrimSpace(resolved) == "" {
+			writeErr(w, http.StatusBadRequest, "email password credential could not be resolved")
+			return
+		}
+		password = strings.TrimSpace(resolved)
+	}
+	smtpPassword := rawSMTPPass
+	if rawSMTPPass != "" && u.deps.ResolveSecret != nil {
+		resolved, ok := u.deps.ResolveSecret(r.Context(), rawSMTPPass)
+		if !ok || strings.TrimSpace(resolved) == "" {
+			writeErr(w, http.StatusBadRequest, "SMTP password credential could not be resolved")
+			return
+		}
+		smtpPassword = strings.TrimSpace(resolved)
+	}
+
+	info, err := testEmailConnection(r.Context(), email.TestOptions{
+		IMAPHost:     imapHost,
+		IMAPPort:     imapPort,
+		SMTPHost:     smtpHost,
+		SMTPPort:     smtpPort,
+		Username:     username,
+		Password:     password,
+		SMTPUsername: smtpUser,
+		SMTPPassword: smtpPassword,
+		Mailbox:      mailbox,
+	})
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, scrubEmailSecret(err, password, smtpPassword, rawPass, rawSMTPPass))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":    true,
+		"email": info,
 	})
 }
